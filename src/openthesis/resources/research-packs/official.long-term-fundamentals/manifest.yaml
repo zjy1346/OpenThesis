@@ -1,0 +1,35 @@
+{
+  "api_version": "openthesis.io/v1alpha1",
+  "kind": "ResearchPack",
+  "metadata": {
+    "id": "official.long-term-fundamentals",
+    "name": "OpenThesis 长期基本面研究",
+    "version": "0.1.0",
+    "author": "OpenThesis Contributors",
+    "license": "Apache-2.0",
+    "languages": ["zh-CN", "en"]
+  },
+  "description": "官方财报、商业模式、风险、增长机会和长期情景研究框架。",
+  "compatibility": {
+    "application": ">=0.1.0",
+    "research_protocol": "1.x"
+  },
+  "model_requirements": {
+    "structured_output": true,
+    "tool_calling": false,
+    "minimum_context_tokens": 16000
+  },
+  "permissions": {
+    "tools": [
+      "filing.search",
+      "financials.get_fact",
+      "financials.compare",
+      "metrics.calculate",
+      "evidence.get"
+    ],
+    "network": false,
+    "filesystem": false,
+    "execute_code": false
+  }
+}
+

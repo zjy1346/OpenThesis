@@ -1,0 +1,53 @@
+{
+  "workflow": {
+    "id": "complete-fundamental-research",
+    "version": "0.1.0",
+    "steps": [
+      {
+        "id": "financial",
+        "agent": "financial-analyst",
+        "prompt": "prompts/financial-analyst.md"
+      },
+      {
+        "id": "business",
+        "agent": "business-analyst",
+        "prompt": "prompts/business-analyst.md"
+      },
+      {
+        "id": "accounting-risk",
+        "agent": "accounting-risk-analyst",
+        "prompt": "prompts/accounting-risk-analyst.md"
+      },
+      {
+        "id": "growth",
+        "agent": "growth-opportunity-analyst",
+        "prompt": "prompts/growth-opportunity-analyst.md",
+        "depends_on": ["financial", "business", "accounting-risk"]
+      },
+      {
+        "id": "skeptic",
+        "agent": "skeptical-analyst",
+        "prompt": "prompts/skeptical-analyst.md",
+        "depends_on": ["growth"]
+      },
+      {
+        "id": "forecast",
+        "agent": "forecast-analyst",
+        "prompt": "prompts/forecast-analyst.md",
+        "depends_on": ["growth", "skeptic"]
+      },
+      {
+        "id": "synthesis",
+        "agent": "research-synthesizer",
+        "prompt": "prompts/research-synthesizer.md",
+        "depends_on": ["forecast"]
+      }
+    ]
+  },
+  "limits": {
+    "maximum_opportunities": 5,
+    "maximum_agent_calls": 12,
+    "maximum_runtime_seconds": 1200
+  }
+}
+
