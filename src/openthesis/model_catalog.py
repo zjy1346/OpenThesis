@@ -6,6 +6,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Iterable
 
+from .i18n import model_preset_id_from_label, model_preset_label
 
 class ModelDiscoveryError(RuntimeError):
     """A user-safe model catalog error which never contains credentials."""
@@ -149,9 +150,17 @@ CLOUD_PRESET_IDS = frozenset(
 
 
 def get_model_preset(value: str) -> ModelPreset:
-    return PRESETS_BY_ID.get(value) or PRESETS_BY_LABEL.get(value) or PRESETS_BY_ID[
-        "custom"
-    ]
+    localized_id = model_preset_id_from_label(value)
+    return (
+        PRESETS_BY_ID.get(value)
+        or PRESETS_BY_LABEL.get(value)
+        or (PRESETS_BY_ID.get(localized_id) if localized_id else None)
+        or PRESETS_BY_ID["custom"]
+    )
+
+
+def preset_labels(language: str) -> tuple[str, ...]:
+    return tuple(model_preset_label(preset.preset_id, language) for preset in MODEL_PRESETS)
 
 
 def merge_model_ids(
