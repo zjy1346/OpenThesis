@@ -1,6 +1,6 @@
 # OpenThesis
 
-> 面向长期个人投资者的开源、模型无关 AI 公司研究系统。  
+> 面向长期个人投资者的开源、模型无关 AI 公司研究投资系统。  
 > An open-source, model-agnostic AI company research system for long-term individual investors.
 
 ## 中文简介
