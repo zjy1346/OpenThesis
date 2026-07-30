@@ -223,4 +223,897 @@ flowchart TD
 
 The domain and provider boundaries remain intentionally independent from Tkinter so a
 web interface, service API, or alternative desktop shell can be added later without
-rewriting w~7æÚ$z{-®éÜj×æ÷B6†÷'B×FW&Ò7Fö6²F—&V7F–öã  ¢Ò&WfVçVRæB'W6–æW72ÖG&—fW"w&÷wFƒ°¢Ò÷W&F–ærÖ&v–ã°¢Òg&VR66‚fÆ÷s°¢Ò$ô”3°¢Ò6—FÂW‡VæF—GW&S°¢ÒF–ÇWF–öã°¢Ò6VÆV7FVB6ö×ç’×7V6–f–2µ—3°¢ÒFVf–æVB&—6²ÖWfVçB&ö&&–Æ—F–W2à ¢222Rã"f÷&V67B÷WGW@ ¦–ÖÀ§66Væ&–ó¢&6P¦†÷&—¦öå÷–V'3¢P§&ö&&–Æ—G“¢ãS §&WfVçVUö6w# ¢ö–çC¢ã¢&ævS¢³ã‚ÂãEĞ§FW&Ö–æÅö÷W&F–æuöÖ&v–ã ¢ö–çC¢ã#¢&ævS¢³ã‚Âã#5Ğ¦77V×F–öç3¢µĞ¦–çfÆ–FF–öåö6öæF—F–öç3¢µĞ¦  ¤&V"Â&6RÂæB'VÆÂ&ö&&–Æ—F–W2×W7B&RW‡Æ–6—BæBæ÷&ÖÆ—¦VBà ¢222Rã2fÇVF–öà ¤–æ—F–ÂfÇVF–öâFööÇ3  ¢Ò&WfW'6RD4c°¢Òf÷'v&BD4c°¢Ò6Vç6—F—f—G’æÇ—6—3°¢Ò†—7F÷&–6ÂfÇVF–öâ6öçFW‡Bà ¥F†R6Æ7VÆF–öâVæv–æRW&f÷&×2ÆÂfÇVF–öâÖF‚âvVçG2W‡Æ–âæB6†ÆÆVævR–çWG2à ¥F†R&VfW'&VBf—'7BVW7F–öâ—3  £âv†B÷W&F–ær77V×F–öç2×W7B&RG'VRf÷"F†R7W'&VçBÖ&¶WB&–6RFò&R§W7F–f–VCğ ¢22bâÖöGVÆ"&W6V&6‚6·0 ¢222bã6¶vRf÷&Ö@ ¤&W6V&6‚ÖöGVÆR—2F—7G&–'WFVB2öæRæ÷F†W6—6f–ÆRâ—B—2¤•Ö6ö×F–&ÆRFV6Æ&F—fR6¶vRà ¤W†×ÆS  ¦FW‡@¦6öÖ×Væ—G’ç62Öw&÷wF‚æ÷F†W6—0®)IÎ)H)HÖæ–fW7Bç–ÖÀ®)IÎ)H)Hv÷&¶fÆ÷rç–ÖÀ®)IÎ)H)H&ö×G2ğ®)IÎ)H)H66†VÖ2ğ®)IÎ)H)H'VÆW2ğ®)IÎ)H)H'V'&–72ğ®)IÎ)H)HW†×ÆW2ğ®)IÎ)H)HFW7G2ğ®)IN)H)H$TDÔRæÖ@¦  ¥F†R&ö¦V7B6†—2âöff–6–Â'V–ÇBÖ–â6³  ¦FW‡@¦öff–6–ÂæÆöær×FW&ÒÖgVæFÖVçFÇ0¦  ¢222bã"6¶vR&W7öç6–&–Æ—F–W0 ¤6²Ö’FVf–æS  ¢Ò&W6V&6‚VW7F–öç3°¢ÒvVçB&ö×G3°¢Òv÷&¶fÆ÷r7FW3°¢ÒWf–FVæ6RÆWfVÇ3°¢Òw&÷wF‚Ö÷÷'GVæ—G’6FVv÷&–W3°¢Ò–æGW7G'’×7V6–f–2ÖWG&–73°¢Ò66Væ&–òÖFÖ—76–öâ'VÆW3°¢Ò÷WGWB66†VÖ3°¢Ò&W÷'B6V7F–öç3°¢Ò&Væ6†Ö&²'V'&–72à ¤6²FV6Æ&W2&WV—&VBÖöFVÂ6&–Æ—F–W2æBÆÆ÷vVB&W6V&6‚FööÇ2â—BFöW2æ÷B&WV—&R'F–7VÆ"ÖöFVÂfVæF÷"à ¢222bã26¶vRÆ–W&–æp ¦FW‡@¦æöâÖ÷fW'&–F&ÆR6÷&R6fWG’öÆ–7¢(i"öff–6–Â&6R&W6V&6‚6°¢(i"÷F–öæÂ6V7F÷"6°¢(i"W6W"÷fW'&–FRÆ–W ¦  ¢222bãB6V7W&—G’&W7G&–7F–öç0 ¥F†Rf—'7B6¶vRfW'6–öâÆÆ÷w3  ¢Ò”ÔÃ°¢ÒÖ&¶F÷vã°¢Ò¥4ôâ66†VÖ°¢Ò&W7G&–7FVBf÷&×VÆW‡&W76–öç2à ¤—BFöW2æ÷BÆÆ÷s  ¢Ò—F†öâÂ¦f67&—BÂ6†VÆÂÂ÷"&&—G&'’W†V7WF&ÆR6öFS°¢ÒVç&W7G&–7FVBæWGv÷&²&WVW7G3°¢Òf–ÆW7—7FVÒ66W73°¢Ò6V7&WB66W73°¢ÒG&ç67F–öâ6&–Æ—F–W3°¢ÒÖöF–f–6F–öâöb&r6÷W&6RFö7VÖVçG2÷"öff–6–Âf7G2à ¥&W7G&–7FVBf÷&×VÆ2&R'6VB'’6fRW‡&W76–öâVæv–æRâF†W’&RæWfW"76VBFòWfÆà ¢222bãR–ç7FÆÆF–öà ¤&Vf÷&R–ç7FÆÆF–öâF†RÆ–6F–öã  £âfÆ–FFW2F†R&6†—fRæBÖæ–fW7C°£"â6†V6·26ö×F–&–Æ—G“°£2âF—7Æ—2&WVW7FVBFööÇ2æBW&Ö—76–öç3°£Bâ66ç2f÷"&ö†–&—FVBf–ÆW2æB6öç7G'V7G3°£Râ'Vç2–æ6ÇVFVBfÆ–FF–öâFW7G3°£bâ&V6÷&G26¶vR–BÂfW'6–öâÂ6÷W&6RÂæB6öçFVçB†6‚à ¤'V–ÇBÖ–âÂ6–væVBÖ6öÖ×Væ—G’ÂÆö6Â×W6W"ÂæBVçG'W7FVB6¶vW2&Rf—6–&Ç’F—7F–æwV—6†VBà ¢22râ&W&öGV6–&–Æ—G ¤WfW'’&W÷'B&V6÷&G3  ¦–ÖÀ¦vVæW&FVEöC¢##bÓrÓ#•C#£3£ ¦FFö5ööc¢##bÓrÓ#•C££ §6÷W&6U÷6æ6†÷Eö†6ƒ¢6†#Sc¢ââà§&÷f–FW#¢W6W"×6VÆV7FV@¦ÖöFVÃ¢&÷f–FW"ÖÖöFVÂÖ–@¦ÖöFVÅ÷&ÖWFW'3 ¢FV×W&GW&S¢ã §&W6V&6…÷6³ ¢–C¢öff–6–ÂæÆöær×FW&ÒÖgVæFÖVçFÇ0¢fW'6–öã¢ãã ¢†6ƒ¢6†#Sc¢ââà§v÷&¶fÆ÷s ¢–C¢6ö×ÆWFRÖgVæFÖVçFÂ×&W6V&6€¢fW'6–öã¢ãã ¦Æ–6F–öå÷fW'6–öã¢ãã ¦  ¥W6W"VF—G2&R7F÷&VB2æWrfW'6–öç2æBGG&–'WFVBFòF†RW6W"&F†W"F†â&V–ær&W6VçFVB2ÖöFVÂ÷WGWBà ¢22‚â&Væ6†Ö&²FW6–và ¥F†R&Væ6†Ö&²ÖV7W&W2f–ææ6–Â&W6V&6‚&–Æ—G’6W&FVÇ’g&öÒgWGW&R–çfW7FÖVçBW&f÷&Öæ6Rà ¢222‚ãf–Æ–ær&W6V&6‚G&6° ¤–æ—F–Â66÷&–æs  §ÂF–ÖVç6–öâÂvV–v‡BÀ§ÂÒÒ×ÂÒÒÓ§À§Âf–ææ6–Âf7B67W&7’Â#RÀ§Â6Æ7VÆF–öâ67W&7’ÂRRÀ§Â6—FF–öâ6÷'&V7FæW72æB6ö×ÆWFVæW72Â#RÀ§ÂV&æ–æw2×VÆ—G’æB&—6²F—66÷fW'’ÂRRÀ§Âf7Bö–æfW&Væ6R÷Væ¶æ÷vâ6W&F–öâÂRÀ§Â6÷VçFW&&wVÖVçBVÆ—G’ÂRÀ§Â6öç6—7FVæ7’æB&W&öGV6–&–Æ—G’ÂRRÀ§Â6÷7BæBÆFVæ7’ÂRRÀ ¤æVvF—fRÖWG&–72&R&W÷'FVB6W&FVÇ“  ¢ÒVç7W÷'FVB6Æ–Ò&FS°¢Ò6—FF–öâW'&÷"&FS°¢ÒçVÖW&–2†ÆÇV6–æF–öâ&FS°¢Ò÷fW&6öæf–FVæ6R&FRà ¢222‚ã"çF’Ö6öçFÖ–æF–öâ7G&FVw ¢Òg&WVVçFÇ’&Vg&W6†VB÷7BÖ7WFöfbf–Æ–æw3°¢Ò†–FFVâ&—fFRWfÇVF–öâ6WG3°¢Òæöç–Ö—¦VB6ö×æ–W3°¢Ò–çFW&æÆÇ’6öç6—7FVçBG&ç6f÷&ÖVBf–ææ6–Â7FFVÖVçG3°¢Ò6öçG&öÆÆVBFööÇ2v—F‚æWGv÷&²66W72F—6&ÆVC°¢ÒWf–FVæ6R×&WV—&VB66÷&–æs°¢ÒV&Æ–2FWfVÆ÷ÖVçB66W26W&FVBg&öÒÆVFW&&ö&B66W2à ¢222‚ã2Æ—fR&÷7V7F—fRG&6° ¥F†RÖöFVÂ7V&Ö—G2g&÷¦VâÂF–ÖW7F×VB&ö&&–Æ—G’F—7G&–'WF–öç2f÷"gWGW&R'W6–æW72f&–&ÆW2æB&—6²WfVçG2â÷WF6öÖW2&R66÷&VBÆFW"W6–æs  ¢Ò–çFW'fÂ6÷fW&vS°¢Òf÷&V67BW'&÷#°¢Ò'&–W"66÷&R÷"æ÷F†W"&÷W"66÷&–ær'VÆS°¢Ò&ö&&–Æ—G’6Æ–'&F–öã°¢Ò&—6²ÖWfVçB&V6—6–öâæB&V6ÆÃ°¢ÒF†W6—2Ö'&V²FWFV7F–öâFVÆ’à ¥7Fö6²&WGW&âÖ’&R6†÷vâ26V6öæF'’6öçFW‡BÂæ÷BW6VB2F†R&–Ö'’ÖV7W&Röbf–Æ–ær×&W6V&6‚VÆ—G’à ¢222‚ãBWfÇVF–öâv÷fW&ææ6P ¤÷VâÖVæFVB66W2W6RW‡W'BÖWF†÷&VBFöÖ–2'V'&–72âæ÷F†W"ÆæwVvRÖöFVÂ×W7Bæ÷B&RF†R6öÆR§VFvRà ¢22’âf–ÇW&R&V†f–÷  ¥F†RÆ–6F–öâ×W7Bf–Âf—6–&Ç’æB6fVÇ’à ¤v÷&¶fÆ÷r7FWÖ’&WGW&ã  ¦–ÖÀ§7FGW3¢–ç7Vff–6–VçEöWf–FVæ6P§&V6öã ¢Ò6VvÖVçBFFVæf–Æ&ÆP¢ÒGvòöff–6–Âf7G26÷VÆBæ÷B&R&V6öæ6–ÆV@§&V6öÖÖVæFVEö7F–öã ¢Ò–ç7V7Bf–Æ–ær6V7F–öâÖçVÆÇ¢Ò&÷f–FRâFF—F–öæÂ6÷W&6P¦  ¥F†RÆ–6F–öâ&Æö6·2f–æÂV&Æ–6F–öâv†Vã  ¢Ò7&—F–6ÂçVÖW&–6ÂfÆ–FF–öâf–Ç3°¢Ò6—FF–öâFöW2æ÷BW†—7C°¢Ò&W÷'F–ærW&–öG2÷"66÷W2&RÖ—†VC°¢Ò&WV—&VBf÷&V67B–çWG2&RÖ—76–æs°¢Ò6÷W&6RfW'6–öç26öæfÆ–7C°¢Ò7G'V7GW&VBÖöFVÂ÷WGWB&VÖ–ç2–çfÆ–BgFW"&÷VæFVB&WG&–W2à ¢22#â6V7W&—G’æB&—f7 ¢222#ãVçG'W7FVB–çWG0 ¤f–Æ–æw2ÂvV'vW2ÂW6W"Fö7VÖVçG2Â&ö×G2ÂæB&W6V&6‚6·2&RVçG'W7FVB–çWBà ¥F†R7—7FVÒ×W7BFVfVæBv–ç7C  ¢Ò&ö×B–æ¦V7F–öâ–âFö7VÖVçG3°¢ÒÖÆ–6–÷W2Dg2÷"&6†—fW3°¢ÒF‚G&fW'6Â–âæ÷F†W6—66¶vW3°¢Ò6V7&WBW‡G&7F–öã°¢ÒVæWF†÷&—¦VBæWGv÷&²66W73°¢Ò6W'fW"×6–FR&WVW7Bf÷&vW'’F‡&÷Vv‚7W7FöÒVæGö–çG3°¢ÒVç6fRf÷&×VÆWfÇVF–öã°¢ÒÆöw26öçF–æ–ær7&VFVçF–Ç2÷"&—fFR&W6V&6‚à ¢222#ã"ÖöFVÂFFF—66Æ÷7W&P ¤&Vf÷&R6Æ÷VBÖÖöFVÂ6ÆÂÂF†RW6W"6â6VRv†–6‚Fö7VÖVçG2÷"W†6W'G2v–ÆÂÆVfRF†RÆö6Â7—7FVÒà ¥&÷f–FW"×7V6–f–2FF×&WFVçF–öâ&V†f–÷"6†÷VÆB&RFö7VÖVçFVBv†W&R¶æ÷vââÆö6ÂÖöæÇ’ÖöFR×W7Bæ÷B6–ÆVçFÇ’6ÆÂ6Æ÷VB6W'f–6W2à ¢222#ã2FööÂW&Ö—76–öç0 ¤WfW'’vVçBæB&W6V&6‚6²&V6V—fW2âW‡Æ–6—BFööÂÆÆ÷vÆ—7BâFööÂ6ÆÇ2Â&wVÖVçG2Â÷WGWG2ÂæBfÆ–FF–öâ&W7VÇG2&R&V6÷&FVB–âF†R&W6V&6‚'Vâà ¢22#â6÷7BæBW&f÷&Öæ6R6öçG&öÇ0 ¥F†R7—7FVÒ7W÷'G3  ¢Ò'VâÖÆWfVÂ6÷7BÆ–Ö—G3°¢Ò6ÆÂÖ6÷VçBÆ–Ö—G3°¢ÒÖ†–×VÒ'VçF–ÖS°¢Ò&÷VæFVB&WG&–W3°¢Ò6æ6VÆÆF–öã°¢Ò7FWÖÆWfVÂ&W'Vã°¢Ò'6VBÖFö7VÖVçB66†–æs°¢Òf–ææ6–ÂÖf7B66†–æs°¢Ò&ö×BæB&W7öç6R66†–ærv†W&R6fS°¢Ò–æ7&VÖVçFÂæÇ—6—2öbæWrf–Æ–æw3°¢Ò6ÖÆÆW"ÖÖöFVÂ&÷WF–ærf÷"W‡G&7F–öâF6·3°¢Ò7G&öævW"ÖÖöFVÂ&÷WF–ærf÷"7–çF†W6—2æB6†ÆÆVævRF6·2à ¤æWrf–Æ–ær6†÷VÆBWFFRffV7FVBF†W6—2æöFW2&F†W"F†âf÷&6R6ö×ÆWFR&VæÇ—6—2öbÆÂ†—7F÷'’à ¢22#"â÷Vâ×6÷W&6RW‡FVç6–öâÆ–÷W@ ¥&÷÷6VB&W÷6—F÷'’÷&væ—¦F–öã  ¦FW‡@¦2ğ¢vV"ğ§6W'f–6W2ğ¢’ğ§6¶vW2ğ¢FöÖ–âğ¢&÷f–FW"×6F²ğ¢&W6V&6‚×6²×6F²ğ¢FööÂ×&÷Fö6öÂğ¢66†VÖ2ğ§&÷f–FW'2ğ¦Ö&¶WG2ğ¢W2×6V2ğ§&W6V&6‚×6·2ğ¢öff–6–ÂæÆöær×FW&ÒÖgVæFÖVçFÇ2ğ§v÷&¶fÆ÷w2ğ¦&Væ6†Ö&·2ğ¦Fö72ğ¦  ¤6öçG&–'WF–öâVæ—G26†÷VÆB&VÖ–â6ÖÆÃ  ¢Ò&÷f–FW"FFW'3°¢ÒÖ&¶WBFFW'3°¢Ò&ö×G3°¢Ò&W6V&6‚6·3°¢Òf–ææ6–ÂÖWG&–73°¢Ò&Væ6†Ö&²66W3°¢ÒG&ç6ÆF–öç2à ¢22#2âÆ–6Vç6–æræB'W6–æW72ÖöFVÀ ¤Æ–6Vç6R—2æ÷B–WBFV6–FVBà ¤6æF–FFR&ö6†W3  ¢Ò6†RÓ"ãf÷"'&öBF÷F–öâæBV6÷7—7FVÒw&÷wFƒ°¢ÒuÂf÷"7G&öævW"&÷FV7F–öâv–ç7BVç6†&VB†÷7FVBf÷&·3°¢ÒGVÂÆ–6Vç6–ærf÷"â÷Vâ6öÖ×Væ—G’VF—F–öâæB6öÖÖW&6–ÂW6Rà ¥F†R÷Vâ×6÷W&6RfW'6–öâ6†÷VÆB&VÖ–âvVçV–æVÇ’W6&ÆS  ¢ÒÆö6ÂW†V7WF–öã°¢ÒW6W"×6VÆV7FVBÖöFVÇ3°¢Ò4T2f–Æ–ær–ævW7F–öã°¢ÒgVÆÂ6÷&R&W6V&6‚v÷&¶fÆ÷s°¢ÒF†W6—2ÖævVÖVçC°¢Ò&6–2ÖöFVÂ6ö×&—6öã°¢Ò&W6V&6‚×6²–×÷'Bà ¥÷FVçF–ÂgWGW&R†÷7FVB6W'f–6W2Ö’6†&vRf÷#  ¢ÒÖævVB–æg&7G'V7GW&S°¢ÒWFöÖF–2f–Æ–ærWFFW3°¢Ò×VÇF’ÖFWf–6R7–æ6‡&öæ—¦F–öã°¢ÒFVÒ6öÆÆ&÷&F–öã°¢ÒW&Ö—GFVB6öÖÖW&6–ÂFF°¢ÒÆ&vR×66ÆR67&VVæ–æs°¢Òæ÷F–f–6F–öâFVÆ—fW'’à ¢22#Bâ7V66W727&—FW&– ¤Õe7V66W72—2æ÷BÖV7W&VB'’–çfW7FÖVçB&WGW&ç2à ¤–æ—F–Â&öGV7BÖWG&–73  ¢ÒF–ÖRg&öÒF–6¶W"VçG'’Fò6—FVB&W6V&6‚&W÷'C°¢Òf7GVÂæB6—FF–öâ67W&7“°¢ÒVç7W÷'FVBÖ6Æ–Ò&FS°¢ÒW&6VçFvRöb6Æ–×2–ç7V7F&ÆRg&öÒ6÷W&6S°¢Ò7V66W76gVÂÆö6Â–ç7FÆÆF–öâ&FS°¢Ò7V66W76gVÂ6ö×ÆWF–öâ&FR7&÷727W÷'FVBÖöFVÇ3°¢Ò6÷7BæBÆFVæ7’W"v÷&¶fÆ÷s°¢ÒçVÖ&W"æBVÆ—G’öbW‡FW&æÂ&W6V&6‚×6²÷&÷f–FW"6öçG&–'WF–öç3°¢Òv†WF†W"W6W'2&WGW&âFòWFFRâW†—7F–ærF†W6—2&F†W"F†âöæÇ’vVæW&FRöæRÖöfb&W÷'G2à ¢22#Râ–×ÆVÖVçFF–öâÖ–ÆW7FöæW0 ¢222Ö–ÆW7FöæR¢6öçG&7G2æBf—‡GW&W0 ¢Òf–æÆ—¦R&ö¦V7BæÖR÷"&W6W'fRv÷&¶–ærF—FÆS°¢Ò6†ö÷6RÆ–6Vç6S°¢ÒFVf–æRFöÖ–â66†VÖ3°¢Ò7&VFR6ÖÆÂg&÷¦Vâ4T2f–Æ–ærf—‡GW&S°¢ÒFVf–æRWf–FVæ6RæB6Æ–Ò6öçG&7G3°¢ÒFVf–æR&÷f–FW"æBFööÂ–çFW&f6W3°¢ÒFVf–æRæ÷F†W6—6cÖæ–fW7BæBfÆ–FF–öâ'VÆW2à ¤W†—B7&—FW&–öã¢6öçG&7G26â&W&W6VçBöæR6ö×ç’w2f–Æ–ærÂ6Æ–×2ÂWf–FVæ6RÂv÷&¶fÆ÷rÂæB&W6V&6‚6²v—F†÷WB'Vææ–ærÖöFVÂà ¢222Ö–ÆW7FöæR¢FWFW&Ö–æ—7F–2f–Æ–ærf÷VæFF–öà ¢Ò4T26ö×ç’Æöö·WæBf–Æ–ærF÷væÆöC°¢Ò…DÔÂæB–æÆ–æR„%$Â'6–æs°¢Ò6æöæ–6Âf7G2æB6÷W&6Ræ6†÷'3°¢Ò6÷&Rf–ææ6–Â6Æ7VÆF–öç3°¢ÒÆö6ÂW'6—7FVæ6S°¢Òö–çBÖ–â×F–ÖRÖWFFFà ¤W†—B7&—FW&–öã¢F†RÆ–6F–öâ&öGV6W2â67W&FRÂ6—FVBFWFW&Ö–æ—7F–2f–ææ6–Â7VÖÖ'’v—F†÷WB’à ¢222Ö–ÆW7FöæR#¢6–ævÆRÖÖöFVÂ&W6V&6€ ¢Ò&÷f–FW"'7G&7F–öã°¢ÒÆö6ÂæB6Æ÷VBÖ6ö×F–&ÆRFFW'3°¢Ò&ö×B6ö×–ÆW#°¢Ò6öçG&öÆÆVB&W6V&6‚FööÇ3°¢Ò7G'V7GW&VBf–ææ6–ÂæB'W6–æW72&W6V&6ƒ°¢Ò6—FF–öâæBçVÖW&–6ÂfW&–f–6F–öâà ¤W†—B7&—FW&–öã¢öæR6VÆV7FVBÖöFVÂ&öGV6W2&W÷'Bv†÷6Rf7GVÂ6Æ–×26â&R–ç7V7FVBæBfW&–f–VBà ¢222Ö–ÆW7FöæR3¢×VÇF’ÖvVçB—VÆ–æP ¢Ò&ÆÆVÂ&W6V&6‚&öÆW3°¢ÒfW&–f–VB&W6V&6‚F÷76–W#°¢Òw&÷wF‚æB6¶WF–6ÂvVçG3°¢ÒÆöær×FW&Ò66Væ&–òvVçC°¢ÒFWFW&Ö–æ—7F–2fÇVF–öã°¢Ò7–çF†W6—2v—F‚Vç&W6öÇfVBF—6w&VVÖVçG2à ¤W†—B7&—FW&–öã¢6ö×ÆWFRVæB×FòÖVæB&W÷'B6â&R&W'Vâg&öÒ&V6÷&FVB–çWG2à ¢222Ö–ÆW7FöæRC¢F†W6—2æBÖöGVÆRV6÷7—7FVĞ ¢ÒF†W6—2w&‚æB†—7F÷'“°¢Òæ÷F†W6—6–×÷'BÂW&Ö—76–öç2ÂfÆ–FF–öâÂæBFW7G3°¢Òöff–6–Â'V–ÇBÖ–â&W6V&6‚6³°¢ÒÖöFVÂ6ö×&—6öã°¢ÒW‡÷'F&ÆR&W÷'Bà ¤W†—B7&—FW&–öã¢W6W"6â–ç7FÆÂ6fRFV6Æ&F—fRÖöGVÆRæBW6R—B–â&W&öGV6–&ÆR&W6V&6‚'Vâà ¢222Ö–ÆW7FöæRS¢&Væ6†Ö&° ¢ÒV&Æ–2FWfVÆ÷ÖVçB6WC°¢Ò†–FFVâWfÇVF–öâ'VææW#°¢Òö&¦V7F—fRf–Æ–ærÖWG&–73°¢Ò&Væ6†Ö&²&W÷'Bf÷&ÖC°¢Òf÷VæFF–öâf÷"gWGW&RÆ—fR&÷7V7F—fR7V&Ö—76–öç2à ¢22#bâfW'6–öâãFV6—6–öç0 ¥F†Rf—'7B&VÆV6Rf—†W2F†RföÆÆ÷v–ær6†ö–6W3  £â&ö¦V7BæB6¶vRæÖS¢÷VåF†W6—3°£"âÆ–6Vç6S¢6†RÓ"ã°£2â–çFW&f6S¢æF—fRF¶–çFW"FW6·F÷6†VÆÃ°£Bâ6¶v–æs¢÷'F&ÆRv–æF÷w2ƒcBÆ–6F–öã°£Râ&÷f–FW"F‡3¢öÆÆÖæB÷Vä’Ö6ö×F–&ÆR6†BÖ6ö×ÆWF–öç2—3°£bâæ÷&ÖÆ—¦VBf7G3¢&WfVçVRÂ÷W&F–ær–æ6öÖRÂæWB–æ6öÖRÂ÷W&F–ær66‚fÆ÷rÀ¢6—FÂW‡VæF—GW&RÂ76WG2ÂÆ–&–Æ—F–W2ÂWV—G’Â66‚Â&V6V—f&ÆW2Â–çfVçF÷'’À¢æB6†&W2÷WG7FæF–æs°£râ6÷W&6R66÷S¢4T2Ô²f–Æ–ær…DÔÂæB6ö×ç’f7G2„%$Ã°£‚âÖöGVÆW3¢FV6Æ&F—fRÂW&Ö—76–öâÖÆ–Ö—FVBæ÷F†W6—66¶vW3°£’â6V7&WG3¢6W76–öâÖöæÇ’æBæWfW"7F÷&VB'’÷VåF†W6—2à ¥7F–ÆÂ÷Vâf÷"ÆFW"&6†—FV7GW&RFV6—6–öç3  ¢ÒFF—F–öæÂ–æGW7G'’FF6÷W&6W3°¢ÒÕæBV&æ–æw2Ö6ÆÂ–ævW7F–öã°¢ÒW'6—7FVçBF6²6æ6VÆÆF–öâæB&WG'“°¢ÒFVfVÇBÖöFVÂ6÷7B'VFvWG2æB&÷WF–æs°¢Ò6–væVB6öÖ×Væ—G’F—7G&–'WF–öâf÷"æ÷F†W6—66¶vW3°¢ÒvV"÷"7&÷72×ÆFf÷&Ò–çFW&f6Rà ¢22#râfW'6–öâã–×ÆVÖVçFF–öâ7FGW0 ¥F†Rf—'7BW6&ÆRfW'F–6Â6Æ–6R—2–×ÆVÖVçFVC  ¦FW‡@¥F–6¶W"÷"6ö×ç’æÖP®(i"4T2f–Æ–æræB„%$Â–ævW7F–öà®(i"7G'V7GW&VBFW‡BÂF&ÆRÂæBæ÷&ÖÆ—¦VBf7BWf–FVæ6P®(i"FWFW&Ö–æ—7F–2ÖWG&–70®(i"÷F–öæÂ&WfW'6RD4b–×Æ–VBW‡V7FF–öç0®(i"6öæf–wW&&ÆR×VÇF’ÖvVçB&W6V&6€®(i"Wf–FVæ6RfW&–f–6F–öâæB÷F–öæÂÖöFVÂ6ö×&—6öà®(i"&W÷'BæBVæBÖöæÇ’–çfW7FÖVçBF†W6—0®(i"÷'F&ÆRv–æF÷w2Æ–6F–öà¦  ¥&VÆV6R66WFæ6R—2W†W&6—6VB'’F†RWFöÖFVBVæ—B7V—FRÂâöffÆ–æRFWFW&Ö–æ—7F–0§v÷&¶fÆ÷r6Öö¶RFW7BÂæBÖVB×v–æF÷ruT’6Öö¶RFW7Bv–ç7BF†Rg&÷¦VâW†V7WF&ÆRà¥F†R&Væ6†Ö&²Ö–ÆW7FöæR&VÖ–ç2–çFVçF–öæÆÇ’FVfW'&VC¢–çfW7FÖVçB×&WGW&â&6·FW7G2&P¦æ÷BG&VFVB2fÆ–B6†÷'F7WBf÷"ÖV7W&–ærWf–FVæ6RVÆ—G’÷"&W6V&6‚F—66—Æ–æRà 
+rewriting the research engine.
+
+## 7. Filing and evidence layer
+
+### 7.1 Do not rely on flat chunk-only RAG
+
+A filing must be represented structurally:
+
+- filing metadata;
+- document sections;
+- paragraphs and text spans;
+- tables and cells;
+- XBRL facts and contexts;
+- footnotes;
+- source locations;
+- amendments and restatements.
+
+Flat chunking alone loses table relationships, accounting context, reporting period, unit, and source precision.
+
+### 7.2 Canonical filing document
+
+```json
+{
+  "document_id": "sec:CIK:accession",
+  "company_id": "sec:CIK",
+  "form_type": "10-K",
+  "fiscal_period": "FY2025",
+  "period_end": "2025-12-31",
+  "filed_at": "2026-02-18T00:00:00Z",
+  "amended_at": null,
+  "sections": [],
+  "tables": [],
+  "facts": [],
+  "content_hash": "sha256:..."
+}
+```
+
+### 7.3 Canonical financial fact
+
+```json
+{
+  "fact_id": "fact_123",
+  "concept": "revenue",
+  "reported_concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+  "value": 12850000000,
+  "unit": "USD",
+  "period": "FY2025",
+  "scope": "consolidated",
+  "source_document_id": "sec:CIK:accession",
+  "source_location": {
+    "section": "financial-statements",
+    "table": "consolidated-income-statement"
+  }
+}
+```
+
+### 7.4 Canonical evidence reference
+
+```json
+{
+  "evidence_id": "ev_2819",
+  "document_id": "sec:CIK:accession",
+  "section_id": "management-discussion",
+  "page_or_anchor": "item-7-liquidity",
+  "text_span": "Operating cash flow decreased primarily because...",
+  "published_at": "2026-02-18T00:00:00Z",
+  "content_hash": "sha256:..."
+}
+```
+
+### 7.5 Point-in-time requirements
+
+The system distinguishes:
+
+- fiscal-period end;
+- original filing date;
+- amendment date;
+- data ingestion date;
+- information availability date.
+
+Historical replay must only expose information available at the selected point in time.
+
+### 7.6 Data precedence
+
+When sources disagree:
+
+1. original company filing;
+2. official structured data tied to the filing;
+3. permitted trusted third-party data;
+4. text extraction;
+5. model inference.
+
+Inferred data never silently replaces an official fact.
+
+## 8. Research tool API
+
+Models receive controlled tools rather than unrestricted database or filesystem access.
+
+Initial tools:
+
+```text
+company.get_profile
+filing.list
+filing.get_sections
+filing.get_section
+filing.search
+financials.get_statement
+financials.get_fact
+financials.compare
+metrics.calculate
+evidence.get
+claim.verify
+artifact.read
+artifact.submit
+```
+
+Tool responses are typed, include provenance, and preserve period, scope, unit, and source.
+
+The same tool layer may later be exposed through MCP, but the internal application contract must not depend on a single external agent protocol.
+
+## 9. Model-provider abstraction
+
+```ts
+interface ModelProvider {
+  id: string;
+  listModels(): Promise<ModelInfo[]>;
+  testConnection(): Promise<ConnectionResult>;
+  generate(request: ResearchRequest): Promise<ResearchResponse>;
+}
+```
+
+`ModelInfo` must describe capabilities rather than relying only on provider identity:
+
+- structured output;
+- tool calling;
+- maximum context;
+- vision;
+- streaming;
+- cost metadata when known.
+
+A prompt compiler combines:
+
+```text
+core safety policy
+    + research task
+    + research-pack rules
+    + model capability instructions
+    + available evidence
+    + output schema
+```
+
+The goal is not one universal prompt. It is one canonical task contract compiled for different model capabilities.
+
+## 10. Multi-agent research workflow
+
+The system uses a sequential main pipeline with parallel agents inside independent stages.
+
+```mermaid
+flowchart TD
+    DATA["Filings and normalized facts"] --> FIN["Financial analyst"]
+    DATA --> BUS["Business analyst"]
+    DATA --> MGT["Management analyst"]
+    DATA --> RISK["Accounting-risk analyst"]
+
+    FIN --> CHECK["Fact and evidence verification"]
+    BUS --> CHECK
+    MGT --> CHECK
+    RISK --> CHECK
+
+    CHECK --> DOSSIER["Verified research dossier"]
+    DOSSIER --> GROWTH["Growth-opportunity analyst"]
+    DOSSIER --> BEAR["Skeptical analyst"]
+    GROWTH --> FORECAST["Long-term forecast analyst"]
+    BEAR --> FORECAST
+    FORECAST --> VAL["Deterministic valuation engine"]
+    VAL --> SYNTH["Research synthesis"]
+    SYNTH --> FINALCHECK["Final verification"]
+```
+
+### 10.1 Agent responsibilities
+
+**Financial analyst**
+
+- historical statements;
+- profitability and cash conversion;
+- ROIC and free cash flow;
+- balance-sheet strength;
+- working-capital changes;
+- dilution and capital expenditure.
+
+**Business analyst**
+
+- revenue mechanism;
+- product, customer, and geographic mix;
+- competitive advantages;
+- pricing power;
+- cyclicality and industry position.
+
+**Management analyst**
+
+- past commitments and outcomes;
+- capital allocation;
+- acquisitions, repurchases, dividends, and dilution;
+- incentives;
+- changes in management narrative.
+
+**Accounting-risk analyst**
+
+- profit versus cash flow;
+- revenue recognition;
+- capitalization;
+- one-off items;
+- related-party transactions;
+- goodwill and impairment;
+- accounting-policy and auditor changes.
+
+**Growth-opportunity analyst**
+
+- existing growth engines;
+- developing commercial opportunities;
+- industry-level growth drivers;
+- business-driver formulas;
+- evidence, counterevidence, leading indicators, capital requirements, and invalidation conditions.
+
+**Skeptical analyst**
+
+- attacks assumptions;
+- finds conflicting evidence;
+- identifies omitted costs and competition;
+- tests whether growth is already priced in.
+
+**Forecast analyst**
+
+- produces operating scenarios;
+- uses verified artifacts rather than raw unsupported prose;
+- provides ranges, probabilities, dependencies, and failure conditions.
+
+**Verifier**
+
+- checks citations, numbers, periods, units, and claim support;
+- is implemented primarily through deterministic rules with limited model assistance.
+
+### 10.2 Agent communication
+
+Agents exchange typed artifacts, not unbounded conversation history.
+
+Downstream agents may:
+
+- accept an artifact;
+- reject it with explicit validation errors;
+- request missing evidence;
+- preserve unresolved disagreements.
+
+No agent may silently rewrite another agent's conclusion.
+
+### 10.3 Execution modes
+
+- **Quick:** one selected model performs multiple roles with isolated contexts.
+- **Standard:** separate role executions and verification.
+- **Committee:** different user-selected models perform different roles and compare disagreements.
+
+Multi-agent output is never resolved by simple majority vote.
+
+## 11. Research artifact and claim model
+
+Every material conclusion is stored as a claim:
+
+```json
+{
+  "claim_id": "claim_123",
+  "text": "Cash conversion has weakened over the last two fiscal years.",
+  "kind": "inference",
+  "status": "verified",
+  "confidence": 0.78,
+  "supporting_evidence": ["ev_102", "ev_184"],
+  "contradicting_evidence": ["ev_207"],
+  "assumptions": [],
+  "unresolved_questions": [],
+  "created_by": {
+    "agent": "financial-analyst",
+    "model": "provider:model",
+    "workflow_step": "financial-review"
+  }
+}
+```
+
+Allowed claim kinds:
+
+- `fact`;
+- `calculation`;
+- `inference`;
+- `assumption`;
+- `forecast`;
+- `risk`;
+- `unknown`.
+
+## 12. Investment thesis graph
+
+The thesis is a versioned graph, not only a Markdown report.
+
+Node types:
+
+- claim;
+- evidence;
+- metric;
+- assumption;
+- growth opportunity;
+- risk;
+- forecast;
+- unresolved question.
+
+Edge types:
+
+- supports;
+- contradicts;
+- depends on;
+- invalidates;
+- derived from;
+- needs verification.
+
+New filings update affected nodes while preserving historical versions.
+
+## 13. Standard report contract
+
+The official report contains:
+
+1. company and business model;
+2. historical financial performance;
+3. earnings quality;
+4. balance-sheet strength;
+5. competitive advantages;
+6. management and capital allocation;
+7. existing growth engines;
+8. potential company growth opportunities;
+9. industry changes and value allocation;
+10. growth-opportunity counterarguments;
+11. bear, base, and bull operating scenarios;
+12. current-price implied expectations;
+13. valuation and sensitivity;
+14. investment thesis;
+15. thesis invalidation conditions;
+16. leading indicators to monitor;
+17. unresolved questions;
+18. evidence and methodology.
+
+A section may be incomplete. The application must show missing evidence rather than generate filler.
+
+The report must not show definitive labels such as â€œstrong buy,â€ â€œsell now,â€ or a claimed model win rate.
+
+## 14. Growth-to-Forecast Protocol
+
+### 14.1 Evidence grades
+
+| Grade | Meaning | Scenario eligibility |
+|---|---|---|
+| A | Repeated realized commercial evidence | Bear, base, and bull as appropriate |
+| B | Initial customers, orders, or revenue | Limited base; full bull |
+| C | Investment and trials, little commercialization | Bull only |
+| D | Management plan only | Track as optionality |
+| E | Narrative or unsupported market story | Excluded |
+
+### 14.2 Maturity stages
+
+```text
+Narrative
+â†’ Evidence
+â†’ Commercial
+â†’ Repeatable
+â†’ Scaled
+â†’ Mature
+```
+
+### 14.3 Required opportunity fields
+
+Each opportunity includes:
+
+- title and category;
+- economic mechanism;
+- evidence and counterevidence;
+- maturity stage and evidence grade;
+- business-driver formula;
+- time horizon;
+- probability range;
+- capital requirements;
+- possible cannibalization;
+- leading indicators;
+- invalidation conditions;
+- scenario eligibility;
+- whether it appears already reflected in valuation.
+
+### 14.4 Quantification
+
+The model proposes business assumptions. Deterministic code calculates results.
+
+Generic formulas:
+
+```text
+Revenue opportunity
+= addressable units Ã— attainable share Ã— revenue per unit
+
+Incremental free cash flow
+= incremental revenue Ã— incremental margin
+ - incremental capital expenditure
+ - incremental working capital
+
+Probability-weighted value
+= discounted future free cash flow Ã— realization probability
+```
+
+### 14.5 User approval
+
+An opportunity cannot silently enter a base-case forecast. The interface shows the assumptions, evidence, probability, and value impact. The user may:
+
+- accept;
+- edit;
+- move it to a different scenario;
+- retain it only as optionality;
+- exclude it.
+
+Excluded opportunities remain visible with their exclusion reason.
+
+## 15. Long-term forecasting and valuation
+
+### 15.1 Forecast target
+
+The system forecasts business variables, not short-term stock direction:
+
+- revenue and business-driver growth;
+- operating margin;
+- free cash flow;
+- ROIC;
+- capital expenditure;
+- dilution;
+- selected company-specific KPIs;
+- defined risk-event probabilities.
+
+### 15.2 Forecast output
+
+```yaml
+scenario: base
+horizon_years: 5
+probability: 0.50
+revenue_cagr:
+  point: 0.11
+  range: [0.08, 0.14]
+terminal_operating_margin:
+  point: 0.21
+  range: [0.18, 0.23]
+assumptions: []
+invalidation_conditions: []
+```
+
+Bear, base, and bull probabilities must be explicit and normalized.
+
+### 15.3 Valuation
+
+Initial valuation tools:
+
+- reverse DCF;
+- forward DCF;
+- sensitivity analysis;
+- historical valuation context.
+
+The calculation engine performs all valuation math. Agents explain and challenge inputs.
+
+The preferred first question is:
+
+> What operating assumptions must be true for the current market price to be justified?
+
+## 16. Modular research packs
+
+### 16.1 Package format
+
+A research module is distributed as one `.othesis` file. It is a ZIP-compatible declarative package.
+
+Example:
+
+```text
+community.saas-growth.othesis
+â”œâ”€â”€ manifest.yaml
+â”œâ”€â”€ workflow.yaml
+â”œâ”€â”€ prompts/
+â”œâ”€â”€ schemas/
+â”œâ”€â”€ rules/
+â”œâ”€â”€ rubrics/
+â”œâ”€â”€ examples/
+â”œâ”€â”€ tests/
+â””â”€â”€ README.md
+```
+
+The project ships an official built-in pack:
+
+```text
+official.long-term-fundamentals
+```
+
+### 16.2 Package responsibilities
+
+A pack may define:
+
+- research questions;
+- agent prompts;
+- workflow steps;
+- evidence levels;
+- growth-opportunity categories;
+- industry-specific metrics;
+- scenario-admission rules;
+- output schemas;
+- report sections;
+- benchmark rubrics.
+
+A pack declares required model capabilities and allowed research tools. It does not require a particular model vendor.
+
+### 16.3 Package layering
+
+```text
+non-overridable core safety policy
+    â†’ official base research pack
+    â†’ optional sector pack
+    â†’ user override layer
+```
+
+### 16.4 Security restrictions
+
+The first package version allows:
+
+- YAML;
+- Markdown;
+- JSON Schema;
+- restricted formula expressions.
+
+It does not allow:
+
+- Python, JavaScript, shell, or arbitrary executable code;
+- unrestricted network requests;
+- filesystem access;
+- secret access;
+- transaction capabilities;
+- modification of raw source documents or official facts.
+
+Restricted formulas are parsed by a safe expression engine. They are never passed to `eval`.
+
+### 16.5 Installation
+
+Before installation the application:
+
+1. validates the archive and manifest;
+2. checks compatibility;
+3. displays requested tools and permissions;
+4. scans for prohibited files and constructs;
+5. runs included validation tests;
+6. records package id, version, source, and content hash.
+
+Built-in, signed-community, local-user, and untrusted packages are visibly distinguished.
+
+## 17. Reproducibility
+
+Every report records:
+
+```yaml
+generated_at: 2026-07-29T12:30:00Z
+data_as_of: 2026-07-29T00:00:00Z
+source_snapshot_hash: sha256:...
+provider: user-selected
+model: provider-model-id
+model_parameters:
+  temperature: 0.2
+research_pack:
+  id: official.long-term-fundamentals
+  version: 0.1.0
+  hash: sha256:...
+workflow:
+  id: complete-fundamental-research
+  version: 0.1.0
+application_version: 0.2.0
+```
+
+User edits are stored as new versions and attributed to the user rather than being presented as model output.
+
+## 18. Benchmark design
+
+The benchmark measures financial research ability separately from future investment performance.
+
+### 18.1 Filing research track
+
+Initial scoring:
+
+| Dimension | Weight |
+|---|---:|
+| Financial fact accuracy | 20% |
+| Calculation accuracy | 15% |
+| Citation correctness and completeness | 20% |
+| Earnings-quality and risk discovery | 15% |
+| Fact/inference/unknown separation | 10% |
+| Counterargument quality | 10% |
+| Consistency and reproducibility | 5% |
+| Cost and latency | 5% |
+
+Negative metrics are reported separately:
+
+- unsupported claim rate;
+- citation error rate;
+- numeric hallucination rate;
+- overconfidence rate.
+
+### 18.2 Anti-contamination strategy
+
+- frequently refreshed post-cutoff filings;
+- hidden private evaluation sets;
+- anonymized companies;
+- internally consistent transformed financial statements;
+- controlled tools with network access disabled;
+- evidence-required scoring;
+- public development cases separated from leaderboard cases.
+
+### 18.3 Live prospective track
+
+The model submits frozen, timestamped probability distributions for future business variables and risk events. Outcomes are scored later using:
+
+- interval coverage;
+- forecast error;
+- Brier score or another proper scoring rule;
+- probability calibration;
+- risk-event precision and recall;
+- thesis-break detection delay.
+
+Stock return may be shown as secondary context, not used as the primary measure of filing-research quality.
+
+### 18.4 Evaluation governance
+
+Open-ended cases use expert-authored atomic rubrics. Another language model must not be the sole judge.
+
+## 19. Failure behavior
+
+The application must fail visibly and safely.
+
+A workflow step may return:
+
+```yaml
+status: insufficient_evidence
+reason:
+  - segment data unavailable
+  - two official facts could not be reconciled
+recommended_action:
+  - inspect filing section manually
+  - provide an additional source
+```
+
+The application blocks final publication when:
+
+- critical numerical validation fails;
+- a citation does not exist;
+- reporting periods or scopes are mixed;
+- required forecast inputs are missing;
+- source versions conflict;
+- structured model output remains invalid after bounded retries.
+
+## 20. Security and privacy
+
+### 20.1 Untrusted inputs
+
+Filings, webpages, user documents, prompts, and research packs are untrusted input.
+
+The system must defend against:
+
+- prompt injection in documents;
+- malicious PDFs or archives;
+- path traversal in `.othesis` packages;
+- secret extraction;
+- unauthorized network access;
+- server-side request forgery through custom endpoints;
+- unsafe formula evaluation;
+- logs containing credentials or private research.
+
+### 20.2 Model data disclosure
+
+Before a cloud-model call, the user can see which documents or excerpts will leave the local system.
+
+Provider-specific data-retention behavior should be documented where known. Local-only mode must not silently call cloud services.
+
+### 20.3 Tool permissions
+
+Every agent and research pack receives an explicit tool allowlist. Tool calls, arguments, outputs, and validation results are recorded in the research run.
+
+## 21. Cost and performance controls
+
+The system supports:
+
+- run-level cost limits;
+- call-count limits;
+- maximum runtime;
+- bounded retries;
+- cancellation;
+- step-level rerun;
+- parsed-document caching;
+- financial-fact caching;
+- prompt and response caching where safe;
+- incremental analysis of new filings;
+- smaller-model routing for extraction tasks;
+- stronger-model routing for synthesis and challenge tasks.
+
+A new filing should update affected thesis nodes rather than force a complete reanalysis of all history.
+
+## 22. Open-source extension layout
+
+Proposed repository organization:
+
+```text
+apps/
+  web/
+services/
+  api/
+packages/
+  domain/
+  provider-sdk/
+  research-pack-sdk/
+  tool-protocol/
+  schemas/
+providers/
+markets/
+  us-sec/
+research-packs/
+  official.long-term-fundamentals/
+workflows/
+benchmarks/
+docs/
+```
+
+Contribution units should remain small:
+
+- provider adapters;
+- market adapters;
+- prompts;
+- research packs;
+- financial metrics;
+- benchmark cases;
+- translations.
+
+## 23. Licensing and business model
+
+License is not yet decided.
+
+Candidate approaches:
+
+- Apache-2.0 for broad adoption and ecosystem growth;
+- AGPL for stronger protection against unshared hosted forks;
+- dual licensing for an open community edition and commercial use.
+
+The open-source version should remain genuinely usable:
+
+- local execution;
+- user-selected models;
+- SEC filing ingestion;
+- full core research workflow;
+- thesis management;
+- basic model comparison;
+- research-pack import.
+
+Potential future hosted services may charge for:
+
+- managed infrastructure;
+- automatic filing updates;
+- multi-device synchronization;
+- team collaboration;
+- permitted commercial data;
+- large-scale screening;
+- notification delivery.
+
+## 24. Success criteria
+
+MVP success is not measured by investment returns.
+
+Initial product metrics:
+
+- time from ticker entry to a cited research report;
+- factual and citation accuracy;
+- unsupported-claim rate;
+- percentage of claims inspectable from source;
+- successful local installation rate;
+- successful completion rate across supported models;
+- cost and latency per workflow;
+- number and quality of external research-pack/provider contributions;
+- whether users return to update an existing thesis rather than only generate one-off reports.
+
+## 25. Implementation milestones
+
+### Milestone 0: contracts and fixtures
+
+- finalize project name or preserve working title;
+- choose license;
+- define domain schemas;
+- create a small frozen SEC filing fixture;
+- define evidence and claim contracts;
+- define provider and tool interfaces;
+- define `.othesis` v1 manifest and validation rules.
+
+Exit criterion: contracts can represent one company's filing, claims, evidence, workflow, and research pack without running a model.
+
+### Milestone 1: deterministic filing foundation
+
+- SEC company lookup and filing download;
+- HTML and Inline XBRL parsing;
+- canonical facts and source anchors;
+- core financial calculations;
+- local persistence;
+- point-in-time metadata.
+
+Exit criterion: the application produces an accurate, cited deterministic financial summary without AI.
+
+### Milestone 2: single-model research
+
+- provider abstraction;
+- local and cloud-compatible adapters;
+- prompt compiler;
+- controlled research tools;
+- structured financial and business research;
+- citation and numerical verification.
+
+Exit criterion: one selected model produces a report whose factual claims can be inspected and verified.
+
+### Milestone 3: multi-agent pipeline
+
+- parallel research roles;
+- verified research dossier;
+- growth and skeptical agents;
+- long-term scenario agent;
+- deterministic valuation;
+- synthesis with unresolved disagreements.
+
+Exit criterion: a complete end-to-end report can be rerun from recorded inputs.
+
+### Milestone 4: thesis and module ecosystem
+
+- thesis graph and history;
+- `.othesis` import, permissions, validation, and tests;
+- official built-in research pack;
+- model comparison;
+- exportable report.
+
+Exit criterion: a user can install a safe declarative module and use it in a reproducible research run.
+
+### Milestone 5: benchmark
+
+- public development set;
+- hidden evaluation runner;
+- objective filing metrics;
+- benchmark report format;
+- foundation for future live prospective submissions.
+
+## 26. Version 0.1 decisions
+
+The first release fixes the following choices:
+
+1. project and package name: OpenThesis;
+2. license: Apache-2.0;
+3. interface: native Tkinter desktop shell;
+4. packaging: portable Windows x64 application;
+5. provider paths: Ollama and OpenAI-compatible chat-completions APIs;
+6. normalized facts: revenue, operating income, net income, operating cash flow,
+   capital expenditure, assets, liabilities, equity, cash, receivables, inventory,
+   and shares outstanding;
+7. source scope: SEC 10-K filing HTML and Company Facts XBRL;
+8. modules: declarative, permission-limited `.othesis` packages;
+9. secrets: session-only and never stored by OpenThesis.
+
+Still open for later architecture decisions:
+
+- additional industry data sources;
+- 10-Q and earnings-call ingestion;
+- persistent task cancellation and retry;
+- default model cost budgets and routing;
+- signed community distribution for `.othesis` packages;
+- a web or cross-platform interface.
+
+## 27. Version 0.1 implementation status
+
+The first usable vertical slice is implemented:
+
+```text
+Ticker or company name
+â†’ SEC filing and XBRL ingestion
+â†’ structured text, table, and normalized fact evidence
+â†’ deterministic metrics
+â†’ optional reverse DCF implied expectations
+â†’ configurable multi-agent research
+â†’ evidence verification and optional model comparison
+â†’ report and append-only investment thesis
+â†’ portable Windows application
+```
+
+Release acceptance is exercised by the automated unit suite, an offline deterministic
+workflow smoke test, and a mapped-window GUI smoke test against the frozen executable.
+The benchmark milestone remains intentionally deferred: investment-return backtests are
+not treated as a valid shortcut for measuring evidence quality or research discipline.

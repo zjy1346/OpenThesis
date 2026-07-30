@@ -188,6 +188,24 @@ def extract_table_evidence(
                 source_url=filing.source_url,
                 title=f"{filing.form_type} {filing.period_end} Â· è¡¨æ ¼ {table_index}",
                 locator=f"table:{table_index}",
-                exce}Ó{h‘éì¶»§q«^u•¹ ˆˆ¤((€€€±¥¹•Ì¹•áÑ•¹¡lˆŒŒƒž‚Sž¦Û¢þž¢,ˆ°€ˆ‰t¤(€€€™½È…ÉÑ¥™…Ð¥¸…ÉÑ¥™…ÑÌè(€€€€€€€±¥¹•Ì¹…ÁÁ•¹ (€€€€€€€€€€€˜ˆ´í…ÉÑ¥™…ÑlÑ¥Ñ±”uôƒ
-Üí…ÉÑ¥™…Ñl…•¹Ñ}¥uõ€ƒ
-Üí…ÉÑ¥™…Ñlµ½‘•±}¥uõ€ˆ(€€€€€€€€¤(€€€±¥¹•Ì¹•áÑ•¹ (€€€€€€€l(€€€€€€€€€€€€ˆˆ°(€€€€€€€€€€€€ˆŒŒƒšZçšÎW¢¾Óšb8ˆ°(€€€€€€€€€€€€ˆˆ°(€€€€€€€€€€€€‹¢Ò‹–*‡šVÃ–óšv—¢«žîOšz–2[’ê/–º{–æÛžRÇž†»–ºkšŸž¢/–ê?¢º‡žº_Žš¢‡–z/žRš"C––ºç–þ¦†ï’â;¢¾š6»Žˆ(€€€€€€€€€€€€‹–¢ºû–J3šr«ž~—¦†ç–2ë–"¾òošržî#š*W¢Ö–"“šZ·žRÇžR£š"ß¢«¢†3’ös–ëŽˆ°(€€€€€€€t(€€€€¤(€€€É•ÑÕÉ¸€‰q¸ˆ¹©½¥¸¡±¥¹•Ì¤(
+                excerpt=excerpt,
+                published_at=filing.filed_at,
+                content_hash=filing.content_hash,
+            )
+        )
+        if len(evidence) >= maximum_tables:
+            break
+    return evidence
+
+
+def build_filing_evidence(
+    filings: Iterable[FilingDocument],
+    *,
+    maximum_filings: int = 2,
+) -> list[dict[str, object]]:
+    collected: list[dict[str, object]] = []
+    ordered = sorted(filings, key=lambda item: item.filed_at, reverse=True)
+    for filing in ordered[:maximum_filings]:
+        collected.extend(item.to_dict() for item in extract_topic_evidence(filing))
+        collected.extend(item.to_dict() for item in extract_table_evidence(filing))
+    return collected

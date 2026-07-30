@@ -30,6 +30,14 @@ from .comparison import compare_research_runs
 from .demo import DEMO_COMPANY, demo_facts
 from .domain import Company, FinancialFact
 from .filing_parser import build_filing_evidence
+from .onboarding import (
+    COMMON_COMPANY_LABELS,
+    SEC_DEFAULT_PROFILE,
+    SEC_PROFILE_LABELS,
+    build_sec_user_agent,
+    extract_sec_contact_email,
+    get_common_company,
+)
 from .packs import (
     PackValidationError,
     ResearchPack,
@@ -71,6 +79,7 @@ class OpenThesisApp:
         self.company_results: list[Company] = []
         self.pack_by_label: dict[str, ResearchPack] = {}
         self.current_report_text = ""
+        self.research_running = False
         self._report_link_tags: list[str] = []
         self._configure_style()
         self._build_ui()
@@ -88,7 +97,16 @@ class OpenThesisApp:
             pass
         style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
         style.configure("Subtitle.TLabel", foreground="#4b5563")
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure(
+            "Accent.TButton",
+            font=("Segoe UI", 12, "bold"),
+            padding=(18, 10),
+        )
+        style.configure(
+            "Workflow.TLabel",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#075985",
+        )
 
     def _build_ui(self) -> None:
         header = ttk.Frame(self.root, padding=(18, 14))
@@ -133,6 +151,40 @@ class OpenThesisApp:
         self.progress.pack(side=RIGHT)
 
     def _build_research_tab(self) -> None:
+        self.selected_company_var = tk.StringVar(value="å°šæœªé€‰æ‹©å…¬å¸")
+        self.start_hint_var = tk.StringVar(value="è¯·å…ˆåœ¨ä¸‹æ–¹é€‰æ‹©ä¸€å®¶å…¬å¸ã€‚")
+
+        workflow = ttk.LabelFrame(
+            self.research_tab, text="ç ”ç©¶æµç¨‹", padding=(12, 8)
+        )
+        workflow.pack(fill=X, pady=(0, 10))
+        workflow.columnconfigure(1, weight=1)
+        ttk.Label(
+            workflow,
+            text="â‘  é€‰æ‹©å…¬å¸   â†’   â‘¡ ç¡®è®¤é…ç½®   â†’   â‘¢ å¼€å§‹ç ”ç©¶",
+            style="Workflow.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky=W, pady=(0, 6))
+        ttk.Label(workflow, textvariable=self.selected_company_var).grid(
+            row=1, column=0, columnspan=2, sticky=W
+        )
+        self.run_button = ttk.Button(
+            workflow,
+            text="å¼€å§‹ç ”ç©¶",
+            style="Accent.TButton",
+            command=self._start_research,
+        )
+        self.run_button.grid(row=0, column=3, rowspan=2, sticky="e", padx=(16, 0))
+        ttk.Label(
+            workflow,
+            textvariable=self.start_hint_var,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, columnspan=2, sticky=W, pady=(4, 0))
+        ttk.Button(
+            workflow,
+            text="æ¨¡å‹ä¸ SEC è®¾ç½®",
+            command=lambda: self.notebook.select(self.model_tab),
+        ).grid(row=2, column=3, sticky="e", padx=(16, 0), pady=(4, 0))
+
         outer = ttk.Panedwindow(self.research_tab, orient=HORIZONTAL)
         outer.pack(fill=BOTH, expand=True)
         controls = ttk.Frame(outer, padding=(0, 0, 12, 0), width=310)
@@ -146,13 +198,34 @@ class OpenThesisApp:
         search_row = ttk.Frame(controls)
         search_row.pack(fill=X)
         self.company_query_var = tk.StringVar()
-        ttk.Entry(search_row, textvariable=self.company_query_var).pack(
+        company_search = ttk.Entry(search_row, textvariable=self.company_query_var)
+        company_search.pack(
             side=LEFT, fill=X, expand=True
         )
+        company_search.bind("<Return>", lambda _event: self._search_company())
         ttk.Button(search_row, text="æœç´¢", command=self._search_company).pack(
             side=RIGHT, padx=(6, 0)
         )
-        self.company_list = tk.Listbox(controls, height=8, exportselection=False)
+
+        ttk.Label(controls, text="å¸¸ç”¨å…¬å¸å¿«æ·é€‰æ‹©").pack(
+            anchor=W, pady=(9, 3)
+        )
+        common_row = ttk.Frame(controls)
+        common_row.pack(fill=X)
+        self.common_company_var = tk.StringVar(value=COMMON_COMPANY_LABELS[0])
+        self.common_company_combo = ttk.Combobox(
+            common_row,
+            textvariable=self.common_company_var,
+            state="readonly",
+            values=COMMON_COMPANY_LABELS,
+            width=28,
+        )
+        self.common_company_combo.pack(side=LEFT, fill=X, expand=True)
+        ttk.Button(
+            common_row, text="é€‰æ‹©", command=self._select_common_company
+        ).pack(side=RIGHT, padx=(6, 0))
+
+        self.company_list = tk.Listbox(controls, height=5, exportselection=False)
         self.company_list.pack(fill=X, pady=(7, 5))
         self.company_list.bind("<<ListboxSelect>>", self._select_company)
         ttk.Button(
@@ -208,23 +281,8 @@ class OpenThesisApp:
             variable=self.compare_models_var,
         ).pack(anchor=W, pady=(9, 0))
 
-        ttk.Separator(controls).pack(fill=X, pady=14)
-        ttk.Label(controls, text="3. å¼€å§‹ç ”ç©¶", font=("Segoe UI", 12, "bold")).pack(
-            anchor=W, pady=(0, 8)
-        )
-        self.selected_company_var = tk.StringVar(value="å°šæœªé€‰æ‹©å…¬å¸")
-        ttk.Label(
-            controls, textvariable=self.selected_company_var, wraplength=280
-        ).pack(anchor=W, pady=(0, 8))
-        self.run_button = ttk.Button(
-            controls,
-            text="è¿è¡Œå®Œæ•´é•¿æœŸç ”ç©¶",
-            style="Accent.TButton",
-            command=self._start_research,
-        )
-        self.run_button.pack(fill=X)
         ttk.Button(controls, text="å¯¼å‡ºå½“å‰æŠ¥å‘Š", command=self._export_report).pack(
-            fill=X, pady=(7, 0)
+            fill=X, pady=(12, 0)
         )
 
         report_toolbar = ttk.Frame(report)
@@ -252,171 +310,897 @@ class OpenThesisApp:
         scrollbar.configure(command=self.report_text.yview)
         self._set_report(
             "æ¬¢è¿ä½¿ç”¨ OpenThesisã€‚\n\n"
-            "å¯ä»¥ç›´æ¥é€‰æ‹©â€œåˆæˆæ¼”ç¤ºå…¬å¸â€éªŒè¯æœ¬åœ°å·¥ä½œæµï¼Œ"
-            "ä¹Ÿå¯ä»¥åœ¨æ¨¡å‹è®¾ç½®ä¸­å¡«å†™ SEC è”ç³»é‚®ç®±åæœç´¢çœŸå®ç¾è‚¡å…¬å¸ã€yë{h‘éì¶»§q«^t\˜Ù[ËÈˆYˆÛÛ\\™WÙ[˜X›Y[ÙH\˜Ù[ˆ
-Kˆ
-Bˆ
-Kˆ
-BˆYˆ›İÛÛ\\™WÙ[˜X›Y‚ˆ™]\›ˆš[X\B‚ˆÙXÛÛ™\WÜ›İšY\ˆHÜ™X]WÜ›İšY\ŠÛÛ\\™WØÛÛ™šYÊBˆÙXÛÛ™\WİÛÜšÙ›İÈH™\ÙX\˜ÚÛÜšÙ›İÊˆÙ[‹œİÜ˜YÙKÙ[XİYÜXÚËÙXÛÛ™\WÜ›İšY\‹ÛÛ\\™WØÛÛ™šYÂˆ
-BˆÙXÛÛ™\HHÙXÛÛ™\WİÛÜšÙ›İËœ[ŠˆÛÛ\[Kˆ˜XİËˆš[[™×Ù]šY[˜ÙOYš[[™×Ù]šY[˜ÙKÈ\NˆYÛ›Ü™VØ\™Ë]\WBˆ˜[X][Û—Ú[œ]Ï]˜[X][Û—Ú[œ]Ëˆ›ÙÜ™\ÜÏ[[X™HY\ÜØYÙK\˜Ù[ˆÙ[‹™]™[Ü]Y]YKœ]
-ˆ
-ˆœ›ÙÜ™\ÜÈ‹ˆ
-ˆ¹kîy«å9ª(yg¢ûï&ÛY\ÜØYÙ_H‹L
-È\˜Ù[ËÈŠKˆ
-Bˆ
-Kˆ
-BˆÛÛ\\™WÜ™\ÙX\˜ÚÜ[œÊÙ[‹œİÜ˜YÙKš[X\KÙXÛÛ™\JBˆÙ[‹™]™[Ü]Y]YKœ]
+            "ç¬¬ä¸€æ­¥ï¼šæœç´¢æˆ–å¿«æ·é€‰æ‹©å…¬å¸ï¼›ç¬¬äºŒæ­¥ï¼šç¡®è®¤ç ”ç©¶æ¨¡å—å’Œæ¨¡å‹è®¾ç½®ï¼›"
+            "ç¬¬ä¸‰æ­¥ï¼šç‚¹å‡»é¡µé¢é¡¶éƒ¨å§‹ç»ˆå¯è§çš„â€œå¼€å§‹ç ”ç©¶â€ã€‚\n\n"
+            "å¯ä»¥é€‰æ‹©â€œåˆæˆæ¼”ç¤ºå…¬å¸â€ç¦»çº¿éªŒè¯å®Œæ•´æµç¨‹ã€‚ç ”ç©¶çœŸå®å…¬å¸æ—¶ï¼Œ"
+            "è¯·åœ¨â€œæ¨¡å‹ä¸ SEC è®¾ç½®â€ä¸­å¡«å†™ä½ è‡ªå·±çš„ SEC è”ç³»é‚®ç®±ã€‚"
+        )
+        self._update_start_state()
 
-œ›ÙÜ™\ÜÈ‹
-¹cã9ª(yg¢ùb!¹«iù«å:/ ùk£9¢$‹L
-JJBˆ™]\›ˆš[X\B‚ˆÙ[‹—Ü[—Ø˜XÚÙÜ›İ[™
-\ÚËœ™\ÙX\˜ÚØÛÛ\]H‹¹è%9êm¹.îùb¨y«hùg*:/ä:(c8 )ˆŠB‚ˆYˆİ\İÛ[Ù[
-Ù[ŠHOˆ›Û™N‚ˆÛÛ™šYÈHÙ[‹—Û[Ù[ØÛÛ™šYÊ
-BˆYˆ›İÛÛ™šYË™[˜X›Y‚ˆY\ÜØYÙX›ŞœÚİÚ[™›Ê¹­bú+åyª(yg¢È‹¹odùbcz`"y¢êH›Û™{ï#9.#y/&º, ùå*:+ëz* 9ª(yg¢øà ˆŠBˆ™]\›‚‚ˆYˆ\ÚÊ
-HOˆİ‚ˆ›İšY\ˆHÜ™X]WÜ›İšY\ŠÛÛ™šYÊBˆYˆ›İšY\ˆ\È›Û™N‚ˆ™]\›ˆ¹§*ºacyïk¹ª(yg¢È‚ˆ™]\›ˆ›İšY\‹\İØÛÛ›™Xİ[ÛŠ
-B‚ˆÙ[‹—Ü[—Ø˜XÚÙÜ›İ[™
-\ÚË›[Ù[İ\İ‹¹«hùg*9­bú+åyª(yg¢ú/ç¹£©x )ˆŠB‚ˆYˆÜ™Yœ™\ÚÜXÚÜÊÙ[ŠHOˆ›Û™N‚ˆÙ[‹œXÚ×ØWÛX™[˜ÛX\Š
-BˆÙ[‹œXÚÜ×Û\İ™[]JS‘
-Bˆ›ÜˆXÚÈ[ˆ\İÚ[œİ[YÜXÚÜÊÙ[‹œİÜ˜YÙKœXÚÜ×Ù\ŠN‚ˆX™[HˆÜXÚË›˜[Y_H0­ÈÜXÚË™\œÚ[ÛŸH‚ˆÙ[‹œXÚ×ØWÛX™[ÛX™[HHXÚÂˆÙ[‹œXÚÜ×Û\İš[œÙ\
-ˆS‘ˆÛX™[HŞÜXÚËœXÚ×ÚYWHÜXÚË˜ÛÛ[Ú\ÚÎŒL_H‚ˆ
-BˆX™[ÈH\İ
-Ù[‹œXÚ×ØWÛX™[
-BˆÙ[‹œXÚ×ØÛÛX›Ë˜ÛÛ™šYİ\™J˜[Y\Ï[X™[ÊBˆYˆX™[È[™Ù[‹œXÚ×İ˜\‹™Ù]
+    def _build_history_tab(self) -> None:
+        toolbar = ttk.Frame(self.history_tab)
+        toolbar.pack(fill=X, pady=(0, 8))
+        ttk.Label(toolbar, text="æœ¬åœ°ç ”ç©¶å†å²", font=("Segoe UI", 12, "bold")).pack(
+            side=LEFT
+        )
+        ttk.Button(toolbar, text="åˆ·æ–°", command=self._refresh_history).pack(side=RIGHT)
+        columns = ("ticker", "name", "status", "started_at")
+        self.history_tree = ttk.Treeview(
+            self.history_tab, columns=columns, show="headings", selectmode="browse"
+        )
+        for column, label, width in (
+            ("ticker", "ä»£ç ", 90),
+            ("name", "å…¬å¸", 320),
+            ("status", "çŠ¶æ€", 110),
+            ("started_at", "å¼€å§‹æ—¶é—´", 220),
+        ):
+            self.history_tree.heading(column, text=label)
+            self.history_tree.column(column, width=width, anchor=W)
+        self.history_tree.pack(fill=BOTH, expand=True)
+        self.history_tree.bind("<Double-1>", self._open_history)
 
-H›İ[ˆX™[Î‚ˆÙ[‹œXÚ×İ˜\‹œÙ]
-X™[ÖÌJB‚ˆYˆÚ[\ÜÜXÚÊÙ[ŠHOˆ›Û™N‚ˆ]Hš[YX[ÙË˜\ÚÛÜ[™š[[˜[YJˆ]OH¹kï9aiHÜ[•\Ú\È9è%9êm¹ª(ygeÈ‹ˆš[]\\ÏVÊ“Ü[•\Ú\È™\ÙX\˜ÚXÚÈ‹Š‹›İ\Ú\ÈŠWKˆ
-BˆYˆ›İ]‚ˆ™]\›‚ˆN‚ˆXÚÈH[œİ[ÜXÚÊ]
-]
-KÙ[‹œİÜ˜YÙKœXÚÜ×Ù\ŠBˆ^Ù\
-XÚÕ˜[Y][Û‘\œ›Ü‹ÔÑ\œ›Ü‹˜[YQ\œ›ÜŠH\È^Î‚ˆY\ÜØYÙX›ŞœÚİÙ\œ›ÜŠ¹è%9êm¹ª(ygeúj£:+àyi,z-)H‹İŠ^ÊJBˆ™]\›‚ˆÙ[‹—Ü™Yœ™\ÚÜXÚÜÊ
-BˆY\ÜØYÙX›ŞœÚİÚ[™›Êˆ¹è%9êm¹ª(ygeùmì¹k¢z(áH‹ˆˆÜXÚË›˜[Y_W¹âb9§+;ï&ÜXÚË™\œÚ[ÛŸW¹dâ9n#;ï&ÜXÚË˜ÛÛ[Ú\ÚÎŒM—_H‹ˆ
-B‚ˆYˆÜ™Yœ™\ÚÚ\İÜJÙ[ŠHOˆ›Û™N‚ˆ›Üˆ][H[ˆÙ[‹š\İÜWİ™YK™Ù]ØÚ[™[Š
-N‚ˆÙ[‹š\İÜWİ™YK™[]J][JBˆ›Üˆ›İÈ[ˆÙ[‹œİÜ˜YÙK›\İÜ[œÊ
-N‚ˆÙ[‹š\İÜWİ™YKš[œÙ\
-ˆˆ‹ˆS‘ˆZY\›İÖÈœ[—ÚY—Kˆ˜[Y\ÏJ›İÖÈXÚÙ\ˆ—K›İÖÈ›˜[YH—K›İÖÈœİ]\È—K›İÖÈœİ\YØ]—JKˆ
-B‚ˆYˆÜ™Yœ™\Úİ\Ù\ÊÙ[ŠHOˆ›Û™N‚ˆYˆ›İ\Ø]ŠÙ[‹\Ú\×İ™YHŠN‚ˆ™]\›‚ˆ›Üˆ][H[ˆÙ[‹\Ú\×İ™YK™Ù]ØÚ[™[Š
-N‚ˆÙ[‹\Ú\×İ™YK™[]J][JBˆ›Üˆ›İÈ[ˆÙ[‹œİÜ˜YÙK›\İİ\Ú\×İ™\œÚ[ÛœÊ
-N‚ˆÙ[‹\Ú\×İ™YKš[œÙ\
-ˆˆ‹ˆS‘ˆZY\›İÖÈ\Ú\×İ™\œÚ[Û—ÚY—Kˆ˜[Y\ÏJˆ›İÖÈXÚÙ\ˆ—Kˆ›İÖÈ™\œÚ[Ûˆ—Kˆ›İÖÈ˜Ü™X]YØH—Kˆ›İÖÈ˜Ü™X]YØ]—Kˆ
-Kˆ
-B‚ˆYˆÛÜ[—İ\Ú\ÊÙ[‹Ù]™[ˆØš™XİH›Û™JHOˆ›Û™N‚ˆÙ[Xİ[ÛˆHÙ[‹\Ú\×İ™YKœÙ[Xİ[ÛŠ
-BˆYˆ›İÙ[Xİ[Û‚ˆ™]\›‚ˆ\Ú\ÈHÙ[‹œİÜ˜YÙK™Ù]İ\Ú\×İ™\œÚ[ÛŠÙ[Xİ[Û–ÌJBˆYˆ\Ú\È\È›Û™N‚ˆ™]\›‚ˆÙ[‹™Y][™×İ\Ú\×ØÚZÈH\Ú\ÖÈ˜ÛÛ\[WØÚZÈ—BˆÙ[‹\Ú\×ÙY]Ü‹™[]JŒKŒ‹S‘
-BˆÙ[‹\Ú\×ÙY]Ü‹š[œÙ\
-ŒKŒ‹œÛÛ—Ü™]J\Ú\ÖÈ˜ÛÛ[—JJB‚ˆYˆÜØ]™Wİ\Ú\×ÙY]
-Ù[ŠHOˆ›Û™N‚ˆYˆ›İÙ[‹™Y][™×İ\Ú\×ØÚZÎ‚ˆY\ÜØYÙX›ŞœÚİÚ[™›Ê¹¢¥z-a:`.ú/¤H‹º+íùab:`"y¢êy. 9.*¹mì¹§"yâb9§+8à ˆŠBˆ™]\›‚ˆN‚ˆÛÛ[HœÛÛ‹›ØYÊÙ[‹\Ú\×ÙY]Ü‹™Ù]
-ŒKŒ‹S‘
-JBˆ^Ù\œÛÛ‹’”ÓÓ‘XÛÙQ\œ›Üˆ\È^Î‚ˆY\ÜØYÙX›ŞœÚİÙ\œ›ÜŠˆ’”ÓÓˆ9¨/9o#úe&z+ëÈ‹ˆ¹ë+Ù^Ë›[™[›ßH:(c;ï#9ë+Ù^Ë˜ÛÛ›ßH9b%ûï&Ù^Ë›\ÙßH‚ˆ
-Bˆ™]\›‚ˆœ›ÛH™ÛXZ[ˆ[\Ü]×Û›İ×Ú\ÛÂ‚ˆØ]™YHÙ[‹œİÜ˜YÙKœØ]™Wİ\Ú\×İ™\œÚ[ÛŠˆÙ[‹™Y][™×İ\Ú\×ØÚZËˆÛÛ[ˆÜ™X]YØOH\Ù\ˆ‹ˆÜ™X]YØ]]]×Û›İ×Ú\ÛÊ
-Kˆ
-BˆÙ[‹—Ü™Yœ™\Úİ\Ù\Ê
-BˆY\ÜØYÙX›ŞœÚİÚ[™›Ê¹¢¥z-a:`.ú/¤H‹ˆ¹mì¹/çykf9..ˆÜØ]™YÉİ™\œÚ[Û‰×_HŠB‚ˆYˆÛÜ[—Ú\İÜJÙ[‹Ù]™[ˆØš™XİH›Û™JHOˆ›Û™N‚ˆÙ[Xİ[ÛˆHÙ[‹š\İÜWİ™YKœÙ[Xİ[ÛŠ
-BˆYˆ›İÙ[Xİ[Û‚ˆ™]\›‚ˆ[—ÚYHÙ[Xİ[Û–ÌBˆÙ[‹—Ù\Ü^WÜ[Š[—ÚY
-BˆÙ[‹››İX›ÛÚËœÙ[Xİ
-Ù[‹œ™\ÙX\˜ÚİXŠB‚ˆYˆÙ\Ü^WÜ[ŠÙ[‹[—ÚYˆİŠHOˆ›Û™N‚ˆ\Y˜XİÈHÙ[‹œİÜ˜YÙK™Ù]Ø\Y˜XİÊ[—ÚY
-BˆÙ[‹˜İ\œ™[Ü[—ÚYH[—ÚYˆÙ[‹—ÜÙ]Ü™\Ü
-™[™\—Ü™\ÙX\˜ÚÜ[Š[—ÚY\Y˜XİÊJB‚ˆYˆÙ^ÜÜ™\Ü
-Ù[ŠHOˆ›Û™N‚ˆYˆ›İÙ[‹˜İ\œ™[Ü™\Üİ^œİš\
+    def _build_model_tab(self) -> None:
+        container = ttk.Frame(self.model_tab, width=760)
+        container.pack(anchor=W, fill=BOTH, expand=True)
+        ttk.Label(
+            container, text="æ¨¡å‹ä¸æ•°æ®æºè®¾ç½®", font=("Segoe UI", 13, "bold")
+        ).pack(anchor=W, pady=(0, 10))
 
-N‚ˆY\ÜØYÙX›ŞœÚİÚ[™›Ê¹kï9aî¹¢©ydbˆ‹¹odùbcy¬¨y§"ycëùkï9aî¹æ¡9a¡yk®xà ˆŠBˆ™]\›‚ˆ]Hš[YX[ÙË˜\ÚÜØ]™X\Ùš[[˜[YJˆ]OH¹kï9aîˆÜ[•\Ú\È9¢©ydbˆ‹ˆY˜][^[œÚ[ÛH‹‹ˆš[]\\ÏVÊ•^‹Š‹ŠK
-“X\šÙİÛˆ‹Š‹›YŠK
-’”ÓÓˆ‹Š‹šœÛÛˆŠWKˆ
-BˆYˆ]‚ˆ]
-]
-KÜš]Wİ^
-Ù[‹˜İ\œ™[Ü™\Üİ^[˜ÛÙ[™ÏH]‹NŠBˆÙ[‹œİ]\×İ˜\‹œÙ]
-ˆ¹¢©ydb¹mì¹kï9aî»ï&Ü]HŠB‚ˆYˆÜÙ]Ü™\Ü
-Ù[‹ÛÛ[ˆİŠHOˆ›Û™N‚ˆÙ[‹˜İ\œ™[Ü™\Üİ^HÛÛ[ˆÙ[‹œ™\Üİ^™[]JŒKŒ‹S‘
-BˆÙ[‹œ™\Üİ^š[œÙ\
-ŒKŒ‹ÛÛ[
-Bˆ›ÜˆYÈ[ˆÙ[‹—Ü™\ÜÛ[š×İYÜÎ‚ˆÙ[‹œ™\Üİ^Y×Ù[]JYÊBˆÙ[‹—Ü™\ÜÛ[š×İYÜË˜ÛX\Š
-Bˆ›Üˆ[™^X]Ú[ˆ[[Y\˜]J™K™š[™]\ŠˆšÏÎ‹ËÖ×—Ï—J_WJÈ‹ÛÛ[
-JN‚ˆ\›HX]Ú™Ü›İ\
-
-Kœœİš\
-‹‹Î»ï#8à »ï&ûï&ˆŠBˆYˆ›İ\›‚ˆÛÛ[YBˆYÈHˆœ™\Üİ\›ŞÚ[™^H‚ˆİ\HˆŒKŒ
-ÈÛX]Úœİ\
+        self.provider_var = tk.StringVar(value="none")
+        self.model_var = tk.StringVar()
+        self.base_url_var = tk.StringVar()
+        self.api_key_var = tk.StringVar()
+        self.sec_profile_var = tk.StringVar(value=SEC_DEFAULT_PROFILE)
+        self.sec_email_var = tk.StringVar()
+        self.sec_user_agent_var = tk.StringVar()
 
-_HÚ\œÈ‚ˆ[™HˆÜİ\H
-ÈÛ[Š\›
-_HÚ\œÈ‚ˆÙ[‹œ™\Üİ^Y×ØY
-YËİ\[™
-BˆÙ[‹œ™\Üİ^Y×ØÛÛ™šYİ\™JYË›Ü™YÜ›İ[™HˆÌÍNNH‹[™\›[™OUYJBˆÙ[‹œ™\Üİ^Y×Øš[™
-ˆYËˆ]Û‹LOˆ‹ˆ[X™HÙ]™[\™Ù]]\›ˆÙX˜œ›İÜÙ\‹›Ü[—Û™]×İXŠ\™Ù]
-Kˆ
-BˆÙ[‹œ™\Üİ^Y×Øš[™
-ˆYË[\ˆ‹[X™HÙ]™[ˆÙ[‹œ™\Üİ^˜ÛÛ™šYİ\™Jİ\œÛÜHš[™ˆŠBˆ
-BˆÙ[‹œ™\Üİ^Y×Øš[™
-ˆYËX]™Oˆ‹[X™HÙ]™[ˆÙ[‹œ™\Üİ^˜ÛÛ™šYİ\™Jİ\œÛÜHˆŠBˆ
-BˆÙ[‹—Ü™\ÜÛ[š×İYÜË˜\[™
-YÊB‚ˆYˆÜ[—Ø˜XÚÙÜ›İ[™
-ˆÙ[‹ˆ\ÚÎˆØš™XİˆİXØÙ\Ü×Ù]™[ˆİ‹ˆİ]\×ÛY\ÜØYÙNˆİ‹ˆ
-HOˆ›Û™N‚ˆÙ[‹œİ]\×İ˜\‹œÙ]
-İ]\×ÛY\ÜØYÙJB‚ˆYˆ[›™\Š
-HOˆ›Û™N‚ˆN‚ˆ™\İ[H\ÚÊ
-HÈ\NˆYÛ›Ü™VÛÜ\˜]Ü—BˆÙ[‹™]™[Ü]Y]YKœ]
+        model_frame = ttk.LabelFrame(
+            container, text="AI æ¨¡å‹ï¼ˆå¯é€‰ï¼‰", padding=12
+        )
+        model_frame.pack(fill=X)
+        fields = (
+            ("æ¨¡å‹æä¾›æ–¹", "provider"),
+            ("æ¨¡å‹åç§°", "model"),
+            ("æ¥å£åœ°å€", "base_url"),
+            ("API Keyï¼ˆä»…æœ¬æ¬¡ä¼šè¯ï¼‰", "api_key"),
+        )
+        for row, (label, field) in enumerate(fields):
+            ttk.Label(model_frame, text=label).grid(
+                row=row, column=0, sticky=W, padx=(0, 12), pady=6
+            )
+            if field == "provider":
+                widget = ttk.Combobox(
+                    model_frame,
+                    textvariable=self.provider_var,
+                    state="readonly",
+                    values=("none", "ollama", "openai-compatible"),
+                    width=48,
+                )
+                widget.bind("<<ComboboxSelected>>", self._provider_changed)
+            else:
+                variable = {
+                    "model": self.model_var,
+                    "base_url": self.base_url_var,
+                    "api_key": self.api_key_var,
+                }[field]
+                widget = ttk.Entry(
+                    model_frame,
+                    textvariable=variable,
+                    width=52,
+                    show="*" if field == "api_key" else "",
+                )
+            widget.grid(row=row, column=1, sticky="ew", pady=6)
+        model_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            model_frame,
+            text=(
+                "é€‰æ‹© none æ—¶åªè¿è¡Œæœ¬åœ°ç¡®å®šæ€§è´¢åŠ¡åˆ†æã€‚API Key ä»…ä¿å­˜åœ¨æœ¬æ¬¡ä¼šè¯ï¼Œ"
+                "ä¸ä¼šå†™å…¥æ•°æ®åº“ã€‚"
+            ),
+            style="Subtitle.TLabel",
+            wraplength=760,
+        ).grid(row=4, column=0, columnspan=2, sticky=W, pady=(8, 0))
 
-İXØÙ\Ü×Ù]™[™\İ[
-JBˆ^Ù\^Ù\[Ûˆ\È^Î‚ˆÙ[‹™]™[Ü]Y]YKœ]
-ˆ
-ˆ™\œ›Üˆ‹ˆÂˆ›Y\ÜØYÙHˆİŠ^ÊKˆ˜XÙX˜XÚÈˆ˜XÙX˜XÚË™›Ü›X]Ù^Ê
-KˆKˆ
-Bˆ
-B‚ˆ™XY[™Ë•™XY
-\™Ù]\[›™\‹Y[[ÛUYJKœİ\
+        sec_frame = ttk.LabelFrame(
+            container, text="SEC EDGAR è´¢æŠ¥è®¿é—®", padding=12
+        )
+        sec_frame.pack(fill=X, pady=(12, 0))
+        sec_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            sec_frame,
+            text="SEC ä¸éœ€è¦ API Keyï¼Œä½†è¦æ±‚è¯·æ±‚è€…æä¾›çœŸå®ã€å¯è”ç³»çš„é‚®ç®±ã€‚",
+            style="Subtitle.TLabel",
+            wraplength=620,
+        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 8))
+        self.sec_help_button = ttk.Button(
+            sec_frame,
+            text="å¸®åŠ©ï¼šSEC æ˜¯ä»€ä¹ˆï¼Œå¦‚ä½•è·å–è´¢æŠ¥ï¼Ÿ",
+            command=self._show_sec_help,
+        )
+        self.sec_help_button.grid(row=0, column=2, sticky="e", padx=(12, 0))
 
-B‚ˆYˆÙ˜Z[—Ù]™[ÊÙ[ŠHOˆ›Û™N‚ˆÚ[HYN‚ˆN‚ˆ]™[^[ØYHÙ[‹™]™[Ü]Y]YK™Ù]Û›İØZ]
+        ttk.Label(sec_frame, text="å¸¸ç”¨è¯·æ±‚èº«ä»½æ¨¡æ¿").grid(
+            row=1, column=0, sticky=W, padx=(0, 12), pady=6
+        )
+        sec_profile_combo = ttk.Combobox(
+            sec_frame,
+            textvariable=self.sec_profile_var,
+            state="readonly",
+            values=SEC_PROFILE_LABELS,
+            width=28,
+        )
+        sec_profile_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        sec_profile_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_sec_preview()
+        )
 
-Bˆ^Ù\]Y]YK‘[\N‚ˆœ™XZÂˆYˆ]™[OH˜ÛÛ\[WÜ™\İ[È‚ˆÙ[‹˜ÛÛ\[WÜ™\İ[ÈH\İ
-^[ØY
-HÈ\NˆYÛ›Ü™VØ\™Ë]\WBˆÙ[‹˜ÛÛ\[WÛ\İ™[]JS‘
-Bˆ›ÜˆÛÛ\[H[ˆÙ[‹˜ÛÛ\[WÜ™\İ[Î‚ˆÙ[‹˜ÛÛ\[WÛ\İš[œÙ\
-S‘ˆØÛÛ\[KXÚÙ\ŸH0­ÈØÛÛ\[K›˜[Y_HŠBˆÙ[‹œİ]\×İ˜\‹œÙ]
-ˆ¹¢o¹b,Û[ŠÙ[‹˜ÛÛ\[WÜ™\İ[Ê_H9k­¹ak9cîŠBˆ[Yˆ]™[OHœ›ÙÜ™\ÜÈ‚ˆY\ÜØYÙK\˜Ù[H^[ØYÈ\NˆYÛ›Ü™VÛZ\Ø×BˆÙ[‹œİ]\×İ˜\‹œÙ]
-İŠY\ÜØYÙJJBˆÙ[‹œ›ÙÜ™\ÜÖÈ˜[YH—HH[
-\˜Ù[
-Bˆ[Yˆ]™[OHœ™\ÙX\˜ÚØÛÛ\]H‚ˆ[ˆH^[ØYˆÙ[‹œ[—Ø]Û‹˜ÛÛ™šYİ\™Jİ]OH››Ü›X[ŠBˆÙ[‹œ›ÙÜ™\ÜÖÈ˜[YH—HHLˆÙ[‹—Ü™Yœ™\ÚÚ\İÜJ
-BˆÙ[‹—Ü™Yœ™\Úİ\Ù\Ê
-BˆÙ[‹—Ù\Ü^WÜ[Š[‹œ[—ÚY
-HÈ\NˆYÛ›Ü™VØ]‹YYš[™YBˆÙ[‹œİ]\×İ˜\‹œÙ]
-ˆ¹è%9êm¹k£9¢$;ï&Ü[‹œİ]\Ë˜[Y_HŠHÈ\NˆYÛ›Ü™VØ]‹YYš[™YBˆ[Yˆ]™[OH›[Ù[İ\İ‚ˆÙ[‹œİ]\×İ˜\‹œÙ]
-İŠ^[ØY
-JBˆY\ÜØYÙX›ŞœÚİÚ[™›Ê¹ª(yg¢ú/ç¹£©y­bú+åH‹İŠ^[ØY
-JBˆ[Yˆ]™[OH™\œ›Üˆ‚ˆÙ[‹œ[—Ø]Û‹˜ÛÛ™šYİ\™Jİ]OH››Ü›X[ŠBˆÙ[‹œİ]\×İ˜\‹œÙ]
-¹.îùb¨yi,z-)HŠBˆ]HH^[ØYÈ\NˆYÛ›Ü™VØ\ÜÚYÛ›Y[BˆÙ[‹—ÜÙ]Ü™\Ü
-ˆˆ¹.îùb¨yi,z-)W—Ù]VÉÛY\ÜØYÙI×_W—¹o 9cäz+â¹¥«y/èy kûï&—Ù]VÉİ˜XÙX˜XÚÉ×_H‚ˆ
-BˆY\ÜØYÙX›ŞœÚİÙ\œ›ÜŠ“Ü[•\Ú\È9.îùb¨yi,z-)H‹]VÈ›Y\ÜØYÙH—JBˆÙ[‹œ›Ûİ˜Y\ŠLÙ[‹—Ù˜Z[—Ù]™[ÊB‚‚™YˆXZ[Š
-HOˆ›Û™N‚ˆXYÛ›ÜİX×Ü]H]
-[\š[K™Ù][\\Š
-JHÈ“Ü[•\Ú\Ë\İ\\›ÙÈ‚‚ˆYˆXYÛ›ÜİXÊY\ÜØYÙNˆİŠHOˆ›Û™N‚ˆYˆÜË™[š\›Û‹™Ù]
-“ÔS•TÒT×ÑPQÓ“ÔÕPÈŠHOHŒH‚ˆÚ]XYÛ›ÜİX×Ü]›Ü[Š˜H‹[˜ÛÙ[™ÏH]‹NŠH\Èİ™X[N‚ˆİ™X[KÜš]JˆÛY\ÜØYÙ_WˆŠB‚ˆXYÛ›ÜİXÊ˜Ü™X][™Ë]Ë\›ÛİŠBˆ›ÛİHË•Ê
-BˆXYÛ›ÜİXÊË\›ÛİXÜ™X]YŠBˆÜ[•\Ú\Ğ\
-›Ûİ
-BˆXYÛ›ÜİXÊ˜\Z[š]X[^™YŠBˆ›Ûİ\]WÚY]\ÚÜÊ
-BˆXYÛ›ÜİXÊˆÚ[™İË]]O^İ]_NÜİ]O^Üİ]_NÛX\Y^ÛX\YNİšY]ØX›O^İšY]ØX›_NÈ‚ˆœÚ^™O^İÚY^ÚZYÚH‹™›Ü›X]
-ˆ]O\›Ûİ]J
-Kˆİ]O\›Ûİœİ]J
-KˆX\Y\›ÛİÚ[™›×Ú\ÛX\Y
+        ttk.Label(sec_frame, text="è”ç³»é‚®ç®±ï¼ˆå¡«å†™ä½ è‡ªå·±çš„ï¼‰").grid(
+            row=2, column=0, sticky=W, padx=(0, 12), pady=6
+        )
+        ttk.Entry(
+            sec_frame, textvariable=self.sec_email_var, width=52
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
 
-KˆšY]ØX›O\›ÛİÚ[™›×İšY]ØX›J
-KˆÚY\›ÛİÚ[™›×İÚY
+        ttk.Label(sec_frame, text="å‘é€ç»™ SEC çš„è¯·æ±‚æ ‡è¯†").grid(
+            row=3, column=0, sticky=W, padx=(0, 12), pady=6
+        )
+        ttk.Label(
+            sec_frame,
+            textvariable=self.sec_user_agent_var,
+            style="Subtitle.TLabel",
+            wraplength=660,
+        ).grid(row=3, column=1, columnspan=2, sticky=W, pady=6)
+        ttk.Label(
+            sec_frame,
+            text=(
+                "è¯·å‹¿å¡«å†™ç›®æ ‡å…¬å¸çš„æŠ•èµ„è€…å…³ç³»é‚®ç®±ã€‚è¿™é‡Œæ ‡è¯†çš„æ˜¯æ•°æ®è¯·æ±‚è€…ã€‚"
+                "é‚®ç®±ä¿å­˜åœ¨æœ¬æœºè®¾ç½®ï¼Œå¹¶éš SEC è¯·æ±‚å‘é€ã€‚"
+            ),
+            foreground="#92400e",
+            wraplength=760,
+        ).grid(row=4, column=0, columnspan=3, sticky=W, pady=(6, 0))
 
-KˆZYÚ\›ÛİÚ[™›×ÚZYÚ
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=X, pady=(12, 0))
+        ttk.Button(
+            buttons,
+            text="ä¿å­˜æœ¬æœºè®¾ç½®ï¼ˆä¸ä¿å­˜ API Keyï¼‰",
+            command=self._save_settings,
+        ).pack(side=LEFT)
+        ttk.Button(buttons, text="æµ‹è¯•æ¨¡å‹è¿æ¥", command=self._test_model).pack(
+            side=LEFT, padx=(8, 0)
+        )
 
-Kˆ
-Bˆ
-BˆİZWÜÛ[ÚÙHHÜË™[š\›Û‹™Ù]
-“ÔS•TÒT×ÑÕRWÔÓSÒÑWÕTÕŠHOHŒH‚ˆÛ[ÚÙWÜ™\İ[HÈšY]ØX›Hˆ˜[Ù_BˆYˆİZWÜÛ[ÚÙN‚ˆYˆš[š\ÚÙİZWÜÛ[ÚÙJ
-HOˆ›Û™N‚ˆÛ[ÚÙWÜ™\İ[ÈšY]ØX›H—HH›ÛÛ
-ˆ›ÛİÚ[™›×Ù^\İÊ
-Bˆ[™›ÛİÚ[™›×Ú\ÛX\Y
+        comparison = ttk.LabelFrame(container, text="å¯é€‰ï¼šç¬¬äºŒä¸ªå¯¹æ¯”æ¨¡å‹", padding=10)
+        comparison.pack(fill=X, pady=(12, 0))
+        self.compare_provider_var = tk.StringVar(value="none")
+        self.compare_model_var = tk.StringVar()
+        self.compare_base_url_var = tk.StringVar()
+        self.compare_api_key_var = tk.StringVar()
+        compare_fields = (
+            ("æä¾›æ–¹", self.compare_provider_var, True, False),
+            ("æ¨¡å‹åç§°", self.compare_model_var, False, False),
+            ("æ¥å£åœ°å€", self.compare_base_url_var, False, False),
+            ("API Keyï¼ˆä»…æœ¬æ¬¡ä¼šè¯ï¼‰", self.compare_api_key_var, False, True),
+        )
+        for row, (label, variable, is_combo, secret) in enumerate(compare_fields):
+            ttk.Label(comparison, text=label).grid(
+                row=row, column=0, sticky=W, padx=(0, 12), pady=4
+            )
+            if is_combo:
+                widget = ttk.Combobox(
+                    comparison,
+                    textvariable=variable,
+                    state="readonly",
+                    values=("none", "ollama", "openai-compatible"),
+                    width=43,
+                )
+            else:
+                widget = ttk.Entry(
+                    comparison,
+                    textvariable=variable,
+                    width=47,
+                    show="*" if secret else "",
+                )
+            widget.grid(row=row, column=1, sticky="ew", pady=4)
+        comparison.columnconfigure(1, weight=1)
+        self.sec_email_var.trace_add("write", self._refresh_sec_preview)
 
-Bˆ[™›ÛİÚ[™›×İšY]ØX›J
-Bˆ[™›ÛİÚ[™›×İÚY
+    def _build_packs_tab(self) -> None:
+        toolbar = ttk.Frame(self.packs_tab)
+        toolbar.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            toolbar, text=".othesis ç ”ç©¶æ¨¡å—", font=("Segoe UI", 12, "bold")
+        ).pack(side=LEFT)
+        ttk.Button(toolbar, text="å¯¼å…¥æ¨¡å—", command=self._import_pack).pack(side=RIGHT)
+        self.packs_list = tk.Listbox(self.packs_tab, height=12, exportselection=False)
+        self.packs_list.pack(fill=X)
+        ttk.Label(
+            self.packs_tab,
+            text=(
+                "v0.1 æ¨¡å—ä»…å…è®¸ Markdownã€JSON å…¼å®¹ YAMLã€JSON Schema å’Œæ–‡æœ¬ï¼›"
+                "ä¸å…è®¸è¿è¡Œä»£ç ã€è®¿é—®æ–‡ä»¶ç³»ç»Ÿã€ç½‘ç»œæˆ–å¯†é’¥ã€‚"
+            ),
+            style="Subtitle.TLabel",
+        ).pack(anchor=W, pady=(10, 0))
 
-HHNˆ[™›ÛİÚ[™›×ÚZYÚ
+    def _build_thesis_tab(self) -> None:
+        outer = ttk.Panedwindow(self.thesis_tab, orient=HORIZONTAL)
+        outer.pack(fill=BOTH, expand=True)
+        left = ttk.Frame(outer, padding=(0, 0, 10, 0))
+        right = ttk.Frame(outer)
+        outer.add(left, weight=1)
+        outer.add(right, weight=2)
 
-HHˆ
-Bˆ›Ûİ™\İ›ŞJ
-B‚ˆ›Ûİ˜Y\ŠÍLš[š\ÚÙİZWÜÛ[ÚÙJBˆ›Ûİ›XZ[›ÛÜ
+        ttk.Label(left, text="æŠ•èµ„é€»è¾‘ç‰ˆæœ¬", font=("Segoe UI", 12, "bold")).pack(
+            anchor=W, pady=(0, 8)
+        )
+        self.thesis_tree = ttk.Treeview(
+            left,
+            columns=("ticker", "version", "created_by", "created_at"),
+            show="headings",
+            height=18,
+        )
+        for column, label, width in (
+            ("ticker", "ä»£ç ", 70),
+            ("version", "ç‰ˆæœ¬", 60),
+            ("created_by", "åˆ›å»ºè€…", 150),
+            ("created_at", "æ—¶é—´", 180),
+        ):
+            self.thesis_tree.heading(column, text=label)
+            self.thesis_tree.column(column, width=width, anchor=W)
+        self.thesis_tree.pack(fill=BOTH, expand=True)
+        self.thesis_tree.bind("<<TreeviewSelect>>", self._open_thesis)
+        ttk.Button(left, text="åˆ·æ–°", command=self._refresh_theses).pack(
+            fill=X, pady=(7, 0)
+        )
 
-BˆXYÛ›ÜİXÊ›XZ[›ÛÜY[™YŠBˆYˆİZWÜÛ[ÚÙH[™›İÛ[ÚÙWÜ™\İ[ÈšY]ØX›H—N‚ˆ˜Z\ÙH[[YQ\œ›ÜŠ”XÚØYÙYÕRHY›İ™XÛÛYHX\Y[™šY]ØX›HŠB
+        toolbar = ttk.Frame(right)
+        toolbar.pack(fill=X, pady=(0, 8))
+        ttk.Label(toolbar, text="å¯ç¼–è¾‘ Thesis JSON", font=("Segoe UI", 12, "bold")).pack(
+            side=LEFT
+        )
+        ttk.Button(
+            toolbar, text="å¦å­˜ä¸ºæ–°ç‰ˆæœ¬", command=self._save_thesis_edit
+        ).pack(side=RIGHT)
+        self.thesis_editor = tk.Text(
+            right, wrap="word", font=("Consolas", 10), padx=10, pady=10
+        )
+        self.thesis_editor.pack(fill=BOTH, expand=True)
+        self.editing_thesis_cik = ""
+
+    def _build_about_tab(self) -> None:
+        text = (
+            f"OpenThesis {__version__}\n\n"
+            "é¢å‘ä¸ªäººé•¿æœŸæŠ•èµ„è€…çš„å¼€æºã€æ¨¡å‹æ— å…³å…¬å¸ç ”ç©¶ç³»ç»Ÿã€‚\n\n"
+            "åŸåˆ™ï¼šæ¯ä¸ªäº‹å®éƒ½éœ€è¦è¯æ®ï¼›è´¢åŠ¡è®¡ç®—ç”±ç¡®å®šæ€§ç¨‹åºå®Œæˆï¼›"
+            "é¢„æµ‹ä½¿ç”¨æƒ…æ™¯ã€åŒºé—´å’Œå¤±æ•ˆæ¡ä»¶ï¼›AI ä¸æ‰§è¡Œä»»ä½•äº¤æ˜“ã€‚\n\n"
+            f"æœ¬åœ°æ•°æ®ç›®å½•ï¼š{self.storage.data_dir}"
+        )
+        ttk.Label(
+            self.about_tab,
+            text=text,
+            justify=LEFT,
+            wraplength=780,
+            font=("Segoe UI", 11),
+        ).pack(anchor=W)
+
+    def _load_settings(self) -> None:
+        provider = self.storage.get_setting("provider", "none")
+        self.provider_var.set(provider)
+        self.model_var.set(self.storage.get_setting("model", ""))
+        default_base = (
+            "http://localhost:11434"
+            if provider == "ollama"
+            else "https://api.openai.com/v1"
+        )
+        self.base_url_var.set(self.storage.get_setting("base_url", default_base))
+        self.sec_profile_var.set(
+            self.storage.get_setting("sec_contact_profile", SEC_DEFAULT_PROFILE)
+        )
+        saved_email = self.storage.get_setting("sec_contact_email", "")
+        if not saved_email:
+            saved_email = extract_sec_contact_email(
+                self.storage.get_setting("sec_user_agent", "")
+            )
+        self.sec_email_var.set(saved_email)
+        self._refresh_sec_preview()
+        self.compare_provider_var.set(
+            self.storage.get_setting("compare_provider", "none")
+        )
+        self.compare_model_var.set(self.storage.get_setting("compare_model", ""))
+        self.compare_base_url_var.set(
+            self.storage.get_setting("compare_base_url", "")
+        )
+
+    def _save_settings(self) -> bool:
+        email = self.sec_email_var.get().strip()
+        user_agent = ""
+        if email:
+            try:
+                user_agent = self._sec_user_agent_value()
+            except ValueError as exc:
+                messagebox.showerror("SEC è”ç³»é‚®ç®±æ— æ•ˆ", str(exc))
+                self.notebook.select(self.model_tab)
+                return False
+        self.storage.set_setting("provider", self.provider_var.get())
+        self.storage.set_setting("model", self.model_var.get().strip())
+        self.storage.set_setting("base_url", self.base_url_var.get().strip())
+        self.storage.set_setting("sec_contact_profile", self.sec_profile_var.get())
+        self.storage.set_setting("sec_contact_email", email)
+        self.storage.set_setting("sec_user_agent", user_agent)
+        self.storage.set_setting("compare_provider", self.compare_provider_var.get())
+        self.storage.set_setting(
+            "compare_model", self.compare_model_var.get().strip()
+        )
+        self.storage.set_setting(
+            "compare_base_url", self.compare_base_url_var.get().strip()
+        )
+        self.status_var.set("è®¾ç½®å·²ä¿å­˜ï¼›API Key æœªæŒä¹…åŒ–")
+        self._refresh_sec_preview()
+        return True
+
+    def _refresh_sec_preview(self, *_args: object) -> None:
+        email = self.sec_email_var.get().strip()
+        if not email:
+            self.sec_user_agent_var.set("å¡«å†™é‚®ç®±åè‡ªåŠ¨ç”Ÿæˆï¼Œæ— éœ€ç”³è¯· SEC API Key")
+            return
+        try:
+            self.sec_user_agent_var.set(self._sec_user_agent_value())
+        except ValueError:
+            self.sec_user_agent_var.set("é‚®ç®±æ ¼å¼å°šæœªå®Œæˆ")
+
+    def _sec_user_agent_value(self) -> str:
+        return build_sec_user_agent(
+            self.sec_profile_var.get(),
+            self.sec_email_var.get(),
+        )
+
+    def _show_sec_help(self) -> None:
+        help_window = tk.Toplevel(self.root)
+        help_window.title("SEC EDGAR ä½¿ç”¨å¸®åŠ©")
+        help_window.transient(self.root)
+        help_window.geometry("680x480")
+        help_window.minsize(600, 420)
+
+        ttk.Label(
+            help_window,
+            text="SEC æ˜¯ä»€ä¹ˆï¼ŒOpenThesis å¦‚ä½•è·å–è´¢æŠ¥ï¼Ÿ",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor=W, padx=18, pady=(16, 8))
+        help_text = tk.Text(
+            help_window,
+            wrap="word",
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=12,
+            background="#fbfbfb",
+            height=16,
+        )
+        help_text.pack(fill=BOTH, expand=True, padx=18)
+        help_text.insert(
+            "1.0",
+            (
+                "SEC æ˜¯ç¾å›½è¯åˆ¸äº¤æ˜“å§”å‘˜ä¼šã€‚EDGAR æ˜¯å…¶å…¬å¼€å…¬å¸ç”³æŠ¥æ•°æ®åº“ï¼Œ"
+                "å¯è·å– 10-Kã€10-Q å’Œç»“æ„åŒ– Company Facts ç­‰èµ„æ–™ã€‚\n\n"
+                "OpenThesis è·å–è¿™äº›å…¬å¼€æ•°æ®ä¸éœ€è¦ API Keyï¼Œä¹Ÿä¸éœ€è¦æ³¨å†Œ SEC è´¦å·ã€‚"
+                "SEC è¦æ±‚è‡ªåŠ¨åŒ–è¯·æ±‚æºå¸¦ User-Agentï¼Œä»¥ä¾¿å‡ºç°å¼‚å¸¸æµé‡æ—¶è”ç³»è¯·æ±‚è€…ã€‚\n\n"
+                "æ­£ç¡®å¡«å†™æ–¹æ³•ï¼š\n"
+                "1. é€‰æ‹©ä¸ä½ ç›¸ç¬¦çš„å¸¸ç”¨è¯·æ±‚èº«ä»½æ¨¡æ¿ï¼›\n"
+                "2. å¡«å†™ä½ æœ¬äººæˆ–æ‰€åœ¨ç ”ç©¶å›¢é˜Ÿèƒ½å¤Ÿæ­£å¸¸æ”¶ä¿¡çš„é‚®ç®±ï¼›\n"
+                "3. ç‚¹å‡»â€œä¿å­˜æœ¬æœºè®¾ç½®â€ï¼›\n"
+                "4. å›åˆ°â€œå…¬å¸ç ”ç©¶â€ï¼Œé€‰æ‹©å…¬å¸å¹¶ç‚¹å‡»é¡¶éƒ¨â€œå¼€å§‹ç ”ç©¶â€ã€‚\n\n"
+                "ä¸è¦å¡«å†™è¢«ç ”ç©¶å…¬å¸çš„æŠ•èµ„è€…å…³ç³»é‚®ç®±ï¼Œä¹Ÿä¸è¦å†’å……ç›®æ ‡å…¬å¸ã€‚"
+                "å†…ç½®å¸¸ç”¨å…¬å¸åªç”¨äºå¿«é€Ÿé€‰æ‹©ç ”ç©¶å¯¹è±¡ï¼Œä¸è¯·æ±‚è€…è”ç³»é‚®ç®±æ— å…³ã€‚\n\n"
+                "ç¤ºä¾‹ï¼šOpenThesis/0.2.0 (Personal Investor; "
+                "contact: your-name@example.com)"
+            ),
+        )
+        help_text.configure(state="disabled")
+        help_buttons = ttk.Frame(help_window, padding=18)
+        help_buttons.pack(fill=X)
+        ttk.Button(
+            help_buttons,
+            text="æ‰“å¼€ SEC å®˜æ–¹å¼€å‘è€…è¯´æ˜",
+            command=lambda: webbrowser.open_new_tab(
+                "https://www.sec.gov/search-filings/edgar-application-programming-interfaces"
+            ),
+        ).pack(side=LEFT)
+        ttk.Button(
+            help_buttons, text="å…³é—­", command=help_window.destroy
+        ).pack(side=RIGHT)
+
+    def _provider_changed(self, _event: object = None) -> None:
+        if self.provider_var.get() == "ollama" and not self.base_url_var.get().strip():
+            self.base_url_var.set("http://localhost:11434")
+        elif (
+            self.provider_var.get() == "openai-compatible"
+            and not self.base_url_var.get().strip()
+        ):
+            self.base_url_var.set("https://api.openai.com/v1")
+
+    def _model_config(self) -> ModelConfig:
+        return ModelConfig(
+            provider=self.provider_var.get(),
+            model=self.model_var.get().strip(),
+            base_url=self.base_url_var.get().strip(),
+            api_key=self.api_key_var.get(),
+        )
+
+    def _comparison_model_config(self) -> ModelConfig:
+        return ModelConfig(
+            provider=self.compare_provider_var.get(),
+            model=self.compare_model_var.get().strip(),
+            base_url=self.compare_base_url_var.get().strip(),
+            api_key=self.compare_api_key_var.get(),
+        )
+
+    def _selected_pack(self) -> ResearchPack:
+        label = self.pack_var.get()
+        return self.pack_by_label.get(label) or builtin_pack()
+
+    def _valuation_inputs(self) -> dict[str, float] | None:
+        raw_market_cap = self.market_cap_var.get().strip()
+        if not raw_market_cap:
+            return None
+        try:
+            market_cap = float(raw_market_cap) * 1_000_000_000
+            discount = float(self.discount_rate_var.get()) / 100
+            terminal = float(self.terminal_growth_var.get()) / 100
+        except ValueError as exc:
+            raise ValueError("åå‘ DCF è¾“å…¥å¿…é¡»æ˜¯æ•°å­—") from exc
+        if market_cap <= 0 or discount <= terminal:
+            raise ValueError("å¸‚å€¼å¿…é¡»ä¸ºæ­£æ•°ï¼Œä¸”æŠ˜ç°ç‡å¿…é¡»é«˜äºæ°¸ç»­å¢é•¿ç‡")
+        return {
+            "market_cap": market_cap,
+            "discount_rate": discount,
+            "terminal_growth": terminal,
+        }
+
+    def _search_company(self) -> None:
+        query_text = self.company_query_var.get().strip()
+        if not query_text:
+            messagebox.showinfo("æœç´¢å…¬å¸", "è¯·è¾“å…¥è‚¡ç¥¨ä»£ç æˆ–å…¬å¸åç§°ã€‚")
+            return
+        try:
+            user_agent_text = self._sec_user_agent_value()
+        except ValueError as exc:
+            messagebox.showinfo(
+                "éœ€è¦ SEC è”ç³»é‚®ç®±",
+                f"{exc}\n\nè¯·åœ¨â€œæ¨¡å‹ä¸æ•°æ®æºè®¾ç½®â€ä¸­å¡«å†™åä¿å­˜ã€‚",
+            )
+            self.notebook.select(self.model_tab)
+            return
+        self._run_background(
+            lambda: SecClient(
+                user_agent_text, self.storage.data_dir / "sec-cache"
+            ).search_companies(query_text),
+            "company_results",
+            "æ­£åœ¨æŸ¥è¯¢ SEC å…¬å¸åˆ—è¡¨â€¦",
+        )
+
+    def _select_company(self, _event: object = None) -> None:
+        selection = self.company_list.curselection()
+        if not selection:
+            return
+        self.selected_company = self.company_results[selection[0]]
+        self.selected_company_var.set(
+            f"{self.selected_company.ticker} Â· {self.selected_company.name}"
+        )
+        self._update_start_state()
+
+    def _select_common_company(self) -> None:
+        try:
+            company = get_common_company(self.common_company_var.get())
+        except ValueError as exc:
+            messagebox.showinfo("é€‰æ‹©å¸¸ç”¨å…¬å¸", str(exc))
+            return
+        self.selected_company = company
+        self.selected_company_var.set(f"{company.ticker} Â· {company.name}")
+        self._set_report(
+            f"å·²é€‰æ‹©å¸¸ç”¨å…¬å¸ï¼š{company.ticker} Â· {company.name}ã€‚\n\n"
+            "è¯·ç¡®è®¤ç ”ç©¶é…ç½®ï¼Œç„¶åç‚¹å‡»é¡µé¢é¡¶éƒ¨çš„â€œå¼€å§‹ç ”ç©¶â€ã€‚"
+        )
+        self._update_start_state()
+
+    def _select_demo_company(self) -> None:
+        self.selected_company = DEMO_COMPANY
+        self.selected_company_var.set(
+            f"{DEMO_COMPANY.ticker} Â· {DEMO_COMPANY.name}"
+        )
+        self._set_report(
+            "å·²é€‰æ‹©åˆæˆæ¼”ç¤ºå…¬å¸ã€‚æ‰€æœ‰æ•°æ®å‡ä¸ºè™šæ„ï¼Œåªç”¨äºéªŒè¯è½¯ä»¶åŠŸèƒ½ã€‚"
+        )
+        self._update_start_state()
+
+    def _update_start_state(self) -> None:
+        if self.research_running:
+            self.run_button.configure(state="disabled", text="ç ”ç©¶è¿›è¡Œä¸­â€¦")
+            self.start_hint_var.set("æ­£åœ¨è¿è¡Œå¤š Agent ç ”ç©¶æµç¨‹ï¼Œè¯·æŸ¥çœ‹åº•éƒ¨è¿›åº¦ã€‚")
+        elif self.selected_company is None:
+            self.run_button.configure(state="disabled", text="å¼€å§‹ç ”ç©¶")
+            self.start_hint_var.set("è¯·å…ˆåœ¨ä¸‹æ–¹é€‰æ‹©ä¸€å®¶å…¬å¸ã€‚")
+        else:
+            self.run_button.configure(state="normal", text="å¼€å§‹ç ”ç©¶")
+            self.start_hint_var.set("å…¬å¸å·²é€‰æ‹©ï¼›ç¡®è®¤é…ç½®åå³å¯å¼€å§‹ã€‚")
+
+    def _start_research(self) -> None:
+        company = self.selected_company
+        if company is None:
+            messagebox.showinfo("å¼€å§‹ç ”ç©¶", "è¯·å…ˆé€‰æ‹©å…¬å¸ã€‚")
+            return
+        if not self._save_settings():
+            return
+        # Capture all Tk values on the UI thread. Tk variables must never be
+        # read from the background worker.
+        user_agent = ""
+        if company.cik != DEMO_COMPANY.cik:
+            try:
+                user_agent = self._sec_user_agent_value()
+            except ValueError as exc:
+                messagebox.showerror(
+                    "éœ€è¦ SEC è”ç³»é‚®ç®±",
+                    f"{exc}\n\nçœŸå®å…¬å¸ç ”ç©¶éœ€è¦è®¿é—® SECï¼Œè¯·å…ˆå®Œæˆ SEC è®¾ç½®ã€‚",
+                )
+                self.notebook.select(self.model_tab)
+                return
+        download_filings = self.download_filings_var.get()
+        config = self._model_config()
+        compare_enabled = self.compare_models_var.get()
+        compare_config = self._comparison_model_config()
+        selected_pack = self._selected_pack()
+        try:
+            valuation_inputs = self._valuation_inputs()
+        except ValueError as exc:
+            messagebox.showerror("åå‘ DCF è¾“å…¥é”™è¯¯", str(exc))
+            return
+        if compare_enabled and (not config.enabled or not compare_config.enabled):
+            messagebox.showerror(
+                "åŒæ¨¡å‹é…ç½®ä¸å®Œæ•´",
+                "å¯ç”¨æ¨¡å‹æ¯”è¾ƒæ—¶ï¼Œä¸»æ¨¡å‹å’Œç¬¬äºŒæ¨¡å‹éƒ½å¿…é¡»é…ç½®æä¾›æ–¹ã€æ¨¡å‹åç§°å’Œæ¥å£åœ°å€ã€‚",
+            )
+            self.notebook.select(self.model_tab)
+            return
+        self.research_running = True
+        self._update_start_state()
+        self.progress["value"] = 2
+        self._set_report(f"æ­£åœ¨å‡†å¤‡ {company.ticker} çš„ç ”ç©¶æ•°æ®â€¦")
+
+        def task() -> object:
+            filing_evidence: list[dict[str, object]] = []
+            if company.cik == DEMO_COMPANY.cik:
+                self.storage.save_company(company)
+                facts = demo_facts()
+                self.storage.save_facts([FinancialFact(**item) for item in facts])
+            else:
+                client = SecClient(user_agent, self.storage.data_dir / "sec-cache")
+                self.storage.save_company(company)
+                filings = client.list_annual_filings(company, limit=5)
+                if download_filings:
+                    target = self.storage.filings_dir / company.cik
+                    filings = [client.download_filing(item, target) for item in filings]
+                    filing_evidence = build_filing_evidence(filings)
+                self.storage.save_filings(filings)
+                normalized = client.get_company_facts(company)
+                self.storage.save_facts(normalized)
+                facts = [item.to_dict() for item in normalized]
+
+            provider = create_provider(config)
+            workflow = ResearchWorkflow(
+                self.storage, selected_pack, provider, config
+            )
+            primary = workflow.run(
+                company,
+                facts,
+                filing_evidence=filing_evidence,  # type: ignore[arg-type]
+                valuation_inputs=valuation_inputs,
+                progress=lambda message, percent: self.event_queue.put(
+                    (
+                        "progress",
+                        (
+                            f"ä¸»æ¨¡å‹ï¼š{message}" if compare_enabled else message,
+                            percent // 2 if compare_enabled else percent,
+                        ),
+                    )
+                ),
+            )
+            if not compare_enabled:
+                return primary
+
+            secondary_provider = create_provider(compare_config)
+            secondary_workflow = ResearchWorkflow(
+                self.storage, selected_pack, secondary_provider, compare_config
+            )
+            secondary = secondary_workflow.run(
+                company,
+                facts,
+                filing_evidence=filing_evidence,  # type: ignore[arg-type]
+                valuation_inputs=valuation_inputs,
+                progress=lambda message, percent: self.event_queue.put(
+                    (
+                        "progress",
+                        (f"å¯¹æ¯”æ¨¡å‹ï¼š{message}", 50 + percent // 2),
+                    )
+                ),
+            )
+            compare_research_runs(self.storage, primary, secondary)
+            self.event_queue.put(("progress", ("åŒæ¨¡å‹åˆ†æ­§æ¯”è¾ƒå®Œæˆ", 100)))
+            return primary
+
+        self._run_background(task, "research_complete", "ç ”ç©¶ä»»åŠ¡æ­£åœ¨è¿è¡Œâ€¦")
+
+    def _test_model(self) -> None:
+        config = self._model_config()
+        if not config.enabled:
+            messagebox.showinfo("æµ‹è¯•æ¨¡å‹", "å½“å‰é€‰æ‹© noneï¼Œä¸ä¼šè°ƒç”¨è¯­è¨€æ¨¡å‹ã€‚")
+            return
+
+        def task() -> str:
+            provider = create_provider(config)
+            if provider is None:
+                return "æœªé…ç½®æ¨¡å‹"
+            return provider.test_connection()
+
+        self._run_background(task, "model_test", "æ­£åœ¨æµ‹è¯•æ¨¡å‹è¿æ¥â€¦")
+
+    def _refresh_packs(self) -> None:
+        self.pack_by_label.clear()
+        self.packs_list.delete(0, END)
+        for pack in list_installed_packs(self.storage.packs_dir):
+            label = f"{pack.name} Â· {pack.version}"
+            self.pack_by_label[label] = pack
+            self.packs_list.insert(
+                END, f"{label}  [{pack.pack_id}]  {pack.content_hash[:10]}"
+            )
+        labels = list(self.pack_by_label)
+        self.pack_combo.configure(values=labels)
+        if labels and self.pack_var.get() not in labels:
+            self.pack_var.set(labels[0])
+
+    def _import_pack(self) -> None:
+        path = filedialog.askopenfilename(
+            title="å¯¼å…¥ OpenThesis ç ”ç©¶æ¨¡å—",
+            filetypes=[("OpenThesis Research Pack", "*.othesis")],
+        )
+        if not path:
+            return
+        try:
+            pack = install_pack(Path(path), self.storage.packs_dir)
+        except (PackValidationError, OSError, ValueError) as exc:
+            messagebox.showerror("ç ”ç©¶æ¨¡å—éªŒè¯å¤±è´¥", str(exc))
+            return
+        self._refresh_packs()
+        messagebox.showinfo(
+            "ç ”ç©¶æ¨¡å—å·²å®‰è£…",
+            f"{pack.name}\nç‰ˆæœ¬ï¼š{pack.version}\nå“ˆå¸Œï¼š{pack.content_hash[:16]}",
+        )
+
+    def _refresh_history(self) -> None:
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        for row in self.storage.list_runs():
+            self.history_tree.insert(
+                "",
+                END,
+                iid=row["run_id"],
+                values=(row["ticker"], row["name"], row["status"], row["started_at"]),
+            )
+
+    def _refresh_theses(self) -> None:
+        if not hasattr(self, "thesis_tree"):
+            return
+        for item in self.thesis_tree.get_children():
+            self.thesis_tree.delete(item)
+        for row in self.storage.list_thesis_versions():
+            self.thesis_tree.insert(
+                "",
+                END,
+                iid=row["thesis_version_id"],
+                values=(
+                    row["ticker"],
+                    row["version"],
+                    row["created_by"],
+                    row["created_at"],
+                ),
+            )
+
+    def _open_thesis(self, _event: object = None) -> None:
+        selection = self.thesis_tree.selection()
+        if not selection:
+            return
+        thesis = self.storage.get_thesis_version(selection[0])
+        if thesis is None:
+            return
+        self.editing_thesis_cik = thesis["company_cik"]
+        self.thesis_editor.delete("1.0", END)
+        self.thesis_editor.insert("1.0", json_pretty(thesis["content"]))
+
+    def _save_thesis_edit(self) -> None:
+        if not self.editing_thesis_cik:
+            messagebox.showinfo("æŠ•èµ„é€»è¾‘", "è¯·å…ˆé€‰æ‹©ä¸€ä¸ªå·²æœ‰ç‰ˆæœ¬ã€‚")
+            return
+        try:
+            content = json.loads(self.thesis_editor.get("1.0", END))
+        except json.JSONDecodeError as exc:
+            messagebox.showerror(
+                "JSON æ ¼å¼é”™è¯¯", f"ç¬¬ {exc.lineno} è¡Œï¼Œç¬¬ {exc.colno} åˆ—ï¼š{exc.msg}"
+            )
+            return
+        from .domain import utc_now_iso
+
+        saved = self.storage.save_thesis_version(
+            self.editing_thesis_cik,
+            content,
+            created_by="user",
+            created_at=utc_now_iso(),
+        )
+        self._refresh_theses()
+        messagebox.showinfo("æŠ•èµ„é€»è¾‘", f"å·²ä¿å­˜ä¸º v{saved['version']}")
+
+    def _open_history(self, _event: object = None) -> None:
+        selection = self.history_tree.selection()
+        if not selection:
+            return
+        run_id = selection[0]
+        self._display_run(run_id)
+        self.notebook.select(self.research_tab)
+
+    def _display_run(self, run_id: str) -> None:
+        artifacts = self.storage.get_artifacts(run_id)
+        self.current_run_id = run_id
+        self._set_report(render_research_run(run_id, artifacts))
+
+    def _export_report(self) -> None:
+        if not self.current_report_text.strip():
+            messagebox.showinfo("å¯¼å‡ºæŠ¥å‘Š", "å½“å‰æ²¡æœ‰å¯å¯¼å‡ºçš„å†…å®¹ã€‚")
+            return
+        path = filedialog.asksaveasfilename(
+            title="å¯¼å‡º OpenThesis æŠ¥å‘Š",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("Markdown", "*.md"), ("JSON", "*.json")],
+        )
+        if path:
+            Path(path).write_text(self.current_report_text, encoding="utf-8")
+            self.status_var.set(f"æŠ¥å‘Šå·²å¯¼å‡ºï¼š{path}")
+
+    def _set_report(self, content: str) -> None:
+        self.current_report_text = content
+        self.report_text.delete("1.0", END)
+        self.report_text.insert("1.0", content)
+        for tag in self._report_link_tags:
+            self.report_text.tag_delete(tag)
+        self._report_link_tags.clear()
+        for index, match in enumerate(re.finditer(r"https?://[^\s<>\])}]+", content)):
+            url = match.group(0).rstrip(".,;:ï¼Œã€‚ï¼›ï¼š")
+            if not url:
+                continue
+            tag = f"report_url_{index}"
+            start = f"1.0 + {match.start()} chars"
+            end = f"{start} + {len(url)} chars"
+            self.report_text.tag_add(tag, start, end)
+            self.report_text.tag_configure(tag, foreground="#075985", underline=True)
+            self.report_text.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _event, target=url: webbrowser.open_new_tab(target),
+            )
+            self.report_text.tag_bind(
+                tag, "<Enter>", lambda _event: self.report_text.configure(cursor="hand2")
+            )
+            self.report_text.tag_bind(
+                tag, "<Leave>", lambda _event: self.report_text.configure(cursor="")
+            )
+            self._report_link_tags.append(tag)
+
+    def _run_background(
+        self,
+        task: object,
+        success_event: str,
+        status_message: str,
+    ) -> None:
+        self.status_var.set(status_message)
+
+        def runner() -> None:
+            try:
+                result = task()  # type: ignore[operator]
+                self.event_queue.put((success_event, result))
+            except Exception as exc:
+                self.event_queue.put(
+                    (
+                        "error",
+                        {
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                )
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                event, payload = self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event == "company_results":
+                self.company_results = list(payload)  # type: ignore[arg-type]
+                self.company_list.delete(0, END)
+                for company in self.company_results:
+                    self.company_list.insert(END, f"{company.ticker} Â· {company.name}")
+                self.status_var.set(f"æ‰¾åˆ° {len(self.company_results)} å®¶å…¬å¸")
+            elif event == "progress":
+                message, percent = payload  # type: ignore[misc]
+                self.status_var.set(str(message))
+                self.progress["value"] = int(percent)
+            elif event == "research_complete":
+                run = payload
+                self.research_running = False
+                self._update_start_state()
+                self.progress["value"] = 100
+                self._refresh_history()
+                self._refresh_theses()
+                self._display_run(run.run_id)  # type: ignore[attr-defined]
+                self.status_var.set(f"ç ”ç©¶å®Œæˆï¼š{run.status.value}")  # type: ignore[attr-defined]
+            elif event == "model_test":
+                self.status_var.set(str(payload))
+                messagebox.showinfo("æ¨¡å‹è¿æ¥æµ‹è¯•", str(payload))
+            elif event == "error":
+                self.research_running = False
+                self._update_start_state()
+                self.status_var.set("ä»»åŠ¡å¤±è´¥")
+                data = payload  # type: ignore[assignment]
+                self._set_report(
+                    f"ä»»åŠ¡å¤±è´¥\n\n{data['message']}\n\nå¼€å‘è¯Šæ–­ä¿¡æ¯ï¼š\n{data['traceback']}"
+                )
+                messagebox.showerror("OpenThesis ä»»åŠ¡å¤±è´¥", data["message"])
+        self.root.after(100, self._drain_events)
+
+
+def main() -> None:
+    diagnostic_path = Path(tempfile.gettempdir()) / "OpenThesis-startup.log"
+
+    def diagnostic(message: str) -> None:
+        if os.environ.get("OPENTHESIS_DIAGNOSTIC") == "1":
+            with diagnostic_path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{message}\n")
+
+    diagnostic("creating-tk-root")
+    root = tk.Tk()
+    diagnostic("tk-root-created")
+    app = OpenThesisApp(root)
+    diagnostic("app-initialized")
+    root.update_idletasks()
+    diagnostic(
+        "window-title={title};state={state};mapped={mapped};viewable={viewable};"
+        "size={width}x{height}".format(
+            title=root.title(),
+            state=root.state(),
+            mapped=root.winfo_ismapped(),
+            viewable=root.winfo_viewable(),
+            width=root.winfo_width(),
+            height=root.winfo_height(),
+        )
+    )
+    gui_smoke = os.environ.get("OPENTHESIS_GUI_SMOKE_TEST") == "1"
+    smoke_result = {"viewable": False}
+    if gui_smoke:
+        def finish_gui_smoke() -> None:
+            smoke_result["viewable"] = bool(
+                root.winfo_exists()
+                and root.winfo_ismapped()
+                and root.winfo_viewable()
+                and root.winfo_width() >= 980
+                and root.winfo_height() >= 680
+                and app.run_button.winfo_viewable()
+                and app.run_button.cget("text") == "å¼€å§‹ç ”ç©¶"
+            )
+            root.destroy()
+
+        root.after(750, finish_gui_smoke)
+    root.mainloop()
+    diagnostic("mainloop-ended")
+    if gui_smoke and not smoke_result["viewable"]:
+        raise RuntimeError(
+            "Packaged GUI or its primary start action did not become viewable"
+        )

@@ -40,11 +40,14 @@ The user chooses the model. OpenThesis supplies the research protocol, financial
 
 OpenThesis will not integrate brokerage accounts, place orders, generate short-term trading signals, or promise investment returns.
 
-## First release
+## Current release
 
-Version 0.1.0 includes:
+Version 0.2.0 includes:
 
 - a local Windows desktop interface;
+- a visible three-step research flow with a persistent primary start button;
+- common-company shortcuts and guided SEC requester identity templates;
+- in-app SEC help that explains EDGAR access and safe contact-email usage;
 - SQLite persistence and research history;
 - SEC company lookup, five-year 10-K download, text/table evidence, and Company Facts ingestion;
 - deterministic financial metrics, reverse DCF implied expectations, and an offline synthetic-company demo;
@@ -60,7 +63,7 @@ The consolidated product and architecture specification is in [docs/PROJECT_SPEC
 
 ## Run the portable Windows release
 
-1. Extract `OpenThesis-0.1.0-windows-x64-portable.zip`.
+1. Extract `OpenThesis-0.2.0-windows-x64-portable.zip`.
 2. Keep `_internal` beside `OpenThesis.exe`.
 3. Start `OpenThesis.exe`.
 4. Choose the synthetic demo company for a fully offline first run.
