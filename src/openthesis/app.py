@@ -38,6 +38,15 @@ from .onboarding import (
     extract_sec_contact_email,
     get_common_company,
 )
+from .model_catalog import (
+    PRESET_LABELS,
+    ModelDiscoveryError,
+    ModelPreset,
+    discover_models,
+    get_model_preset,
+    infer_model_preset,
+    merge_model_ids,
+)
 from .packs import (
     PackValidationError,
     ResearchPack,
@@ -66,6 +75,59 @@ def json_pretty(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
+class VerticalScrolledFrame(ttk.Frame):
+    """A vertical scroller whose mouse wheel is active only while hovered."""
+
+    def __init__(self, master: tk.Misc, *, width: int | None = None):
+        super().__init__(master)
+        self.canvas = tk.Canvas(
+            self, highlightthickness=0, borderwidth=0, width=width
+        )
+        self.scrollbar = ttk.Scrollbar(
+            self, orient=VERTICAL, command=self.canvas.yview
+        )
+        self.content = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window(
+            (0, 0), window=self.content, anchor="nw"
+        )
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        self.scrollbar.pack(side=RIGHT, fill=Y)
+        self.content.bind("<Configure>", self._sync_scroll_region)
+        self.canvas.bind("<Configure>", self._sync_content_width)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel, add="+")
+
+    def _sync_scroll_region(self, _event: object = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _sync_content_width(self, event: tk.Event[tk.Misc]) -> None:
+        self.canvas.itemconfigure(self._window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event[tk.Misc]) -> str:
+        widget = self.winfo_containing(
+            self.winfo_pointerx(), self.winfo_pointery()
+        )
+        while widget is not None and widget is not self:
+            widget = widget.master
+        if widget is not self:
+            return ""
+        if getattr(event, "num", None) == 4:
+            units = -1
+        elif getattr(event, "num", None) == 5:
+            units = 1
+        else:
+            delta = int(getattr(event, "delta", 0))
+            units = -int(delta / 120) if delta else 0
+        if units:
+            self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def scroll_to_bottom(self) -> None:
+        self.canvas.yview_moveto(1.0)
+
+
 class OpenThesisApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -81,6 +143,8 @@ class OpenThesisApp:
         self.current_report_text = ""
         self.research_running = False
         self._report_link_tags: list[str] = []
+        self._model_catalog_cache: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._model_refresh_generation = {"primary": 0, "compare": 0}
         self._configure_style()
         self._build_ui()
         self._load_settings()
@@ -119,7 +183,6 @@ class OpenThesisApp:
         ).pack(side=LEFT, padx=(14, 0), pady=(8, 0))
 
         self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill=BOTH, expand=True, padx=14, pady=(0, 8))
 
         self.research_tab = ttk.Frame(self.notebook, padding=12)
         self.history_tab = ttk.Frame(self.notebook, padding=12)
@@ -141,14 +204,15 @@ class OpenThesisApp:
         self._build_thesis_tab()
         self._build_about_tab()
 
-        status_frame = ttk.Frame(self.root, padding=(14, 3, 14, 9))
-        status_frame.pack(fill=X)
+        self.status_frame = ttk.Frame(self.root, padding=(14, 3, 14, 9))
+        self.status_frame.pack(side="bottom", fill=X)
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side=LEFT)
+        ttk.Label(self.status_frame, textvariable=self.status_var).pack(side=LEFT)
         self.progress = ttk.Progressbar(
-            status_frame, mode="determinate", maximum=100, length=280
+            self.status_frame, mode="determinate", maximum=100, length=280
         )
         self.progress.pack(side=RIGHT)
+        self.notebook.pack(fill=BOTH, expand=True, padx=14, pady=(0, 8))
 
     def _build_research_tab(self) -> None:
         self.selected_company_var = tk.StringVar(value="尚未选择公司")
@@ -187,9 +251,13 @@ class OpenThesisApp:
 
         outer = ttk.Panedwindow(self.research_tab, orient=HORIZONTAL)
         outer.pack(fill=BOTH, expand=True)
-        controls = ttk.Frame(outer, padding=(0, 0, 12, 0), width=310)
+        self.research_controls_scroll = VerticalScrolledFrame(outer, width=310)
+        controls = ttk.Frame(
+            self.research_controls_scroll.content, padding=(0, 0, 12, 12)
+        )
+        controls.pack(fill=BOTH, expand=True)
         report = ttk.Frame(outer)
-        outer.add(controls, weight=0)
+        outer.add(self.research_controls_scroll, weight=0)
         outer.add(report, weight=1)
 
         ttk.Label(controls, text="1. 选择公司", font=("Segoe UI", 12, "bold")).pack(
@@ -255,24 +323,40 @@ class OpenThesisApp:
             style="Subtitle.TLabel",
             wraplength=280,
         ).pack(anchor=W, pady=(8, 0))
-        valuation_frame = ttk.LabelFrame(controls, text="可选：反向 DCF", padding=8)
-        valuation_frame.pack(fill=X, pady=(10, 0))
+        self.dcf_expanded = tk.BooleanVar(value=False)
+        self.dcf_toggle_button = ttk.Button(
+            controls,
+            text="▶ 高级设置：反向 DCF",
+            command=self._toggle_dcf,
+        )
+        self.dcf_toggle_button.pack(fill=X, pady=(10, 0))
+        self.valuation_frame = ttk.LabelFrame(
+            controls, text="反向 DCF 参数", padding=8
+        )
         self.market_cap_var = tk.StringVar()
         self.discount_rate_var = tk.StringVar(value="10")
         self.terminal_growth_var = tk.StringVar(value="3")
-        ttk.Label(valuation_frame, text="当前市值（十亿美元）").grid(
+        ttk.Label(self.valuation_frame, text="当前市值（十亿美元）").grid(
             row=0, column=0, sticky=W
         )
-        ttk.Entry(valuation_frame, textvariable=self.market_cap_var, width=11).grid(
+        ttk.Entry(
+            self.valuation_frame, textvariable=self.market_cap_var, width=11
+        ).grid(
             row=0, column=1, sticky=W, padx=(6, 0)
         )
-        ttk.Label(valuation_frame, text="折现率 %").grid(row=1, column=0, sticky=W)
-        ttk.Entry(valuation_frame, textvariable=self.discount_rate_var, width=11).grid(
+        ttk.Label(self.valuation_frame, text="折现率 %").grid(
+            row=1, column=0, sticky=W
+        )
+        ttk.Entry(
+            self.valuation_frame, textvariable=self.discount_rate_var, width=11
+        ).grid(
             row=1, column=1, sticky=W, padx=(6, 0)
         )
-        ttk.Label(valuation_frame, text="永续增长率 %").grid(row=2, column=0, sticky=W)
+        ttk.Label(self.valuation_frame, text="永续增长率 %").grid(
+            row=2, column=0, sticky=W
+        )
         ttk.Entry(
-            valuation_frame, textvariable=self.terminal_growth_var, width=11
+            self.valuation_frame, textvariable=self.terminal_growth_var, width=11
         ).grid(row=2, column=1, sticky=W, padx=(6, 0))
         self.compare_models_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -340,66 +424,42 @@ class OpenThesisApp:
         self.history_tree.bind("<Double-1>", self._open_history)
 
     def _build_model_tab(self) -> None:
-        container = ttk.Frame(self.model_tab, width=760)
-        container.pack(anchor=W, fill=BOTH, expand=True)
+        self.model_settings_scroll = VerticalScrolledFrame(self.model_tab)
+        self.model_settings_scroll.pack(fill=BOTH, expand=True)
+        container = ttk.Frame(
+            self.model_settings_scroll.content, padding=(0, 0, 12, 14), width=760
+        )
+        container.pack(anchor=W, fill=X, expand=True)
         ttk.Label(
             container, text="模型与数据源设置", font=("Segoe UI", 13, "bold")
         ).pack(anchor=W, pady=(0, 10))
 
         self.provider_var = tk.StringVar(value="none")
+        self.model_preset_var = tk.StringVar(
+            value=get_model_preset("none").label
+        )
         self.model_var = tk.StringVar()
         self.base_url_var = tk.StringVar()
         self.api_key_var = tk.StringVar()
+        self.model_catalog_status_var = tk.StringVar(value="请选择提供方预设。")
         self.sec_profile_var = tk.StringVar(value=SEC_DEFAULT_PROFILE)
         self.sec_email_var = tk.StringVar()
         self.sec_user_agent_var = tk.StringVar()
 
         model_frame = ttk.LabelFrame(
-            container, text="AI 模型（可选）", padding=12
+            container, text="主 AI 模型（可选）", padding=12
         )
         model_frame.pack(fill=X)
-        fields = (
-            ("模型提供方", "provider"),
-            ("模型名称", "model"),
-            ("接口地址", "base_url"),
-            ("API Key（仅本次会话）", "api_key"),
-        )
-        for row, (label, field) in enumerate(fields):
-            ttk.Label(model_frame, text=label).grid(
-                row=row, column=0, sticky=W, padx=(0, 12), pady=6
-            )
-            if field == "provider":
-                widget = ttk.Combobox(
-                    model_frame,
-                    textvariable=self.provider_var,
-                    state="readonly",
-                    values=("none", "ollama", "openai-compatible"),
-                    width=48,
-                )
-                widget.bind("<<ComboboxSelected>>", self._provider_changed)
-            else:
-                variable = {
-                    "model": self.model_var,
-                    "base_url": self.base_url_var,
-                    "api_key": self.api_key_var,
-                }[field]
-                widget = ttk.Entry(
-                    model_frame,
-                    textvariable=variable,
-                    width=52,
-                    show="*" if field == "api_key" else "",
-                )
-            widget.grid(row=row, column=1, sticky="ew", pady=6)
-        model_frame.columnconfigure(1, weight=1)
+        self._build_model_selector(model_frame, compare=False)
         ttk.Label(
             model_frame,
             text=(
-                "选择 none 时只运行本地确定性财务分析。API Key 仅保存在本次会话，"
-                "不会写入数据库。"
+                "首次启动不会调用 AI；只有主动选择模型并开始研究时才会发送研究上下文。"
+                "API Key 只保存在内存中，不写入数据库或日志。"
             ),
             style="Subtitle.TLabel",
             wraplength=760,
-        ).grid(row=4, column=0, columnspan=2, sticky=W, pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky=W, pady=(8, 0))
 
         sec_frame = ttk.LabelFrame(
             container, text="SEC EDGAR 财报访问", padding=12
@@ -471,40 +531,117 @@ class OpenThesisApp:
             side=LEFT, padx=(8, 0)
         )
 
-        comparison = ttk.LabelFrame(container, text="可选：第二个对比模型", padding=10)
-        comparison.pack(fill=X, pady=(12, 0))
+        self.comparison_expanded = tk.BooleanVar(value=False)
+        self.comparison_toggle_button = ttk.Button(
+            container,
+            text="▶ 可选：第二个对比模型",
+            command=self._toggle_comparison_model,
+        )
+        self.comparison_toggle_button.pack(fill=X, pady=(12, 0))
+        self.comparison_frame = ttk.LabelFrame(
+            container, text="第二个对比模型", padding=10
+        )
         self.compare_provider_var = tk.StringVar(value="none")
+        self.compare_model_preset_var = tk.StringVar(
+            value=get_model_preset("none").label
+        )
         self.compare_model_var = tk.StringVar()
         self.compare_base_url_var = tk.StringVar()
         self.compare_api_key_var = tk.StringVar()
-        compare_fields = (
-            ("提供方", self.compare_provider_var, True, False),
-            ("模型名称", self.compare_model_var, False, False),
-            ("接口地址", self.compare_base_url_var, False, False),
-            ("API Key（仅本次会话）", self.compare_api_key_var, False, True),
+        self.compare_model_catalog_status_var = tk.StringVar(
+            value="请选择提供方预设。"
         )
-        for row, (label, variable, is_combo, secret) in enumerate(compare_fields):
-            ttk.Label(comparison, text=label).grid(
-                row=row, column=0, sticky=W, padx=(0, 12), pady=4
-            )
-            if is_combo:
-                widget = ttk.Combobox(
-                    comparison,
-                    textvariable=variable,
-                    state="readonly",
-                    values=("none", "ollama", "openai-compatible"),
-                    width=43,
-                )
-            else:
-                widget = ttk.Entry(
-                    comparison,
-                    textvariable=variable,
-                    width=47,
-                    show="*" if secret else "",
-                )
-            widget.grid(row=row, column=1, sticky="ew", pady=4)
-        comparison.columnconfigure(1, weight=1)
+        self._build_model_selector(self.comparison_frame, compare=True)
         self.sec_email_var.trace_add("write", self._refresh_sec_preview)
+
+    def _build_model_selector(
+        self, parent: ttk.LabelFrame, *, compare: bool
+    ) -> None:
+        preset_var = (
+            self.compare_model_preset_var if compare else self.model_preset_var
+        )
+        model_var = self.compare_model_var if compare else self.model_var
+        base_url_var = (
+            self.compare_base_url_var if compare else self.base_url_var
+        )
+        api_key_var = self.compare_api_key_var if compare else self.api_key_var
+        status_var = (
+            self.compare_model_catalog_status_var
+            if compare
+            else self.model_catalog_status_var
+        )
+        ttk.Label(parent, text="提供方预设").grid(
+            row=0, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        preset_combo = ttk.Combobox(
+            parent,
+            textvariable=preset_var,
+            state="readonly",
+            values=PRESET_LABELS,
+            width=52,
+        )
+        preset_combo.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        preset_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._model_preset_changed(compare=compare),
+        )
+
+        ttk.Label(parent, text="模型名称").grid(
+            row=1, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        model_combo = ttk.Combobox(
+            parent, textvariable=model_var, state="normal", width=52
+        )
+        model_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
+        if compare:
+            self.compare_model_combo = model_combo
+        else:
+            self.model_combo = model_combo
+
+        ttk.Label(parent, text="在线目录").grid(
+            row=2, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        ttk.Button(
+            parent,
+            text="刷新在线模型",
+            command=lambda: self._refresh_online_models(compare=compare),
+        ).grid(row=2, column=1, sticky=W, pady=5)
+        ttk.Label(
+            parent,
+            textvariable=status_var,
+            style="Subtitle.TLabel",
+            wraplength=480,
+        ).grid(row=2, column=2, sticky=W, padx=(8, 0), pady=5)
+
+        ttk.Label(parent, text="接口地址").grid(
+            row=3, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        ttk.Entry(parent, textvariable=base_url_var, width=56).grid(
+            row=3, column=1, columnspan=2, sticky="ew", pady=5
+        )
+
+        ttk.Label(parent, text="API Key（仅本次会话）").grid(
+            row=4, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        ttk.Entry(parent, textvariable=api_key_var, width=56, show="*").grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=5
+        )
+
+        ttk.Label(parent, text="帮助").grid(
+            row=5, column=0, sticky=W, padx=(0, 12), pady=5
+        )
+        help_button = ttk.Button(
+            parent,
+            text="获取 API Key / 安装帮助",
+            command=lambda: self._open_model_help(compare=compare),
+        )
+        help_button.grid(row=5, column=1, sticky=W, pady=5)
+        if compare:
+            self.compare_model_help_button = help_button
+        else:
+            self.model_help_button = help_button
+        parent.columnconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=2)
 
     def _build_packs_tab(self) -> None:
         toolbar = ttk.Frame(self.packs_tab)
@@ -585,16 +722,45 @@ class OpenThesisApp:
             font=("Segoe UI", 11),
         ).pack(anchor=W)
 
+    def _toggle_dcf(self) -> None:
+        expanded = not self.dcf_expanded.get()
+        self.dcf_expanded.set(expanded)
+        if expanded:
+            self.dcf_toggle_button.configure(text="▼ 高级设置：反向 DCF")
+            self.valuation_frame.pack(fill=X, pady=(6, 0))
+            self.research_controls_scroll.scroll_to_bottom()
+        else:
+            self.dcf_toggle_button.configure(text="▶ 高级设置：反向 DCF")
+            self.valuation_frame.pack_forget()
+
+    def _toggle_comparison_model(self) -> None:
+        expanded = not self.comparison_expanded.get()
+        self.comparison_expanded.set(expanded)
+        if expanded:
+            self.comparison_toggle_button.configure(
+                text="▼ 可选：第二个对比模型"
+            )
+            self.comparison_frame.pack(fill=X, pady=(6, 0))
+            self.model_settings_scroll.scroll_to_bottom()
+        else:
+            self.comparison_toggle_button.configure(
+                text="▶ 可选：第二个对比模型"
+            )
+            self.comparison_frame.pack_forget()
+
     def _load_settings(self) -> None:
         provider = self.storage.get_setting("provider", "none")
-        self.provider_var.set(provider)
-        self.model_var.set(self.storage.get_setting("model", ""))
-        default_base = (
-            "http://localhost:11434"
-            if provider == "ollama"
-            else "https://api.openai.com/v1"
+        model = self.storage.get_setting("model", "")
+        base_url = self.storage.get_setting("base_url", "")
+        saved_preset = self.storage.get_setting("model_preset", "")
+        preset = get_model_preset(saved_preset) if saved_preset else infer_model_preset(
+            provider, base_url
         )
-        self.base_url_var.set(self.storage.get_setting("base_url", default_base))
+        self.model_preset_var.set(preset.label)
+        self.provider_var.set(provider if provider else preset.protocol)
+        self.model_var.set(model)
+        self.base_url_var.set(base_url or preset.base_url)
+        self._configure_model_choices(compare=False, preset=preset)
         self.sec_profile_var.set(
             self.storage.get_setting("sec_contact_profile", SEC_DEFAULT_PROFILE)
         )
@@ -605,13 +771,22 @@ class OpenThesisApp:
             )
         self.sec_email_var.set(saved_email)
         self._refresh_sec_preview()
+        compare_provider = self.storage.get_setting("compare_provider", "none")
+        compare_model = self.storage.get_setting("compare_model", "")
+        compare_base_url = self.storage.get_setting("compare_base_url", "")
+        saved_compare_preset = self.storage.get_setting("compare_model_preset", "")
+        compare_preset = (
+            get_model_preset(saved_compare_preset)
+            if saved_compare_preset
+            else infer_model_preset(compare_provider, compare_base_url)
+        )
+        self.compare_model_preset_var.set(compare_preset.label)
         self.compare_provider_var.set(
-            self.storage.get_setting("compare_provider", "none")
+            compare_provider if compare_provider else compare_preset.protocol
         )
-        self.compare_model_var.set(self.storage.get_setting("compare_model", ""))
-        self.compare_base_url_var.set(
-            self.storage.get_setting("compare_base_url", "")
-        )
+        self.compare_model_var.set(compare_model)
+        self.compare_base_url_var.set(compare_base_url or compare_preset.base_url)
+        self._configure_model_choices(compare=True, preset=compare_preset)
 
     def _save_settings(self) -> bool:
         email = self.sec_email_var.get().strip()
@@ -624,12 +799,20 @@ class OpenThesisApp:
                 self.notebook.select(self.model_tab)
                 return False
         self.storage.set_setting("provider", self.provider_var.get())
+        self.storage.set_setting(
+            "model_preset",
+            get_model_preset(self.model_preset_var.get()).preset_id,
+        )
         self.storage.set_setting("model", self.model_var.get().strip())
         self.storage.set_setting("base_url", self.base_url_var.get().strip())
         self.storage.set_setting("sec_contact_profile", self.sec_profile_var.get())
         self.storage.set_setting("sec_contact_email", email)
         self.storage.set_setting("sec_user_agent", user_agent)
         self.storage.set_setting("compare_provider", self.compare_provider_var.get())
+        self.storage.set_setting(
+            "compare_model_preset",
+            get_model_preset(self.compare_model_preset_var.get()).preset_id,
+        )
         self.storage.set_setting(
             "compare_model", self.compare_model_var.get().strip()
         )
@@ -692,7 +875,7 @@ class OpenThesisApp:
                 "4. 回到“公司研究”，选择公司并点击顶部“开始研究”。\n\n"
                 "不要填写被研究公司的投资者关系邮箱，也不要冒充目标公司。"
                 "内置常用公司只用于快速选择研究对象，与请求者联系邮箱无关。\n\n"
-                "示例：OpenThesis/0.2.0 (Personal Investor; "
+                f"示例：OpenThesis/{__version__} (Personal Investor; "
                 "contact: your-name@example.com)"
             ),
         )
@@ -710,29 +893,153 @@ class OpenThesisApp:
             help_buttons, text="关闭", command=help_window.destroy
         ).pack(side=RIGHT)
 
-    def _provider_changed(self, _event: object = None) -> None:
-        if self.provider_var.get() == "ollama" and not self.base_url_var.get().strip():
-            self.base_url_var.set("http://localhost:11434")
-        elif (
-            self.provider_var.get() == "openai-compatible"
-            and not self.base_url_var.get().strip()
-        ):
-            self.base_url_var.set("https://api.openai.com/v1")
+    def _model_preset_changed(self, *, compare: bool) -> None:
+        preset_var = (
+            self.compare_model_preset_var if compare else self.model_preset_var
+        )
+        provider_var = self.compare_provider_var if compare else self.provider_var
+        model_var = self.compare_model_var if compare else self.model_var
+        base_url_var = (
+            self.compare_base_url_var if compare else self.base_url_var
+        )
+        preset = get_model_preset(preset_var.get())
+        provider_var.set(preset.protocol)
+        base_url_var.set(preset.base_url)
+        model_var.set(preset.recommended_models[0] if preset.recommended_models else "")
+        self._model_refresh_generation["compare" if compare else "primary"] += 1
+        self._configure_model_choices(compare=compare, preset=preset)
+
+    def _configure_model_choices(
+        self, *, compare: bool, preset: ModelPreset | None = None
+    ) -> None:
+        selected = (
+            get_model_preset(self.compare_model_preset_var.get())
+            if compare
+            else get_model_preset(self.model_preset_var.get())
+        )
+        if preset is not None:
+            selected = preset
+        combo = self.compare_model_combo if compare else self.model_combo
+        status_var = (
+            self.compare_model_catalog_status_var
+            if compare
+            else self.model_catalog_status_var
+        )
+        model_var = self.compare_model_var if compare else self.model_var
+        base_url_var = (
+            self.compare_base_url_var if compare else self.base_url_var
+        )
+        cache_key = (selected.preset_id, base_url_var.get().strip())
+        online = self._model_catalog_cache.get(cache_key, ())
+        choices = merge_model_ids(selected.recommended_models, online)
+        current = model_var.get().strip()
+        if current and current not in choices:
+            choices = (*choices, current)
+        combo.configure(values=choices)
+        if selected.preset_id == "none":
+            status_var.set("当前不会调用 AI。")
+        elif online:
+            status_var.set(f"本次会话已缓存 {len(online)} 个在线模型。")
+        elif selected.models_path is None:
+            status_var.set("此提供方使用内置模型列表，也可手动填写模型 ID。")
+        elif selected.preset_id == "ollama":
+            status_var.set("可刷新本机已安装模型；未安装时请先使用帮助链接。")
+        else:
+            status_var.set("已加载内置推荐模型；可手动刷新在线目录。")
+
+    def _refresh_online_models(self, *, compare: bool) -> None:
+        preset_var = (
+            self.compare_model_preset_var if compare else self.model_preset_var
+        )
+        base_url_var = (
+            self.compare_base_url_var if compare else self.base_url_var
+        )
+        api_key_var = self.compare_api_key_var if compare else self.api_key_var
+        status_var = (
+            self.compare_model_catalog_status_var
+            if compare
+            else self.model_catalog_status_var
+        )
+        preset = get_model_preset(preset_var.get())
+        if preset.preset_id == "none":
+            status_var.set("当前未启用 AI，无需刷新。")
+            return
+        base_url = base_url_var.get().strip()
+        api_key = api_key_var.get()
+        slot = "compare" if compare else "primary"
+        self._model_refresh_generation[slot] += 1
+        generation = self._model_refresh_generation[slot]
+        cache_key = (preset.preset_id, base_url)
+        cached = self._model_catalog_cache.get(cache_key)
+        if cached:
+            self._configure_model_choices(compare=compare, preset=preset)
+            return
+        status_var.set("正在后台刷新在线模型…")
+
+        def runner() -> None:
+            try:
+                models = discover_models(preset, base_url, api_key)
+                payload: dict[str, object] = {
+                    "slot": slot,
+                    "generation": generation,
+                    "preset_id": preset.preset_id,
+                    "base_url": base_url,
+                    "models": models,
+                    "error": "",
+                }
+            except ModelDiscoveryError as exc:
+                payload = {
+                    "slot": slot,
+                    "generation": generation,
+                    "preset_id": preset.preset_id,
+                    "base_url": base_url,
+                    "models": (),
+                    "error": str(exc),
+                }
+            except Exception:
+                payload = {
+                    "slot": slot,
+                    "generation": generation,
+                    "preset_id": preset.preset_id,
+                    "base_url": base_url,
+                    "models": (),
+                    "error": "在线模型目录刷新失败，已保留内置列表。",
+                }
+            self.event_queue.put(("model_catalog", payload))
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _open_model_help(self, *, compare: bool) -> None:
+        preset_var = (
+            self.compare_model_preset_var if compare else self.model_preset_var
+        )
+        preset = get_model_preset(preset_var.get())
+        if preset.help_url:
+            webbrowser.open_new_tab(preset.help_url)
+        else:
+            messagebox.showinfo(
+                "模型帮助",
+                "自定义接口请向服务提供方获取 API Key、模型 ID 和兼容地址。",
+            )
 
     def _model_config(self) -> ModelConfig:
+        preset = get_model_preset(self.model_preset_var.get())
         return ModelConfig(
             provider=self.provider_var.get(),
             model=self.model_var.get().strip(),
             base_url=self.base_url_var.get().strip(),
             api_key=self.api_key_var.get(),
+            temperature=preset.temperature,
         )
 
     def _comparison_model_config(self) -> ModelConfig:
+        preset = get_model_preset(self.compare_model_preset_var.get())
         return ModelConfig(
             provider=self.compare_provider_var.get(),
             model=self.compare_model_var.get().strip(),
             base_url=self.compare_base_url_var.get().strip(),
             api_key=self.compare_api_key_var.get(),
+            temperature=preset.temperature,
         )
 
     def _selected_pack(self) -> ResearchPack:
@@ -1145,6 +1452,47 @@ class OpenThesisApp:
             elif event == "model_test":
                 self.status_var.set(str(payload))
                 messagebox.showinfo("模型连接测试", str(payload))
+            elif event == "model_catalog":
+                data = payload  # type: ignore[assignment]
+                slot = str(data["slot"])
+                compare = slot == "compare"
+                if int(data["generation"]) != self._model_refresh_generation[slot]:
+                    continue
+                preset_var = (
+                    self.compare_model_preset_var
+                    if compare
+                    else self.model_preset_var
+                )
+                base_url_var = (
+                    self.compare_base_url_var if compare else self.base_url_var
+                )
+                current_preset = get_model_preset(preset_var.get())
+                if (
+                    current_preset.preset_id != data["preset_id"]
+                    or base_url_var.get().strip() != data["base_url"]
+                ):
+                    continue
+                status_var = (
+                    self.compare_model_catalog_status_var
+                    if compare
+                    else self.model_catalog_status_var
+                )
+                models = tuple(data["models"])
+                if models:
+                    self._model_catalog_cache[
+                        (str(data["preset_id"]), str(data["base_url"]))
+                    ] = models
+                    self._configure_model_choices(
+                        compare=compare, preset=current_preset
+                    )
+                    status_var.set(
+                        f"已合并 {len(models)} 个在线模型；内置推荐项保持置顶。"
+                    )
+                else:
+                    message = str(data["error"])
+                    if current_preset.preset_id == "ollama":
+                        message += " 若尚未安装或启动 Ollama，请点击帮助。"
+                    status_var.set(message)
             elif event == "error":
                 self.research_running = False
                 self._update_start_state()
@@ -1158,6 +1506,7 @@ class OpenThesisApp:
 
 
 def main() -> None:
+    gui_smoke = os.environ.get("OPENTHESIS_GUI_SMOKE_TEST") == "1"
     diagnostic_path = Path(tempfile.gettempdir()) / "OpenThesis-startup.log"
 
     def diagnostic(message: str) -> None:
@@ -1167,8 +1516,12 @@ def main() -> None:
 
     diagnostic("creating-tk-root")
     root = tk.Tk()
+    if gui_smoke:
+        root.tk.call("tk", "scaling", 1.75)
     diagnostic("tk-root-created")
     app = OpenThesisApp(root)
+    if gui_smoke:
+        root.geometry("980x680")
     diagnostic("app-initialized")
     root.update_idletasks()
     diagnostic(
@@ -1182,18 +1535,40 @@ def main() -> None:
             height=root.winfo_height(),
         )
     )
-    gui_smoke = os.environ.get("OPENTHESIS_GUI_SMOKE_TEST") == "1"
     smoke_result = {"viewable": False}
     if gui_smoke:
         def finish_gui_smoke() -> None:
+            start_visible = bool(
+                app.run_button.winfo_viewable()
+                and app.run_button.cget("text") == "开始研究"
+            )
+            app._toggle_dcf()
+            app.research_controls_scroll.scroll_to_bottom()
+            root.update_idletasks()
+            dcf_accessible = bool(app.valuation_frame.winfo_ismapped())
+            app.notebook.select(app.model_tab)
+            app._toggle_comparison_model()
+            app.model_settings_scroll.scroll_to_bottom()
+            root.update_idletasks()
+            model_bottom_accessible = bool(app.comparison_frame.winfo_ismapped())
+            diagnostic(
+                "gui-smoke="
+                f"start_visible:{start_visible};"
+                f"dcf_accessible:{dcf_accessible};"
+                f"model_bottom_accessible:{model_bottom_accessible};"
+                f"status_visible:{bool(app.status_frame.winfo_viewable())};"
+                f"size:{root.winfo_width()}x{root.winfo_height()}"
+            )
             smoke_result["viewable"] = bool(
                 root.winfo_exists()
                 and root.winfo_ismapped()
                 and root.winfo_viewable()
                 and root.winfo_width() >= 980
                 and root.winfo_height() >= 680
-                and app.run_button.winfo_viewable()
-                and app.run_button.cget("text") == "开始研究"
+                and start_visible
+                and dcf_accessible
+                and model_bottom_accessible
+                and app.status_frame.winfo_viewable()
             )
             root.destroy()
 

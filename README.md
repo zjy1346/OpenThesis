@@ -9,9 +9,10 @@ OpenThesis 帮助个人投资者研究公司的长期价值，而不是预测短
 SEC 财报与 XBRL 数据，建立可追溯的证据链，协调财务、商业模式、风险、增长、
 质疑、预测和验证等专门 Agent，并保存可以持续修订的投资论点。
 
-用户可以选择 Ollama 本地模型或任意 OpenAI-compatible 云端模型，也可以导入
-声明式 `.othesis` 研究模块。财务指标与反向 DCF 由确定性程序计算，AI 生成的
-事实结论必须引用证据。项目不会连接券商、执行交易或提供短线信号。
+用户可以直接选择 DeepSeek、Qwen、Kimi、GLM、OpenAI、Gemini、OpenRouter
+或 Ollama，也可以填写任意 OpenAI-compatible 接口，并导入声明式 `.othesis`
+研究模块。财务指标与反向 DCF 由确定性程序计算，AI 生成的事实结论必须引用
+证据。项目不会连接券商、执行交易或提供短线信号。
 
 ## English introduction
 
@@ -42,16 +43,21 @@ OpenThesis will not integrate brokerage accounts, place orders, generate short-t
 
 ## Current release
 
-Version 0.2.0 includes:
+Version 0.3.0 includes:
 
 - a local Windows desktop interface;
+- built-in presets for DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini, OpenRouter, and Ollama;
+- editable model IDs and endpoints, recommended-model fallbacks, and an explicit online catalog refresh;
+- session-only API keys, independent primary/comparison model configuration, and legacy-setting inference;
+- scrollable research and model settings at the `980×680` minimum size and high DPI;
+- collapsed reverse-DCF and comparison-model advanced sections;
 - a visible three-step research flow with a persistent primary start button;
 - common-company shortcuts and guided SEC requester identity templates;
 - in-app SEC help that explains EDGAR access and safe contact-email usage;
 - SQLite persistence and research history;
 - SEC company lookup, five-year 10-K download, text/table evidence, and Company Facts ingestion;
 - deterministic financial metrics, reverse DCF implied expectations, and an offline synthetic-company demo;
-- Ollama and OpenAI-compatible model adapters;
+- Ollama and OpenAI-compatible model adapters with compatibility-aware request parameters;
 - an evidence-aware multi-agent workflow for financials, business, accounting risk, growth, skepticism, scenarios, synthesis, and verification;
 - clickable SEC evidence sources in exported and on-screen reports;
 - editable, append-only investment-thesis versions;
@@ -63,13 +69,15 @@ The consolidated product and architecture specification is in [docs/PROJECT_SPEC
 
 ## Run the portable Windows release
 
-1. Extract `OpenThesis-0.2.0-windows-x64-portable.zip`.
+1. Extract `OpenThesis-0.3.0-windows-x64-portable.zip`.
 2. Keep `_internal` beside `OpenThesis.exe`.
 3. Start `OpenThesis.exe`.
 4. Choose the synthetic demo company for a fully offline first run.
 
 The application never connects to a brokerage or executes a trade. API keys are
 kept in memory for the current session and are not written to the local database.
+Online model lists are requested only when the user clicks “刷新在线模型”; a
+failure never removes the built-in choices, and model IDs and endpoints stay editable.
 
 ## Run from source on the development machine
 

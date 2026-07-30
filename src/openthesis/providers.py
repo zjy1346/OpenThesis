@@ -11,13 +11,20 @@ class ProviderError(RuntimeError):
     pass
 
 
+class ProviderHTTPError(ProviderError):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail[:1000]
+        super().__init__(f"模型接口返回 HTTP {status_code}：{self.detail}")
+
+
 @dataclass(slots=True)
 class ModelConfig:
     provider: str
     model: str
     base_url: str
     api_key: str = ""
-    temperature: float = 0.2
+    temperature: float | None = 0.2
     timeout_seconds: int = 180
 
     @property
@@ -62,7 +69,12 @@ def _post_json(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise ProviderError(f"模型接口返回 HTTP {exc.code}：{detail[:1000]}") from exc
+        authorization = headers.get("Authorization", "")
+        if authorization:
+            secret = authorization.removeprefix("Bearer ").strip()
+            if secret:
+                detail = detail.replace(secret, "[REDACTED]")
+        raise ProviderHTTPError(exc.code, detail) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise ProviderError(f"模型接口请求失败：{exc}") from exc
 
@@ -117,20 +129,43 @@ class OpenAICompatibleProvider:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "temperature": self.config.temperature,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if self.config.temperature is not None:
+            payload["temperature"] = self.config.temperature
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        response = _post_json(
-            f"{self.base_url}/chat/completions",
-            payload,
-            headers,
-            self.config.timeout_seconds,
-        )
+        try:
+            response = _post_json(
+                f"{self.base_url}/chat/completions",
+                payload,
+                headers,
+                self.config.timeout_seconds,
+            )
+        except ProviderHTTPError as exc:
+            detail = exc.detail.lower()
+            if (
+                json_mode
+                and exc.status_code in {400, 422}
+                and "response_format" in detail
+                and any(
+                    marker in detail
+                    for marker in ("unsupported", "not support", "unknown", "invalid")
+                )
+            ):
+                retry_payload = dict(payload)
+                retry_payload.pop("response_format", None)
+                response = _post_json(
+                    f"{self.base_url}/chat/completions",
+                    retry_payload,
+                    headers,
+                    self.config.timeout_seconds,
+                )
+            else:
+                raise
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -157,16 +192,17 @@ class OllamaProvider:
         *,
         json_mode: bool = True,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.config.model,
             "stream": False,
             "format": "json" if json_mode else "",
-            "options": {"temperature": self.config.temperature},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if self.config.temperature is not None:
+            payload["options"] = {"temperature": self.config.temperature}
         response = _post_json(
             f"{self.base_url}/api/chat",
             payload,

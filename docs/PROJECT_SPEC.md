@@ -68,9 +68,14 @@ The product must support both local and cloud models through a provider abstract
 
 Initial provider scope:
 
-- Ollama or an equivalent local provider;
-- OpenAI-compatible HTTP APIs;
-- at least one native cloud-provider adapter where the generic protocol is insufficient.
+- local Ollama;
+- presets for DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini, and OpenRouter;
+- arbitrary OpenAI-compatible HTTP APIs.
+
+Version 0.3 adds a `ModelPreset` catalog containing region, protocol, default
+endpoint, recommended model IDs, optional online-list path, help link, and
+request-parameter policy. Online discovery is opt-in, session-cached, and merges
+remote results after the built-in recommendations. API keys remain session-only.
 
 Every report records the provider, model identifier, model parameters, workflow version, research-pack version, and data snapshot.
 
@@ -362,6 +367,11 @@ interface ModelProvider {
 - vision;
 - streaming;
 - cost metadata when known.
+
+Provider compatibility rules are explicit. `temperature` may be omitted by a
+preset. OpenAI-compatible requests retry at most once without `response_format`
+only after a 400/422 response explicitly identifies that field as unsupported.
+Authentication, rate-limit, timeout, and unrelated validation failures are not retried.
 
 A prompt compiler combines:
 
@@ -797,7 +807,7 @@ research_pack:
 workflow:
   id: complete-fundamental-research
   version: 0.1.0
-application_version: 0.2.0
+application_version: 0.3.0
 ```
 
 User edits are stored as new versions and attributed to the user rather than being presented as model output.
