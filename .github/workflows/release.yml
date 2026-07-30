@@ -1,0 +1,76 @@
+name: Publish Windows release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/release.yml
+      - .github/release-notes/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build and publish portable Windows package
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packaging tools
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check pyinstaller==6.21.0
+
+      - name: Read project version
+        shell: pwsh
+        run: |
+          $match = Select-String -LiteralPath pyproject.toml -Pattern '^version = "([^"]+)"$'
+          if (-not $match) {
+            throw "Could not read the project version from pyproject.toml"
+          }
+          $version = $match.Matches[0].Groups[1].Value
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TAG=v$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Test and build portable package
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = "installer-output/OpenThesis-$env:RELEASE_VERSION-windows-x64-portable.zip"
+          $checksum = "$archive.sha256"
+          $notes = ".github/release-notes/v$env:RELEASE_VERSION.md"
+          $title = "OpenThesis $env:RELEASE_VERSION"
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --title $title `
+              --notes-file $notes `
+              --latest
+            gh release upload $env:RELEASE_TAG $archive $checksum `
+              --repo $env:GITHUB_REPOSITORY `
+              --clobber
+          } else {
+            gh release create $env:RELEASE_TAG $archive $checksum `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title $title `
+              --notes-file $notes `
+              --latest
+          }
