@@ -4,13 +4,14 @@ import re
 
 from . import __version__
 from .domain import Company
+from .i18n import sec_profile_id_from_label
 
 
-SEC_DEFAULT_PROFILE = "个人投资者（推荐）"
+SEC_DEFAULT_PROFILE = "personal"
 SEC_PROFILE_AGENTS = {
-    SEC_DEFAULT_PROFILE: "Personal Investor",
-    "独立研究者": "Independent Researcher",
-    "公司或研究团队": "Organization Research Team",
+    "personal": "Personal Investor",
+    "independent": "Independent Researcher",
+    "organization": "Organization Research Team",
 }
 SEC_PROFILE_LABELS = tuple(SEC_PROFILE_AGENTS)
 
@@ -26,6 +27,7 @@ def validate_sec_contact_email(email: str) -> str:
 
 
 def build_sec_user_agent(profile: str, email: str) -> str:
+    profile = sec_profile_id_from_label(profile)
     if profile not in SEC_PROFILE_AGENTS:
         raise ValueError("请选择一个 SEC 请求身份模板。")
     normalized_email = validate_sec_contact_email(email)

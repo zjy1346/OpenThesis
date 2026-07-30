@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from .domain import ResearchArtifact, ResearchRun
+from .i18n import EN, normalize_language
 from .storage import Storage
 
 
@@ -34,7 +35,9 @@ def compare_research_runs(
     storage: Storage,
     primary: ResearchRun,
     secondary: ResearchRun,
+    language: str = "zh-CN",
 ) -> ResearchArtifact:
+    english = normalize_language(language) == EN
     left = _final_report(storage.get_artifacts(primary.run_id))
     right = _final_report(storage.get_artifacts(secondary.run_id))
     left_claims = _claim_texts(left)
@@ -71,7 +74,11 @@ def compare_research_runs(
         "secondary_only_claims": sorted(right_claims - left_claims),
         "section_comparison": section_comparison,
         "method": (
-            "确定性结构比较；相同文本不代表事实正确，文本不同也不自动代表实质冲突。"
+            "Deterministic structural comparison: identical text does not prove "
+            "factual correctness, and different text does not automatically "
+            "indicate a substantive conflict."
+            if english
+            else "确定性结构比较；相同文本不代表事实正确，文本不同也不自动代表实质冲突。"
         ),
     }
     identity = json.dumps(content, ensure_ascii=False, sort_keys=True).encode()
@@ -82,11 +89,10 @@ def compare_research_runs(
         ),
         run_id=primary.run_id,
         artifact_type="model-comparison",
-        title="双模型研究分歧",
+        title="Two-model Research Differences" if english else "双模型研究分歧",
         content=content,
         model_id=f"{primary.model_id} vs {secondary.model_id}",
         agent_id="deterministic-comparator",
     )
     storage.save_artifact(artifact)
     return artifact
-

@@ -182,9 +182,9 @@ class ResearchRun:
     started_at: str = field(default_factory=utc_now_iso)
     completed_at: str | None = None
     errors: list[str] = field(default_factory=list)
+    report_language: str = "zh-CN"
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value
         return data
-

@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$version = "0.3.0"
+$version = "0.4.0"
 
 Push-Location $projectRoot
 try {
@@ -25,16 +25,23 @@ try {
         throw "Packaged deterministic smoke test failed"
     }
 
-    $env:OPENTHESIS_GUI_SMOKE_TEST = "1"
-    $env:OPENTHESIS_DATA_DIR = Join-Path $projectRoot ".test-frozen-data"
-    $gui = Start-Process -FilePath $executable -PassThru -Wait
-    Remove-Item Env:\OPENTHESIS_GUI_SMOKE_TEST
-    Remove-Item Env:\OPENTHESIS_DATA_DIR
-    if ($gui.ExitCode -ne 0) {
-        throw "Packaged GUI smoke test failed"
+    foreach ($language in @("zh-CN", "en")) {
+        $env:OPENTHESIS_GUI_SMOKE_TEST = "1"
+        $env:OPENTHESIS_UI_LANGUAGE = $language
+        $env:OPENTHESIS_REPORT_LANGUAGE = $language
+        $env:OPENTHESIS_DATA_DIR = Join-Path $projectRoot ".test-frozen-data-$language"
+        $gui = Start-Process -FilePath $executable -PassThru -Wait
+        Remove-Item Env:\OPENTHESIS_GUI_SMOKE_TEST
+        Remove-Item Env:\OPENTHESIS_UI_LANGUAGE
+        Remove-Item Env:\OPENTHESIS_REPORT_LANGUAGE
+        Remove-Item Env:\OPENTHESIS_DATA_DIR
+        if ($gui.ExitCode -ne 0) {
+            throw "Packaged GUI smoke test failed for $language"
+        }
     }
 
     Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $bundle -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot "README.zh-CN.md") -Destination $bundle -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE") -Destination $bundle -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot "docs\PROJECT_SPEC.md") -Destination $bundle -Force
     Set-Content -LiteralPath (Join-Path $bundle "VERSION.txt") -Value $version -Encoding utf8
@@ -52,6 +59,8 @@ try {
 } finally {
     Remove-Item Env:\OPENTHESIS_SMOKE_TEST -ErrorAction SilentlyContinue
     Remove-Item Env:\OPENTHESIS_GUI_SMOKE_TEST -ErrorAction SilentlyContinue
+    Remove-Item Env:\OPENTHESIS_UI_LANGUAGE -ErrorAction SilentlyContinue
+    Remove-Item Env:\OPENTHESIS_REPORT_LANGUAGE -ErrorAction SilentlyContinue
     Remove-Item Env:\OPENTHESIS_DATA_DIR -ErrorAction SilentlyContinue
     Pop-Location
 }

@@ -15,12 +15,20 @@ from .domain import (
     utc_now_iso,
 )
 from .financials import calculate_metrics, deterministic_summary, reverse_dcf_analysis
+from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, normalize_language, translate
 from .packs import ResearchPack
 from .providers import ModelConfig, ModelProvider
 from .storage import Storage
 
 
 ProgressCallback = Callable[[str, int], None]
+CancelCheck = Callable[[], bool]
+
+
+class ResearchCancelled(RuntimeError):
+    def __init__(self, message: str = "研究已由用户取消", run_id: str = ""):
+        super().__init__(message)
+        self.run_id = run_id
 
 
 CORE_SYSTEM_PROMPT = """\
@@ -74,26 +82,36 @@ def build_fact_evidence(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def verify_agent_output(
-    output: dict[str, Any], available_evidence: set[str]
+    output: dict[str, Any],
+    available_evidence: set[str],
+    language: str = "zh-CN",
 ) -> dict[str, Any]:
+    english = normalize_language(language) == EN
     issues: list[str] = []
     claims = output.get("claims", [])
     if claims is not None and not isinstance(claims, list):
-        issues.append("claims 必须是数组")
+        issues.append("claims must be an array" if english else "claims 必须是数组")
         claims = []
     verified_count = 0
     unsupported_count = 0
     for claim in claims or []:
         if not isinstance(claim, dict):
-            issues.append("存在非对象 claim")
+            issues.append(
+                "A claim is not a JSON object" if english else "存在非对象 claim"
+            )
             continue
         evidence_ids = claim.get("evidence_ids", [])
         if not isinstance(evidence_ids, list):
-            issues.append("claim.evidence_ids 必须是数组")
+            issues.append(
+                "claim.evidence_ids must be an array"
+                if english
+                else "claim.evidence_ids 必须是数组"
+            )
             continue
         missing = [item for item in evidence_ids if item not in available_evidence]
         if missing:
-            issues.append(f"引用不存在：{', '.join(map(str, missing))}")
+            prefix = "Unknown evidence reference: " if english else "引用不存在："
+            issues.append(prefix + ", ".join(map(str, missing)))
         if claim.get("kind") == "fact" and not evidence_ids:
             unsupported_count += 1
         elif not missing:
@@ -115,11 +133,27 @@ class ResearchWorkflow:
         research_pack: ResearchPack,
         provider: ModelProvider | None,
         model_config: ModelConfig,
+        cancel_check: CancelCheck | None = None,
+        report_language: str = "zh-CN",
+        ui_language: str = "zh-CN",
     ):
         self.storage = storage
         self.pack = research_pack
         self.provider = provider
         self.model_config = model_config
+        self.cancel_check = cancel_check or (lambda: False)
+        self.report_language = normalize_language(report_language)
+        self.ui_language = normalize_language(ui_language)
+
+    def _report_text(self, chinese: str, english: str) -> str:
+        return english if self.report_language == EN else chinese
+
+    def _progress_text(self, chinese: str, **params: object) -> str:
+        return translate(chinese, self.ui_language, **params)
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_check():
+            raise ResearchCancelled()
 
     def run(
         self,
@@ -140,9 +174,11 @@ class ResearchWorkflow:
             model_id=self.model_config.model,
             data_as_of=utc_now_iso(),
             status=RunStatus.RUNNING,
+            report_language=self.report_language,
         )
         self.storage.save_run(run)
         try:
+            self._check_cancelled()
             metrics = calculate_metrics(facts)
             evidence = build_fact_evidence(facts)
             evidence.extend(filing_evidence or [])
@@ -155,13 +191,19 @@ class ResearchWorkflow:
                     valuation_inputs.get("terminal_growth", 0.03),
                 )
             context = ResearchContext(company, facts, metrics, evidence, valuation)
-            notify("已完成确定性财务计算", 15)
+            self._check_cancelled()
+            notify(self._progress_text("已完成确定性财务计算"), 15)
+            summary = deterministic_summary(
+                company.name, metrics, self.report_language
+            )
             self._save(
                 run,
                 "deterministic-financial-summary",
-                "确定性财务概览",
+                self._report_text(
+                    "确定性财务概览", "Deterministic Financial Overview"
+                ),
                 {
-                    "markdown": deterministic_summary(company.name, metrics),
+                    "markdown": summary,
                     "metrics": metrics,
                     "evidence": evidence,
                 },
@@ -171,7 +213,9 @@ class ResearchWorkflow:
                 self._save(
                     run,
                     "deterministic-valuation",
-                    "反向 DCF 隐含预期",
+                    self._report_text(
+                        "反向 DCF 隐含预期", "Reverse DCF Implied Expectations"
+                    ),
                     valuation,
                     agent_id="valuation-engine",
                 )
@@ -179,18 +223,28 @@ class ResearchWorkflow:
                 self._save(
                     run,
                     "research-report",
-                    "基础研究报告",
+                    self._report_text("基础研究报告", "Basic Research Report"),
                     {
                         "mode": "deterministic-only",
-                        "summary": deterministic_summary(company.name, metrics),
-                        "notice": "未配置模型，因此没有生成定性研究、增长机会和长期情景。",
+                        "summary": summary,
+                        "notice": self._report_text(
+                            "未配置模型，因此没有生成定性研究、增长机会和长期情景。",
+                            "No model was configured, so qualitative research, "
+                            "growth opportunities, and long-term scenarios were "
+                            "not generated.",
+                        ),
                     },
                     agent_id="deterministic-fallback",
                 )
                 run.status = RunStatus.PARTIAL
                 run.completed_at = utc_now_iso()
                 self.storage.save_run(run)
-                notify("基础财务分析完成；配置模型后可运行完整研究", 100)
+                notify(
+                    self._progress_text(
+                        "基础财务分析完成；配置模型后可运行完整研究"
+                    ),
+                    100,
+                )
                 return run
 
             available = {item["evidence_id"] for item in evidence}
@@ -200,7 +254,12 @@ class ResearchWorkflow:
                 "accounting-risk-analyst": "prompts/accounting-risk-analyst.md",
             }
             stage_results: dict[str, dict[str, Any]] = {}
-            notify("正在并行运行财务、商业与会计风险 Agent", 25)
+            notify(
+                self._progress_text(
+                    "正在并行运行财务、商业与会计风险 Agent（0/3）"
+                ),
+                25,
+            )
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
                     executor.submit(
@@ -208,17 +267,30 @@ class ResearchWorkflow:
                     ): agent_id
                     for agent_id, prompt_path in stage_one.items()
                 }
+                completed_agents = 0
                 for future in as_completed(futures):
                     agent_id = futures[future]
                     result = future.result()
+                    self._check_cancelled()
                     stage_results[agent_id] = result
-                    verification = verify_agent_output(result, available)
+                    verification = verify_agent_output(
+                        result, available, self.report_language
+                    )
                     self._save(
                         run,
                         "agent-analysis",
                         agent_id,
                         {"result": result, "verification": verification},
                         agent_id=agent_id,
+                    )
+                    completed_agents += 1
+                    notify(
+                        self._progress_text(
+                            "基础分析 Agent 已完成 {completed}/3：{agent_id}",
+                            completed=completed_agents,
+                            agent_id=agent_id,
+                        ),
+                        25 + completed_agents * 7,
                     )
 
             dossier = {
@@ -229,12 +301,15 @@ class ResearchWorkflow:
             self._save(
                 run,
                 "verified-research-dossier",
-                "经过验证的研究档案",
+                self._report_text(
+                    "经过验证的研究档案", "Verified Research Dossier"
+                ),
                 dossier,
                 agent_id="evidence-verifier",
             )
-            notify("基础研究档案完成", 50)
+            notify(self._progress_text("基础研究档案完成"), 50)
 
+            notify(self._progress_text("正在研究公司与行业增长机会"), 52)
             growth = self._run_agent(
                 "growth-opportunity-analyst",
                 "prompts/growth-opportunity-analyst.md",
@@ -244,12 +319,13 @@ class ResearchWorkflow:
             self._save(
                 run,
                 "growth-opportunities",
-                "增长机会",
+                self._report_text("增长机会", "Growth Opportunities"),
                 growth,
                 agent_id="growth-opportunity-analyst",
             )
-            notify("增长机会研究完成", 65)
+            notify(self._progress_text("增长机会研究完成"), 65)
 
+            notify(self._progress_text("正在进行反方审查与压力测试"), 67)
             skeptic = self._run_agent(
                 "skeptical-analyst",
                 "prompts/skeptical-analyst.md",
@@ -259,12 +335,13 @@ class ResearchWorkflow:
             self._save(
                 run,
                 "counter-analysis",
-                "反方审查",
+                self._report_text("反方审查", "Counter-analysis"),
                 skeptic,
                 agent_id="skeptical-analyst",
             )
-            notify("反方审查完成", 75)
+            notify(self._progress_text("反方审查完成"), 75)
 
+            notify(self._progress_text("正在生成长期经营情景"), 77)
             forecast = self._run_agent(
                 "forecast-analyst",
                 "prompts/forecast-analyst.md",
@@ -278,12 +355,13 @@ class ResearchWorkflow:
             self._save(
                 run,
                 "forecast-scenarios",
-                "长期经营情景",
+                self._report_text("长期经营情景", "Long-term Operating Scenarios"),
                 forecast,
                 agent_id="forecast-analyst",
             )
-            notify("长期情景完成", 88)
+            notify(self._progress_text("长期情景完成"), 88)
 
+            notify(self._progress_text("正在合成最终长期研究报告"), 90)
             synthesis = self._run_agent(
                 "research-synthesizer",
                 "prompts/research-synthesizer.md",
@@ -295,11 +373,15 @@ class ResearchWorkflow:
                     "forecast": forecast,
                 },
             )
-            verification = verify_agent_output(synthesis, available)
+            verification = verify_agent_output(
+                synthesis, available, self.report_language
+            )
             self._save(
                 run,
                 "research-report",
-                "完整长期研究报告",
+                self._report_text(
+                    "完整长期研究报告", "Complete Long-term Research Report"
+                ),
                 {"report": synthesis, "verification": verification},
                 agent_id="research-synthesizer",
             )
@@ -324,15 +406,25 @@ class ResearchWorkflow:
             self._save(
                 run,
                 "thesis-snapshot",
-                f"投资逻辑 v{thesis_version['version']}",
+                self._report_text(
+                    f"投资逻辑 v{thesis_version['version']}",
+                    f"Investment Thesis v{thesis_version['version']}",
+                ),
                 thesis_version,
                 agent_id="thesis-versioning",
             )
             run.status = RunStatus.COMPLETED if verification["passed"] else RunStatus.PARTIAL
             run.completed_at = utc_now_iso()
             self.storage.save_run(run)
-            notify("研究完成", 100)
+            notify(self._progress_text("研究完成"), 100)
             return run
+        except ResearchCancelled as exc:
+            exc.run_id = run.run_id
+            run.errors.append(str(exc))
+            run.status = RunStatus.CANCELLED
+            run.completed_at = utc_now_iso()
+            self.storage.save_run(run)
+            raise
         except Exception as exc:
             run.errors.append(str(exc))
             run.status = RunStatus.FAILED
@@ -347,13 +439,17 @@ class ResearchWorkflow:
         context_json: str,
         prior_artifacts: dict[str, Any],
     ) -> dict[str, Any]:
+        self._check_cancelled()
         if self.provider is None:
             raise RuntimeError("模型 Provider 未配置")
         role_prompt = self.pack.prompt(prompt_path)
+        language_instruction = OUTPUT_LANGUAGE_INSTRUCTIONS[self.report_language]
         user_prompt = json.dumps(
             {
                 "agent": agent_id,
                 "task_instructions": role_prompt,
+                "output_language": self.report_language,
+                "output_language_instruction": language_instruction,
                 "research_context": json.loads(context_json),
                 "prior_artifacts": prior_artifacts,
                 "required_claim_shape": {
@@ -365,7 +461,17 @@ class ResearchWorkflow:
             },
             ensure_ascii=False,
         )
-        return self.provider.generate(CORE_SYSTEM_PROMPT, user_prompt, json_mode=True)
+        try:
+            result = self.provider.generate(
+                CORE_SYSTEM_PROMPT + "\n" + language_instruction,
+                user_prompt,
+                json_mode=True,
+            )
+        except Exception:
+            self._check_cancelled()
+            raise
+        self._check_cancelled()
+        return result
 
     def _save(
         self,

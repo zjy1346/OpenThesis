@@ -52,6 +52,65 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("证据来源", report)
         self.assertIn("https://www.sec.gov/example", report)
 
+    def test_english_renderer_translates_local_content_but_preserves_ai_text(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "title": "确定性财务概览",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "markdown": "# Example 财务概览",
+                    "metrics": [
+                        {
+                            "year": 2025,
+                            "revenue": 1_000_000_000,
+                            "revenue_growth": 0.1,
+                            "operating_margin": 0.2,
+                            "net_income": 100_000_000,
+                            "operating_cash_flow": 120_000_000,
+                            "free_cash_flow": 90_000_000,
+                            "cash_conversion": 1.2,
+                            "debt_to_assets": 0.3,
+                            "return_on_equity": 0.15,
+                        }
+                    ],
+                    "evidence": [],
+                },
+            },
+            {
+                "artifact_type": "research-report",
+                "title": "完整长期研究报告",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {
+                    "report": {
+                        "executive_summary": "这段旧 AI 正文必须保持原文。",
+                    },
+                    "verification": {
+                        "passed": True,
+                        "claim_count": 0,
+                        "verified_claim_count": 0,
+                        "unsupported_fact_count": 0,
+                        "issues": [],
+                    },
+                },
+            },
+        ]
+        report = render_research_run(
+            "run-en", artifacts, "en", company_name="Example Corp"
+        )
+        self.assertIn("Long-term Company Research", report)
+        self.assertIn("Financial Overview", report)
+        self.assertIn("Executive Summary", report)
+        self.assertIn("Verification Results", report)
+        self.assertIn("这段旧 AI 正文必须保持原文。", report)
+        self.assertNotIn("## 执行摘要", report)
+
+    def test_unknown_report_language_falls_back_to_chinese(self) -> None:
+        report = render_research_run("run-fallback", [], "unknown")
+        self.assertIn("长期公司研究", report)
+
 
 if __name__ == "__main__":
     unittest.main()

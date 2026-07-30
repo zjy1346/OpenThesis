@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
-from openthesis.domain import FinancialFact, utc_now_iso
+from openthesis.domain import FinancialFact, ResearchRun, RunStatus, utc_now_iso
 from openthesis.storage import Storage
 
 
@@ -25,6 +25,37 @@ class StorageTests(unittest.TestCase):
             storage.set_setting("model", "example")
             self.assertEqual(storage.get_setting("model"), "example")
             self.assertEqual(storage.get_setting("missing", "fallback"), "fallback")
+
+    def test_language_settings_are_independent_and_do_not_create_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.set_setting("ui_language", "en")
+            storage.set_setting("report_language", "zh-CN")
+            self.assertEqual(storage.get_setting("ui_language"), "en")
+            self.assertEqual(storage.get_setting("report_language"), "zh-CN")
+            self.assertEqual(storage.get_setting("api_key", ""), "")
+
+    def test_running_runs_are_recovered_as_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            run = ResearchRun(
+                run_id="interrupted-run",
+                company=DEMO_COMPANY,
+                workflow_id="test",
+                research_pack_id="test",
+                research_pack_version="1",
+                provider_id="openai-compatible",
+                model_id="test",
+                data_as_of="2026-01-01T00:00:00+00:00",
+                status=RunStatus.RUNNING,
+            )
+            storage.save_run(run)
+            self.assertEqual(storage.interrupt_running_runs(), 1)
+            recovered = storage.list_runs()[0]
+            self.assertEqual(recovered["status"], RunStatus.CANCELLED.value)
+            self.assertTrue(recovered["completed_at"])
+            self.assertEqual(storage.interrupt_running_runs(), 0)
 
     def test_thesis_versions_are_append_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

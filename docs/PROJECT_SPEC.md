@@ -807,7 +807,7 @@ research_pack:
 workflow:
   id: complete-fundamental-research
   version: 0.1.0
-application_version: 0.3.0
+application_version: 0.4.0
 ```
 
 User edits are stored as new versions and attributed to the user rather than being presented as model output.

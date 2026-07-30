@@ -1,95 +1,131 @@
+<div align="center">
+
 # OpenThesis
 
-> 面向长期个人投资者的开源、模型无关 AI 公司研究投资系统。  
-> An open-source, model-agnostic AI company research system for long-term individual investors.
+**AI-native, evidence-first company research for long-term investors**
 
-## 中文简介
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-OpenThesis 帮助个人投资者研究公司的长期价值，而不是预测短期股价。它读取
-SEC 财报与 XBRL 数据，建立可追溯的证据链，协调财务、商业模式、风险、增长、
-质疑、预测和验证等专门 Agent，并保存可以持续修订的投资论点。
+[![Release](https://img.shields.io/github/v/release/zjy1346/OpenThesis?display_name=tag&sort=semver)](https://github.com/zjy1346/OpenThesis/releases/latest)
+[![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/zjy1346/OpenThesis/releases/latest)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-用户可以直接选择 DeepSeek、Qwen、Kimi、GLM、OpenAI、Gemini、OpenRouter
-或 Ollama，也可以填写任意 OpenAI-compatible 接口，并导入声明式 `.othesis`
-研究模块。财务指标与反向 DCF 由确定性程序计算，AI 生成的事实结论必须引用
-证据。项目不会连接券商、执行交易或提供短线信号。
+Research companies—not short-term price movements.
 
-## English introduction
+</div>
 
-OpenThesis helps investors study companies instead of predicting short-term price movements. It ingests public filings, builds traceable evidence, coordinates specialized research agents, creates long-term operating scenarios, and preserves an investment thesis that can be reviewed as new information arrives.
+OpenThesis is an open-source desktop research system for individual long-term
+investors. It turns public filings, deterministic financial analysis, and
+specialized AI agents into a traceable investment thesis. You choose the model;
+OpenThesis provides the workflow, evidence protocol, financial tools, and
+reproducibility layer.
 
-The user chooses the model. OpenThesis supplies the research protocol, financial tools, prompts, verification, and reproducibility layer.
+> [!IMPORTANT]
+> OpenThesis does not connect to brokerage accounts, execute trades, provide
+> short-term signals, or promise investment returns.
 
-## Product principles
+## Why OpenThesis?
 
-- Bring your own model.
-- Every factual claim needs evidence.
-- Financial calculations are deterministic.
-- Facts, inferences, assumptions, and unknowns remain distinct.
-- Forecasts use scenarios, ranges, probabilities, and invalidation conditions.
-- Research is reproducible from a model, prompt pack, and point-in-time data snapshot.
-- AI supports decisions; it does not execute trades.
+- **Bring your own model.** Use DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini,
+  OpenRouter, Ollama, or any OpenAI-compatible endpoint.
+- **Evidence before opinion.** AI-generated factual claims must cite the filing
+  evidence collected for the run.
+- **Deterministic finance.** Financial summaries and reverse DCF calculations
+  are produced by code, not improvised by a language model.
+- **Purpose-built agents.** Financial, business, accounting-risk, growth,
+  skeptical, forecasting, synthesis, and verification agents collaborate on the
+  same evidence.
+- **Reproducible research.** Each run records its model, parameters, research
+  pack, data snapshot, and report language.
+- **Local-first privacy.** API keys stay in memory for the current session and
+  are never written to the application database.
 
-## Initial scope
+## Research pipeline
 
-- Target user: serious individual long-term investors.
-- Initial market: US-listed companies.
-- Initial source: SEC 10-K filings and Inline XBRL facts.
-- Runtime: local-first Windows desktop application.
-- Model support: local and cloud providers selected by the user.
-- Output: cited company research, growth opportunities, long-term scenarios, valuation assumptions, risks, and a versioned investment thesis.
+```mermaid
+flowchart LR
+    A["SEC filings and XBRL"] --> B["Evidence extraction"]
+    B --> C["Specialist research agents"]
+    C --> D["Long-term scenarios and growth"]
+    D --> E["Synthesis and verification"]
+    E --> F["Versioned investment thesis"]
+```
 
-OpenThesis will not integrate brokerage accounts, place orders, generate short-term trading signals, or promise investment returns.
+## Highlights in v0.4.0
 
-## Current release
+- Independent **interface language** and **research-report language** settings:
+  Simplified Chinese or English.
+- Interface language changes safely after restart; report language applies to
+  the next research run immediately.
+- Every research agent receives the same mandatory report-language constraint,
+  including custom `.othesis` research packs.
+- Deterministic summaries, reverse DCF, validation, model comparison, evidence
+  sections, disclaimers, exports, and history rendering support both languages.
+- Historical AI-authored text remains exactly as generated. OpenThesis does not
+  call a model to translate old reports, so language switching adds no API cost.
+- Full interface localization with safe Simplified Chinese fallback for missing
+  or invalid language values.
+- Previous v0.3.0 improvements remain included: eight provider presets, online
+  model discovery, responsive scrollable layouts, progress feedback, and
+  compatibility-aware OpenAI-style requests.
 
-Version 0.3.0 includes:
+See the consolidated architecture and product specification in
+[docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
 
-- a local Windows desktop interface;
-- built-in presets for DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini, OpenRouter, and Ollama;
-- editable model IDs and endpoints, recommended-model fallbacks, and an explicit online catalog refresh;
-- session-only API keys, independent primary/comparison model configuration, and legacy-setting inference;
-- scrollable research and model settings at the `980×680` minimum size and high DPI;
-- collapsed reverse-DCF and comparison-model advanced sections;
-- a visible three-step research flow with a persistent primary start button;
-- common-company shortcuts and guided SEC requester identity templates;
-- in-app SEC help that explains EDGAR access and safe contact-email usage;
-- SQLite persistence and research history;
-- SEC company lookup, five-year 10-K download, text/table evidence, and Company Facts ingestion;
-- deterministic financial metrics, reverse DCF implied expectations, and an offline synthetic-company demo;
-- Ollama and OpenAI-compatible model adapters with compatibility-aware request parameters;
-- an evidence-aware multi-agent workflow for financials, business, accounting risk, growth, skepticism, scenarios, synthesis, and verification;
-- clickable SEC evidence sources in exported and on-screen reports;
-- editable, append-only investment-thesis versions;
-- optional side-by-side model comparison on the same inputs;
-- safe declarative `.othesis` research-pack import;
-- the built-in `official.long-term-fundamentals` pack.
+## Download and run
 
-The consolidated product and architecture specification is in [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
+1. Open the [latest stable release](https://github.com/zjy1346/OpenThesis/releases/latest)
+   and download the Windows portable ZIP.
+2. Extract the ZIP completely. Do not run the executable from inside the
+   archive.
+3. Keep the `_internal` directory beside `OpenThesis.exe`.
+4. Start `OpenThesis.exe`.
+5. Choose the synthetic demo company for a fully offline first run.
 
-## Run the portable Windows release
+The first launch defaults to **no AI calls**. Research context is sent only
+after you explicitly choose a model and start a research run. Online model lists
+are requested only when you click **Refresh online models**.
 
-1. Extract `OpenThesis-0.3.0-windows-x64-portable.zip`.
-2. Keep `_internal` beside `OpenThesis.exe`.
-3. Start `OpenThesis.exe`.
-4. Choose the synthetic demo company for a fully offline first run.
+## Language settings
 
-The application never connects to a brokerage or executes a trade. API keys are
-kept in memory for the current session and are not written to the local database.
-Online model lists are requested only when the user clicks “刷新在线模型”; a
-failure never removes the built-in choices, and model IDs and endpoints stay editable.
+Open **Settings** to configure two independent options:
 
-## Run from source on the development machine
+| Setting | Options | Takes effect |
+| --- | --- | --- |
+| Interface language | Simplified Chinese / English | After restarting the app |
+| Research-report language | Simplified Chinese / English | On the next research run |
+
+Changing either option does not clear the selected company, model settings,
+research configuration, or in-memory API key. Existing AI text in historical
+reports is not translated; only application-generated headings and
+deterministic sections are rendered in the current report language.
+
+## Supported model entry points
+
+| Region | Providers |
+| --- | --- |
+| China | DeepSeek, Qwen, Kimi, GLM |
+| International | OpenAI, Gemini, OpenRouter |
+| Local | Ollama |
+| Custom | Any OpenAI-compatible endpoint |
+
+Recommended models are built in as fallbacks. Remote model discovery is
+explicit, runs in the background, and never erases the built-in choices when a
+provider returns an error.
+
+## Run from source
 
 Install Python 3.11 or newer. If `python` is not on `PATH`, set
-`OPENTHESIS_PYTHON` to the full path of `python.exe`. No machine-specific path is
-stored in the repository.
+`OPENTHESIS_PYTHON` to the full path of `python.exe`. The repository never stores
+a machine-specific Python path.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1
 ```
 
-Select the synthetic demo company to exercise the complete local data, report, and history path without network access or an API key. Configure a SEC contact email before querying real companies. The packaged Windows application is built at `dist/OpenThesis/OpenThesis.exe`; keep the accompanying `_internal` directory beside the executable.
+For a network-free first run, select the synthetic demo company. Configure a
+valid SEC contact email only when querying real US-listed companies.
 
 ## Test and package
 
@@ -99,8 +135,30 @@ python -m pip install pyinstaller
 powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-The packaging command runs the test suite, builds the Windows application, executes deterministic and GUI smoke tests against the frozen binary, and creates a portable ZIP plus SHA-256 checksum under `installer-output/`.
+The packaging command runs the complete test suite, builds the frozen Windows
+application, executes deterministic and bilingual GUI smoke tests, and creates
+a portable ZIP plus SHA-256 checksum in `installer-output/`.
+
+## Privacy and security
+
+- API keys are session-only: they are not saved to SQLite, settings files,
+  reports, or logs.
+- SEC contact details are stored only in the user's local application data.
+  They are not bundled into release archives.
+- Research history is stored per user outside the installed application
+  directory and is never packaged with the portable release.
+- Model endpoints and model IDs remain editable; selecting `none` performs
+  deterministic analysis without sending context to an AI provider.
+
+Please report security issues without posting secrets, personal data, or API
+keys in a public issue.
+
+## Contributing
+
+Issues and pull requests are welcome. Research modules use the declarative
+`.othesis` format, allowing contributors to add workflows and prompts without
+shipping executable Python code.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).

@@ -12,6 +12,8 @@ from .domain import (
     FinancialFact,
     ResearchArtifact,
     ResearchRun,
+    RunStatus,
+    utc_now_iso,
 )
 
 
@@ -249,6 +251,42 @@ class Storage:
                 ),
             )
 
+    def interrupt_running_runs(
+        self, reason: str = "应用在研究完成前退出，任务已标记为中断"
+    ) -> int:
+        """Mark runs left active by a previous process as safely interrupted."""
+        completed_at = utc_now_iso()
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT run_id, payload_json FROM research_runs WHERE status = ?",
+                (RunStatus.RUNNING.value,),
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                errors = list(payload.get("errors", []))
+                if reason not in errors:
+                    errors.append(reason)
+                payload["errors"] = errors
+                payload["status"] = RunStatus.CANCELLED.value
+                payload["completed_at"] = completed_at
+                db.execute(
+                    """
+                    UPDATE research_runs
+                    SET payload_json = ?, status = ?, completed_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (
+                        json.dumps(payload, ensure_ascii=False),
+                        RunStatus.CANCELLED.value,
+                        completed_at,
+                        row["run_id"],
+                    ),
+                )
+        return len(rows)
+
     def save_artifact(self, artifact: ResearchArtifact) -> None:
         with self.connect() as db:
             db.execute(
@@ -284,6 +322,20 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT r.run_id, r.status, r.started_at, r.completed_at,
+                       c.ticker, c.name, r.payload_json
+                FROM research_runs r
+                JOIN companies c ON c.cik = r.company_cik
+                WHERE r.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def get_artifacts(self, run_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
