@@ -236,16 +236,32 @@ class SecClient:
         facts: list[FinancialFact] = []
         for normalized, candidates in CONCEPT_MAP.items():
             namespace = dei if normalized == "shares_outstanding" else us_gaap
-            reported = next((name for name in candidates if name in namespace), None)
-            if not reported:
-                continue
-            fact = namespace[reported]
-            units: dict[str, list[dict[str, Any]]] = fact.get("units", {})
-            preferred_unit = self._preferred_unit(normalized, units)
-            if not preferred_unit:
-                continue
-            selected = self._select_annual_facts(units[preferred_unit])
-            for row in selected:
+            selected_by_year: dict[int, tuple[int, str, dict[str, Any], str]] = {}
+            for priority, reported in enumerate(candidates):
+                if reported not in namespace:
+                    continue
+                fact = namespace[reported]
+                units: dict[str, list[dict[str, Any]]] = fact.get("units", {})
+                preferred_unit = self._preferred_unit(normalized, units)
+                if not preferred_unit:
+                    continue
+                for row in self._select_annual_facts(units[preferred_unit]):
+                    year = int(row["fy"])
+                    current = selected_by_year.get(year)
+                    candidate = (priority, reported, row, preferred_unit)
+                    if current is None:
+                        selected_by_year[year] = candidate
+                        continue
+                    # Prefer the canonical tag order. Within the same tag,
+                    # retain the latest-filed annual value.
+                    if priority < current[0] or (
+                        priority == current[0]
+                        and str(row.get("filed", ""))
+                        >= str(current[2].get("filed", ""))
+                    ):
+                        selected_by_year[year] = candidate
+            for year in sorted(selected_by_year, reverse=True)[:10]:
+                _, reported, row, preferred_unit = selected_by_year[year]
                 accession = str(row.get("accn", ""))
                 accession_plain = accession.replace("-", "")
                 cik_plain = str(int(company.cik))
@@ -262,7 +278,7 @@ class SecClient:
                         reported_concept=reported,
                         value=float(row["val"]),
                         unit=preferred_unit,
-                        fiscal_year=int(row["fy"]),
+                        fiscal_year=year,
                         fiscal_period=str(row.get("fp", "FY")),
                         form_type=str(row.get("form", "10-K")),
                         start_date=row.get("start"),

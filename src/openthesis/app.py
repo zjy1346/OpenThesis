@@ -26,6 +26,11 @@ from tkinter import (
 import tkinter as tk
 from tkinter import ttk
 
+try:
+    from tkinterweb import HtmlFrame
+except ImportError:  # Source fallback; packaged builds include TkinterWeb.
+    HtmlFrame = None  # type: ignore[assignment]
+
 from . import __version__
 from .comparison import compare_research_runs
 from .demo import DEMO_COMPANY, demo_facts
@@ -69,6 +74,7 @@ from .packs import (
 )
 from .providers import ModelConfig, ProviderError, create_provider
 from .research import ResearchCancelled, ResearchWorkflow
+from .report_html import render_message_html, render_research_html
 from .reporting import render_research_run
 from .sec_client import SecClient, SecClientError
 from .storage import Storage
@@ -95,6 +101,15 @@ def format_elapsed(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
     return f"{minutes:02d}:{remaining:02d}"
+
+
+def ease_out_cubic(progress: float) -> float:
+    bounded = min(1.0, max(0.0, progress))
+    return 1.0 - (1.0 - bounded) ** 3
+
+
+def clamp_report_zoom(value: float) -> float:
+    return min(1.6, max(0.8, round(value, 2)))
 
 
 def friendly_research_error(
@@ -227,6 +242,23 @@ class OpenThesisApp:
         self.company_results: list[Company] = []
         self.pack_by_label: dict[str, ResearchPack] = {}
         self.current_report_text = ""
+        self.current_report_html = ""
+        self._report_context: tuple[
+            str,
+            list[dict[str, object]],
+            str,
+        ] | None = None
+        self.report_technical_visible = False
+        self.report_focus_mode = False
+        self.report_zoom = 1.0
+        self.report_focus_window: tk.Toplevel | None = None
+        self.report_focus_view: object | None = None
+        self.report_focus_text: tk.Text | None = None
+        self.report_focus_technical_button: ttk.Button | None = None
+        self._report_focus_fade_job: str | None = None
+        self._report_focus_transitioning = False
+        self._report_focus_alpha_supported = True
+        self._main_report_dirty = False
         self.research_running = False
         self._research_cancel_event: threading.Event | None = None
         self._research_started_monotonic = 0.0
@@ -236,6 +268,7 @@ class OpenThesisApp:
         self._research_activity_lines: list[str] = []
         self._last_research_error = ""
         self._report_link_tags: list[str] = []
+        self._nav_buttons: dict[str, ttk.Button] = {}
         self._model_catalog_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         self._model_refresh_generation = {"primary": 0, "compare": 0}
         self._configure_style()
@@ -264,6 +297,10 @@ class OpenThesisApp:
     def _translate_static_widgets(self, widget: tk.Misc) -> None:
         if self.ui_language != EN:
             return
+        # HtmlFrame owns a native Tkhtml widget tree that is not part of our
+        # translatable application controls and may expose cyclic descendants.
+        if HtmlFrame is not None and isinstance(widget, HtmlFrame):
+            return
         try:
             keys = widget.keys()
         except (AttributeError, tk.TclError):
@@ -290,20 +327,130 @@ class OpenThesisApp:
     def _configure_style(self) -> None:
         style = ttk.Style()
         try:
-            style.theme_use("vista")
+            style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
-        style.configure("Subtitle.TLabel", foreground="#4b5563")
+        self.root.configure(background="#f4f7fb")
+        style.configure(
+            ".",
+            font=("Segoe UI", 10),
+            background="#f4f7fb",
+            foreground="#172033",
+        )
+        style.configure("TFrame", background="#f4f7fb")
+        style.configure("App.TFrame", background="#f4f7fb")
+        style.configure("Content.TFrame", background="#f4f7fb")
+        style.configure("Sidebar.TFrame", background="#0f172a")
+        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("CardContent.TFrame", background="#ffffff")
+        style.configure(
+            "TLabel",
+            background="#f4f7fb",
+            foreground="#172033",
+        )
+        style.configure(
+            "Title.TLabel",
+            font=("Segoe UI", 22, "bold"),
+            background="#ffffff",
+            foreground="#0f172a",
+        )
+        style.configure(
+            "TitleSmall.TLabel",
+            font=("Segoe UI", 13, "bold"),
+            background="#ffffff",
+            foreground="#0f172a",
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background="#f4f7fb",
+            foreground="#64748b",
+        )
+        style.configure(
+            "HeaderSubtitle.TLabel",
+            background="#ffffff",
+            foreground="#64748b",
+        )
+        style.configure(
+            "Version.TLabel",
+            background="#eff6ff",
+            foreground="#1d4ed8",
+            font=("Segoe UI", 9, "bold"),
+            padding=(8, 4),
+        )
+        style.configure(
+            "SidebarBrand.TLabel",
+            background="#0f172a",
+            foreground="#ffffff",
+            font=("Segoe UI", 17, "bold"),
+        )
+        style.configure(
+            "SidebarCaption.TLabel",
+            background="#0f172a",
+            foreground="#94a3b8",
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "Nav.TButton",
+            background="#0f172a",
+            foreground="#cbd5e1",
+            borderwidth=0,
+            relief="flat",
+            anchor="w",
+            padding=(16, 11),
+            font=("Segoe UI", 10),
+        )
+        style.map(
+            "Nav.TButton",
+            background=[("active", "#1e293b")],
+            foreground=[("active", "#ffffff")],
+        )
+        style.configure(
+            "NavActive.TButton",
+            background="#1d4ed8",
+            foreground="#ffffff",
+            borderwidth=0,
+            relief="flat",
+            anchor="w",
+            padding=(16, 11),
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.map(
+            "NavActive.TButton",
+            background=[("active", "#2563eb")],
+            foreground=[("active", "#ffffff")],
+        )
+        style.configure(
+            "TButton",
+            background="#ffffff",
+            foreground="#334155",
+            bordercolor="#cbd5e1",
+            lightcolor="#ffffff",
+            darkcolor="#cbd5e1",
+            padding=(11, 7),
+            relief="flat",
+        )
+        style.map(
+            "TButton",
+            background=[("active", "#f1f5f9"), ("disabled", "#e2e8f0")],
+            foreground=[("disabled", "#94a3b8")],
+        )
         style.configure(
             "Accent.TButton",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             padding=(18, 10),
+            background="#2563eb",
+            foreground="#ffffff",
+            bordercolor="#2563eb",
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#1d4ed8"), ("disabled", "#94a3b8")],
+            foreground=[("active", "#ffffff"), ("disabled", "#e2e8f0")],
         )
         style.configure(
             "Workflow.TLabel",
             font=("Segoe UI", 10, "bold"),
-            foreground="#075985",
+            foreground="#1d4ed8",
         )
         style.configure(
             "ResearchStatus.TLabel",
@@ -314,18 +461,116 @@ class OpenThesisApp:
             "ResearchError.TLabel",
             foreground="#b91c1c",
         )
+        style.configure(
+            "TLabelframe",
+            background="#ffffff",
+            bordercolor="#dbe3ec",
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background="#ffffff",
+            foreground="#334155",
+            font=("Segoe UI", 10, "bold"),
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground="#ffffff",
+            bordercolor="#cbd5e1",
+            lightcolor="#cbd5e1",
+            darkcolor="#cbd5e1",
+            padding=7,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground="#ffffff",
+            background="#ffffff",
+            bordercolor="#cbd5e1",
+            padding=6,
+        )
+        style.configure(
+            "Treeview",
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground="#1e293b",
+            rowheight=30,
+            bordercolor="#dbe3ec",
+            borderwidth=1,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#eef2f7",
+            foreground="#334155",
+            font=("Segoe UI", 9, "bold"),
+            padding=(8, 7),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#dbeafe")],
+            foreground=[("selected", "#1e3a8a")],
+        )
+        style.configure(
+            "Horizontal.TProgressbar",
+            background="#2563eb",
+            troughcolor="#e2e8f0",
+            bordercolor="#e2e8f0",
+            lightcolor="#2563eb",
+            darkcolor="#2563eb",
+        )
+        style.configure("Sidebar.TNotebook", borderwidth=0, background="#f4f7fb")
+        try:
+            style.layout("Sidebar.TNotebook.Tab", [])
+        except tk.TclError:
+            pass
 
     def _build_ui(self) -> None:
-        header = ttk.Frame(self.root, padding=(18, 14))
-        header.pack(fill=X)
-        ttk.Label(header, text="OpenThesis", style="Title.TLabel").pack(side=LEFT)
-        ttk.Label(
-            header,
-            text="研究公司，而不是预测短期价格",
-            style="Subtitle.TLabel",
-        ).pack(side=LEFT, padx=(14, 0), pady=(8, 0))
+        self.shell = ttk.Frame(self.root, style="App.TFrame")
+        self.shell.pack(fill=BOTH, expand=True)
 
-        self.notebook = ttk.Notebook(self.root)
+        self.sidebar = ttk.Frame(
+            self.shell, style="Sidebar.TFrame", width=210
+        )
+        self.sidebar.pack(side=LEFT, fill=Y)
+        self.sidebar.pack_propagate(False)
+        brand = ttk.Frame(
+            self.sidebar, style="Sidebar.TFrame", padding=(20, 24, 14, 20)
+        )
+        brand.pack(fill=X)
+        ttk.Label(
+            brand, text="OpenThesis", style="SidebarBrand.TLabel"
+        ).pack(anchor=W)
+        ttk.Label(
+            brand,
+            text="Evidence-first research",
+            style="SidebarCaption.TLabel",
+        ).pack(anchor=W, pady=(3, 0))
+
+        self.main_panel = ttk.Frame(self.shell, style="Content.TFrame")
+        self.main_panel.pack(side=LEFT, fill=BOTH, expand=True)
+        self.header = ttk.Frame(
+            self.main_panel, style="Card.TFrame", padding=(22, 14)
+        )
+        self.header.pack(fill=X, padx=14, pady=(14, 10))
+        header_title = ttk.Frame(self.header, style="CardContent.TFrame")
+        header_title.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(header_title, text="长期公司研究工作台", style="Title.TLabel").pack(
+            anchor=W
+        )
+        ttk.Label(
+            header_title,
+            text="研究公司，而不是预测短期价格",
+            style="HeaderSubtitle.TLabel",
+        ).pack(anchor=W, pady=(2, 0))
+        ttk.Label(
+            self.header,
+            text=f"v{__version__}",
+            style="Version.TLabel",
+        ).pack(side=RIGHT, padx=(12, 0))
+
+        self.notebook = ttk.Notebook(
+            self.main_panel, style="Sidebar.TNotebook"
+        )
 
         self.research_tab = ttk.Frame(self.notebook, padding=12)
         self.history_tab = ttk.Frame(self.notebook, padding=12)
@@ -342,6 +587,35 @@ class OpenThesisApp:
         self.notebook.add(self.settings_tab, text="设置")
         self.notebook.add(self.about_tab, text="关于")
 
+        navigation = (
+            ("公司研究", self.research_tab),
+            ("研究历史", self.history_tab),
+            ("模型与数据源", self.model_tab),
+            ("研究模块", self.packs_tab),
+            ("投资逻辑", self.thesis_tab),
+            ("设置", self.settings_tab),
+            ("关于", self.about_tab),
+        )
+        nav_frame = ttk.Frame(
+            self.sidebar, style="Sidebar.TFrame", padding=(10, 4)
+        )
+        nav_frame.pack(fill=X)
+        for label, tab in navigation:
+            tab_id = str(tab)
+            button = ttk.Button(
+                nav_frame,
+                text=label,
+                style="Nav.TButton",
+                command=lambda target=tab: self.notebook.select(target),
+            )
+            button.pack(fill=X, pady=2)
+            self._nav_buttons[tab_id] = button
+        ttk.Label(
+            self.sidebar,
+            text="本地优先 · 不执行交易",
+            style="SidebarCaption.TLabel",
+        ).pack(side="bottom", anchor=W, padx=22, pady=18)
+
         self._build_research_tab()
         self._build_history_tab()
         self._build_model_tab()
@@ -350,7 +624,9 @@ class OpenThesisApp:
         self._build_settings_tab()
         self._build_about_tab()
 
-        self.status_frame = ttk.Frame(self.root, padding=(14, 3, 14, 9))
+        self.status_frame = ttk.Frame(
+            self.main_panel, padding=(14, 4, 14, 10)
+        )
         self.status_frame.pack(side="bottom", fill=X)
         self.status_var = tk.StringVar(value=self._t("就绪"))
         ttk.Label(self.status_frame, textvariable=self.status_var).pack(side=LEFT)
@@ -359,6 +635,369 @@ class OpenThesisApp:
         )
         self.progress.pack(side=RIGHT)
         self.notebook.pack(fill=BOTH, expand=True, padx=14, pady=(0, 8))
+        self.notebook.bind("<<NotebookTabChanged>>", self._sync_navigation)
+        self.root.bind("<F11>", self._handle_report_focus_shortcut, add="+")
+        self.root.bind("<Escape>", self._handle_report_escape, add="+")
+        self.root.bind("<Control-plus>", self._handle_report_zoom_in, add="+")
+        self.root.bind("<Control-equal>", self._handle_report_zoom_in, add="+")
+        self.root.bind("<Control-minus>", self._handle_report_zoom_out, add="+")
+        self.root.bind("<Control-0>", self._handle_report_zoom_reset, add="+")
+        self.root.bind(
+            "<Control-MouseWheel>",
+            self._handle_report_zoom_wheel,
+            add="+",
+        )
+        self.root.bind(
+            "<Configure>",
+            self._sync_report_focus_geometry,
+            add="+",
+        )
+        self._sync_navigation()
+
+    def _sync_navigation(self, _event: object = None) -> None:
+        selected = self.notebook.select()
+        for tab_id, button in self._nav_buttons.items():
+            button.configure(
+                style="NavActive.TButton" if tab_id == selected else "Nav.TButton"
+            )
+
+    def _research_controls_are_visible(self) -> bool:
+        return str(self.research_controls_scroll) in self.research_split.panes()
+
+    @staticmethod
+    def _report_scroll_fraction(view: object | None) -> float:
+        try:
+            internal = getattr(view, "_html")
+            position = internal.yview()
+            if isinstance(position, (tuple, list)) and position:
+                return min(1.0, max(0.0, float(position[0])))
+        except (AttributeError, TypeError, ValueError, tk.TclError):
+            pass
+        return 0.0
+
+    def _toggle_report_focus(self) -> None:
+        if self._report_focus_transitioning:
+            return
+        self._set_report_focus(not self.report_focus_mode)
+
+    def _set_report_focus(self, expanded: bool, *, animate: bool = True) -> None:
+        if self._report_focus_transitioning or expanded == self.report_focus_mode:
+            return
+        if expanded:
+            self._open_report_focus(animate=animate)
+        else:
+            self._close_report_focus(animate=animate)
+
+    def _open_report_focus(self, *, animate: bool) -> None:
+        self.root.update_idletasks()
+        scroll_fraction = self._report_scroll_fraction(self.report_view)
+        window = tk.Toplevel(self.root)
+        self.report_focus_window = window
+        self.report_focus_mode = True
+        self._report_focus_transitioning = True
+        window.withdraw()
+        window.overrideredirect(True)
+        window.transient(self.root)
+        window.configure(background="#f4f7fb")
+        window.protocol("WM_DELETE_WINDOW", self._close_report_focus)
+
+        shell = ttk.Frame(window, style="App.TFrame", padding=(14, 10))
+        shell.pack(fill=BOTH, expand=True)
+        toolbar = ttk.Frame(shell, style="Card.TFrame", padding=(14, 8))
+        toolbar.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            toolbar,
+            text=self._t("沉浸阅读"),
+            font=("Segoe UI", 13, "bold"),
+            style="TitleSmall.TLabel",
+        ).pack(side=LEFT)
+        ttk.Label(
+            toolbar,
+            textvariable=self.research_percent_var,
+            style="HeaderSubtitle.TLabel",
+        ).pack(side=LEFT, padx=(12, 0))
+        ttk.Button(
+            toolbar,
+            text=self._t("⤢ 恢复布局"),
+            command=self._close_report_focus,
+        ).pack(side=RIGHT)
+        self.report_focus_technical_button = ttk.Button(
+            toolbar,
+            text=self._t(
+                "隐藏技术详情"
+                if self.report_technical_visible
+                else "显示技术详情"
+            ),
+            command=self._toggle_report_technical,
+        )
+        self.report_focus_technical_button.pack(side=RIGHT, padx=(0, 7))
+        ttk.Button(
+            toolbar,
+            text=self._t("导出"),
+            command=self._export_report,
+        ).pack(side=RIGHT, padx=(0, 7))
+        ttk.Button(
+            toolbar,
+            text="＋",
+            width=3,
+            command=lambda: self._change_report_zoom(0.1),
+        ).pack(side=RIGHT, padx=(7, 0))
+        ttk.Label(
+            toolbar,
+            textvariable=self.report_zoom_label_var,
+            width=6,
+            anchor="center",
+            style="HeaderSubtitle.TLabel",
+        ).pack(side=RIGHT)
+        ttk.Button(
+            toolbar,
+            text="－",
+            width=3,
+            command=lambda: self._change_report_zoom(-0.1),
+        ).pack(side=RIGHT)
+
+        content = ttk.Frame(shell, style="Card.TFrame")
+        content.pack(fill=BOTH, expand=True)
+        self.report_focus_view = None
+        self.report_focus_text = None
+        if HtmlFrame is not None:
+            focus_view = HtmlFrame(
+                content,
+                messages_enabled=False,
+                vertical_scrollbar=True,
+                horizontal_scrollbar="auto",
+                selection_enabled=True,
+                images_enabled=False,
+                javascript_enabled=False,
+                on_link_click=self._open_report_link,
+                zoom=self.report_zoom,
+            )
+            focus_view.pack(fill=BOTH, expand=True)
+            focus_view.load_html(self.current_report_html)
+            self.report_focus_view = focus_view
+            window.after_idle(
+                lambda: focus_view.yview_moveto(scroll_fraction)
+            )
+        else:
+            scrollbar = ttk.Scrollbar(content, orient=VERTICAL)
+            scrollbar.pack(side=RIGHT, fill=Y)
+            focus_text = tk.Text(
+                content,
+                wrap="word",
+                font=("Segoe UI", max(8, round(10 * self.report_zoom))),
+                padx=22,
+                pady=18,
+                yscrollcommand=scrollbar.set,
+                background="#ffffff",
+                foreground="#172033",
+                relief="flat",
+            )
+            focus_text.insert("1.0", self.current_report_text)
+            focus_text.pack(side=LEFT, fill=BOTH, expand=True)
+            scrollbar.configure(command=focus_text.yview)
+            focus_text.yview_moveto(scroll_fraction)
+            self.report_focus_text = focus_text
+
+        window.bind("<Escape>", self._handle_report_escape, add="+")
+        window.bind("<F11>", self._handle_report_focus_shortcut, add="+")
+        window.bind("<Control-plus>", self._handle_report_zoom_in, add="+")
+        window.bind("<Control-equal>", self._handle_report_zoom_in, add="+")
+        window.bind("<Control-minus>", self._handle_report_zoom_out, add="+")
+        window.bind("<Control-0>", self._handle_report_zoom_reset, add="+")
+        window.bind(
+            "<Control-MouseWheel>",
+            self._handle_report_zoom_wheel,
+            add="+",
+        )
+        self._sync_report_focus_geometry()
+        self._report_focus_alpha_supported = True
+        try:
+            window.attributes("-alpha", 0.0 if animate else 1.0)
+        except tk.TclError:
+            self._report_focus_alpha_supported = False
+        window.deiconify()
+        window.lift(self.root)
+        window.focus_force()
+        self.report_focus_button.configure(text=self._t("⤢ 恢复布局"))
+        if animate and self._report_focus_alpha_supported:
+            self._fade_report_focus(opening=True, frame=0, frames=10)
+        else:
+            self._report_focus_transitioning = False
+
+    def _close_report_focus(
+        self,
+        _event: object = None,
+        *,
+        animate: bool = True,
+    ) -> None:
+        window = self.report_focus_window
+        if window is None or not window.winfo_exists():
+            self._destroy_report_focus()
+            return
+        if self._report_focus_fade_job:
+            self.root.after_cancel(self._report_focus_fade_job)
+            self._report_focus_fade_job = None
+        self._sync_main_report_from_focus()
+        self._report_focus_transitioning = True
+        if animate and self._report_focus_alpha_supported:
+            self._fade_report_focus(opening=False, frame=0, frames=9)
+        else:
+            self._destroy_report_focus()
+
+    def _fade_report_focus(
+        self,
+        *,
+        opening: bool,
+        frame: int,
+        frames: int,
+    ) -> None:
+        window = self.report_focus_window
+        if window is None or not window.winfo_exists():
+            self._destroy_report_focus()
+            return
+        eased = ease_out_cubic(frame / frames)
+        alpha = eased if opening else 1.0 - eased
+        try:
+            window.attributes("-alpha", alpha)
+        except tk.TclError:
+            self._report_focus_alpha_supported = False
+            if opening:
+                self._report_focus_transitioning = False
+            else:
+                self._destroy_report_focus()
+            return
+        if frame < frames:
+            self._report_focus_fade_job = self.root.after(
+                16,
+                lambda: self._fade_report_focus(
+                    opening=opening,
+                    frame=frame + 1,
+                    frames=frames,
+                ),
+            )
+            return
+        self._report_focus_fade_job = None
+        if opening:
+            self._report_focus_transitioning = False
+            window.attributes("-alpha", 1.0)
+        else:
+            self._destroy_report_focus()
+
+    def _destroy_report_focus(self) -> None:
+        scroll_fraction = self._report_scroll_fraction(self.report_focus_view)
+        window = self.report_focus_window
+        if window is not None:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+        self.report_focus_window = None
+        self.report_focus_view = None
+        self.report_focus_text = None
+        self.report_focus_technical_button = None
+        self.report_focus_mode = False
+        self._report_focus_transitioning = False
+        self._report_focus_fade_job = None
+        self.report_focus_button.configure(text=self._t("⛶ 沉浸阅读"))
+        if self.report_view is not None:
+            self.root.after_idle(
+                lambda: self.report_view.yview_moveto(scroll_fraction)
+            )
+        elif self.report_text is not None:
+            self.report_text.yview_moveto(scroll_fraction)
+        self.root.focus_force()
+
+    def _sync_main_report_from_focus(self) -> None:
+        if not self._main_report_dirty:
+            return
+        if self.report_view is not None:
+            self.report_view.load_html(self.current_report_html)
+            self.report_view.configure(zoom=self.report_zoom)
+        elif self.report_text is not None:
+            self.report_text.delete("1.0", END)
+            self.report_text.insert("1.0", self.current_report_text)
+            self.report_text.configure(
+                font=("Segoe UI", max(8, round(10 * self.report_zoom)))
+            )
+        self._main_report_dirty = False
+
+    def _sync_report_focus_geometry(self, event: object = None) -> None:
+        if event is not None and getattr(event, "widget", self.root) is not self.root:
+            return
+        window = self.report_focus_window
+        if window is None or not window.winfo_exists():
+            return
+        if self.root.state() == "iconic":
+            return
+        self.root.update_idletasks()
+        width = max(1, self.root.winfo_width())
+        height = max(1, self.root.winfo_height())
+        x = self.root.winfo_rootx()
+        y = self.root.winfo_rooty()
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _handle_report_focus_shortcut(self, _event: object = None) -> str | None:
+        if self.notebook.select() != str(self.research_tab):
+            return None
+        self._toggle_report_focus()
+        return "break"
+
+    def _handle_report_escape(self, _event: object = None) -> str | None:
+        if not self.report_focus_mode:
+            return None
+        self._set_report_focus(False)
+        return "break"
+
+    def _change_report_zoom(self, delta: float) -> None:
+        self._set_report_zoom(self.report_zoom + delta)
+
+    def _set_report_zoom(self, target: float, *, animate: bool = True) -> None:
+        # Tkhtml must reflow the complete document when zoom changes. Apply the
+        # target once; the focus-window fade remains compositor-animated.
+        self._apply_report_zoom(clamp_report_zoom(target))
+
+    def _apply_report_zoom(self, value: float) -> None:
+        self.report_zoom = clamp_report_zoom(value)
+        self.report_zoom_label_var.set(f"{self.report_zoom * 100:.0f}%")
+        if self.report_focus_view is not None:
+            self.report_focus_view.configure(zoom=self.report_zoom)  # type: ignore[attr-defined]
+            self._main_report_dirty = True
+        elif self.report_focus_text is not None:
+            self.report_focus_text.configure(
+                font=("Segoe UI", max(8, round(10 * self.report_zoom)))
+            )
+            self._main_report_dirty = True
+        elif self.report_view is not None:
+            self.report_view.configure(zoom=self.report_zoom)
+        elif self.report_text is not None:
+            self.report_text.configure(
+                font=("Segoe UI", max(8, round(10 * self.report_zoom)))
+            )
+
+    def _handle_report_zoom_in(self, _event: object = None) -> str | None:
+        if not self.report_focus_mode:
+            return None
+        self._change_report_zoom(0.1)
+        return "break"
+
+    def _handle_report_zoom_out(self, _event: object = None) -> str | None:
+        if not self.report_focus_mode:
+            return None
+        self._change_report_zoom(-0.1)
+        return "break"
+
+    def _handle_report_zoom_reset(self, _event: object = None) -> str | None:
+        if not self.report_focus_mode:
+            return None
+        self._set_report_zoom(1.0)
+        return "break"
+
+    def _handle_report_zoom_wheel(self, event: tk.Event) -> str | None:
+        if not self.report_focus_mode:
+            return None
+        delta = 0.1 if int(getattr(event, "delta", 0)) > 0 else -0.1
+        self._change_report_zoom(delta)
+        return "break"
 
     def _build_research_tab(self) -> None:
         self.selected_company_var = tk.StringVar(value=self._t("尚未选择公司"))
@@ -366,39 +1005,41 @@ class OpenThesisApp:
             value=self._t("请先在下方选择一家公司。")
         )
 
-        workflow = ttk.LabelFrame(
+        self.workflow_frame = ttk.LabelFrame(
             self.research_tab, text="研究流程", padding=(12, 8)
         )
-        workflow.pack(fill=X, pady=(0, 10))
-        workflow.columnconfigure(0, weight=1)
+        self.workflow_frame.pack(fill=X, pady=(0, 10))
+        self.workflow_frame.columnconfigure(0, weight=1)
         ttk.Label(
-            workflow,
+            self.workflow_frame,
             text="① 选择公司   →   ② 确认配置   →   ③ 开始研究",
             style="Workflow.TLabel",
         ).grid(row=0, column=0, sticky=W, pady=(0, 6))
-        ttk.Label(workflow, textvariable=self.selected_company_var).grid(
+        ttk.Label(
+            self.workflow_frame, textvariable=self.selected_company_var
+        ).grid(
             row=1, column=0, sticky=W
         )
         self.run_button = ttk.Button(
-            workflow,
+            self.workflow_frame,
             text="开始研究",
             style="Accent.TButton",
             command=self._start_research,
         )
         self.run_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
         ttk.Label(
-            workflow,
+            self.workflow_frame,
             textvariable=self.start_hint_var,
             style="Subtitle.TLabel",
         ).grid(row=2, column=0, sticky=W, pady=(4, 0))
         ttk.Button(
-            workflow,
+            self.workflow_frame,
             text="模型与 SEC 设置",
             command=lambda: self.notebook.select(self.model_tab),
         ).grid(row=2, column=1, sticky="e", padx=(16, 0), pady=(4, 0))
 
         self.research_feedback_frame = ttk.LabelFrame(
-            workflow, text="任务进度", padding=(10, 7)
+            self.workflow_frame, text="任务进度", padding=(10, 7)
         )
         self.research_feedback_frame.grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(9, 0)
@@ -474,16 +1115,20 @@ class OpenThesisApp:
         ).pack(side=LEFT, padx=(6, 0))
         self.research_error_actions.grid_remove()
 
-        outer = ttk.Panedwindow(self.research_tab, orient=HORIZONTAL)
-        outer.pack(fill=BOTH, expand=True)
-        self.research_controls_scroll = VerticalScrolledFrame(outer, width=310)
+        self.research_split = ttk.Panedwindow(
+            self.research_tab, orient=HORIZONTAL
+        )
+        self.research_split.pack(fill=BOTH, expand=True)
+        self.research_controls_scroll = VerticalScrolledFrame(
+            self.research_split, width=310
+        )
         controls = ttk.Frame(
             self.research_controls_scroll.content, padding=(0, 0, 12, 12)
         )
         controls.pack(fill=BOTH, expand=True)
-        report = ttk.Frame(outer)
-        outer.add(self.research_controls_scroll, weight=0)
-        outer.add(report, weight=1)
+        self.report_panel = ttk.Frame(self.research_split)
+        self.research_split.add(self.research_controls_scroll, weight=0)
+        self.research_split.add(self.report_panel, weight=1)
 
         ttk.Label(controls, text="1. 选择公司", font=("Segoe UI", 12, "bold")).pack(
             anchor=W, pady=(0, 8)
@@ -594,29 +1239,88 @@ class OpenThesisApp:
             fill=X, pady=(12, 0)
         )
 
-        report_toolbar = ttk.Frame(report)
-        report_toolbar.pack(fill=X)
-        ttk.Label(
-            report_toolbar, text="研究报告", font=("Segoe UI", 12, "bold")
-        ).pack(side=LEFT)
-        ttk.Button(
-            report_toolbar, text="清空显示", command=lambda: self._set_report("")
-        ).pack(side=RIGHT)
-        text_frame = ttk.Frame(report)
-        text_frame.pack(fill=BOTH, expand=True, pady=(8, 0))
-        scrollbar = ttk.Scrollbar(text_frame, orient=VERTICAL)
-        scrollbar.pack(side=RIGHT, fill=Y)
-        self.report_text = tk.Text(
-            text_frame,
-            wrap="word",
-            font=("Consolas", 10),
-            padx=12,
-            pady=12,
-            yscrollcommand=scrollbar.set,
-            background="#fbfbfb",
+        self.report_toolbar = ttk.Frame(
+            self.report_panel, padding=(2, 0, 0, 0)
         )
-        self.report_text.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.configure(command=self.report_text.yview)
+        self.report_toolbar.pack(fill=X)
+        ttk.Label(
+            self.report_toolbar,
+            text="研究报告",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(side=LEFT)
+        self.report_focus_button = ttk.Button(
+            self.report_toolbar,
+            text="⛶ 沉浸阅读",
+            command=self._toggle_report_focus,
+        )
+        self.report_focus_button.pack(side=RIGHT)
+        self.report_technical_button = ttk.Button(
+            self.report_toolbar,
+            text="显示技术详情",
+            command=self._toggle_report_technical,
+        )
+        self.report_technical_button.pack(side=RIGHT, padx=(0, 7))
+        ttk.Button(
+            self.report_toolbar,
+            text="清空显示",
+            command=lambda: self._set_report(""),
+        ).pack(side=RIGHT, padx=(0, 7))
+        ttk.Button(
+            self.report_toolbar,
+            text="导出",
+            command=self._export_report,
+        ).pack(side=RIGHT, padx=(0, 7))
+        self.report_zoom_label_var = tk.StringVar(value="100%")
+        ttk.Button(
+            self.report_toolbar,
+            text="＋",
+            width=3,
+            command=lambda: self._change_report_zoom(0.1),
+        ).pack(side=RIGHT, padx=(7, 0))
+        ttk.Label(
+            self.report_toolbar,
+            textvariable=self.report_zoom_label_var,
+            width=6,
+            anchor="center",
+        ).pack(side=RIGHT)
+        ttk.Button(
+            self.report_toolbar,
+            text="－",
+            width=3,
+            command=lambda: self._change_report_zoom(-0.1),
+        ).pack(side=RIGHT)
+        text_frame = ttk.Frame(self.report_panel)
+        text_frame.pack(fill=BOTH, expand=True, pady=(8, 0))
+        self.report_view = None
+        self.report_text: tk.Text | None = None
+        if HtmlFrame is not None:
+            self.report_view = HtmlFrame(
+                text_frame,
+                messages_enabled=False,
+                vertical_scrollbar=True,
+                horizontal_scrollbar="auto",
+                selection_enabled=True,
+                images_enabled=False,
+                javascript_enabled=False,
+                on_link_click=self._open_report_link,
+            )
+            self.report_view.pack(fill=BOTH, expand=True)
+        else:
+            scrollbar = ttk.Scrollbar(text_frame, orient=VERTICAL)
+            scrollbar.pack(side=RIGHT, fill=Y)
+            self.report_text = tk.Text(
+                text_frame,
+                wrap="word",
+                font=("Segoe UI", 10),
+                padx=18,
+                pady=16,
+                yscrollcommand=scrollbar.set,
+                background="#ffffff",
+                foreground="#172033",
+                relief="flat",
+            )
+            self.report_text.pack(side=LEFT, fill=BOTH, expand=True)
+            scrollbar.configure(command=self.report_text.yview)
         self._set_report(
             self._t(
                 "欢迎使用 OpenThesis。\n\n"
@@ -2039,14 +2743,22 @@ class OpenThesisApp:
             and self.report_language == EN
         ):
             company_name = "Example Cloud Systems (Synthetic Demo Company)"
-        self._set_report(
-            render_research_run(
-                run_id,
-                artifacts,
-                self.report_language,
-                company_name=company_name,
-            )
+        self._report_context = (run_id, artifacts, company_name)
+        markdown = render_research_run(
+            run_id,
+            artifacts,
+            self.report_language,
+            company_name=company_name,
+            include_technical=self.report_technical_visible,
         )
+        html_content = render_research_html(
+            run_id,
+            artifacts,
+            self.report_language,
+            company_name=company_name,
+            include_technical=self.report_technical_visible,
+        )
+        self._set_report(markdown, html_content=html_content, preserve_context=True)
 
     def _export_report(self) -> None:
         if not self.current_report_text.strip():
@@ -2055,18 +2767,109 @@ class OpenThesisApp:
             )
             return
         path = filedialog.asksaveasfilename(
+            parent=self.report_focus_window or self.root,
             title=self._t("导出 OpenThesis 报告"),
-            defaultextension=".txt",
-            filetypes=[("Text", "*.txt"), ("Markdown", "*.md"), ("JSON", "*.json")],
+            defaultextension=".html",
+            filetypes=[
+                ("HTML", "*.html"),
+                ("Markdown", "*.md"),
+                ("Text", "*.txt"),
+            ],
         )
         if path:
-            Path(path).write_text(self.current_report_text, encoding="utf-8")
+            content = (
+                self.current_report_html
+                if Path(path).suffix.lower() in {".html", ".htm"}
+                else self.current_report_text
+            )
+            Path(path).write_text(content, encoding="utf-8")
             self.status_var.set(
                 self._t("报告已导出：{path}", path=path)
             )
 
-    def _set_report(self, content: str) -> None:
+    def _open_report_link(self, url: str) -> None:
+        if url.lower().startswith(("https://", "http://")):
+            webbrowser.open_new_tab(url)
+
+    def _toggle_report_technical(self) -> None:
+        self.report_technical_visible = not self.report_technical_visible
+        self.report_technical_button.configure(
+            text=self._t(
+                "隐藏技术详情"
+                if self.report_technical_visible
+                else "显示技术详情"
+            )
+        )
+        if self.report_focus_technical_button is not None:
+            self.report_focus_technical_button.configure(
+                text=self._t(
+                    "隐藏技术详情"
+                    if self.report_technical_visible
+                    else "显示技术详情"
+                )
+            )
+        if not self._report_context:
+            return
+        run_id, artifacts, company_name = self._report_context
+        markdown = render_research_run(
+            run_id,
+            artifacts,
+            self.report_language,
+            company_name=company_name,
+            include_technical=self.report_technical_visible,
+        )
+        html_content = render_research_html(
+            run_id,
+            artifacts,
+            self.report_language,
+            company_name=company_name,
+            include_technical=self.report_technical_visible,
+        )
+        self._set_report(markdown, html_content=html_content, preserve_context=True)
+
+    def _set_report(
+        self,
+        content: str,
+        *,
+        html_content: str | None = None,
+        preserve_context: bool = False,
+    ) -> None:
+        if not preserve_context:
+            self._report_context = None
+            self.report_technical_visible = False
+            if hasattr(self, "report_technical_button"):
+                self.report_technical_button.configure(text=self._t("显示技术详情"))
+            if self.report_focus_technical_button is not None:
+                self.report_focus_technical_button.configure(
+                    text=self._t("显示技术详情")
+                )
         self.current_report_text = content
+        self.current_report_html = html_content or render_message_html(
+            content,
+            self.ui_language,
+        )
+        focus_active = (
+            self.report_focus_view is not None
+            or self.report_focus_text is not None
+        )
+        if self.report_view is not None and not focus_active:
+            self.report_view.load_html(self.current_report_html)
+        if self.report_focus_view is not None:
+            self.report_focus_view.load_html(  # type: ignore[attr-defined]
+                self.current_report_html
+            )
+            self.report_focus_view.configure(  # type: ignore[attr-defined]
+                zoom=self.report_zoom
+            )
+        if self.report_focus_text is not None:
+            self.report_focus_text.delete("1.0", END)
+            self.report_focus_text.insert("1.0", content)
+        if focus_active:
+            self._main_report_dirty = True
+        if self.report_text is None:
+            return
+        if focus_active:
+            return
         self.report_text.delete("1.0", END)
         self.report_text.insert("1.0", content)
         for tag in self._report_link_tags:
@@ -2350,6 +3153,22 @@ def main() -> None:
             app._start_research()
 
         def finish_gui_smoke() -> None:
+            # Flush geometry changes posted by the worker completion event
+            # before evaluating visibility. This avoids a false failure when
+            # Tk has updated data bindings but has not completed layout yet.
+            root.update_idletasks()
+
+            def settle_animation(
+                seconds: float,
+                until: object | None = None,
+            ) -> None:
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    root.update()
+                    if until is not None and until():  # type: ignore[operator]
+                        break
+                    time.sleep(0.01)
+
             start_visible = bool(
                 app.run_button.winfo_viewable()
                 and app.run_button.cget("text") == app._t("开始研究")
@@ -2361,6 +3180,54 @@ def main() -> None:
             research_completed = bool(
                 not app.research_running
                 and app.research_percent_var.get() == "100%"
+            )
+            app._set_report_focus(True)
+            settle_animation(
+                2.0,
+                lambda: not app._report_focus_transitioning,
+            )
+            focus_transition_at_check = app._report_focus_transitioning
+            focus_window_size = (
+                (
+                    app.report_focus_window.winfo_width(),
+                    app.report_focus_window.winfo_height(),
+                    bool(app.report_focus_window.winfo_viewable()),
+                )
+                if app.report_focus_window is not None
+                else (0, 0, False)
+            )
+            immersive_accessible = bool(
+                app.report_focus_mode
+                and not app._report_focus_transitioning
+                and app.report_focus_window is not None
+                and app.report_focus_window.winfo_viewable()
+                and app.report_focus_window.winfo_width() >= 970
+                and app.report_focus_view is not None
+                and app.sidebar.winfo_viewable()
+                and app.header.winfo_viewable()
+                and app.workflow_frame.winfo_viewable()
+                and app.status_frame.winfo_viewable()
+                and app._research_controls_are_visible()
+            )
+            app._set_report_zoom(1.2)
+            root.update_idletasks()
+            zoom_accessible = bool(
+                app.report_zoom_label_var.get() == "120%"
+                and abs(app.report_zoom - 1.2) < 0.001
+            )
+            app._set_report_focus(False)
+            settle_animation(
+                2.0,
+                lambda: not app._report_focus_transitioning,
+            )
+            layout_restored = bool(
+                not app.report_focus_mode
+                and app.report_focus_window is None
+                and app.sidebar.winfo_viewable()
+                and app.header.winfo_viewable()
+                and app.workflow_frame.winfo_viewable()
+                and app.status_frame.winfo_viewable()
+                and app._research_controls_are_visible()
             )
             app._toggle_dcf()
             app.research_controls_scroll.scroll_to_bottom()
@@ -2378,6 +3245,11 @@ def main() -> None:
                 and app.report_language_combo.winfo_viewable()
                 and app.save_language_button.winfo_viewable()
             )
+            rich_report_ready = bool(
+                app.report_view is not None
+                and '<table class="data-table">' in app.current_report_html
+                and "supporting_evidence_ids" not in app.current_report_html
+            )
             diagnostic(
                 "gui-smoke="
                 f"language:{app.ui_language};"
@@ -2388,10 +3260,26 @@ def main() -> None:
                 f"{app.run_button.winfo_y()},"
                 f"{app.run_button.winfo_width()}x{app.run_button.winfo_height()};"
                 f"feedback_visible:{feedback_visible};"
+                f"feedback_mapped:{bool(app.research_feedback_frame.winfo_ismapped())};"
+                f"feedback_geometry:{app.research_feedback_frame.winfo_x()},"
+                f"{app.research_feedback_frame.winfo_y()},"
+                f"{app.research_feedback_frame.winfo_width()}x"
+                f"{app.research_feedback_frame.winfo_height()};"
                 f"research_completed:{research_completed};"
+                f"immersive_accessible:{immersive_accessible};"
+                f"focus_transitioning:{app._report_focus_transitioning};"
+                f"focus_transition_at_check:{focus_transition_at_check};"
+                f"focus_window_size:{focus_window_size};"
+                f"focus_window_exists:{bool(app.report_focus_window)};"
+                f"focus_mode:{app.report_focus_mode};"
+                f"zoom_accessible:{zoom_accessible};"
+                f"zoom_label:{app.report_zoom_label_var.get()};"
+                f"zoom_value:{app.report_zoom};"
+                f"layout_restored:{layout_restored};"
                 f"dcf_accessible:{dcf_accessible};"
                 f"model_bottom_accessible:{model_bottom_accessible};"
                 f"settings_accessible:{settings_accessible};"
+                f"rich_report_ready:{rich_report_ready};"
                 f"status_visible:{bool(app.status_frame.winfo_viewable())};"
                 f"size:{root.winfo_width()}x{root.winfo_height()}"
             )
@@ -2404,9 +3292,13 @@ def main() -> None:
                 and start_visible
                 and feedback_visible
                 and research_completed
+                and immersive_accessible
+                and zoom_accessible
+                and layout_restored
                 and dcf_accessible
                 and model_bottom_accessible
                 and settings_accessible
+                and rich_report_ready
                 and app.status_frame.winfo_viewable()
             )
             root.destroy()

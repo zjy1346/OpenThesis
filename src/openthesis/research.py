@@ -15,6 +15,7 @@ from .domain import (
     utc_now_iso,
 )
 from .financials import calculate_metrics, deterministic_summary, reverse_dcf_analysis
+from .growth import normalize_growth_output
 from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, normalize_language, translate
 from .packs import ResearchPack
 from .providers import ModelConfig, ModelProvider
@@ -310,12 +311,18 @@ class ResearchWorkflow:
             notify(self._progress_text("基础研究档案完成"), 50)
 
             notify(self._progress_text("正在研究公司与行业增长机会"), 52)
-            growth = self._run_agent(
+            growth_raw = self._run_agent(
                 "growth-opportunity-analyst",
                 "prompts/growth-opportunity-analyst.md",
                 context.compact_json(),
                 {"research_dossier": dossier},
             )
+            growth_validation = normalize_growth_output(
+                growth_raw,
+                available,
+                self.report_language,
+            )
+            growth = growth_validation.output
             self._save(
                 run,
                 "growth-opportunities",

@@ -4,5 +4,10 @@ $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $python = Resolve-OpenThesisPython
 Initialize-OpenThesisTk -Python $python -ProjectRoot $projectRoot
-$env:PYTHONPATH = Join-Path $projectRoot "src"
+$pythonPaths = @((Join-Path $projectRoot "src"))
+$buildTools = Join-Path $projectRoot ".build-tools"
+if (Test-Path -LiteralPath $buildTools) {
+    $pythonPaths = @($buildTools) + $pythonPaths
+}
+$env:PYTHONPATH = $pythonPaths -join [IO.Path]::PathSeparator
 & $python -m openthesis

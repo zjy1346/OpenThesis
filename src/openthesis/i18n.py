@@ -40,6 +40,9 @@ OUTPUT_LANGUAGE_INSTRUCTIONS: Final = {
 
 UI_EN: Final[dict[str, str]] = {
     "研究公司，而不是预测短期价格": "Research companies, not short-term prices",
+    "长期公司研究工作台": "Long-term Company Research",
+    "模型与数据源": "Models & Data",
+    "本地优先 · 不执行交易": "Local-first · No trading",
     "公司研究": "Company Research",
     "研究历史": "Research History",
     "模型设置": "Model Settings",
@@ -86,6 +89,12 @@ UI_EN: Final[dict[str, str]] = {
     "导出当前报告": "Export Current Report",
     "研究报告": "Research Report",
     "清空显示": "Clear View",
+    "导出": "Export",
+    "显示技术详情": "Show Technical Details",
+    "隐藏技术详情": "Hide Technical Details",
+    "⛶ 沉浸阅读": "⛶ Focus Mode",
+    "⤢ 恢复布局": "⤢ Restore Layout",
+    "沉浸阅读": "Focus Reading",
     "欢迎使用 OpenThesis。\n\n第一步：搜索或快捷选择公司；第二步：确认研究模块和模型设置；第三步：点击页面顶部始终可见的“开始研究”。\n\n可以选择“合成演示公司”离线验证完整流程。研究真实公司时，请在“模型与 SEC 设置”中填写你自己的 SEC 联系邮箱。": (
         "Welcome to OpenThesis.\n\nFirst, search for or quickly select a "
         "company. Second, confirm the research pack and model settings. Third, "

@@ -17,3 +17,5 @@
 
 不输出买入、卖出或交易指令。明确标识哪些内容是事实、推论、假设、预测和未知项。
 
+`growth_opportunities` 必须保留输入中经过验证的 `opportunities` 数组结构，
+不得把字段改写为 Markdown，也不得新增证据 ID。

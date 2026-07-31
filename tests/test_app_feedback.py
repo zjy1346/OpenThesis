@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from openthesis.app import format_elapsed, friendly_research_error
+from openthesis.app import (
+    clamp_report_zoom,
+    ease_out_cubic,
+    format_elapsed,
+    friendly_research_error,
+)
 
 
 class ResearchFeedbackTests(unittest.TestCase):
@@ -10,6 +15,15 @@ class ResearchFeedbackTests(unittest.TestCase):
         self.assertEqual(format_elapsed(0), "00:00")
         self.assertEqual(format_elapsed(65), "01:05")
         self.assertEqual(format_elapsed(3661), "01:01:01")
+
+    def test_report_animation_helpers_are_bounded(self) -> None:
+        self.assertEqual(ease_out_cubic(-1), 0)
+        self.assertEqual(ease_out_cubic(0), 0)
+        self.assertEqual(ease_out_cubic(1), 1)
+        self.assertGreater(ease_out_cubic(0.5), 0.5)
+        self.assertEqual(clamp_report_zoom(0.2), 0.8)
+        self.assertEqual(clamp_report_zoom(2.0), 1.6)
+        self.assertEqual(clamp_report_zoom(1.234), 1.23)
 
     def test_authentication_error_is_actionable(self) -> None:
         title, guidance = friendly_research_error(

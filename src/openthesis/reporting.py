@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 from .financials import deterministic_summary
+from .growth import (
+    GROWTH_FIELD_LABELS,
+    evidence_grade_label,
+    format_probability_range,
+    growth_field_label,
+    growth_opportunities_from_value,
+    scenario_label,
+)
 from .i18n import EN, normalize_language
 
 
@@ -92,7 +100,17 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
     if isinstance(value, dict):
         lines = []
         for key, item in value.items():
-            label = labels.get(str(key), str(key).replace("_", " ").title() if english else str(key).replace("_", " "))
+            if str(key).startswith("_"):
+                continue
+            label = labels.get(str(key))
+            if label is None and str(key) in GROWTH_FIELD_LABELS:
+                label = growth_field_label(str(key), language)
+            if label is None:
+                label = (
+                    str(key).replace("_", " ").title()
+                    if english
+                    else str(key).replace("_", " ")
+                )
             rendered = _render_value(item, language, level + 1)
             if isinstance(item, (dict, list)):
                 lines.append(f"**{label}**")
@@ -102,6 +120,154 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
                 lines.append(f"- **{label}{separator}** {rendered[0]}")
         return lines
     return [str(value)]
+
+
+def _render_growth_opportunities(
+    value: object,
+    language: str,
+    *,
+    include_technical: bool = False,
+) -> list[str]:
+    english = normalize_language(language) == EN
+    opportunities = growth_opportunities_from_value(value, language)
+    if not opportunities:
+        return [
+            (
+                "Current evidence is insufficient to present a growth opportunity."
+                if english
+                else "当前证据不足，未形成可展示的增长机会。"
+            )
+        ]
+    lines: list[str] = []
+    for opportunity in opportunities:
+        title = opportunity.get("title") or (
+            "Unnamed opportunity" if english else "未命名机会"
+        )
+        lines.extend([f"### {title}", ""])
+        badges = [
+            evidence_grade_label(opportunity.get("evidence_grade"), language)
+        ]
+        if opportunity.get("category"):
+            badges.append(str(opportunity["category"]))
+        if opportunity.get("maturity_stage"):
+            badges.append(str(opportunity["maturity_stage"]))
+        lines.extend([" · ".join(f"`{item}`" for item in badges), ""])
+        probability = format_probability_range(
+            opportunity.get("probability_range"), language
+        )
+        horizon = opportunity.get("time_horizon_years")
+        horizon_text = (
+            (f"{horizon} years" if english else f"{horizon} 年")
+            if horizon
+            else ("Insufficient evidence" if english else "证据不足")
+        )
+        lines.extend(
+            [
+                (
+                    f"- Probability: {probability}"
+                    if english
+                    else f"- 可能性：{probability}"
+                ),
+                (
+                    f"- Time horizon: {horizon_text}"
+                    if english
+                    else f"- 时间跨度：{horizon_text}"
+                ),
+            ]
+        )
+        scenarios = [
+            scenario_label(item, language)
+            for item in opportunity.get("scenario_eligibility", [])
+        ]
+        if scenarios:
+            separator = ", " if english else "、"
+            lines.append(
+                (
+                    "- Eligible scenarios: "
+                    if english
+                    else "- 适用情景："
+                )
+                + separator.join(scenarios)
+            )
+        lines.extend(
+            [
+                "",
+                "**Growth mechanism**" if english else "**增长机制**",
+                "",
+                str(opportunity.get("mechanism") or (
+                    "Insufficient evidence." if english else "证据不足。"
+                )),
+                "",
+            ]
+        )
+        supporting = opportunity.get("supporting_evidence_ids", [])
+        contradicting = opportunity.get("contradicting_evidence_ids", [])
+        lines.append(
+            (
+                f"Evidence: {len(supporting)} supporting · {len(contradicting)} contradicting"
+                if english
+                else f"证据：{len(supporting)} 条支持 · {len(contradicting)} 条相反"
+            )
+        )
+        if opportunity.get("leading_indicators"):
+            lines.extend(
+                [
+                    "",
+                    "**Leading indicators**" if english else "**领先指标**",
+                    *[
+                        f"- {item}"
+                        for item in opportunity["leading_indicators"]
+                    ],
+                ]
+            )
+        if opportunity.get("invalidation_conditions"):
+            lines.extend(
+                [
+                    "",
+                    (
+                        "**Invalidation conditions**"
+                        if english
+                        else "**失效条件**"
+                    ),
+                    *[
+                        f"- {item}"
+                        for item in opportunity["invalidation_conditions"]
+                    ],
+                ]
+            )
+        if include_technical:
+            lines.extend(
+                [
+                    "",
+                    (
+                        f"> Opportunity ID: `{opportunity.get('opportunity_id', '')}`"
+                        if english
+                        else f"> 机会 ID：`{opportunity.get('opportunity_id', '')}`"
+                    ),
+                    (
+                        "> Supporting evidence IDs: "
+                        if english
+                        else "> 支持证据 ID："
+                    )
+                    + (
+                        ", ".join(map(str, supporting))
+                        if supporting
+                        else "—"
+                    ),
+                    (
+                        "> Contradicting evidence IDs: "
+                        if english
+                        else "> 相反证据 ID："
+                    )
+                    + (
+                        ", ".join(map(str, contradicting))
+                        if contradicting
+                        else "—"
+                    ),
+                ]
+            )
+        lines.append("")
+    return lines
 
 
 def _artifact_title(artifact: dict[str, Any], language: str) -> str:
@@ -117,6 +283,7 @@ def render_research_run(
     language: str = "zh-CN",
     *,
     company_name: str = "",
+    include_technical: bool = False,
 ) -> str:
     language = normalize_language(language)
     english = language == EN
@@ -149,6 +316,15 @@ def render_research_run(
         ),
         None,
     )
+    growth_artifact = next(
+        (
+            artifact
+            for artifact in reversed(artifacts)
+            if artifact["artifact_type"] == "growth-opportunities"
+        ),
+        None,
+    )
+    growth_rendered = False
     if deterministic:
         metrics = deterministic["content"].get("metrics")
         if company_name and isinstance(metrics, list):
@@ -271,11 +447,22 @@ def render_research_run(
                 for key in section_labels:
                     if key not in report:
                         continue
+                    rendered = (
+                        _render_growth_opportunities(
+                            report[key],
+                            language,
+                            include_technical=include_technical,
+                        )
+                        if key == "growth_opportunities"
+                        else _render_value(report[key], language)
+                    )
+                    if key == "growth_opportunities":
+                        growth_rendered = True
                     lines.extend(
                         [
                             f"## {section_labels[key]}",
                             "",
-                            *_render_value(report[key], language),
+                            *rendered,
                             "",
                         ]
                     )
@@ -307,6 +494,20 @@ def render_research_run(
                 for issue in verification.get("issues", []):
                     lines.append(issue_prefix + str(issue))
                 lines.append("")
+
+    if growth_artifact and not growth_rendered:
+        lines.extend(
+            [
+                _pick(language, "## 增长机会", "## Growth Opportunities"),
+                "",
+                *_render_growth_opportunities(
+                    growth_artifact.get("content"),
+                    language,
+                    include_technical=include_technical,
+                ),
+                "",
+            ]
+        )
 
     comparison = next(
         (

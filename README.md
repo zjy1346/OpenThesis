@@ -52,23 +52,23 @@ flowchart LR
     E --> F["Versioned investment thesis"]
 ```
 
-## Highlights in v0.4.0
+## Highlights in v0.5.0
 
-- Independent **interface language** and **research-report language** settings:
-  Simplified Chinese or English.
-- Interface language changes safely after restart; report language applies to
-  the next research run immediately.
-- Every research agent receives the same mandatory report-language constraint,
-  including custom `.othesis` research packs.
-- Deterministic summaries, reverse DCF, validation, model comparison, evidence
-  sections, disclaimers, exports, and history rendering support both languages.
-- Historical AI-authored text remains exactly as generated. OpenThesis does not
-  call a model to translate old reports, so language switching adds no API cost.
-- Full interface localization with safe Simplified Chinese fallback for missing
-  or invalid language values.
-- Previous v0.3.0 improvements remain included: eight provider presets, online
-  model discovery, responsive scrollable layouts, progress feedback, and
-  compatibility-aware OpenAI-style requests.
+- A modern HTML report reader replaces raw Markdown presentation, with aligned
+  financial tables, KPI cards, evidence callouts, and clean growth-opportunity
+  cards.
+- Growth opportunities now follow a validated schema with localized labels,
+  evidence grades, probability ranges, time horizons, and scenario eligibility.
+- Evidence and agent IDs are hidden by default and available through an opt-in
+  technical-details view.
+- Focus Reading expands the report over the application without resizing the
+  underlying interface. Windows-composited fade transitions avoid repeated HTML
+  reflow; `F11` enters or exits and `Esc` restores the normal view.
+- Report zoom supports 80%–160%, buttons, keyboard shortcuts, and Ctrl+wheel.
+- SEC XBRL fallback concepts fill missing fiscal years while preserving canonical
+  concept priority.
+- Reports export as standalone HTML, Markdown, or text.
+- Previous bilingual interface and report-language controls remain included.
 
 See the consolidated architecture and product specification in
 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).

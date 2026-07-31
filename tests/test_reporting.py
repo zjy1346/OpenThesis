@@ -111,6 +111,40 @@ class ReportingTests(unittest.TestCase):
         report = render_research_run("run-fallback", [], "unknown")
         self.assertIn("长期公司研究", report)
 
+    def test_growth_fields_are_localized_and_ids_hidden_by_default(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "growth-opportunities",
+                "title": "增长机会",
+                "agent_id": "growth-opportunity-analyst",
+                "model_id": "test:model",
+                "content": {
+                    "opportunities": [
+                        {
+                            "title": "新产品平台",
+                            "mechanism": "扩大可服务市场。",
+                            "evidence_grade": "C",
+                            "time_horizon_years": 3,
+                            "probability_range": [0.3, 0.5],
+                            "supporting_evidence_ids": ["fact:private"],
+                            "scenario_eligibility": ["base"],
+                        }
+                    ]
+                },
+            }
+        ]
+        report = render_research_run("run-growth", artifacts)
+        self.assertIn("新产品平台", report)
+        self.assertIn("30%–50%", report)
+        self.assertNotIn("supporting_evidence_ids", report)
+        self.assertNotIn("fact:private", report)
+        technical = render_research_run(
+            "run-growth",
+            artifacts,
+            include_technical=True,
+        )
+        self.assertIn("fact:private", technical)
+
 
 if __name__ == "__main__":
     unittest.main()

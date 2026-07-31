@@ -1,16 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 project_root = Path(SPECPATH)
 resources = project_root / "src" / "openthesis" / "resources"
+datas = [(str(resources), "openthesis/resources")]
+binaries = []
+hiddenimports = []
+for package in ("tkinterweb", "tkinterweb_tkhtml"):
+    package_datas, package_binaries, package_hiddenimports = collect_all(package)
+    datas += package_datas
+    binaries += package_binaries
+    hiddenimports += package_hiddenimports
 
 a = Analysis(
     [str(project_root / "launcher.py")],
     pathex=[str(project_root / "src")],
-    binaries=[],
-    datas=[(str(resources), "openthesis/resources")],
-    hiddenimports=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

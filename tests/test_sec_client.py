@@ -101,7 +101,51 @@ class SecClientTests(unittest.TestCase):
         self.assertEqual(by_concept["net_income"].value, 120)
         self.assertEqual(by_concept["revenue"].fiscal_year, 2025)
 
+    def test_alternate_xbrl_concept_fills_missing_years(self) -> None:
+        def row(year: int, value: int) -> dict[str, object]:
+            return {
+                "val": value,
+                "fy": year,
+                "fp": "FY",
+                "form": "10-K",
+                "start": f"{year}-01-01",
+                "end": f"{year}-12-31",
+                "filed": f"{year + 1}-02-01",
+                "accn": f"0001-{str(year)[-2:]}-001",
+            }
+
+        payload = {
+            "facts": {
+                "us-gaap": {
+                    "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                        "units": {"USD": [row(2025, 1200)]}
+                    },
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                row(2025, 9999),
+                                row(2024, 900),
+                            ]
+                        }
+                    },
+                },
+                "dei": {},
+            }
+        }
+        company = Company(cik="0000001234", ticker="TEST", name="Test Systems")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        revenue = {
+            fact.fiscal_year: (fact.value, fact.reported_concept)
+            for fact in facts
+            if fact.concept == "revenue"
+        }
+        self.assertEqual(
+            revenue[2025],
+            (1200, "RevenueFromContractWithCustomerExcludingAssessedTax"),
+        )
+        self.assertEqual(revenue[2024], (900, "Revenues"))
+
 
 if __name__ == "__main__":
     unittest.main()
-
