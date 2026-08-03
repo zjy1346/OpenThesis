@@ -65,6 +65,36 @@ class JsonLineServer:
             if not isinstance(preferences, dict):
                 raise ValueError("preferences are required")
             return self.service.update_preferences(preferences)
+        if method == "company.search":
+            query = params.get("query")
+            if not isinstance(query, str):
+                raise ValueError("query is required")
+            return self.service.search_companies(query, limit=params.get("limit", 15))
+        if method == "models.catalog":
+            return self.service.model_catalog()
+        if method == "models.discover":
+            return self.service.discover_models_for_session(params)
+        if method == "models.test":
+            return self.service.test_model_connection(params)
+        if method == "packs.install":
+            filename = params.get("filename")
+            encoded_archive = params.get("data_base64")
+            if not isinstance(filename, str) or not isinstance(encoded_archive, str):
+                raise ValueError("research pack payload is required")
+            return self.service.install_research_pack(filename, encoded_archive)
+        if method == "thesis.list":
+            return self.service.list_theses(limit=params.get("limit", 100))
+        if method == "thesis.get":
+            thesis_version_id = params.get("thesis_version_id")
+            if not isinstance(thesis_version_id, str) or not thesis_version_id:
+                raise ValueError("thesis_version_id is required")
+            return self.service.get_thesis(thesis_version_id)
+        if method == "thesis.save":
+            company_cik = params.get("company_cik")
+            content = params.get("content")
+            if not isinstance(company_cik, str) or not isinstance(content, dict):
+                raise ValueError("thesis content is required")
+            return self.service.save_thesis_version(company_cik, content)
         if method == "research.list":
             return self.service.list_research_runs(limit=params.get("limit", 50))
         if method == "research.get_report":
@@ -74,7 +104,14 @@ class JsonLineServer:
             language = params.get("language")
             if language is not None and not isinstance(language, str):
                 raise ValueError("language must be a string")
-            return self.service.get_report(run_id, language=language)
+            include_technical = params.get("include_technical", False)
+            if not isinstance(include_technical, bool):
+                raise ValueError("include_technical must be a boolean")
+            return self.service.get_report(
+                run_id,
+                language=language,
+                include_technical=include_technical,
+            )
         if method == "research.start":
             return self.service.start_research(params)
         if method in {"research.status", "research.cancel"}:

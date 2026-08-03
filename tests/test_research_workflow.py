@@ -173,6 +173,50 @@ class DeterministicWorkflowTests(unittest.TestCase):
             payload = json.loads(saved["payload_json"])
             self.assertEqual(payload["report_language"], "en")
 
+    def test_parallel_agent_switch_controls_concurrency(self) -> None:
+        class ConcurrencyProvider:
+            def __init__(self) -> None:
+                self.active = 0
+                self.maximum = 0
+                self.lock = threading.Lock()
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, _system_prompt: str, _user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                threading.Event().wait(0.03)
+                with self.lock:
+                    self.active -= 1
+                return {"claims": []}
+
+        def run_with(parallel: bool) -> int:
+            with tempfile.TemporaryDirectory() as directory:
+                provider = ConcurrencyProvider()
+                storage = Storage(Path(directory))
+                storage.save_company(DEMO_COMPANY)
+                storage.save_facts([FinancialFact(**item) for item in demo_facts()])
+                workflow = ResearchWorkflow(
+                    storage,
+                    builtin_pack(),
+                    provider,
+                    ModelConfig(
+                        provider="openai-compatible",
+                        model="fake",
+                        base_url="https://example.test/v1",
+                    ),
+                    parallel_agents=parallel,
+                )
+                workflow.run(DEMO_COMPANY, demo_facts())
+                return provider.maximum
+
+        self.assertEqual(run_with(False), 1)
+        self.assertGreaterEqual(run_with(True), 2)
+
     def test_cancellation_is_persisted_without_calling_provider(self) -> None:
         class CountingProvider:
             def __init__(self) -> None:

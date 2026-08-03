@@ -72,11 +72,12 @@ class ModelCatalogTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def test_eight_named_presets_are_unique_and_complete(self) -> None:
+    def test_named_presets_are_unique_and_complete(self) -> None:
         expected = {
             "deepseek",
             "qwen",
             "kimi",
+            "kimi-global",
             "glm",
             "openai",
             "gemini",
@@ -91,6 +92,7 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertIn(preset.protocol, {"openai-compatible", "ollama"})
             self.assertTrue(preset.base_url.startswith(("https://", "http://localhost")))
             self.assertTrue(preset.recommended_models)
+            self.assertTrue(preset.help_url.startswith("https://"))
 
     def test_expected_addresses_and_recommended_models(self) -> None:
         self.assertEqual(
@@ -98,6 +100,14 @@ class ModelCatalogTests(unittest.TestCase):
         )
         self.assertEqual(
             PRESETS_BY_ID["openai"].recommended_models[0], "gpt-5.6-terra"
+        )
+        self.assertEqual(PRESETS_BY_ID["kimi"].recommended_models[0], "kimi-k3")
+        self.assertIn("kimi-k2.7-code", PRESETS_BY_ID["kimi"].recommended_models)
+        self.assertEqual(
+            PRESETS_BY_ID["kimi"].base_url, "https://api.moonshot.cn/v1"
+        )
+        self.assertEqual(
+            PRESETS_BY_ID["kimi-global"].base_url, "https://api.moonshot.ai/v1"
         )
         self.assertEqual(PRESETS_BY_ID["glm"].models_path, None)
         self.assertEqual(PRESETS_BY_ID["ollama"].models_path, "/api/tags")
@@ -121,6 +131,14 @@ class ModelCatalogTests(unittest.TestCase):
             "custom",
         )
         self.assertEqual(infer_model_preset("none", "").preset_id, "none")
+        self.assertEqual(
+            infer_model_preset("openai-compatible", "https://api.moonshot.cn/v1").preset_id,
+            "kimi",
+        )
+        self.assertEqual(
+            infer_model_preset("openai-compatible", "https://api.moonshot.ai/v1").preset_id,
+            "kimi-global",
+        )
 
     def test_merge_deduplicates_and_keeps_recommendations_first(self) -> None:
         self.assertEqual(
@@ -159,6 +177,17 @@ class ModelCatalogTests(unittest.TestCase):
                     timeout_seconds=timeout,
                 )
             self.assertNotIn("never-print-this-secret", str(caught.exception))
+
+    def test_discovery_failure_identifies_status_and_safe_host(self) -> None:
+        with self.assertRaises(ModelDiscoveryError) as caught:
+            discover_models(
+                PRESETS_BY_ID["kimi"],
+                f"{self.base_url}/unauthorized",
+                "session-only-secret",
+            )
+        self.assertIn("HTTP 401", str(caught.exception))
+        self.assertIn("127.0.0.1", str(caught.exception))
+        self.assertNotIn("session-only-secret", str(caught.exception))
 
     def test_provider_without_standard_catalog_uses_builtin_message(self) -> None:
         with self.assertRaises(ModelDiscoveryError):

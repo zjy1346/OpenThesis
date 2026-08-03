@@ -98,6 +98,21 @@ class JsonLineServerTests(unittest.TestCase):
                     }
                 )
 
+    def test_catalog_methods_are_available_over_json_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = JsonLineServer(AppService(Path(directory)))
+
+            result = server.dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "models.catalog",
+                    "params": {},
+                }
+            )
+
+            self.assertTrue(any(item["preset_id"] == "ollama" for item in result))
+
 
 if __name__ == "__main__":
     unittest.main()

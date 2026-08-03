@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -24,6 +25,7 @@ from .storage import Storage
 
 ProgressCallback = Callable[[str, int], None]
 CancelCheck = Callable[[], bool]
+AgentProgressCallback = Callable[[str, str], None]
 
 
 class ResearchCancelled(RuntimeError):
@@ -137,6 +139,8 @@ class ResearchWorkflow:
         cancel_check: CancelCheck | None = None,
         report_language: str = "zh-CN",
         ui_language: str = "zh-CN",
+        parallel_agents: bool = True,
+        agent_progress: AgentProgressCallback | None = None,
     ):
         self.storage = storage
         self.pack = research_pack
@@ -145,6 +149,8 @@ class ResearchWorkflow:
         self.cancel_check = cancel_check or (lambda: False)
         self.report_language = normalize_language(report_language)
         self.ui_language = normalize_language(ui_language)
+        self.parallel_agents = parallel_agents
+        self.agent_progress = agent_progress or (lambda _agent_id, _state: None)
 
     def _report_text(self, chinese: str, english: str) -> str:
         return english if self.report_language == EN else chinese
@@ -261,7 +267,111 @@ class ResearchWorkflow:
                 ),
                 25,
             )
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            notify(
+                (
+                    "Running base agents in parallel (0/3)"
+                    if self.ui_language == EN and self.parallel_agents
+                    else "Running base agents sequentially (0/3)"
+                    if self.ui_language == EN
+                    else "正在并行运行基础 Agent（0/3）"
+                    if self.parallel_agents
+                    else "正在按顺序运行基础 Agent（0/3）"
+                ),
+                25,
+            )
+            for agent_id in stage_one:
+                self._set_agent_state(agent_id, "queued")
+            if self.parallel_agents:
+                executor = ThreadPoolExecutor(max_workers=3)
+                futures = {}
+                try:
+                    for agent_id, prompt_path in stage_one.items():
+                        self._set_agent_state(agent_id, "running")
+                        futures[executor.submit(
+                            self._run_agent, agent_id, prompt_path, context.compact_json(), {}
+                        )] = agent_id
+                    pending = set(futures)
+                    completed_agents = 0
+                    while pending:
+                        self._check_cancelled()
+                        done, pending = wait(
+                            pending, timeout=0.05, return_when=FIRST_COMPLETED
+                        )
+                        for future in done:
+                            agent_id = futures[future]
+                            try:
+                                result = future.result()
+                            except ResearchCancelled:
+                                self._set_agent_state(agent_id, "cancelled")
+                                raise
+                            except Exception:
+                                self._set_agent_state(agent_id, "failed")
+                                raise
+                            self._check_cancelled()
+                            stage_results[agent_id] = result
+                            verification = verify_agent_output(
+                                result, available, self.report_language
+                            )
+                            self._save(
+                                run,
+                                "agent-analysis",
+                                agent_id,
+                                {"result": result, "verification": verification},
+                                agent_id=agent_id,
+                            )
+                            self._set_agent_state(agent_id, "completed")
+                            completed_agents += 1
+                            notify(
+                                self._progress_text(
+                                    "基础分析 Agent 已完成 {completed}/3：{agent_id}",
+                                    completed=completed_agents,
+                                    agent_id=agent_id,
+                                ),
+                                25 + completed_agents * 7,
+                            )
+                finally:
+                    executor.shutdown(
+                        wait=not self.cancel_check(),
+                        cancel_futures=True,
+                    )
+            else:
+                completed_agents = 0
+                for agent_id, prompt_path in stage_one.items():
+                    self._check_cancelled()
+                    self._set_agent_state(agent_id, "running")
+                    try:
+                        result = self._run_agent(
+                            agent_id, prompt_path, context.compact_json(), {}
+                        )
+                    except ResearchCancelled:
+                        self._set_agent_state(agent_id, "cancelled")
+                        raise
+                    except Exception:
+                        self._set_agent_state(agent_id, "failed")
+                        raise
+                    self._check_cancelled()
+                    stage_results[agent_id] = result
+                    verification = verify_agent_output(
+                        result, available, self.report_language
+                    )
+                    self._save(
+                        run,
+                        "agent-analysis",
+                        agent_id,
+                        {"result": result, "verification": verification},
+                        agent_id=agent_id,
+                    )
+                    self._set_agent_state(agent_id, "completed")
+                    completed_agents += 1
+                    notify(
+                        self._progress_text(
+                            "基础分析 Agent 已完成 {completed}/3：{agent_id}",
+                            completed=completed_agents,
+                            agent_id=agent_id,
+                        ),
+                        25 + completed_agents * 7,
+                    )
+            if False:
                 futures = {
                     executor.submit(
                         self._run_agent, agent_id, prompt_path, context.compact_json(), {}
@@ -439,14 +549,47 @@ class ResearchWorkflow:
             self.storage.save_run(run)
             raise
 
-    def _run_agent(
+    def _set_agent_state(self, agent_id: str, state: str) -> None:
+        self.agent_progress(agent_id, state)
+
+    def _generate_with_cancellation(
         self,
-        agent_id: str,
-        prompt_path: str,
-        context_json: str,
-        prior_artifacts: dict[str, Any],
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        json_mode: bool = True,
     ) -> dict[str, Any]:
-        self._check_cancelled()
+        """Run a provider call without allowing a cancelled UI job to hang.
+
+        Provider SDKs generally expose a blocking request. Running that call in
+        a daemon worker lets the workflow acknowledge cancellation immediately;
+        the late result is deliberately discarded by the cancelled workflow.
+        """
+        result: dict[str, Any] | None = None
+        error: BaseException | None = None
+
+        def invoke() -> None:
+            nonlocal result, error
+            try:
+                result = self.provider.generate(  # type: ignore[union-attr]
+                    system_prompt,
+                    user_prompt,
+                    json_mode=json_mode,
+                )
+            except Exception as exc:
+                error = exc
+
+        worker = threading.Thread(target=invoke, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            worker.join(0.05)
+            if self.cancel_check():
+                raise ResearchCancelled()
+        if error is not None:
+            raise error
+        if result is None:
+            raise RuntimeError("model provider returned no result")
+        return result
         if self.provider is None:
             raise RuntimeError("模型 Provider 未配置")
         role_prompt = self.pack.prompt(prompt_path)
@@ -470,6 +613,47 @@ class ResearchWorkflow:
         )
         try:
             result = self.provider.generate(
+                CORE_SYSTEM_PROMPT + "\n" + language_instruction,
+                user_prompt,
+                json_mode=True,
+            )
+        except Exception:
+            self._check_cancelled()
+            raise
+        self._check_cancelled()
+        return result
+
+    def _run_agent(
+        self,
+        agent_id: str,
+        prompt_path: str,
+        context_json: str,
+        prior_artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._check_cancelled()
+        if self.provider is None:
+            raise RuntimeError("model provider is not configured")
+        role_prompt = self.pack.prompt(prompt_path)
+        language_instruction = OUTPUT_LANGUAGE_INSTRUCTIONS[self.report_language]
+        user_prompt = json.dumps(
+            {
+                "agent": agent_id,
+                "task_instructions": role_prompt,
+                "output_language": self.report_language,
+                "output_language_instruction": language_instruction,
+                "research_context": json.loads(context_json),
+                "prior_artifacts": prior_artifacts,
+                "required_claim_shape": {
+                    "text": "string",
+                    "kind": "fact|calculation|inference|assumption|forecast|risk|unknown",
+                    "confidence": "0..1 or null",
+                    "evidence_ids": ["fact:<id>"],
+                },
+            },
+            ensure_ascii=False,
+        )
+        try:
+            result = self._generate_with_cancellation(
                 CORE_SYSTEM_PROMPT + "\n" + language_instruction,
                 user_prompt,
                 json_mode=True,

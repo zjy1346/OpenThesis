@@ -106,6 +106,19 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(authorization, "Bearer session-secret")
         self.assertEqual(payload["temperature"], 0.2)
 
+    def test_api_key_whitespace_is_trimmed_before_bearer_header(self) -> None:
+        ProviderHandler.requests.clear()
+        provider = OpenAICompatibleProvider(
+            ModelConfig(
+                provider="openai-compatible",
+                model="test",
+                base_url=f"{self.base_url}/v1",
+                api_key=" session-secret \n",
+            )
+        )
+        provider.generate("system", "user")
+        self.assertEqual(ProviderHandler.requests[-1][2], "Bearer session-secret")
+
     def test_optional_temperature_is_omitted(self) -> None:
         ProviderHandler.requests.clear()
         provider = OpenAICompatibleProvider(

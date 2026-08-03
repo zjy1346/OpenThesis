@@ -11,14 +11,14 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "1.0.0-alpha.1"
+$version = "1.0.4"
 
-if (-not (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller"))) {
-    throw "The locked PyInstaller build tools are missing from .build-tools."
+$pythonPaths = @((Join-Path $projectRoot "src"))
+if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
+    $pythonPaths = @($buildTools) + $pythonPaths
 }
-
-$pythonPaths = @($buildTools, (Join-Path $projectRoot "src"))
 $env:PYTHONPATH = $pythonPaths -join [IO.Path]::PathSeparator
+$env:CARGO_TARGET_DIR = $cargoTarget
 New-Item -ItemType Directory -Path $resourceRoot -Force | Out-Null
 
 Push-Location $projectRoot
@@ -35,30 +35,50 @@ try {
         throw "Expected sidecar executable was not created: $sidecarExecutable"
     }
 
-    & (Join-Path $PSScriptRoot "desktop.ps1") build
+    & (Join-Path $PSScriptRoot "desktop.ps1") portable
     if ($LASTEXITCODE -ne 0) {
         throw "Tauri desktop build failed with exit code $LASTEXITCODE"
     }
 
-    $nsisDirectory = Join-Path $cargoTarget "release\bundle\nsis"
-    $installer = Get-ChildItem -LiteralPath $nsisDirectory -Filter "*.exe" -File |
-        Sort-Object LastWriteTimeUtc -Descending |
-        Select-Object -First 1
-    if (-not $installer) {
-        throw "The NSIS installer was not created."
-    }
     $output = Join-Path $projectRoot "installer-output"
     New-Item -ItemType Directory -Path $output -Force | Out-Null
-    $publishedInstaller = Join-Path $output "OpenThesis-$version-windows-x64-setup.exe"
-    Copy-Item -LiteralPath $installer.FullName -Destination $publishedInstaller -Force
-    $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $publishedInstaller
-    Set-Content -LiteralPath "$publishedInstaller.sha256" `
-        -Value "$($hash.Hash)  $([IO.Path]::GetFileName($publishedInstaller))" `
+
+    $portableStage = Join-Path $projectRoot ("build\portable\{0}\{1}" -f $version, [guid]::NewGuid())
+    $portableRoot = Join-Path $portableStage "OpenThesis"
+    $portableSidecar = Join-Path $portableRoot "bin\openthesis-sidecar"
+    New-Item -ItemType Directory -Path $portableSidecar -Force | Out-Null
+
+    $desktopExecutable = Join-Path $cargoTarget "release\openthesis-desktop.exe"
+    if (-not (Test-Path -LiteralPath $desktopExecutable -PathType Leaf)) {
+        throw "The desktop executable was not created: $desktopExecutable"
+    }
+    Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $portableRoot "OpenThesis.exe")
+    Copy-Item -Path (Join-Path $sidecarBundle "*") -Destination $portableSidecar -Recurse
+
+    $portableZip = Join-Path $output "OpenThesis-$version-windows-x64-portable.zip"
+    Compress-Archive -LiteralPath $portableRoot -DestinationPath $portableZip -CompressionLevel Optimal -Force
+    $portableHash = Get-FileHash -Algorithm SHA256 -LiteralPath $portableZip
+    Set-Content -LiteralPath "$portableZip.sha256" `
+        -Value "$($portableHash.Hash)  $([IO.Path]::GetFileName($portableZip))" `
         -Encoding ascii
 
+    & (Join-Path $PSScriptRoot "verify-release-privacy.ps1") -Archive $portableZip
+    if ($LASTEXITCODE -ne 0) {
+        throw "Release privacy verification failed with exit code $LASTEXITCODE"
+    }
+    & (Join-Path $PSScriptRoot "verify-desktop-portable.ps1") -Version $version -CargoTarget $cargoTarget
+    if ($LASTEXITCODE -ne 0) {
+        throw "Portable package verification failed with exit code $LASTEXITCODE"
+    }
+    & (Join-Path $PSScriptRoot "verify-desktop-runtime.ps1") `
+        -Executable (Join-Path $portableRoot "OpenThesis.exe")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Portable runtime verification failed with exit code $LASTEXITCODE"
+    }
+
     Write-Output "Sidecar: $sidecarExecutable"
-    Write-Output "Installer: $publishedInstaller"
-    Write-Output "SHA256: $($hash.Hash)"
+    Write-Output "Portable: $portableZip"
+    Write-Output "Portable SHA256: $($portableHash.Hash)"
 } finally {
     Pop-Location
 }

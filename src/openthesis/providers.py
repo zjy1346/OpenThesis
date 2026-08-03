@@ -125,8 +125,9 @@ class OpenAICompatibleProvider:
         json_mode: bool = True,
     ) -> dict[str, Any]:
         headers = {}
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        api_key = self.config.api_key.strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [

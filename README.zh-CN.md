@@ -22,10 +22,10 @@ OpenThesis 是一款面向个人长期投资者的开源桌面研究系统。它
 > OpenThesis 不连接券商账户、不执行交易、不提供短线信号，也不承诺任何投资回报。
 
 > [!NOTE]
-> **v1.0.0-alpha.1 是架构预览版。** 本版引入新的 Tauri + React 桌面外壳与隔离的
-> Python 研究核心，当前支持离线合成演示、进度与取消、报告历史及双语言设置。
-> 真实公司 SEC 研究、模型配置、研究模块、反向 DCF 控件和投资逻辑管理仍保留在旧版
-> Python 界面中，并将在后续版本继续迁移。
+> **v1.0.4 是当前 Windows 发布版。** 新的 Tauri + React 工作台已经通过隔离的 Python
+> 研究核心运行真实公司 SEC 研究，并支持模型配置与在线目录、研究模块、反向 DCF、
+> 双模型对比、进度与取消、双语言设置、报告历史、原生报告导出、模型帮助链接、
+> 架构诊断和追加式投资逻辑版本管理。
 
 ## 为什么选择 OpenThesis？
 
@@ -63,12 +63,14 @@ flowchart LR
 - 完整保留双语言界面和研究报告语言控制。
 
 完整产品与架构说明见 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md)。
+已完成能力、剩余迁移项与稳定版退出条件见
+[docs/MIGRATION_STATUS.md](docs/MIGRATION_STATUS.md)。
 
 ## 下载与运行
 
-1. 打开[最新版本](https://github.com/zjy1346/OpenThesis/releases/latest)，下载 Windows x64 安装程序。
-2. 使用随附的 SHA-256 文件核对安装包。
-3. 安装并启动 OpenThesis。
+1. 打开[最新版本](https://github.com/zjy1346/OpenThesis/releases/latest)，下载 Windows x64 便携 ZIP。
+2. 使用随附的 SHA-256 文件核对压缩包。
+3. 完整解压后运行 `OpenThesis\OpenThesis.exe`，并保留旁边的 `bin` 目录。
 4. 首次体验运行合成演示研究，全程离线且不需要 API Key。
 
 首次启动默认**不调用 AI**。只有用户主动选择模型并开始研究时，研究上下文才会发送到所选接口。
