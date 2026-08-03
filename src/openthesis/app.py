@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import ctypes
 import threading
 import time
 import traceback
@@ -73,6 +74,7 @@ from .packs import (
     list_installed_packs,
 )
 from .providers import ModelConfig, ProviderError, create_provider
+from .paths import default_data_dir
 from .research import ResearchCancelled, ResearchWorkflow
 from .report_html import render_message_html, render_research_html
 from .reporting import render_research_run
@@ -80,14 +82,9 @@ from .sec_client import SecClient, SecClientError
 from .storage import Storage
 
 
-def default_data_dir() -> Path:
-    override = os.environ.get("OPENTHESIS_DATA_DIR")
-    if override:
-        return Path(override)
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "OpenThesis"
-    return Path.home() / ".openthesis"
+SIDEBAR_RAIL_WIDTH = 64
+SIDEBAR_DRAWER_WIDTH = 152
+SIDEBAR_DRAWER_DURATION_MS = 200.0
 
 
 def json_pretty(value: object) -> str:
@@ -106,6 +103,60 @@ def format_elapsed(seconds: float) -> str:
 def ease_out_cubic(progress: float) -> float:
     bounded = min(1.0, max(0.0, progress))
     return 1.0 - (1.0 - bounded) ** 3
+
+
+def cubic_bezier_progress(
+    progress: float,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+) -> float:
+    """Return CSS cubic-bezier progress for a normalized time value."""
+
+    bounded = min(1.0, max(0.0, progress))
+    if bounded in (0.0, 1.0):
+        return bounded
+
+    def component(parameter: float, first: float, second: float) -> float:
+        inverse = 1.0 - parameter
+        return (
+            3.0 * inverse * inverse * parameter * first
+            + 3.0 * inverse * parameter * parameter * second
+            + parameter * parameter * parameter
+        )
+
+    lower = 0.0
+    upper = 1.0
+    parameter = bounded
+    for _ in range(18):
+        parameter = (lower + upper) / 2.0
+        if component(parameter, x1, x2) < bounded:
+            lower = parameter
+        else:
+            upper = parameter
+    return min(1.0, max(0.0, component(parameter, y1, y2)))
+
+
+def system_reduces_motion() -> bool:
+    override = os.environ.get("OPENTHESIS_REDUCE_MOTION", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if os.name != "nt":
+        return False
+    try:
+        animations_enabled = ctypes.c_int(1)
+        succeeded = ctypes.windll.user32.SystemParametersInfoW(  # type: ignore[attr-defined]
+            0x1042,
+            0,
+            ctypes.byref(animations_enabled),
+            0,
+        )
+        return bool(succeeded) and not bool(animations_enabled.value)
+    except (AttributeError, OSError):
+        return False
 
 
 def clamp_report_zoom(value: float) -> float:
@@ -215,6 +266,85 @@ class VerticalScrolledFrame(ttk.Frame):
         self.canvas.yview_moveto(1.0)
 
 
+class HoverTooltip:
+    """A compact, non-animated tooltip used by collapsed navigation items."""
+
+    def __init__(
+        self,
+        widget: tk.Misc,
+        text_provider: object,
+        *,
+        delay_ms: int = 350,
+    ) -> None:
+        self.widget = widget
+        self.text_provider = text_provider
+        self.delay_ms = delay_ms
+        self._job: str | None = None
+        self._window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _text(self) -> str:
+        provider = self.text_provider
+        return str(provider() if callable(provider) else provider).strip()
+
+    def _schedule(self, _event: object = None) -> None:
+        self._cancel()
+        if self._text():
+            self._job = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+
+    def _show(self) -> None:
+        self._job = None
+        text = self._text()
+        if not text or not self.widget.winfo_exists():
+            return
+        self._hide()
+        window = tk.Toplevel(self.widget)
+        window.withdraw()
+        window.overrideredirect(True)
+        try:
+            window.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        label = tk.Label(
+            window,
+            text=text,
+            background="#0f172a",
+            foreground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=6,
+            relief="flat",
+        )
+        label.pack()
+        window.update_idletasks()
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 8
+        y = self.widget.winfo_rooty() + max(
+            0, (self.widget.winfo_height() - window.winfo_reqheight()) // 2
+        )
+        window.geometry(f"+{x}+{y}")
+        window.deiconify()
+        self._window = window
+
+    def _hide(self, _event: object = None) -> None:
+        self._cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except tk.TclError:
+                pass
+            self._window = None
+
+
 class OpenThesisApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -268,7 +398,24 @@ class OpenThesisApp:
         self._research_activity_lines: list[str] = []
         self._last_research_error = ""
         self._report_link_tags: list[str] = []
-        self._nav_buttons: dict[str, ttk.Button] = {}
+        self._nav_buttons: dict[str, tuple[ttk.Button, ttk.Button]] = {}
+        self._nav_metadata: dict[str, tuple[str, str]] = {}
+        self.sidebar_collapsed = (
+            self.storage.get_setting("sidebar_collapsed", "false") == "true"
+        )
+        self.sidebar_reduced_motion = system_reduces_motion()
+        self._sidebar_animation_job: str | None = None
+        self._sidebar_drawer_x = float(
+            SIDEBAR_RAIL_WIDTH
+            if not self.sidebar_collapsed
+            else SIDEBAR_RAIL_WIDTH - SIDEBAR_DRAWER_WIDTH
+        )
+        self._sidebar_animation_started = 0.0
+        self._sidebar_animation_start_x = self._sidebar_drawer_x
+        self._sidebar_animation_target_x = self._sidebar_drawer_x
+        self._sidebar_animation_duration_ms = 0.0
+        self.research_controls_collapsed = False
+        self.progress_details_visible = False
         self._model_catalog_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         self._model_refresh_generation = {"primary": 0, "compare": 0}
         self._configure_style()
@@ -340,7 +487,13 @@ class OpenThesisApp:
         style.configure("TFrame", background="#f4f7fb")
         style.configure("App.TFrame", background="#f4f7fb")
         style.configure("Content.TFrame", background="#f4f7fb")
-        style.configure("Sidebar.TFrame", background="#0f172a")
+        style.configure("Sidebar.TFrame", background="#ffffff")
+        style.configure(
+            "SidebarDrawer.TFrame",
+            background="#ffffff",
+            relief="solid",
+            borderwidth=1,
+        )
         style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
         style.configure("CardContent.TFrame", background="#ffffff")
         style.configure(
@@ -379,45 +532,96 @@ class OpenThesisApp:
         )
         style.configure(
             "SidebarBrand.TLabel",
-            background="#0f172a",
-            foreground="#ffffff",
+            background="#ffffff",
+            foreground="#0f172a",
             font=("Segoe UI", 17, "bold"),
         )
         style.configure(
             "SidebarCaption.TLabel",
-            background="#0f172a",
-            foreground="#94a3b8",
+            background="#ffffff",
+            foreground="#64748b",
             font=("Segoe UI", 9),
         )
         style.configure(
-            "Nav.TButton",
-            background="#0f172a",
-            foreground="#cbd5e1",
+            "SidebarSection.TLabel",
+            background="#ffffff",
+            foreground="#94a3b8",
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.configure(
+            "NavIcon.TButton",
+            background="#ffffff",
+            foreground="#475569",
+            borderwidth=0,
+            relief="flat",
+            anchor="center",
+            padding=(0, 10),
+            font=("Segoe UI Symbol", 11),
+        )
+        style.map(
+            "NavIcon.TButton",
+            background=[("pressed", "#e2e8f0"), ("active", "#f1f5f9")],
+            foreground=[("pressed", "#0f172a"), ("active", "#0f172a")],
+        )
+        style.configure(
+            "NavIconActive.TButton",
+            background="#e8eefc",
+            foreground="#1d4ed8",
+            borderwidth=0,
+            relief="flat",
+            anchor="center",
+            padding=(0, 10),
+            font=("Segoe UI Symbol", 11, "bold"),
+        )
+        style.map(
+            "NavIconActive.TButton",
+            background=[("pressed", "#dbe7ff"), ("active", "#eef4ff")],
+            foreground=[("pressed", "#1e40af"), ("active", "#1d4ed8")],
+        )
+        style.configure(
+            "NavLabel.TButton",
+            background="#ffffff",
+            foreground="#475569",
             borderwidth=0,
             relief="flat",
             anchor="w",
-            padding=(16, 11),
+            padding=(8, 10),
             font=("Segoe UI", 10),
         )
         style.map(
-            "Nav.TButton",
-            background=[("active", "#1e293b")],
-            foreground=[("active", "#ffffff")],
+            "NavLabel.TButton",
+            background=[("pressed", "#e2e8f0"), ("active", "#f1f5f9")],
+            foreground=[("pressed", "#0f172a"), ("active", "#0f172a")],
         )
         style.configure(
-            "NavActive.TButton",
-            background="#1d4ed8",
-            foreground="#ffffff",
+            "NavLabelActive.TButton",
+            background="#e8eefc",
+            foreground="#1d4ed8",
             borderwidth=0,
             relief="flat",
             anchor="w",
-            padding=(16, 11),
+            padding=(8, 10),
             font=("Segoe UI", 10, "bold"),
         )
         style.map(
-            "NavActive.TButton",
-            background=[("active", "#2563eb")],
-            foreground=[("active", "#ffffff")],
+            "NavLabelActive.TButton",
+            background=[("pressed", "#dbe7ff"), ("active", "#eef4ff")],
+            foreground=[("pressed", "#1e40af"), ("active", "#1d4ed8")],
+        )
+        style.configure(
+            "SidebarToggle.TButton",
+            background="#f1f5f9",
+            foreground="#334155",
+            borderwidth=0,
+            relief="flat",
+            anchor="center",
+            padding=(7, 6),
+            font=("Segoe UI Symbol", 11, "bold"),
+        )
+        style.map(
+            "SidebarToggle.TButton",
+            background=[("pressed", "#dbe4ef"), ("active", "#e2e8f0")],
+            foreground=[("pressed", "#0f172a"), ("active", "#0f172a")],
         )
         style.configure(
             "TButton",
@@ -431,7 +635,11 @@ class OpenThesisApp:
         )
         style.map(
             "TButton",
-            background=[("active", "#f1f5f9"), ("disabled", "#e2e8f0")],
+            background=[
+                ("pressed", "#e2e8f0"),
+                ("active", "#f1f5f9"),
+                ("disabled", "#e2e8f0"),
+            ],
             foreground=[("disabled", "#94a3b8")],
         )
         style.configure(
@@ -444,7 +652,33 @@ class OpenThesisApp:
         )
         style.map(
             "Accent.TButton",
-            background=[("active", "#1d4ed8"), ("disabled", "#94a3b8")],
+            background=[
+                ("pressed", "#1e40af"),
+                ("active", "#1d4ed8"),
+                ("disabled", "#94a3b8"),
+            ],
+            foreground=[("active", "#ffffff"), ("disabled", "#e2e8f0")],
+        )
+        style.configure(
+            "Compact.TButton",
+            padding=(9, 5),
+            font=("Segoe UI", 9),
+        )
+        style.configure(
+            "CompactAccent.TButton",
+            padding=(13, 6),
+            font=("Segoe UI", 10, "bold"),
+            background="#2563eb",
+            foreground="#ffffff",
+            bordercolor="#2563eb",
+        )
+        style.map(
+            "CompactAccent.TButton",
+            background=[
+                ("pressed", "#1e40af"),
+                ("active", "#1d4ed8"),
+                ("disabled", "#94a3b8"),
+            ],
             foreground=[("active", "#ffffff"), ("disabled", "#e2e8f0")],
         )
         style.configure(
@@ -456,10 +690,12 @@ class OpenThesisApp:
             "ResearchStatus.TLabel",
             font=("Segoe UI", 10, "bold"),
             foreground="#0f172a",
+            background="#ffffff",
         )
         style.configure(
             "ResearchError.TLabel",
             foreground="#b91c1c",
+            background="#ffffff",
         )
         style.configure(
             "TLabelframe",
@@ -529,39 +765,52 @@ class OpenThesisApp:
         self.shell.pack(fill=BOTH, expand=True)
 
         self.sidebar = ttk.Frame(
-            self.shell, style="Sidebar.TFrame", width=210
+            self.shell,
+            style="Sidebar.TFrame",
+            width=SIDEBAR_RAIL_WIDTH,
         )
         self.sidebar.pack(side=LEFT, fill=Y)
         self.sidebar.pack_propagate(False)
-        brand = ttk.Frame(
-            self.sidebar, style="Sidebar.TFrame", padding=(20, 24, 14, 20)
+        self.sidebar_brand = ttk.Frame(
+            self.sidebar,
+            style="Sidebar.TFrame",
+            width=SIDEBAR_RAIL_WIDTH,
+            height=74,
         )
-        brand.pack(fill=X)
-        ttk.Label(
-            brand, text="OpenThesis", style="SidebarBrand.TLabel"
-        ).pack(anchor=W)
-        ttk.Label(
-            brand,
-            text="Evidence-first research",
-            style="SidebarCaption.TLabel",
-        ).pack(anchor=W, pady=(3, 0))
+        self.sidebar_brand.pack(fill=X)
+        self.sidebar_brand.pack_propagate(False)
+        self.sidebar_toggle_button = ttk.Button(
+            self.sidebar_brand,
+            text="‹",
+            style="SidebarToggle.TButton",
+            command=self._toggle_sidebar,
+        )
+        self.sidebar_toggle_button.place(x=12, y=18, width=40, height=36)
+        HoverTooltip(
+            self.sidebar_toggle_button,
+            lambda: self._t(
+                "展开导航" if self.sidebar_collapsed else "折叠导航"
+            ),
+        )
 
         self.main_panel = ttk.Frame(self.shell, style="Content.TFrame")
         self.main_panel.pack(side=LEFT, fill=BOTH, expand=True)
         self.header = ttk.Frame(
-            self.main_panel, style="Card.TFrame", padding=(22, 14)
+            self.main_panel, style="Card.TFrame", padding=(18, 9)
         )
         self.header.pack(fill=X, padx=14, pady=(14, 10))
         header_title = ttk.Frame(self.header, style="CardContent.TFrame")
         header_title.pack(side=LEFT, fill=X, expand=True)
-        ttk.Label(header_title, text="长期公司研究工作台", style="Title.TLabel").pack(
-            anchor=W
-        )
+        ttk.Label(
+            header_title,
+            text="长期公司研究工作台",
+            style="Title.TLabel",
+        ).pack(side=LEFT, anchor=W)
         ttk.Label(
             header_title,
             text="研究公司，而不是预测短期价格",
             style="HeaderSubtitle.TLabel",
-        ).pack(anchor=W, pady=(2, 0))
+        ).pack(side=LEFT, anchor=W, padx=(16, 0))
         ttk.Label(
             self.header,
             text=f"v{__version__}",
@@ -588,33 +837,91 @@ class OpenThesisApp:
         self.notebook.add(self.about_tab, text="关于")
 
         navigation = (
-            ("公司研究", self.research_tab),
-            ("研究历史", self.history_tab),
-            ("模型与数据源", self.model_tab),
-            ("研究模块", self.packs_tab),
-            ("投资逻辑", self.thesis_tab),
-            ("设置", self.settings_tab),
-            ("关于", self.about_tab),
+            ("研究", (("◉", "公司研究", self.research_tab), ("◷", "研究历史", self.history_tab))),
+            ("配置", (("◫", "模型与数据源", self.model_tab), ("◇", "研究模块", self.packs_tab))),
+            ("资产", (("⑂", "投资逻辑", self.thesis_tab),)),
+            ("应用", (("⚙", "设置", self.settings_tab), ("ⓘ", "关于", self.about_tab))),
         )
-        nav_frame = ttk.Frame(
+        self.sidebar_drawer = ttk.Frame(
+            self.shell,
+            style="SidebarDrawer.TFrame",
+            width=SIDEBAR_DRAWER_WIDTH,
+        )
+        self.sidebar_drawer.place(
+            x=round(self._sidebar_drawer_x),
+            y=0,
+            width=SIDEBAR_DRAWER_WIDTH,
+            relheight=1,
+        )
+        drawer_brand = ttk.Frame(
+            self.sidebar_drawer,
+            style="Sidebar.TFrame",
+            height=74,
+        )
+        drawer_brand.pack(fill=X)
+        drawer_brand.pack_propagate(False)
+        ttk.Label(
+            drawer_brand,
+            text="OpenThesis",
+            style="SidebarBrand.TLabel",
+        ).pack(anchor=W, padx=(14, 8), pady=(16, 0))
+        ttk.Label(
+            drawer_brand,
+            text="Evidence-first research",
+            style="SidebarCaption.TLabel",
+        ).pack(anchor=W, padx=(14, 8), pady=(2, 0))
+
+        self.nav_frame = ttk.Frame(
             self.sidebar, style="Sidebar.TFrame", padding=(10, 4)
         )
-        nav_frame.pack(fill=X)
-        for label, tab in navigation:
-            tab_id = str(tab)
-            button = ttk.Button(
-                nav_frame,
-                text=label,
-                style="Nav.TButton",
-                command=lambda target=tab: self.notebook.select(target),
-            )
-            button.pack(fill=X, pady=2)
-            self._nav_buttons[tab_id] = button
-        ttk.Label(
-            self.sidebar,
+        self.nav_frame.pack(fill=X)
+        self.drawer_nav_frame = ttk.Frame(
+            self.sidebar_drawer, style="Sidebar.TFrame", padding=(8, 4)
+        )
+        self.drawer_nav_frame.pack(fill=X)
+        for section_name, items in navigation:
+            ttk.Label(
+                self.nav_frame,
+                text=" ",
+                style="SidebarSection.TLabel",
+            ).pack(fill=X, pady=(13, 4))
+            ttk.Label(
+                self.drawer_nav_frame,
+                text=section_name,
+                style="SidebarSection.TLabel",
+            ).pack(fill=X, padx=8, pady=(13, 4))
+            for icon, label, tab in items:
+                tab_id = str(tab)
+                icon_button = ttk.Button(
+                    self.nav_frame,
+                    text=icon,
+                    style="NavIcon.TButton",
+                    command=lambda target=tab: self.notebook.select(target),
+                )
+                icon_button.pack(fill=X, pady=2)
+                label_button = ttk.Button(
+                    self.drawer_nav_frame,
+                    text=label,
+                    style="NavLabel.TButton",
+                    command=lambda target=tab: self.notebook.select(target),
+                )
+                label_button.pack(fill=X, pady=2)
+                self._nav_buttons[tab_id] = (icon_button, label_button)
+                self._nav_metadata[tab_id] = (icon, label)
+                HoverTooltip(
+                    icon_button,
+                    lambda source=label: self._t(source)
+                    if self.sidebar_collapsed
+                    else "",
+                )
+        self.sidebar_footer_label = ttk.Label(
+            self.sidebar_drawer,
             text="本地优先 · 不执行交易",
             style="SidebarCaption.TLabel",
-        ).pack(side="bottom", anchor=W, padx=22, pady=18)
+        )
+        self.sidebar_footer_label.pack(
+            side="bottom", anchor=W, padx=14, pady=16
+        )
 
         self._build_research_tab()
         self._build_history_tab()
@@ -652,17 +959,141 @@ class OpenThesisApp:
             self._sync_report_focus_geometry,
             add="+",
         )
+        self._raise_sidebar_layers()
         self._sync_navigation()
+        self._apply_sidebar_state()
+
+    def _raise_sidebar_layers(self) -> None:
+        self.sidebar_drawer.lift(self.main_panel)
+        self.sidebar.lift(self.sidebar_drawer)
+
+    def _toggle_sidebar(self) -> None:
+        self.sidebar_collapsed = not self.sidebar_collapsed
+        self.storage.set_setting(
+            "sidebar_collapsed", "true" if self.sidebar_collapsed else "false"
+        )
+        self._apply_sidebar_state(animate=True)
+
+    def _apply_sidebar_state(self, *, animate: bool = False) -> None:
+        target_x = float(
+            SIDEBAR_RAIL_WIDTH - SIDEBAR_DRAWER_WIDTH
+            if self.sidebar_collapsed
+            else SIDEBAR_RAIL_WIDTH
+        )
+        self.sidebar_toggle_button.configure(
+            text="›" if self.sidebar_collapsed else "‹"
+        )
+        if animate and not self.sidebar_reduced_motion:
+            self._start_sidebar_animation(target_x)
+        else:
+            self._cancel_sidebar_animation()
+            self._set_sidebar_drawer_x(target_x)
+            self._raise_sidebar_layers()
+        self._sync_navigation()
+
+    def _cancel_sidebar_animation(self) -> None:
+        if self._sidebar_animation_job is not None:
+            try:
+                self.root.after_cancel(self._sidebar_animation_job)
+            except tk.TclError:
+                pass
+            self._sidebar_animation_job = None
+
+    def _set_sidebar_drawer_x(self, position: float) -> None:
+        lower = float(SIDEBAR_RAIL_WIDTH - SIDEBAR_DRAWER_WIDTH)
+        upper = float(SIDEBAR_RAIL_WIDTH)
+        self._sidebar_drawer_x = min(upper, max(lower, position))
+        self.sidebar_drawer.place_configure(x=round(self._sidebar_drawer_x))
+
+    def _start_sidebar_animation(self, target_x: float) -> None:
+        self._cancel_sidebar_animation()
+        self._raise_sidebar_layers()
+        distance = abs(target_x - self._sidebar_drawer_x)
+        if distance < 0.5:
+            self._set_sidebar_drawer_x(target_x)
+            return
+        full_distance = float(SIDEBAR_DRAWER_WIDTH)
+        self._sidebar_animation_start_x = self._sidebar_drawer_x
+        self._sidebar_animation_target_x = target_x
+        self._sidebar_animation_started = time.monotonic()
+        self._sidebar_animation_duration_ms = max(
+            90.0,
+            SIDEBAR_DRAWER_DURATION_MS * distance / full_distance,
+        )
+        self._sidebar_animation_job = self.root.after(
+            0, self._step_sidebar_animation
+        )
+
+    def _step_sidebar_animation(self) -> None:
+        elapsed_ms = (
+            time.monotonic() - self._sidebar_animation_started
+        ) * 1000.0
+        progress = min(
+            1.0,
+            elapsed_ms / max(1.0, self._sidebar_animation_duration_ms),
+        )
+        eased = cubic_bezier_progress(progress, 0.32, 0.72, 0.0, 1.0)
+        position = self._sidebar_animation_start_x + (
+            self._sidebar_animation_target_x
+            - self._sidebar_animation_start_x
+        ) * eased
+        self._set_sidebar_drawer_x(position)
+        if progress >= 1.0:
+            self._sidebar_animation_job = None
+            self._set_sidebar_drawer_x(self._sidebar_animation_target_x)
+            return
+        self._sidebar_animation_job = self.root.after(
+            16, self._step_sidebar_animation
+        )
 
     def _sync_navigation(self, _event: object = None) -> None:
         selected = self.notebook.select()
-        for tab_id, button in self._nav_buttons.items():
-            button.configure(
-                style="NavActive.TButton" if tab_id == selected else "Nav.TButton"
+        for tab_id, (icon_button, label_button) in self._nav_buttons.items():
+            active = tab_id == selected
+            icon_button.configure(
+                style="NavIconActive.TButton" if active else "NavIcon.TButton"
+            )
+            label_button.configure(
+                style="NavLabelActive.TButton" if active else "NavLabel.TButton"
             )
 
     def _research_controls_are_visible(self) -> bool:
         return str(self.research_controls_scroll) in self.research_split.panes()
+
+    def _toggle_research_controls(self) -> None:
+        self._set_research_controls_collapsed(
+            not self.research_controls_collapsed
+        )
+
+    def _set_research_controls_collapsed(self, collapsed: bool) -> None:
+        visible = self._research_controls_are_visible()
+        if collapsed and visible:
+            self.research_split.forget(self.research_controls_scroll)
+        elif not collapsed and not visible:
+            self.research_split.insert(
+                0, self.research_controls_scroll, weight=0
+            )
+        self.research_controls_collapsed = collapsed
+        self.research_controls_toggle_button.configure(
+            text=self._t(
+                "显示研究配置" if collapsed else "隐藏研究配置"
+            )
+        )
+
+    def _toggle_progress_details(self) -> None:
+        self._set_progress_details_visible(not self.progress_details_visible)
+
+    def _set_progress_details_visible(self, visible: bool) -> None:
+        self.progress_details_visible = visible
+        if visible:
+            self.research_feedback_details.grid()
+        else:
+            self.research_feedback_details.grid_remove()
+        self.progress_details_button.configure(
+            text=self._t(
+                "隐藏进度详情" if visible else "显示进度详情"
+            )
+        )
 
     @staticmethod
     def _report_scroll_fraction(view: object | None) -> float:
@@ -1005,46 +1436,51 @@ class OpenThesisApp:
             value=self._t("请先在下方选择一家公司。")
         )
 
-        self.workflow_frame = ttk.LabelFrame(
-            self.research_tab, text="研究流程", padding=(12, 8)
+        self.workflow_frame = ttk.Frame(
+            self.research_tab, style="Card.TFrame", padding=(14, 10)
         )
         self.workflow_frame.pack(fill=X, pady=(0, 10))
         self.workflow_frame.columnconfigure(0, weight=1)
         ttk.Label(
             self.workflow_frame,
-            text="① 选择公司   →   ② 确认配置   →   ③ 开始研究",
-            style="Workflow.TLabel",
-        ).grid(row=0, column=0, sticky=W, pady=(0, 6))
-        ttk.Label(
-            self.workflow_frame, textvariable=self.selected_company_var
-        ).grid(
-            row=1, column=0, sticky=W
-        )
-        self.run_button = ttk.Button(
-            self.workflow_frame,
-            text="开始研究",
-            style="Accent.TButton",
-            command=self._start_research,
-        )
-        self.run_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(16, 0))
+            textvariable=self.selected_company_var,
+            style="ResearchStatus.TLabel",
+        ).grid(row=0, column=0, sticky=W)
         ttk.Label(
             self.workflow_frame,
             textvariable=self.start_hint_var,
-            style="Subtitle.TLabel",
-        ).grid(row=2, column=0, sticky=W, pady=(4, 0))
-        ttk.Button(
-            self.workflow_frame,
-            text="模型与 SEC 设置",
-            command=lambda: self.notebook.select(self.model_tab),
-        ).grid(row=2, column=1, sticky="e", padx=(16, 0), pady=(4, 0))
+            style="HeaderSubtitle.TLabel",
+            wraplength=520,
+        ).grid(row=1, column=0, sticky=W, pady=(2, 0))
 
-        self.research_feedback_frame = ttk.LabelFrame(
-            self.workflow_frame, text="任务进度", padding=(10, 7)
+        command_actions = ttk.Frame(
+            self.workflow_frame, style="CardContent.TFrame"
         )
-        self.research_feedback_frame.grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(9, 0)
+        command_actions.grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=(14, 0)
         )
-        self.research_feedback_frame.columnconfigure(0, weight=1)
+        self.research_controls_toggle_button = ttk.Button(
+            command_actions,
+            text="隐藏研究配置",
+            style="Compact.TButton",
+            command=self._toggle_research_controls,
+        )
+        self.research_controls_toggle_button.pack(side=LEFT)
+        ttk.Button(
+            command_actions,
+            text="模型与数据源",
+            style="Compact.TButton",
+            command=lambda: self.notebook.select(self.model_tab),
+        ).pack(side=LEFT, padx=(7, 0))
+        self.run_button = ttk.Button(
+            command_actions,
+            text="开始研究",
+            style="CompactAccent.TButton",
+            command=self._start_research,
+        )
+        self.run_button.pack(side=LEFT, padx=(7, 0))
+
+        self.research_feedback_frame = self.workflow_frame
         self.research_feedback_title_var = tk.StringVar(
             value=self._t("等待开始研究")
         )
@@ -1055,52 +1491,78 @@ class OpenThesisApp:
         )
         self.research_elapsed_var = tk.StringVar(value=self._t("已用时 00:00"))
         self.research_error_var = tk.StringVar()
+
+        progress_row = ttk.Frame(
+            self.workflow_frame, style="CardContent.TFrame"
+        )
+        progress_row.grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(9, 0)
+        )
+        progress_row.columnconfigure(0, weight=1)
         ttk.Label(
-            self.research_feedback_frame,
+            progress_row,
             textvariable=self.research_feedback_title_var,
             style="ResearchStatus.TLabel",
         ).grid(row=0, column=0, sticky=W)
-        ttk.Label(
-            self.research_feedback_frame,
-            textvariable=self.research_elapsed_var,
-            style="Subtitle.TLabel",
-        ).grid(row=0, column=1, sticky="e", padx=(12, 0))
-        ttk.Label(
-            self.research_feedback_frame,
-            textvariable=self.research_feedback_detail_var,
-            style="Subtitle.TLabel",
-            wraplength=680,
-        ).grid(row=1, column=0, columnspan=2, sticky=W, pady=(3, 5))
-        progress_row = ttk.Frame(self.research_feedback_frame)
-        progress_row.grid(row=2, column=0, columnspan=2, sticky="ew")
-        progress_row.columnconfigure(0, weight=1)
         self.research_progress_bar = ttk.Progressbar(
             progress_row, mode="determinate", maximum=100
         )
-        self.research_progress_bar.grid(row=0, column=0, sticky="ew")
+        self.research_progress_bar.grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0)
+        )
         self.research_percent_var = tk.StringVar(value="0%")
         ttk.Label(progress_row, textvariable=self.research_percent_var, width=5).grid(
-            row=0, column=1, padx=(8, 0)
+            row=1, column=3, padx=(8, 0), pady=(6, 0)
         )
+        ttk.Label(
+            progress_row,
+            textvariable=self.research_elapsed_var,
+            style="HeaderSubtitle.TLabel",
+            width=15,
+        ).grid(row=0, column=1, padx=(8, 0))
+        self.progress_details_button = ttk.Button(
+            progress_row,
+            text="显示进度详情",
+            style="Compact.TButton",
+            command=self._toggle_progress_details,
+        )
+        self.progress_details_button.grid(row=0, column=2, padx=(8, 0))
         self.cancel_research_button = ttk.Button(
             progress_row,
             text="取消研究",
+            style="Compact.TButton",
             command=self._cancel_research,
             state="disabled",
         )
-        self.cancel_research_button.grid(row=0, column=2, padx=(8, 0))
+        self.cancel_research_button.grid(row=0, column=3, padx=(8, 0))
+
+        self.research_feedback_details = ttk.Frame(
+            self.workflow_frame, style="CardContent.TFrame"
+        )
+        self.research_feedback_details.grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
+        self.research_feedback_details.columnconfigure(0, weight=1)
+        ttk.Label(
+            self.research_feedback_details,
+            textvariable=self.research_feedback_detail_var,
+            style="HeaderSubtitle.TLabel",
+            wraplength=760,
+        ).grid(row=0, column=0, columnspan=2, sticky=W)
         self.research_error_label = ttk.Label(
-            self.research_feedback_frame,
+            self.research_feedback_details,
             textvariable=self.research_error_var,
             style="ResearchError.TLabel",
-            wraplength=680,
+            wraplength=760,
         )
         self.research_error_label.grid(
-            row=3, column=0, sticky=W, pady=(6, 0)
+            row=1, column=0, sticky=W, pady=(6, 0)
         )
-        self.research_error_actions = ttk.Frame(self.research_feedback_frame)
+        self.research_error_actions = ttk.Frame(
+            self.research_feedback_details, style="CardContent.TFrame"
+        )
         self.research_error_actions.grid(
-            row=3, column=1, sticky="e", padx=(12, 0), pady=(6, 0)
+            row=1, column=1, sticky="e", padx=(12, 0), pady=(6, 0)
         )
         self.retry_research_button = ttk.Button(
             self.research_error_actions,
@@ -1114,6 +1576,7 @@ class OpenThesisApp:
             command=lambda: self.notebook.select(self.model_tab),
         ).pack(side=LEFT, padx=(6, 0))
         self.research_error_actions.grid_remove()
+        self.research_feedback_details.grid_remove()
 
         self.research_split = ttk.Panedwindow(
             self.research_tab, orient=HORIZONTAL
@@ -2240,6 +2703,7 @@ class OpenThesisApp:
             self._t("如需继续，请重新选择公司并运行研究。")
         )
         self.research_error_actions.grid()
+        self._set_progress_details_visible(True)
 
     def _begin_research_feedback(self, company: Company) -> None:
         self._research_started_monotonic = time.monotonic()
@@ -2256,6 +2720,8 @@ class OpenThesisApp:
         self._set_research_progress(
             self._research_progress_message, 2, record=True
         )
+        self._set_progress_details_visible(False)
+        self._set_research_controls_collapsed(True)
 
     def _set_research_progress(
         self, message: str, percent: int, *, record: bool = True
@@ -2360,6 +2826,7 @@ class OpenThesisApp:
             self._t("技术信息：{message}", message=display_message)
         )
         self.research_error_actions.grid()
+        self._set_progress_details_visible(True)
         self.research_elapsed_var.set(
             self._t(
                 "已用时 {elapsed}",
@@ -3140,6 +3607,8 @@ def main() -> None:
     smoke_result = {"viewable": False}
     if gui_smoke:
         def begin_gui_smoke_research() -> None:
+            app.sidebar_collapsed = False
+            app._apply_sidebar_state()
             offline_preset = get_model_preset("none")
             app.model_preset_var.set(
                 model_preset_label(offline_preset.preset_id, app.ui_language)
@@ -3174,12 +3643,78 @@ def main() -> None:
                 and app.run_button.cget("text") == app._t("开始研究")
             )
             feedback_visible = bool(
-                app.research_feedback_frame.winfo_viewable()
-                and app.research_progress_bar.winfo_viewable()
+                app.workflow_frame.winfo_width() >= 400
+                and app.research_progress_bar.winfo_width() >= 100
+                and app.research_progress_bar.winfo_height() >= 4
             )
             research_completed = bool(
                 not app.research_running
                 and app.research_percent_var.get() == "100%"
+            )
+            report_priority_size = (
+                app.report_panel.winfo_width(),
+                app.report_panel.winfo_height(),
+            )
+            report_priority_active = bool(
+                not app._research_controls_are_visible()
+                and app.report_panel.winfo_viewable()
+                and report_priority_size[0] >= 620
+                and report_priority_size[1] >= 300
+            )
+            sidebar_rail_width = app.sidebar.winfo_width()
+            sidebar_icon_y_before = tuple(
+                button_pair[0].winfo_rooty()
+                for button_pair in app._nav_buttons.values()
+            )
+            sidebar_expanded_x = round(app._sidebar_drawer_x)
+            app._toggle_sidebar()
+            settle_animation(
+                1.0,
+                lambda: app._sidebar_animation_job is None,
+            )
+            sidebar_collapsed_x = round(app._sidebar_drawer_x)
+            sidebar_icon_y_collapsed = tuple(
+                button_pair[0].winfo_rooty()
+                for button_pair in app._nav_buttons.values()
+            )
+            sidebar_collapsible = bool(
+                60 <= sidebar_rail_width <= 70
+                and sidebar_expanded_x == SIDEBAR_RAIL_WIDTH
+                and sidebar_collapsed_x
+                == SIDEBAR_RAIL_WIDTH - SIDEBAR_DRAWER_WIDTH
+                and app.sidebar_collapsed
+                and sidebar_icon_y_before == sidebar_icon_y_collapsed
+            )
+            app._toggle_sidebar()
+            settle_animation(
+                1.0,
+                lambda: app._sidebar_animation_job is None,
+            )
+            sidebar_reexpanded_x = round(app._sidebar_drawer_x)
+            sidebar_icon_y_reexpanded = tuple(
+                button_pair[0].winfo_rooty()
+                for button_pair in app._nav_buttons.values()
+            )
+            sidebar_stable = bool(
+                sidebar_reexpanded_x == SIDEBAR_RAIL_WIDTH
+                and sidebar_icon_y_before == sidebar_icon_y_reexpanded
+            )
+            app._toggle_sidebar()
+            settle_animation(0.07)
+            sidebar_mid_x = app._sidebar_drawer_x
+            app._toggle_sidebar()
+            settle_animation(
+                1.0,
+                lambda: app._sidebar_animation_job is None,
+            )
+            sidebar_interruptible = bool(
+                round(app._sidebar_drawer_x) == SIDEBAR_RAIL_WIDTH
+                and (
+                    app.sidebar_reduced_motion
+                    or SIDEBAR_RAIL_WIDTH - SIDEBAR_DRAWER_WIDTH
+                    < sidebar_mid_x
+                    < SIDEBAR_RAIL_WIDTH
+                )
             )
             app._set_report_focus(True)
             settle_animation(
@@ -3207,7 +3742,6 @@ def main() -> None:
                 and app.header.winfo_viewable()
                 and app.workflow_frame.winfo_viewable()
                 and app.status_frame.winfo_viewable()
-                and app._research_controls_are_visible()
             )
             app._set_report_zoom(1.2)
             root.update_idletasks()
@@ -3227,8 +3761,9 @@ def main() -> None:
                 and app.header.winfo_viewable()
                 and app.workflow_frame.winfo_viewable()
                 and app.status_frame.winfo_viewable()
-                and app._research_controls_are_visible()
+                and not app._research_controls_are_visible()
             )
+            app._set_research_controls_collapsed(False)
             app._toggle_dcf()
             app.research_controls_scroll.scroll_to_bottom()
             root.update_idletasks()
@@ -3265,7 +3800,20 @@ def main() -> None:
                 f"{app.research_feedback_frame.winfo_y()},"
                 f"{app.research_feedback_frame.winfo_width()}x"
                 f"{app.research_feedback_frame.winfo_height()};"
+                f"progress_geometry:{app.research_progress_bar.winfo_width()}x"
+                f"{app.research_progress_bar.winfo_height()};"
                 f"research_completed:{research_completed};"
+                f"report_priority_active:{report_priority_active};"
+                f"report_priority_size:{report_priority_size[0]}x"
+                f"{report_priority_size[1]};"
+                f"report_panel_final_size:{app.report_panel.winfo_width()}x"
+                f"{app.report_panel.winfo_height()};"
+                f"sidebar_collapsible:{sidebar_collapsible};"
+                f"sidebar_stable:{sidebar_stable};"
+                f"sidebar_interruptible:{sidebar_interruptible};"
+                f"sidebar_rail_width:{sidebar_rail_width};"
+                f"sidebar_drawer_x:{sidebar_expanded_x},"
+                f"{sidebar_collapsed_x},{sidebar_reexpanded_x};"
                 f"immersive_accessible:{immersive_accessible};"
                 f"focus_transitioning:{app._report_focus_transitioning};"
                 f"focus_transition_at_check:{focus_transition_at_check};"
@@ -3292,6 +3840,10 @@ def main() -> None:
                 and start_visible
                 and feedback_visible
                 and research_completed
+                and report_priority_active
+                and sidebar_collapsible
+                and sidebar_stable
+                and sidebar_interruptible
                 and immersive_accessible
                 and zoom_accessible
                 and layout_restored

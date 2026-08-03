@@ -4,6 +4,7 @@ import unittest
 
 from openthesis.app import (
     clamp_report_zoom,
+    cubic_bezier_progress,
     ease_out_cubic,
     format_elapsed,
     friendly_research_error,
@@ -24,6 +25,16 @@ class ResearchFeedbackTests(unittest.TestCase):
         self.assertEqual(clamp_report_zoom(0.2), 0.8)
         self.assertEqual(clamp_report_zoom(2.0), 1.6)
         self.assertEqual(clamp_report_zoom(1.234), 1.23)
+
+    def test_drawer_curve_is_bounded_monotonic_and_responsive(self) -> None:
+        values = [
+            cubic_bezier_progress(step / 20, 0.32, 0.72, 0.0, 1.0)
+            for step in range(21)
+        ]
+        self.assertEqual(values[0], 0)
+        self.assertEqual(values[-1], 1)
+        self.assertEqual(values, sorted(values))
+        self.assertGreater(values[4], 0.2)
 
     def test_authentication_error_is_actionable(self) -> None:
         title, guidance = friendly_research_error(

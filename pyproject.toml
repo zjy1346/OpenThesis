@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openthesis"
-version = "0.5.0"
+version = "1.0.0-alpha.1"
 description = "Model-agnostic, evidence-grounded AI research for long-term investors"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="OpenThesis">
+  <rect width="512" height="512" rx="112" fill="#111827"/>
+  <path d="M136 160h240v48H136zm0 72h168v48H136zm0 72h112v48H136z" fill="#f8fafc"/>
+  <path d="M326 280h50v72h-50z" fill="#38bdf8"/>
+</svg>

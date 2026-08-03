@@ -25,6 +25,14 @@ reproducibility layer.
 > OpenThesis does not connect to brokerage accounts, execute trades, provide
 > short-term signals, or promise investment returns.
 
+> [!NOTE]
+> **v1.0.0-alpha.1 is an architecture preview.** It introduces the new
+> Tauri + React desktop shell and the isolated Python research sidecar. The
+> preview currently supports the offline synthetic demo, progress/cancellation,
+> report history, and bilingual settings. Real-company SEC research, model
+> configuration, research packs, reverse DCF controls, and thesis management
+> remain available in the legacy Python interface while they are migrated.
+
 ## Why OpenThesis?
 
 - **Bring your own model.** Use DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini,
@@ -75,13 +83,11 @@ See the consolidated architecture and product specification in
 
 ## Download and run
 
-1. Open the [latest stable release](https://github.com/zjy1346/OpenThesis/releases/latest)
-   and download the Windows portable ZIP.
-2. Extract the ZIP completely. Do not run the executable from inside the
-   archive.
-3. Keep the `_internal` directory beside `OpenThesis.exe`.
-4. Start `OpenThesis.exe`.
-5. Choose the synthetic demo company for a fully offline first run.
+1. Open the [latest release](https://github.com/zjy1346/OpenThesis/releases/latest)
+   and download the Windows x64 setup executable.
+2. Verify it against the attached SHA-256 file.
+3. Install and start OpenThesis.
+4. Run the synthetic demo for a fully offline first experience.
 
 The first launch defaults to **no AI calls**. Research context is sent only
 after you explicitly choose a model and start a research run. Online model lists
@@ -124,6 +130,13 @@ a machine-specific Python path.
 powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1
 ```
 
+To run the new desktop architecture, install Node.js, Rust, and the Visual C++
+Build Tools, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\desktop.ps1 dev
+```
+
 For a network-free first run, select the synthetic demo company. Configure a
 valid SEC contact email only when querying real US-listed companies.
 
@@ -133,6 +146,12 @@ valid SEC contact email only when querying real US-listed companies.
 powershell -ExecutionPolicy Bypass -File .\scripts\test.ps1
 python -m pip install pyinstaller
 powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
+```
+
+Build the Tauri preview and its Python sidecar with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-desktop.ps1
 ```
 
 The packaging command runs the complete test suite, builds the frozen Windows
