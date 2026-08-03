@@ -26,12 +26,12 @@ reproducibility layer.
 > short-term signals, or promise investment returns.
 
 > [!NOTE]
-> **v1.0.0-alpha.1 is an architecture preview.** It introduces the new
-> Tauri + React desktop shell and the isolated Python research sidecar. The
-> preview currently supports the offline synthetic demo, progress/cancellation,
-> report history, and bilingual settings. Real-company SEC research, model
-> configuration, research packs, reverse DCF controls, and thesis management
-> remain available in the legacy Python interface while they are migrated.
+> **v1.0.4 is the current Windows release.** The Tauri + React workbench now
+> runs real-company SEC research through the isolated Python research core. It
+> includes model configuration and discovery, research packs, reverse DCF,
+> two-model comparison, progress/cancellation, bilingual settings, report
+> history, native report export, provider help links, architecture diagnostics,
+> and append-only thesis management.
 
 ## Why OpenThesis?
 
@@ -80,13 +80,16 @@ flowchart LR
 
 See the consolidated architecture and product specification in
 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
+The checked migration boundary and remaining stable-1.0 gates are tracked in
+[docs/MIGRATION_STATUS.md](docs/MIGRATION_STATUS.md).
 
 ## Download and run
 
 1. Open the [latest release](https://github.com/zjy1346/OpenThesis/releases/latest)
-   and download the Windows x64 setup executable.
+   and download the Windows x64 portable ZIP.
 2. Verify it against the attached SHA-256 file.
-3. Install and start OpenThesis.
+3. Extract the complete archive and run `OpenThesis\OpenThesis.exe`. Keep the
+   adjacent `bin` directory in place.
 4. Run the synthetic demo for a fully offline first experience.
 
 The first launch defaults to **no AI calls**. Research context is sent only

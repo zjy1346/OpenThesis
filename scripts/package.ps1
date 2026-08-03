@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$version = "1.0.0-alpha.1"
+$version = "1.0.4"
 
 Push-Location $projectRoot
 try {

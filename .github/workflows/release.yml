@@ -27,9 +27,23 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install packaging tools
         shell: pwsh
         run: python -m pip install --disable-pip-version-check pyinstaller==6.21.0 .
+
+      - name: Install desktop dependencies
+        shell: pwsh
+        run: npm ci --prefix desktop
 
       - name: Read project version
         shell: pwsh
@@ -42,9 +56,20 @@ jobs:
           "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
           "RELEASE_TAG=v$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Test and build portable package
+      - name: Run test suites
         shell: pwsh
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package.ps1
+        run: |
+          python -m unittest discover -s tests
+          npm test --prefix desktop -- --run
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP "openthesis-cargo-target"
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+
+      - name: Test and build portable desktop package
+        shell: pwsh
+        run: |
+          $env:OPENTHESIS_PYTHON = (Get-Command python).Source
+          $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP "openthesis-cargo-target"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-desktop.ps1
 
       - name: Publish GitHub release
         shell: pwsh

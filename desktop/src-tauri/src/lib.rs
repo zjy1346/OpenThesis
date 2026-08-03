@@ -1,232 +1,163 @@
-use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+mod backend;
 
-static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+use std::path::Path;
+use tauri::AppHandle;
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_opener::OpenerExt;
 
-#[derive(Default)]
-struct BackendState {
-    process: Mutex<Option<BackendProcess>>,
-}
+const MAX_EXPORT_BYTES: usize = 32 * 1024 * 1024;
 
-struct BackendProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-enum BackendError {
-    Transport(String),
-    Rpc(String),
-}
-
-impl BackendProcess {
-    fn start(app: &AppHandle) -> Result<Self, String> {
-        let mut child = backend_command(app)?
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "research core could not be started".to_string())?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "research core input is unavailable".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "research core output is unavailable".to_string())?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+fn sanitize_export_name(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let extension = if lower.ends_with(".md") {
+        ".md"
+    } else if lower.ends_with(".txt") {
+        ".txt"
+    } else {
+        ".html"
+    };
+    let stem = value
+        .strip_suffix(extension)
+        .or_else(|| value.strip_suffix(&extension.to_ascii_uppercase()))
+        .unwrap_or(value);
+    let mut safe = String::new();
+    let mut separator_pending = false;
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            if separator_pending && !safe.is_empty() && !safe.ends_with('-') {
+                safe.push('-');
+            }
+            separator_pending = false;
+            if safe.len() < 80 {
+                safe.push(character);
+            }
+        } else {
+            separator_pending = true;
+        }
     }
+    let safe = safe.trim_matches('-');
+    let stem = if safe.is_empty() {
+        "OpenThesis-report"
+    } else {
+        safe
+    };
+    format!("{stem}{extension}")
+}
 
-    fn request(&mut self, method: String, params: Value) -> Result<Value, BackendError> {
-        let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-            "params": params,
-        });
-        writeln!(self.stdin, "{request}")
-            .and_then(|_| self.stdin.flush())
-            .map_err(|_| {
-                BackendError::Transport("research core request could not be sent".to_string())
-            })?;
-
-        let mut response_line = String::new();
-        let bytes_read = self
-            .stdout
-            .read_line(&mut response_line)
-            .map_err(|_| BackendError::Transport("research core did not respond".to_string()))?;
-        if bytes_read == 0 {
-            return Err(BackendError::Transport(
-                "research core stopped unexpectedly".to_string(),
-            ));
-        }
-        let response: Value = serde_json::from_str(&response_line).map_err(|_| {
-            BackendError::Transport("research core returned an invalid response".to_string())
-        })?;
-        if response.get("id") != Some(&json!(request_id)) {
-            return Err(BackendError::Transport(
-                "research core returned an unexpected response".to_string(),
-            ));
-        }
-        if let Some(error) = response.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("research core request failed");
-            return Err(BackendError::Rpc(message.to_string()));
-        }
-        response.get("result").cloned().ok_or_else(|| {
-            BackendError::Transport("research core response is missing a result".to_string())
-        })
+fn content_for_export<'a>(path: &Path, markdown: &'a str, html: &'a str) -> &'a str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("html" | "htm") => html,
+        _ => markdown,
     }
 }
 
-impl Drop for BackendProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+fn is_allowed_external_url(value: &str) -> bool {
+    if value.len() > 2048 {
+        return false;
     }
+    tauri::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 #[tauri::command]
-fn backend_request(
+async fn export_report(
     app: AppHandle,
-    state: State<'_, BackendState>,
-    method: String,
-    params: Value,
-) -> Result<Value, String> {
-    let mut process = state
-        .process
-        .lock()
-        .map_err(|_| "research core state is unavailable".to_string())?;
-    if process.is_none() {
-        *process = Some(BackendProcess::start(&app)?);
+    suggested_name: String,
+    markdown: String,
+    html: String,
+) -> Result<bool, String> {
+    if markdown.len().saturating_add(html.len()) > MAX_EXPORT_BYTES {
+        return Err("report is too large to export".to_string());
     }
-    let result = process
-        .as_mut()
-        .ok_or_else(|| "research core could not be started".to_string())?
-        .request(method, params);
-    match result {
-        Ok(value) => Ok(value),
-        Err(BackendError::Rpc(message)) => Err(message),
-        Err(BackendError::Transport(message)) => {
-            *process = None;
-            Err(message)
-        }
-    }
+    let file_name = sanitize_export_name(&suggested_name);
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_title("Export OpenThesis report")
+            .set_file_name(file_name)
+            .add_filter("HTML", &["html"])
+            .add_filter("Markdown", &["md"])
+            .add_filter("Text", &["txt"])
+            .blocking_save_file();
+        let Some(selected) = selected else {
+            return Ok(false);
+        };
+        let path = selected
+            .into_path()
+            .map_err(|_| "the selected export location is unavailable".to_string())?;
+        let content = content_for_export(&path, &markdown, &html);
+        std::fs::write(path, content).map_err(|_| "the report could not be written".to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|_| "the export dialog stopped unexpectedly".to_string())?
 }
 
-fn backend_command(app: &AppHandle) -> Result<Command, String> {
-    if let Ok(explicit_path) = std::env::var("OPENTHESIS_SIDECAR_PATH") {
-        return Ok(Command::new(explicit_path));
+#[tauri::command]
+fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    if !is_allowed_external_url(&url) {
+        return Err("only secure external links are allowed".to_string());
     }
-
-    if cfg!(debug_assertions) {
-        let python = std::env::var("OPENTHESIS_PYTHON").unwrap_or_else(|_| "python".to_string());
-        let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("src");
-        let mut command = Command::new(python);
-        command
-            .arg("-m")
-            .arg("openthesis.sidecar")
-            .env("PYTHONPATH", source_root);
-        return Ok(command);
-    }
-
-    let executable_name = if cfg!(target_os = "windows") {
-        "openthesis-sidecar.exe"
-    } else {
-        "openthesis-sidecar"
-    };
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|_| "desktop resource directory is unavailable".to_string())?;
-    let executable_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-    let candidates = sidecar_candidates(Some(resource_dir), executable_dir, executable_name);
-    let sidecar_path = candidates
-        .iter()
-        .find(|path| path.is_file())
-        .or_else(|| candidates.first())
-        .ok_or_else(|| "desktop resource directory is unavailable".to_string())?;
-    Ok(Command::new(sidecar_path))
-}
-
-fn sidecar_candidates(
-    resource_dir: Option<PathBuf>,
-    executable_dir: Option<PathBuf>,
-    executable_name: &str,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    for base in [resource_dir, executable_dir].into_iter().flatten() {
-        let candidate = base
-            .join("bin")
-            .join("openthesis-sidecar")
-            .join(executable_name);
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|_| "the external link could not be opened".to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sidecar_candidates;
+    use super::{
+        content_for_export, is_allowed_external_url, sanitize_export_name,
+    };
     use std::path::PathBuf;
 
     #[test]
-    fn packaged_resource_precedes_portable_directory() {
-        let candidates = sidecar_candidates(
-            Some(PathBuf::from("resources")),
-            Some(PathBuf::from("portable")),
-            "openthesis-sidecar.exe",
+    fn export_format_is_selected_only_from_the_chosen_extension() {
+        assert_eq!(
+            content_for_export(PathBuf::from("report.html").as_path(), "md", "html"),
+            "html"
         );
         assert_eq!(
-            candidates,
-            vec![
-                PathBuf::from("resources/bin/openthesis-sidecar/openthesis-sidecar.exe"),
-                PathBuf::from("portable/bin/openthesis-sidecar/openthesis-sidecar.exe"),
-            ]
+            content_for_export(PathBuf::from("report.md").as_path(), "md", "html"),
+            "md"
+        );
+        assert_eq!(
+            content_for_export(PathBuf::from("report.txt").as_path(), "md", "html"),
+            "md"
         );
     }
 
     #[test]
-    fn duplicate_directories_are_checked_once() {
-        let candidates = sidecar_candidates(
-            Some(PathBuf::from("same")),
-            Some(PathBuf::from("same")),
-            "openthesis-sidecar",
-        );
+    fn export_name_and_external_urls_are_bounded() {
         assert_eq!(
-            candidates,
-            vec![PathBuf::from(
-                "same/bin/openthesis-sidecar/openthesis-sidecar"
-            )]
+            sanitize_export_name("AAPL:../../report.html"),
+            "AAPL-report.html"
         );
+        assert!(is_allowed_external_url("https://example.com/help"));
+        assert!(!is_allowed_external_url("file:///private/data"));
+        assert!(!is_allowed_external_url("javascript:alert(1)"));
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(BackendState::default())
-        .invoke_handler(tauri::generate_handler![backend_request])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(backend::BackendState::default())
+        .invoke_handler(tauri::generate_handler![
+            backend::backend_request,
+            export_report,
+            open_external_url
+        ])
         .run(tauri::generate_context!())
         .expect("error while running OpenThesis desktop");
 }

@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Iterable
+from urllib.parse import urlsplit
 
 from .i18n import model_preset_id_from_label, model_preset_label
 
@@ -65,10 +66,20 @@ MODEL_PRESETS: tuple[ModelPreset, ...] = (
         "国内 · Kimi",
         "国内",
         "openai-compatible",
-        "https://api.moonshot.ai/v1",
-        ("kimi-k2.6", "kimi-k2.5"),
+        "https://api.moonshot.cn/v1",
+        ("kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5"),
         "/models",
         "https://platform.moonshot.cn/console/api-keys",
+    ),
+    ModelPreset(
+        "kimi-global",
+        "国外 · Kimi International",
+        "国外",
+        "openai-compatible",
+        "https://api.moonshot.ai/v1",
+        ("kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5"),
+        "/models",
+        "https://platform.kimi.ai/console/api-keys",
     ),
     ModelPreset(
         "glm",
@@ -215,16 +226,29 @@ def discover_models(
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code in {401, 403}:
-            message = "认证失败，请检查 API Key 和账号权限。"
+            message = (
+                f"认证失败（HTTP {exc.code}，地址 {_safe_endpoint_label(url)}），"
+                "请检查 API Key、区域预设和账号权限。"
+            )
         elif exc.code == 404:
-            message = "该接口没有可用的在线模型目录，请使用内置列表或手动填写。"
+            message = (
+                f"在线模型目录不存在（HTTP 404，地址 {_safe_endpoint_label(url)}），"
+                "请检查区域预设或使用内置列表。"
+            )
         else:
-            message = f"在线模型目录返回 HTTP {exc.code}，已保留内置列表。"
+            message = (
+                f"在线模型目录返回 HTTP {exc.code}（地址 {_safe_endpoint_label(url)}），"
+                "已保留内置列表。"
+            )
         raise ModelDiscoveryError(message) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise ModelDiscoveryError("在线模型目录连接超时或不可达，已保留内置列表。") from exc
+        raise ModelDiscoveryError(
+            f"在线模型目录连接超时或不可达（地址 {_safe_endpoint_label(url)}），已保留内置列表。"
+        ) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise ModelDiscoveryError("在线模型目录返回了无法识别的数据，已保留内置列表。") from exc
+        raise ModelDiscoveryError(
+            f"在线模型目录返回了无法识别的数据（地址 {_safe_endpoint_label(url)}），已保留内置列表。"
+        ) from exc
 
     if preset.protocol == "ollama":
         raw_models = payload.get("models", []) if isinstance(payload, dict) else []
@@ -240,5 +264,19 @@ def discover_models(
         ]
     models = merge_model_ids((), (item for item in discovered if item))
     if not models:
-        raise ModelDiscoveryError("在线模型目录为空，已保留内置列表。")
+        raise ModelDiscoveryError(
+            f"在线模型目录为空（地址 {_safe_endpoint_label(url)}），已保留内置列表。"
+        )
     return models
+
+
+def _safe_endpoint_label(url: str) -> str:
+    """Return only a host[:port] for diagnostics; never expose URL credentials."""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or "unknown host"
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return host
+    except ValueError:
+        return "unknown host"

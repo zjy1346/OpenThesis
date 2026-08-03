@@ -68,6 +68,12 @@ class InternationalizationTests(unittest.TestCase):
             "unsafe path",
             translate_error("研究包包含不安全路径：../bad", EN),
         )
+        translated_catalog_error = translate_error(
+            "认证失败（HTTP 401，地址 api.moonshot.ai），请检查 API Key、区域预设和账号权限。",
+            EN,
+        )
+        self.assertIn("Authentication failed (HTTP 401, endpoint api.moonshot.ai)", translated_catalog_error)
+        self.assertNotIn("区域预设", translated_catalog_error)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
+    hide_console="hide-early",
 )
 
 bundle = COLLECT(
