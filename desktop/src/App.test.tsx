@@ -38,12 +38,12 @@ describe("report-first workbench", () => {
     vi.clearAllMocks();
     vi.mocked(bootstrapBackend).mockResolvedValue({
       contract_version: "1.0",
-      app_version: "1.0.4",
+      app_version: "1.1.0",
       capabilities: [],
       preferences: {
         ui_language: "en",
         report_language: "zh-CN",
-        sidebar_collapsed: "false",
+        sidebar_collapsed: "true",
         parallel_agents: "false",
       },
       recent_runs: [],
@@ -86,9 +86,55 @@ describe("report-first workbench", () => {
   it("keeps the report workspace primary when no history exists", async () => {
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Research workspace" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Research report" })).toBeVisible();
     expect(screen.getByText("No research reports yet")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Collapse navigation" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open navigation" })).toBeVisible();
+  });
+
+  it("expands navigation on hover and can pin it open without moving the icon rail", async () => {
+    vi.mocked(updatePreferences).mockResolvedValue({
+      ui_language: "en",
+      report_language: "zh-CN",
+      sidebar_collapsed: "false",
+      parallel_agents: "false",
+    });
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Research report" });
+    const navigation = screen.getByRole("complementary", { name: "OpenThesis primary navigation" });
+    const labels = screen.getByRole("navigation", { name: "Navigation labels", hidden: true });
+    const drawer = labels.closest(".nav-drawer");
+    expect(drawer).toHaveAttribute("aria-hidden", "true");
+
+    fireEvent.mouseEnter(navigation);
+    expect(drawer).toHaveAttribute("aria-hidden", "false");
+    fireEvent.mouseLeave(navigation);
+    expect(drawer).toHaveAttribute("aria-hidden", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    fireEvent.mouseLeave(navigation);
+    expect(drawer).toHaveAttribute("aria-hidden", "false");
+    expect(updatePreferences).toHaveBeenCalledWith({ sidebar_collapsed: "false" });
+  });
+
+  it("uses the active feature title and gives history its own page", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Research history" }));
+    expect(screen.getByRole("heading", { name: "Research history" })).toBeVisible();
+    expect(screen.getByText(/No research history yet/)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("heading", { name: "Settings" })).toBeVisible();
+  });
+
+  it("opens the bilingual help center with both built-in guides", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Help" }));
+    expect(screen.getByRole("heading", { name: "Help" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Start a company research run" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Write your own research pack" })).toBeVisible();
   });
 
   it("saves interface and report languages independently", async () => {
@@ -240,8 +286,9 @@ describe("report-first workbench", () => {
 
   it("refreshes history without restarting the workbench", async () => {
     render(<App />);
-    await screen.findByRole("heading", { name: "Research workspace" });
+    await screen.findByRole("heading", { name: "Research report" });
 
+    fireEvent.click(screen.getByRole("button", { name: "Research history" }));
     fireEvent.click(screen.getByRole("button", { name: "Refresh research history" }));
 
     await waitFor(() => expect(bootstrapBackend).toHaveBeenCalledTimes(2));
@@ -266,8 +313,8 @@ describe("report-first workbench", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "About OpenThesis" }));
 
-    expect(screen.getByRole("heading", { name: "About OpenThesis" })).toBeVisible();
-    expect(screen.getByText("1.0.4")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "About OpenThesis", level: 1 })).toBeVisible();
+    expect(screen.getByText("1.1.0")).toBeVisible();
     expect(screen.getByText("JSON-RPC 1.0")).toBeVisible();
   });
 

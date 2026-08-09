@@ -3,7 +3,6 @@ import { BookOpenText, Settings, Sparkles } from "lucide-react";
 import type { BootstrapResult } from "../../types";
 
 type AboutCopy = {
-  aboutTitle: string;
   aboutBody: string;
   versionLabel: string;
   contractLabel: string;
@@ -20,8 +19,6 @@ export function AboutView({ bootstrap, copy }: { bootstrap: BootstrapResult; cop
   return (
     <div className="about-view">
       <header>
-        <span className="eyebrow">OpenThesis</span>
-        <h2>{copy.aboutTitle}</h2>
         <p>{copy.aboutBody}</p>
       </header>
       <dl className="diagnostic-strip">

@@ -16,6 +16,8 @@ import type { ResearchReport } from "../../types";
 
 type ReportCopy = {
   report: string;
+  researchRun: string;
+  reportDisclaimer: string;
   reportTools: string;
   enterFocus: string;
   exitFocus: string;
@@ -43,6 +45,20 @@ function nextZoom(current: number, delta: number): number {
   return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Number((current + delta).toFixed(1))));
 }
 
+export function stripReportPreamble(markdown: string): string {
+  const lines = markdown.split(/\r?\n/);
+  if (!["# OpenThesis 长期公司研究", "# OpenThesis Long-term Company Research"].includes(lines[0]?.trim())) {
+    return markdown;
+  }
+  let cursor = 1;
+  while (lines[cursor]?.trim() === "") cursor += 1;
+  if (/^(研究运行|Research run)[：:]/.test(lines[cursor]?.trim() ?? "")) cursor += 1;
+  while (lines[cursor]?.trim() === "") cursor += 1;
+  if (/^> (本报告用于研究辅助|This report is research assistance)/.test(lines[cursor]?.trim() ?? "")) cursor += 1;
+  while (lines[cursor]?.trim() === "") cursor += 1;
+  return lines.slice(cursor).join("\n");
+}
+
 export function ReportWorkspace({ report, copy }: { report: ResearchReport; copy: ReportCopy }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
@@ -53,6 +69,10 @@ export function ReportWorkspace({ report, copy }: { report: ResearchReport; copy
   const [focusState, setFocusState] = useState<FocusState>("normal");
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
+  const reportBody = stripReportPreamble(displayedReport.markdown);
+  const compactRunId = displayedReport.run_id.length > 12
+    ? `${displayedReport.run_id.slice(0, 12)}…`
+    : displayedReport.run_id;
 
   const cancelPendingClose = () => {
     if (closeTimer.current !== null) {
@@ -147,9 +167,16 @@ export function ReportWorkspace({ report, copy }: { report: ResearchReport; copy
       style={{ "--report-scale": String(zoom) } as CSSProperties}
     >
       <header className="report-meta">
-        <div><span className="eyebrow">{displayedReport.ticker}</span><h2>{displayedReport.company_name}</h2></div>
+        <div className="report-identity">
+          <span className="eyebrow">{displayedReport.ticker}</span>
+          <h2>{displayedReport.company_name}</h2>
+          <div className="report-context">
+            <span><Clock3 size={13} />{copy.report}</span>
+            <span className="report-run" title={displayedReport.run_id}>{copy.researchRun}: <code>{compactRunId}</code></span>
+            <span>{copy.reportDisclaimer}</span>
+          </div>
+        </div>
         <div className="report-toolbar" role="toolbar" aria-label={copy.reportTools}>
-          <span className="report-label"><Clock3 size={15} /> {copy.report}</span>
           <button type="button" aria-label={copy.zoomOut} title={copy.zoomOut} disabled={zoom <= MIN_ZOOM} onClick={() => setZoom((value) => nextZoom(value, -ZOOM_STEP))}><ZoomOut size={16} /></button>
           <span className="zoom-value" aria-live="polite">{Math.round(zoom * 100)}%</span>
           <button type="button" aria-label={copy.zoomIn} title={copy.zoomIn} disabled={zoom >= MAX_ZOOM} onClick={() => setZoom((value) => nextZoom(value, ZOOM_STEP))}><ZoomIn size={16} /></button>
@@ -163,7 +190,7 @@ export function ReportWorkspace({ report, copy }: { report: ResearchReport; copy
       {exportState === "exporting" && <span className="report-loading" role="status">{copy.exportingReport}</span>}
       {exportState === "exported" && <span className="report-loading" role="status">{copy.exportedReport}</span>}
       {exportState === "failed" && <span className="report-loading error" role="alert">{copy.exportFailed}</span>}
-      <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedReport.markdown}</ReactMarkdown></div>
+      <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown></div>
     </article>
   );
 }
