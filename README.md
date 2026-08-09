@@ -26,7 +26,7 @@ reproducibility layer.
 > short-term signals, or promise investment returns.
 
 > [!NOTE]
-> **v1.0.4 is the current Windows release.** The Tauri + React workbench now
+> **v1.1.0 is the current Windows release.** The Tauri + React workbench now
 > runs real-company SEC research through the isolated Python research core. It
 > includes model configuration and discovery, research packs, reverse DCF,
 > two-model comparison, progress/cancellation, bilingual settings, report
