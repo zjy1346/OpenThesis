@@ -11,7 +11,7 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "1.1.0"
+$version = "1.2.3"
 
 $pythonPaths = @((Join-Path $projectRoot "src"))
 if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
@@ -54,6 +54,12 @@ try {
     }
     Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $portableRoot "OpenThesis.exe")
     Copy-Item -Path (Join-Path $sidecarBundle "*") -Destination $portableSidecar -Recurse
+    # PyInstaller hooks may copy third-party package SBOM directories containing
+    # public maintainer contact metadata. They are not required at runtime and
+    # would weaken the release archive's strict no-email privacy invariant.
+    Get-ChildItem -LiteralPath $portableSidecar -Directory -Recurse -Filter "sboms" |
+        Where-Object { $_.Parent.Name -like "*.dist-info" } |
+        Remove-Item -Recurse -Force
 
     $portableZip = Join-Path $output "OpenThesis-$version-windows-x64-portable.zip"
     Compress-Archive -LiteralPath $portableRoot -DestinationPath $portableZip -CompressionLevel Optimal -Force

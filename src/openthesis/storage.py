@@ -17,7 +17,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Storage:
@@ -57,6 +57,32 @@ class Storage:
                     name TEXT NOT NULL,
                     exchange_name TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS issuers (
+                    issuer_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    industry TEXT NOT NULL DEFAULT '',
+                    industry_support TEXT NOT NULL DEFAULT 'standard'
+                );
+
+                CREATE TABLE IF NOT EXISTS security_listings (
+                    security_id TEXT PRIMARY KEY,
+                    issuer_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    exchange_name TEXT NOT NULL,
+                    listing_currency TEXT NOT NULL,
+                    reporting_currency TEXT NOT NULL,
+                    accounting_standard TEXT NOT NULL,
+                    source_url TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(issuer_id) REFERENCES issuers(issuer_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_listings_issuer
+                ON security_listings(issuer_id);
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_market_symbol
+                ON security_listings(market, symbol);
 
                 CREATE TABLE IF NOT EXISTS filings (
                     document_id TEXT PRIMARY KEY,
@@ -149,6 +175,51 @@ class Storage:
         with self.connect() as db:
             db.execute(
                 """
+                INSERT INTO issuers(issuer_id, name, industry, industry_support)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(issuer_id) DO UPDATE SET
+                    name=excluded.name,
+                    industry=excluded.industry,
+                    industry_support=excluded.industry_support
+                """,
+                (
+                    company.issuer_id,
+                    company.name,
+                    company.industry,
+                    company.industry_support,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO security_listings(
+                    security_id, issuer_id, symbol, market, exchange_name,
+                    listing_currency, reporting_currency, accounting_standard,
+                    source_url
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(security_id) DO UPDATE SET
+                    issuer_id=excluded.issuer_id,
+                    symbol=excluded.symbol,
+                    market=excluded.market,
+                    exchange_name=excluded.exchange_name,
+                    listing_currency=excluded.listing_currency,
+                    reporting_currency=excluded.reporting_currency,
+                    accounting_standard=excluded.accounting_standard,
+                    source_url=excluded.source_url
+                """,
+                (
+                    company.security_id,
+                    company.issuer_id,
+                    company.ticker,
+                    company.market,
+                    company.exchange,
+                    company.listing_currency,
+                    company.reporting_currency,
+                    company.accounting_standard,
+                    company.source_url,
+                ),
+            )
+            db.execute(
+                """
                 INSERT INTO companies(cik, ticker, name, exchange_name)
                 VALUES(?, ?, ?, ?)
                 ON CONFLICT(cik) DO UPDATE SET
@@ -158,6 +229,19 @@ class Storage:
                 """,
                 (company.cik, company.ticker, company.name, company.exchange),
             )
+
+    def get_security_listing(self, security_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT l.*, i.name, i.industry, i.industry_support
+                FROM security_listings l
+                JOIN issuers i ON i.issuer_id = l.issuer_id
+                WHERE l.security_id = ?
+                """,
+                (security_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def save_filings(self, filings: list[FilingDocument]) -> None:
         with self.connect() as db:
@@ -190,35 +274,56 @@ class Storage:
 
     def save_facts(self, facts: list[FinancialFact]) -> None:
         with self.connect() as db:
-            db.executemany(
-                """
-                INSERT OR REPLACE INTO financial_facts(
-                    fact_id, company_cik, concept, reported_concept, value,
-                    unit, fiscal_year, fiscal_period, form_type, start_date,
-                    end_date, filed_at, accession_number, source_url, scope
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        fact.fact_id,
-                        fact.company_cik,
-                        fact.concept,
-                        fact.reported_concept,
-                        fact.value,
-                        fact.unit,
-                        fact.fiscal_year,
-                        fact.fiscal_period,
-                        fact.form_type,
-                        fact.start_date,
-                        fact.end_date,
-                        fact.filed_at,
-                        fact.accession_number,
-                        fact.source_url,
-                        fact.scope,
-                    )
-                    for fact in facts
-                ],
-            )
+            self._insert_facts(db, facts)
+
+    def replace_facts_for_filings(
+        self,
+        company_cik: str,
+        accession_numbers: list[str],
+        facts: list[FinancialFact],
+    ) -> None:
+        """Atomically replace parser output so stale facts cannot survive a reparse."""
+
+        unique_accessions = sorted({item for item in accession_numbers if item})
+        with self.connect() as db:
+            for accession_number in unique_accessions:
+                db.execute(
+                    "DELETE FROM financial_facts WHERE company_cik = ? AND accession_number = ?",
+                    (company_cik, accession_number),
+                )
+            self._insert_facts(db, facts)
+
+    @staticmethod
+    def _insert_facts(db: sqlite3.Connection, facts: list[FinancialFact]) -> None:
+        db.executemany(
+            """
+            INSERT OR REPLACE INTO financial_facts(
+                fact_id, company_cik, concept, reported_concept, value,
+                unit, fiscal_year, fiscal_period, form_type, start_date,
+                end_date, filed_at, accession_number, source_url, scope
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    fact.fact_id,
+                    fact.company_cik,
+                    fact.concept,
+                    fact.reported_concept,
+                    fact.value,
+                    fact.unit,
+                    fact.fiscal_year,
+                    fact.fiscal_period,
+                    fact.form_type,
+                    fact.start_date,
+                    fact.end_date,
+                    fact.filed_at,
+                    fact.accession_number,
+                    fact.source_url,
+                    fact.scope,
+                )
+                for fact in facts
+            ],
+        )
 
     def get_facts(self, cik: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -336,6 +441,30 @@ class Storage:
                 (run_id,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete one finished research record without deleting shared company data."""
+
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT status FROM research_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if row["status"] in {RunStatus.CREATED.value, RunStatus.RUNNING.value}:
+                raise ValueError("an active research run cannot be deleted")
+            db.execute(
+                "UPDATE thesis_versions SET run_id = NULL WHERE run_id = ? AND created_by = 'user'",
+                (run_id,),
+            )
+            db.execute(
+                "DELETE FROM thesis_versions WHERE run_id = ?",
+                (run_id,),
+            )
+            db.execute("DELETE FROM artifacts WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM research_runs WHERE run_id = ?", (run_id,))
+        return True
 
     def get_artifacts(self, run_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:

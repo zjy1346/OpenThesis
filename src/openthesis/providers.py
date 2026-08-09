@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -81,6 +82,12 @@ def _post_json(
 
 def _parse_model_json(text: str) -> dict[str, Any]:
     text = text.strip()
+    if not text:
+        return {
+            "narrative": "",
+            "structured_output_valid": False,
+            "_response_error": "empty_content",
+        }
     if text.startswith("```"):
         first_newline = text.find("\n")
         text = text[first_newline + 1 :] if first_newline >= 0 else text
@@ -170,8 +177,17 @@ class OpenAICompatibleProvider:
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise ProviderError(f"无法解析模型响应：{response}") from exc
-        return _parse_model_json(str(content))
+            raise ProviderError("模型响应缺少可用的 message.content") from exc
+        parsed = _parse_model_json(str(content or ""))
+        choice = response.get("choices", [{}])[0]
+        parsed["_response_meta"] = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "endpoint_host": urllib.parse.urlparse(self.base_url).hostname or "",
+            "finish_reason": choice.get("finish_reason") if isinstance(choice, dict) else None,
+            "content_length": len(str(content or "")),
+        }
+        return parsed
 
 
 class OllamaProvider:
@@ -213,8 +229,16 @@ class OllamaProvider:
         try:
             content = response["message"]["content"]
         except (KeyError, TypeError) as exc:
-            raise ProviderError(f"无法解析 Ollama 响应：{response}") from exc
-        return _parse_model_json(str(content))
+            raise ProviderError("Ollama 响应缺少可用的 message.content") from exc
+        parsed = _parse_model_json(str(content or ""))
+        parsed["_response_meta"] = {
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "endpoint_host": urllib.parse.urlparse(self.base_url).hostname or "",
+            "finish_reason": response.get("done_reason"),
+            "content_length": len(str(content or "")),
+        }
+        return parsed
 
 
 def create_provider(config: ModelConfig) -> ModelProvider | None:

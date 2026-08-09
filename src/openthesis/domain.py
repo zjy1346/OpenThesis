@@ -35,6 +35,19 @@ class Company:
     ticker: str
     name: str
     exchange: str = ""
+    issuer_id: str = ""
+    market: str = "US"
+    security_id: str = ""
+    listing_currency: str = "USD"
+    reporting_currency: str = "USD"
+    accounting_standard: str = "US_GAAP"
+    industry: str = ""
+    industry_support: str = "standard"
+    source_url: str = ""
+
+    def __post_init__(self) -> None:
+        self.issuer_id = self.issuer_id or self.cik
+        self.security_id = self.security_id or self.cik
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -183,6 +196,7 @@ class ResearchRun:
     completed_at: str | None = None
     errors: list[str] = field(default_factory=list)
     report_language: str = "zh-CN"
+    market_snapshot: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

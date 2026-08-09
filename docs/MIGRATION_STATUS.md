@@ -41,6 +41,17 @@ contract, unit, or smoke test unless explicitly marked as manual.
 - [x] Legacy behavior parity and intentional retirements are documented in
   `docs/LEGACY_PARITY.md`.
 
+## Completed in `1.2.0`
+
+- [x] One platform-neutral market Interface routes US, China A-share, and Hong
+  Kong company search without placing exchange logic in the React workbench.
+- [x] Issuers and listed securities have separate persisted identities, with
+  SSE, SZSE, BSE, and HKEX adapters behind the same research seam.
+- [x] CNInfo and HKEXnews official reports normalize conservative PDF facts with
+  page evidence, currency, accounting standard, and explicit missing-data behavior.
+- [x] Manual market snapshots are dated and source-labelled; Financials Beta and
+  cross-currency valuation guards are enforced by the research core.
+
 ## Remaining for the Windows release line
 
 - [ ] Verify accessibility and high-DPI behavior manually on supported Windows

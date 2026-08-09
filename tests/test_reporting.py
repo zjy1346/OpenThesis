@@ -111,6 +111,46 @@ class ReportingTests(unittest.TestCase):
         report = render_research_run("run-fallback", [], "unknown")
         self.assertIn("长期公司研究", report)
 
+    def test_markdown_nontechnical_projection_hides_internal_ids(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "research-report",
+                "title": "完整长期研究报告",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {
+                    "report": {
+                        "counterarguments": [
+                            {
+                                "argument": "反方论点正文",
+                                "target_opportunity_ids": ["growth-1"],
+                                "evidence_ids": ["fact:market:hidden"],
+                            }
+                        ],
+                        "claims": [
+                            {
+                                "text": "主要结论正文",
+                                "kind": "inference",
+                                "evidence_ids": ["filing:hidden"],
+                            }
+                        ],
+                    },
+                    "verification": {"passed": True},
+                },
+            }
+        ]
+
+        report = render_research_run("run-clean", artifacts, include_technical=False)
+
+        self.assertIn("反方论点正文", report)
+        self.assertIn("主要结论正文", report)
+        self.assertNotIn("target opportunity ids", report.casefold())
+        self.assertNotIn("evidence ids", report.casefold())
+        self.assertNotIn("fact:market:", report)
+        self.assertNotIn("filing:hidden", report)
+        self.assertNotIn("类型：** inference", report)
+        self.assertIn("类型：** 推论", report)
+
     def test_growth_fields_are_localized_and_ids_hidden_by_default(self) -> None:
         artifacts = [
             {

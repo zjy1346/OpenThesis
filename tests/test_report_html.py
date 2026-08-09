@@ -102,6 +102,46 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("fact:risk", report)
         self.assertIn("技术详情", report)
 
+    def test_nontechnical_report_recursively_hides_internal_protocol_fields(self) -> None:
+        artifacts = sample_artifacts()
+        artifacts[-1]["content"]["report"].update(
+            {
+                "counterarguments": [
+                    {
+                        "argument": "资本回报仍需验证。",
+                        "target_opportunity_ids": ["growth-1"],
+                        "confidence": 0.9,
+                        "evidence_ids": ["fact:market:secret"],
+                    }
+                ],
+                "scenarios": {
+                    "base": {
+                        "assumptions": ["需求保持稳定。"],
+                        "evidence_ids": ["filing:secret"],
+                    }
+                },
+                "claims": [
+                    {
+                        "text": "盈利能力承压。",
+                        "kind": "inference",
+                        "evidence_ids": ["fact:market:claim"],
+                    }
+                ],
+            }
+        )
+
+        report = render_research_html("run-clean", artifacts, include_technical=False)
+
+        self.assertIn("资本回报仍需验证", report)
+        self.assertIn("需求保持稳定", report)
+        self.assertIn("盈利能力承压", report)
+        self.assertNotIn("target_opportunity_ids", report)
+        self.assertNotIn("evidence_ids", report)
+        self.assertNotIn("fact:market:", report)
+        self.assertNotIn("filing:secret", report)
+        self.assertNotIn(">inference<", report)
+        self.assertIn("推论", report)
+
     def test_english_and_html_escaping(self) -> None:
         artifacts = sample_artifacts()
         artifacts[1]["content"]["opportunities"][0]["title"] = "<unsafe>"

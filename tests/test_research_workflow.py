@@ -9,6 +9,7 @@ from pathlib import Path
 from openthesis.demo import DEMO_COMPANY, demo_facts
 from openthesis.domain import FinancialFact, RunStatus
 from openthesis.packs import builtin_pack
+from openthesis.markets import build_company
 from openthesis.providers import ModelConfig
 from openthesis.research import ResearchCancelled, ResearchWorkflow
 from openthesis.storage import Storage
@@ -29,6 +30,58 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertEqual(len(artifacts), 2)
             self.assertEqual(artifacts[-1]["artifact_type"], "research-report")
 
+    def test_financial_beta_skips_standard_reverse_dcf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("600036.SH", "招商银行")
+            storage.save_company(company)
+            config = ModelConfig(provider="none", model="", base_url="")
+            workflow = ResearchWorkflow(storage, builtin_pack(), None, config)
+
+            run = workflow.run(
+                company,
+                demo_facts(),
+                valuation_inputs={"market_cap": 1_000_000_000, "discount_rate": 0.1, "terminal_growth": 0.03},
+                market_snapshot={"source": "manual", "market_cap": 1_000_000_000, "currency": "CNY", "as_of": "2026-08-09"},
+            )
+
+            valuation = next(
+                item for item in storage.get_artifacts(run.run_id)
+                if item["artifact_type"] == "deterministic-valuation"
+            )
+            self.assertEqual(valuation["content"]["status"], "not_applicable")
+            self.assertEqual(company.industry_support, "financial_beta")
+
+    def test_currency_mismatch_is_not_silently_valued(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company(
+                "00700.HK",
+                "Tencent",
+                reporting_currency="CNY",
+                accounting_standard="IFRS",
+            )
+            storage.save_company(company)
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                None,
+                ModelConfig(provider="none", model="", base_url=""),
+            )
+
+            run = workflow.run(
+                company,
+                demo_facts(),
+                valuation_inputs={"market_cap": 1_000_000_000, "discount_rate": 0.1, "terminal_growth": 0.03},
+                market_snapshot={"source": "manual", "market_cap": 1_000_000_000, "currency": "HKD", "as_of": "2026-08-09"},
+            )
+
+            valuation = next(
+                item for item in storage.get_artifacts(run.run_id)
+                if item["artifact_type"] == "deterministic-valuation"
+            )
+            self.assertEqual(valuation["content"]["status"], "currency_mismatch")
+
     def test_multi_agent_workflow_with_fake_provider(self) -> None:
         class FakeProvider:
             def __init__(self) -> None:
@@ -46,6 +99,16 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 self.assertions(system_prompt, user_prompt, json_mode)
                 return {
                     "executive_summary": "Synthetic verified research.",
+                    "business_model": "Synthetic business model.",
+                    "financial_quality": "Synthetic financial quality.",
+                    "competitive_position": "Synthetic competitive position.",
+                    "growth_opportunities": ["Synthetic opportunity."],
+                    "counterarguments": ["Synthetic counterargument."],
+                    "scenarios": ["Synthetic scenario."],
+                    "thesis": "Synthetic thesis.",
+                    "invalidation_conditions": ["Synthetic invalidation condition."],
+                    "leading_indicators": ["Synthetic leading indicator."],
+                    "unresolved_questions": ["Synthetic unresolved question."],
                     "claims": [
                         {
                             "text": "The supplied data needs further interpretation.",
@@ -92,6 +155,99 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertEqual(len(artifacts), 10)
             theses = storage.list_thesis_versions(DEMO_COMPANY.cik)
             self.assertEqual(len(theses), 1)
+
+    def test_empty_final_synthesis_is_partial_and_preserves_stage_outputs(self) -> None:
+        class EmptyFinalProvider:
+            def __init__(self) -> None:
+                self.count = 0
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, _system_prompt: str, _user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                self.count += 1
+                if self.count == 7:
+                    return {
+                        "narrative": "",
+                        "structured_output_valid": False,
+                        "_response_error": "empty_content",
+                    }
+                if self.count == 8:
+                    return {
+                        "executive_summary": "Recovered synthesis.",
+                        "business_model": "Business model.",
+                        "financial_quality": "Financial quality.",
+                        "competitive_position": "Competitive position.",
+                        "growth_opportunities": ["Opportunity."],
+                        "counterarguments": ["Counterargument."],
+                        "scenarios": ["Scenario."],
+                        "thesis": "Thesis.",
+                        "invalidation_conditions": ["Invalidation."],
+                        "leading_indicators": ["Indicator."],
+                        "unresolved_questions": ["Question."],
+                        "claims": [
+                            {
+                                "text": "Recovered inference",
+                                "kind": "inference",
+                                "evidence_ids": [],
+                            }
+                        ],
+                    }
+                return {
+                    "analysis": f"stage {self.count}",
+                    "claims": [
+                        {
+                            "text": "stage inference",
+                            "kind": "inference",
+                            "evidence_ids": [],
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = EmptyFinalProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(
+                    provider="openai-compatible",
+                    model="fake",
+                    base_url="https://example.test/v1",
+                ),
+            )
+
+            run = workflow.run(DEMO_COMPANY, demo_facts())
+
+            self.assertEqual(run.status, RunStatus.PARTIAL)
+            report = next(
+                item
+                for item in storage.get_artifacts(run.run_id)
+                if item["artifact_type"] == "research-report"
+            )
+            self.assertEqual(report["content"]["mode"], "staged-fallback")
+            self.assertTrue(report["content"]["retryable"])
+            self.assertIn("business_model", report["content"]["report"])
+            self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
+
+            retried = workflow.retry_synthesis(
+                run,
+                storage.get_artifacts(run.run_id),
+                demo_facts(),
+            )
+            self.assertEqual(provider.count, 8, "retry must make exactly one model call")
+            self.assertEqual(retried.status, RunStatus.COMPLETED)
+            retried_report = next(
+                item
+                for item in reversed(storage.get_artifacts(run.run_id))
+                if item["artifact_type"] == "research-report"
+            )
+            self.assertEqual(retried_report["content"]["mode"], "synthesized")
+            self.assertFalse(retried_report["content"]["retryable"])
 
     def test_failed_provider_persists_failed_run(self) -> None:
         class FailingProvider:

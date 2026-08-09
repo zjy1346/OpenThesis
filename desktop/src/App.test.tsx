@@ -8,6 +8,7 @@ import {
   exportResearchReport,
   installResearchPack,
   openExternalUrl,
+  searchCompanies,
   testModelConnection,
   getResearchReport,
   getResearchStatus,
@@ -17,6 +18,7 @@ import {
 
 vi.mock("./backend", () => ({
   bootstrapBackend: vi.fn(),
+  deleteResearchRun: vi.fn(),
   getResearchReport: vi.fn(),
   getThesis: vi.fn(),
   listTheses: vi.fn(),
@@ -38,17 +40,24 @@ describe("report-first workbench", () => {
     vi.clearAllMocks();
     vi.mocked(bootstrapBackend).mockResolvedValue({
       contract_version: "1.0",
-      app_version: "1.1.0",
+      app_version: "1.2.0",
       capabilities: [],
       preferences: {
         ui_language: "en",
         report_language: "zh-CN",
         sidebar_collapsed: "true",
         parallel_agents: "false",
+        research_market: "US",
       },
       recent_runs: [],
       common_companies: [
         { cik: "0000320193", ticker: "AAPL", name: "Apple Inc.", exchange: "Nasdaq" },
+        { cik: "CN_A:BSE:832982.BJ", ticker: "832982.BJ", name: "Jinbo Bio", exchange: "BSE", market: "CN_A", listing_currency: "CNY" },
+      ],
+      market_catalog: [
+        { market: "US", label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: "https://www.sec.gov/edgar/search/" },
+        { market: "CN_A", label_zh: "A 股", label_en: "China A-shares", exchanges: ["SSE", "SZSE", "BSE"], default_currency: "CNY", requires_sec_identity: false, disclosure_home: "https://www.cninfo.com.cn/new/index" },
+        { market: "HK", label_zh: "港股", label_en: "Hong Kong equities", exchanges: ["HKEX"], default_currency: "HKD", requires_sec_identity: false, disclosure_home: "https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh" },
       ],
       model_catalog: [
         {
@@ -135,6 +144,61 @@ describe("report-first workbench", () => {
     expect(screen.getByRole("heading", { name: "Help" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Start a company research run" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Write your own research pack" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Research A-shares, BSE, and Hong Kong listings" })).toBeVisible();
+  });
+
+  it("searches BSE without requiring an SEC email", async () => {
+    vi.mocked(searchCompanies).mockResolvedValue([
+      { cik: "CN_A:BSE:832982.BJ", ticker: "832982.BJ", name: "Jinbo Bio", exchange: "BSE", market: "CN_A", listing_currency: "CNY" },
+    ]);
+    vi.mocked(updatePreferences).mockImplementation(async (value) => ({
+      ui_language: "en",
+      report_language: "zh-CN",
+      sidebar_collapsed: "true",
+      parallel_agents: "false",
+      research_market: "CN_A",
+      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)])),
+    }));
+    render(<App />);
+
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    fireEvent.change(screen.getByLabelText("Listing market"), { target: { value: "CN_A" } });
+    expect(screen.queryByLabelText("SEC contact email")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Search ticker or company name"), { target: { value: "832982" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search companies" }));
+
+    await waitFor(() => expect(searchCompanies).toHaveBeenCalledWith("832982", "CN_A"));
+    expect(await screen.findByText("Jinbo Bio")).toBeVisible();
+    expect(screen.getByLabelText("Listing market").closest(".market-source-row")).not.toBeNull();
+  });
+
+  it("shows classified no-filing actions without exposing technical errors", async () => {
+    vi.mocked(startResearch).mockResolvedValue({
+      job_id: "job-no-filings",
+      state: "queued",
+      message: "",
+      percent: 0,
+      run_id: null,
+    });
+    vi.mocked(getResearchStatus).mockResolvedValue({
+      job_id: "job-no-filings",
+      state: "failed",
+      message: "The official disclosure platform does not currently provide a usable financial report for this company.",
+      percent: 5,
+      run_id: null,
+      error_code: "NO_FILINGS_AVAILABLE",
+      market: "CN_A",
+      disclosure_url: "https://www.cninfo.com.cn/new/index",
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+
+    expect(await screen.findByText(/does not currently provide a usable financial report/, {}, { timeout: 2000 })).toBeVisible();
+    expect(screen.queryByText(/NoneType/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try fetching again" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Open official disclosure platform" }));
+    expect(openExternalUrl).toHaveBeenCalledWith("https://www.cninfo.com.cn/new/index");
   });
 
   it("saves interface and report languages independently", async () => {
@@ -200,6 +264,7 @@ describe("report-first workbench", () => {
     await waitFor(() => {
       expect(getResearchReport).toHaveBeenLastCalledWith("run-1", "zh-CN", true);
     });
+    expect(screen.getByRole("button", { name: "Hide technical details" })).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "Enter focus mode" }));
     expect(reportDocument).toHaveAttribute("data-focus", "focused");
@@ -314,7 +379,7 @@ describe("report-first workbench", () => {
     fireEvent.click(await screen.findByRole("button", { name: "About OpenThesis" }));
 
     expect(screen.getByRole("heading", { name: "About OpenThesis", level: 1 })).toBeVisible();
-    expect(screen.getByText("1.1.0")).toBeVisible();
+    expect(screen.getByText("1.2.0")).toBeVisible();
     expect(screen.getByText("JSON-RPC 1.0")).toBeVisible();
   });
 

@@ -11,6 +11,7 @@ import {
 import type {
   BootstrapResult,
   Company,
+  Market,
   ModelPreset,
   ModelSelection,
   Preferences,
@@ -21,6 +22,11 @@ import type {
 type ResearchCopy = {
   setupTitle: string;
   setupBody: string;
+  market: string;
+  usMarket: string;
+  aShareMarket: string;
+  hkMarket: string;
+  officialDisclosure: string;
   selectedCompany: string;
   secProfile: string;
   secHelp: string;
@@ -50,6 +56,11 @@ type ResearchCopy = {
   packFailed: string;
   advancedValuation: string;
   marketCap: string;
+  manualPrice: string;
+  manualCurrency: string;
+  manualAsOf: string;
+  manualDataHint: string;
+  financeBeta: string;
   discountRate: string;
   terminalGrowth: string;
   launchResearch: string;
@@ -80,6 +91,7 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
 }) {
   const [profile, setProfile] = useState(bootstrap.preferences.sec_contact_profile || "personal");
   const [email, setEmail] = useState(bootstrap.preferences.sec_contact_email || "");
+  const [market, setMarket] = useState<Market>(bootstrap.preferences.research_market || "US");
   const [query, setQuery] = useState("");
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<Company[]>([]);
@@ -96,19 +108,38 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   const [packs, setPacks] = useState<ResearchPackSummary[]>(bootstrap.research_packs);
   const [packMessage, setPackMessage] = useState("");
   const [marketCap, setMarketCap] = useState("");
+  const [marketPrice, setMarketPrice] = useState("");
+  const [marketCurrency, setMarketCurrency] = useState("USD");
+  const [marketAsOf, setMarketAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [discountRate, setDiscountRate] = useState("10");
   const [terminalGrowth, setTerminalGrowth] = useState("3");
+  const marketCatalog = bootstrap.market_catalog ?? [
+    { market: "US" as const, label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: SEC_DEVELOPER_DOCS },
+  ];
+  const marketProfile = marketCatalog.find((item) => item.market === market);
+  const requiresSecIdentity = marketProfile?.requires_sec_identity ?? market === "US";
+
+  const chooseMarket = (next: Market) => {
+    setMarket(next);
+    setSelected(null);
+    setResults([]);
+    setSearchError("");
+    setMarketCurrency(marketCatalog.find((item) => item.market === next)?.default_currency ?? "USD");
+  };
 
   const findCompanies = async () => {
-    if (!email.includes("@")) {
+    if (requiresSecIdentity && !email.includes("@")) {
       setSearchError(copy.secRequired);
       return;
     }
     setSearching(true);
     setSearchError("");
     try {
-      await onSavePreferences({ sec_contact_profile: profile, sec_contact_email: email });
-      setResults(await searchCompanies(query));
+      await onSavePreferences({
+        research_market: market,
+        ...(requiresSecIdentity ? { sec_contact_profile: profile, sec_contact_email: email } : {}),
+      });
+      setResults(await searchCompanies(query, market));
     } catch (reason) {
       setSearchError(reason instanceof Error ? reason.message : copy.coreUnavailable);
     } finally {
@@ -117,7 +148,7 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   };
 
   const launch = async () => {
-    if (!selected || !email.includes("@")) {
+    if (!selected || (requiresSecIdentity && !email.includes("@"))) {
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
     }
@@ -125,6 +156,7 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
       sec_contact_profile: profile,
       sec_contact_email: email,
       parallel_agents: String(parallelAgents),
+      research_market: market,
     });
     await onStart({
       mode: "company",
@@ -139,6 +171,12 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
         market_cap_billions: Number(marketCap) || 0,
         discount_rate_percent: Number(discountRate) || 10,
         terminal_growth_percent: Number(terminalGrowth) || 3,
+      },
+      market_snapshot: {
+        price: Number(marketPrice) || 0,
+        market_cap_billions: Number(marketCap) || 0,
+        currency: marketCurrency,
+        as_of: marketAsOf,
       },
     });
   };
@@ -167,12 +205,28 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
     }
   };
 
+  const openDisclosureHome = async () => {
+    if (!marketProfile?.disclosure_home) return;
+    try {
+      await openExternalUrl(marketProfile.disclosure_home);
+    } catch {
+      setSearchError(copy.coreUnavailable);
+    }
+  };
+
   return (
     <div className="research-setup">
       <header className="setup-heading"><span className="eyebrow">OpenThesis</span><h2>{copy.setupTitle}</h2><p>{copy.setupBody}</p></header>
       <div className="setup-grid">
         <section className="setup-card">
           <span className="step-label">01</span><h3>{copy.selectedCompany}</h3>
+          <div className="market-source-row">
+            <label className="market-field"><span>{copy.market}</span><select value={market} onChange={(event) => chooseMarket(event.target.value as Market)}>
+              <option value="US">{copy.usMarket}</option><option value="CN_A">{copy.aShareMarket}</option><option value="HK">{copy.hkMarket}</option>
+            </select></label>
+            {marketProfile?.disclosure_home && <button className="disclosure-button" type="button" onClick={() => void openDisclosureHome()}><ExternalLink size={14} />{copy.officialDisclosure}</button>}
+          </div>
+          {requiresSecIdentity && <>
           <div className="field-grid two-column">
             <label>{copy.secProfile}<select value={profile} onChange={(event) => setProfile(event.target.value)}>
               <option value="personal">{copy.personal}</option><option value="independent">{copy.independent}</option><option value="organization">{copy.organization}</option>
@@ -184,12 +238,14 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
             <p>{copy.secHelpBody}</p>
             <button className="refresh-button" type="button" onClick={() => void openSecHelp()}><ExternalLink size={15} />{copy.openSecDocs}</button>
           </details>
+          </>}
           <div className="search-row"><input aria-label={copy.companySearch} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={copy.companySearch} />
             <button type="button" onClick={() => void findCompanies()} disabled={searching || !query.trim()}>{searching ? copy.searching : copy.searchAction}</button></div>
           <span className="field-caption">{copy.commonCompanies}</span>
-          <div className="company-chips">{bootstrap.common_companies.map((company) => <button key={company.cik} type="button" data-selected={selected?.cik === company.cik || undefined} onClick={() => setSelected(company)}>{company.ticker}</button>)}</div>
-          {results.length > 0 && <div className="company-results">{results.map((company) => <button key={company.cik} type="button" onClick={() => setSelected(company)}><Building2 size={16} /><span><strong>{company.ticker}</strong>{company.name}</span></button>)}</div>}
+          <div className="company-chips">{bootstrap.common_companies.filter((company) => (company.market ?? "US") === market).map((company) => <button key={company.security_id || company.cik} type="button" data-selected={selected?.cik === company.cik || undefined} onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}>{company.ticker}</button>)}</div>
+          {results.length > 0 && <div className="company-results">{results.map((company) => <button key={company.security_id || company.cik} type="button" onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}><Building2 size={16} /><span><strong>{company.ticker}</strong>{company.name}</span></button>)}</div>}
           {selected && <div className="selected-company"><Building2 size={18} /><span><strong>{selected.ticker}</strong>{selected.name}</span></div>}
+          {selected?.industry_support === "financial_beta" && <p className="provider-hint">{copy.financeBeta}</p>}
           {searchError && <p className="inline-error" role="alert">{searchError}</p>}
         </section>
 
@@ -210,7 +266,10 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
           </div>
           <label className="pack-import">{copy.importPack}<input type="file" accept=".othesis" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
-          <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><div className="field-grid three-column">
+          <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
+            <label>{copy.manualPrice}<input inputMode="decimal" value={marketPrice} onChange={(event) => setMarketPrice(event.target.value)} /></label>
+            <label>{copy.manualCurrency}<select value={marketCurrency} onChange={(event) => setMarketCurrency(event.target.value)}>{[marketProfile?.default_currency, selected?.listing_currency, selected?.reporting_currency, "USD", "CNY", "HKD"].filter((item, index, all): item is string => Boolean(item) && all.indexOf(item) === index).map((currency) => <option key={currency} value={currency}>{currency}</option>)}</select></label>
+            <label>{copy.manualAsOf}<input type="date" value={marketAsOf} onChange={(event) => setMarketAsOf(event.target.value)} /></label>
             <label>{copy.marketCap}<input inputMode="decimal" value={marketCap} onChange={(event) => setMarketCap(event.target.value)} /></label>
             <label>{copy.discountRate}<input inputMode="decimal" value={discountRate} onChange={(event) => setDiscountRate(event.target.value)} /></label>
             <label>{copy.terminalGrowth}<input inputMode="decimal" value={terminalGrowth} onChange={(event) => setTerminalGrowth(event.target.value)} /></label>

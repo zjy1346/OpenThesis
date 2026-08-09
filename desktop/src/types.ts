@@ -5,7 +5,8 @@ export type Preferences = {
   report_language: Language;
   sidebar_collapsed: string;
   parallel_agents: string;
-  [key: string]: string;
+  research_market?: Market;
+  [key: string]: string | undefined;
 };
 
 export type Company = {
@@ -13,6 +14,27 @@ export type Company = {
   ticker: string;
   name: string;
   exchange: string;
+  issuer_id?: string;
+  market?: Market;
+  security_id?: string;
+  listing_currency?: string;
+  reporting_currency?: string;
+  accounting_standard?: string;
+  industry?: string;
+  industry_support?: "standard" | "financial_beta";
+  source_url?: string;
+};
+
+export type Market = "US" | "CN_A" | "HK";
+
+export type MarketProfile = {
+  market: Market;
+  label_zh: string;
+  label_en: string;
+  exchanges: string[];
+  default_currency: string;
+  requires_sec_identity: boolean;
+  disclosure_home: string;
 };
 
 export type ModelPreset = {
@@ -57,6 +79,12 @@ export type ResearchRequest = {
     discount_rate_percent: number;
     terminal_growth_percent: number;
   };
+  market_snapshot?: {
+    price: number;
+    market_cap_billions: number;
+    currency: string;
+    as_of: string;
+  };
 };
 
 export type ResearchRunSummary = {
@@ -67,6 +95,10 @@ export type ResearchRunSummary = {
   started_at: string;
   completed_at: string | null;
   report_language: Language;
+  market?: Market;
+  exchange: string;
+  listing_currency?: string;
+  industry_support?: "standard" | "financial_beta";
 };
 
 export type BootstrapResult = {
@@ -76,6 +108,7 @@ export type BootstrapResult = {
   preferences: Preferences;
   recent_runs: ResearchRunSummary[];
   common_companies: Company[];
+  market_catalog?: MarketProfile[];
   model_catalog: ModelPreset[];
   research_packs: ResearchPackSummary[];
   interrupted_runs: number;
@@ -87,6 +120,12 @@ export type ResearchReport = {
   company_name: string;
   status: string;
   report_language: Language;
+  market?: Market;
+  exchange?: string;
+  listing_currency?: string;
+  industry_support?: "standard" | "financial_beta";
+  market_snapshot?: ResearchRequest["market_snapshot"] | null;
+  retryable_synthesis?: boolean;
   markdown: string;
   html: string;
 };
@@ -103,6 +142,9 @@ export type ResearchJob = {
   total_agents?: number;
   cancel_requested?: boolean;
   elapsed_seconds?: number;
+  error_code?: string | null;
+  market?: Market | null;
+  disclosure_url?: string | null;
 };
 
 export type ThesisVersion = {

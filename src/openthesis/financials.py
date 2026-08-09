@@ -47,6 +47,7 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         assets = values.get("assets")
         liabilities = values.get("liabilities")
         equity = values.get("equity")
+        reported_roe = values.get("reported_roe")
         free_cash_flow = (
             operating_cash_flow - capex
             if operating_cash_flow is not None and capex is not None
@@ -62,23 +63,30 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "cash_conversion": safe_divide(operating_cash_flow, net_income),
                 "free_cash_flow": free_cash_flow,
                 "debt_to_assets": safe_divide(liabilities, assets),
-                "return_on_equity": safe_divide(net_income, equity),
+                # Prefer the issuer's disclosed weighted-average ROE. The
+                # fallback uses ending attributable equity and is explicitly a
+                # less precise approximation when average equity is unavailable.
+                "return_on_equity": reported_roe if reported_roe is not None else safe_divide(net_income, equity),
             }
         )
     return results
 
 
-def format_money(value: float | None) -> str:
+def format_money(value: float | None, currency: str = "USD") -> str:
     if value is None:
         return "—"
+    prefix = {"USD": "$", "CNY": "¥", "HKD": "HK$"}.get(
+        str(currency).upper(),
+        f"{str(currency).upper()} ",
+    )
     absolute = abs(value)
     if absolute >= 1_000_000_000_000:
-        return f"${value / 1_000_000_000_000:,.2f}T"
+        return f"{prefix}{value / 1_000_000_000_000:,.2f}T"
     if absolute >= 1_000_000_000:
-        return f"${value / 1_000_000_000:,.2f}B"
+        return f"{prefix}{value / 1_000_000_000:,.2f}B"
     if absolute >= 1_000_000:
-        return f"${value / 1_000_000:,.2f}M"
-    return f"${value:,.0f}"
+        return f"{prefix}{value / 1_000_000:,.2f}M"
+    return f"{prefix}{value:,.0f}"
 
 
 def format_percent(value: float | None) -> str:
@@ -199,6 +207,7 @@ def deterministic_summary(
     company_name: str,
     metrics: list[dict[str, Any]],
     language: str = "zh-CN",
+    currency: str = "USD",
 ) -> str:
     english = normalize_language(language) == EN
     lines = (
@@ -239,12 +248,12 @@ def deterministic_summary(
         lines.append(
             "| {year} | {revenue} | {growth} | {op_margin} | {net_income} | {ocf} | {fcf} |".format(
                 year=row["year"],
-                revenue=format_money(row.get("revenue")),
+                revenue=format_money(row.get("revenue"), currency),
                 growth=format_percent(row.get("revenue_growth")),
                 op_margin=format_percent(row.get("operating_margin")),
-                net_income=format_money(row.get("net_income")),
-                ocf=format_money(row.get("operating_cash_flow")),
-                fcf=format_money(row.get("free_cash_flow")),
+                net_income=format_money(row.get("net_income"), currency),
+                ocf=format_money(row.get("operating_cash_flow"), currency),
+                fcf=format_money(row.get("free_cash_flow"), currency),
             )
         )
     latest = metrics[0]

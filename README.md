@@ -26,12 +26,12 @@ reproducibility layer.
 > short-term signals, or promise investment returns.
 
 > [!NOTE]
-> **v1.1.0 is the current Windows release.** The Tauri + React workbench now
-> runs real-company SEC research through the isolated Python research core. It
-> includes model configuration and discovery, research packs, reverse DCF,
-> two-model comparison, progress/cancellation, bilingual settings, report
-> history, native report export, provider help links, architecture diagnostics,
-> and append-only thesis management.
+> **v1.2.0 is the current Windows test release.** In addition to US SEC research,
+> OpenThesis now researches China A-shares on SSE, SZSE, and BSE, plus Hong Kong
+> listings on HKEX Main Board and GEM. It keeps issuer identity separate from
+> each listed security, reads official financial-report PDFs, accepts explicitly
+> dated manual market data, and treats banks, insurers, and securities firms as
+> Financials Beta.
 
 ## Why OpenThesis?
 
@@ -53,30 +53,30 @@ reproducibility layer.
 
 ```mermaid
 flowchart LR
-    A["SEC filings and XBRL"] --> B["Evidence extraction"]
+    A["SEC / CNInfo / HKEX filings"] --> B["Evidence extraction and normalization"]
     B --> C["Specialist research agents"]
     C --> D["Long-term scenarios and growth"]
     D --> E["Synthesis and verification"]
     E --> F["Versioned investment thesis"]
 ```
 
-## Highlights in v0.5.0
+## Highlights in v1.2.0
 
-- A modern HTML report reader replaces raw Markdown presentation, with aligned
-  financial tables, KPI cards, evidence callouts, and clean growth-opportunity
-  cards.
-- Growth opportunities now follow a validated schema with localized labels,
-  evidence grades, probability ranges, time horizons, and scenario eligibility.
-- Evidence and agent IDs are hidden by default and available through an opt-in
-  technical-details view.
-- Focus Reading expands the report over the application without resizing the
-  underlying interface. Windows-composited fade transitions avoid repeated HTML
-  reflow; `F11` enters or exits and `Esc` restores the normal view.
-- Report zoom supports 80%–160%, buttons, keyboard shortcuts, and Ctrl+wheel.
-- SEC XBRL fallback concepts fill missing fiscal years while preserving canonical
-  concept priority.
-- Reports export as standalone HTML, Markdown, or text.
-- Previous bilingual interface and report-language controls remain included.
+- Company search covers US equities, SSE, SZSE, BSE, and HKEX, including
+  `600519.SH`, `000001.SZ`, `832982.BJ`, and `00700.HK` symbol normalization.
+- A/H-share issuer identity and listed-security identity are stored separately,
+  so currency, exchange, and disclosure history do not become mixed.
+- Statutory financial reports are collected on demand from CNInfo and HKEXnews;
+  extracted values retain the official URL, report page, reporting currency,
+  accounting standard, and consolidated scope.
+- Live prices are not scraped. Users may enter price or market cap, currency, and
+  an as-of date. Those values are labelled as user-supplied in the report.
+- Financial institutions are supported as Beta for filing, business, risk,
+  growth, and scenario research. Standard free-cash-flow reverse DCF is disabled
+  for them, and cross-currency valuation is skipped unless currencies match.
+- Market-specific research instructions cover A-share ownership, subsidy,
+  pledge, audit, and regulatory risks, plus HKEX listing structure, connected
+  transactions, VIE exposure, accounting standards, and currency differences.
 
 See the consolidated architecture and product specification in
 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).

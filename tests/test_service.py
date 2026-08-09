@@ -13,6 +13,7 @@ from pathlib import Path
 from openthesis.demo import demo_facts
 from openthesis.domain import (
     Company,
+    FilingDocument,
     FinancialFact,
     ResearchArtifact,
     ResearchRun,
@@ -20,7 +21,9 @@ from openthesis.domain import (
     utc_now_iso,
 )
 from openthesis.model_catalog import ModelDiscoveryError
-from openthesis.service import AppService, PreferenceValidationError
+from openthesis.markets import build_company
+from openthesis.market_data import MarketDataError
+from openthesis.service import AppService, PreferenceValidationError, _market_snapshot
 
 
 class _FakeSecClient:
@@ -32,8 +35,20 @@ class _FakeSecClient:
             return []
         return [Company(cik="0000000001", ticker="ACME", name="Acme Corp")][:limit]
 
-    def list_annual_filings(self, _company: Company, limit: int = 5) -> list[object]:
-        return []
+    def list_annual_filings(self, company: Company, limit: int = 5) -> list[FilingDocument]:
+        return [
+            FilingDocument(
+                document_id="sec:test-10k",
+                company_cik=company.cik,
+                accession_number="test-10k",
+                form_type="10-K",
+                fiscal_period="FY",
+                period_end="2025-12-31",
+                filed_at="2026-02-01T00:00:00+00:00",
+                primary_document="annual25.htm",
+                source_url="https://www.sec.gov/Archives/test-10k/annual25.htm",
+            )
+        ][:limit]
 
     def get_company_facts(self, company: Company) -> list[FinancialFact]:
         return [
@@ -42,7 +57,137 @@ class _FakeSecClient:
         ]
 
 
+class _FakeMarketData:
+    def __init__(self):
+        self.calls: list[tuple[str, str, int]] = []
+
+    def resolve(self, query: str, market, *, limit: int = 15):
+        self.calls.append((query, market.value, limit))
+        return [build_company("832982.BJ", "Jinbo Bio")]
+
+
+class _ResearchMarketData:
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def adapter_for(self, _company: Company):
+        return self.adapter
+
+
 class AppServiceTests(unittest.TestCase):
+    def test_delete_research_run_removes_only_the_requested_finished_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.storage.save_company(build_company("688981.SH", "SMIC"))
+            company = build_company("688981.SH", "SMIC")
+            service.storage.save_run(
+                ResearchRun(
+                    run_id="run-delete-service",
+                    company=company,
+                    workflow_id="test",
+                    research_pack_id="test",
+                    research_pack_version="1",
+                    provider_id="none",
+                    model_id="",
+                    data_as_of="2026-08-09T00:00:00+00:00",
+                    status=RunStatus.FAILED,
+                    completed_at=utc_now_iso(),
+                )
+            )
+
+            self.assertEqual(
+                service.delete_research_run("run-delete-service"),
+                {"run_id": "run-delete-service", "deleted": True},
+            )
+            self.assertEqual(service.list_research_runs(), [])
+
+    def test_verified_no_filings_stops_before_model_provider_creation(self) -> None:
+        class NoFilingsAdapter:
+            def list_financial_filings(self, _company: Company, *, limit: int = 5):
+                return []
+
+        provider_calls: list[str] = []
+
+        def provider_factory(config):
+            provider_calls.append(config.public_id)
+            raise AssertionError("model provider must not be created without a financial report")
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory),
+                market_data=_ResearchMarketData(NoFilingsAdapter()),
+                provider_factory=provider_factory,
+            )
+            company = build_company("688825.SH", "长鑫科技")
+            started = service.start_research(
+                {
+                    "mode": "company",
+                    "company": company.to_dict(),
+                    "download_filings": True,
+                    "model": {
+                        "preset_id": "custom",
+                        "model": "test-model",
+                        "base_url": "https://example.test/v1",
+                        "api_key": "session-only",
+                    },
+                }
+            )
+
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline, "no-filings research timed out")
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_code"], "NO_FILINGS_AVAILABLE")
+            self.assertEqual(status["market"], "CN_A")
+            self.assertEqual(status["disclosure_url"], "https://www.cninfo.com.cn/new/index")
+            self.assertNotIn("不代表", status["message"])
+            self.assertEqual(provider_calls, [])
+
+    def test_unverified_official_response_is_distinct_and_skips_model(self) -> None:
+        class UnverifiedAdapter:
+            def list_financial_filings(self, _company: Company, *, limit: int = 5):
+                raise MarketDataError(
+                    "ambiguous response",
+                    code="FILING_STATUS_UNVERIFIED",
+                )
+
+        provider_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory),
+                market_data=_ResearchMarketData(UnverifiedAdapter()),
+                provider_factory=lambda config: provider_calls.append(config.public_id),
+            )
+            company = build_company("688825.SH", "长鑫科技")
+            started = service.start_research(
+                {
+                    "mode": "company",
+                    "company": company.to_dict(),
+                    "model": {
+                        "preset_id": "custom",
+                        "model": "test-model",
+                        "base_url": "https://example.test/v1",
+                        "api_key": "session-only",
+                    },
+                }
+            )
+
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline, "unverified research timed out")
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_code"], "FILING_STATUS_UNVERIFIED")
+            self.assertNotIn("ambiguous response", status["message"])
+            self.assertEqual(provider_calls, [])
+
     def test_bootstrap_exposes_stable_contract_and_safe_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory), app_version="1.0.0-alpha.1")
@@ -55,6 +200,11 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(result["preferences"]["report_language"], "zh-CN")
             self.assertEqual(result["preferences"]["parallel_agents"], "false")
             self.assertEqual(result["recent_runs"], [])
+            self.assertEqual(
+                {item["market"] for item in result["market_catalog"]},
+                {"US", "CN_A", "HK"},
+            )
+            self.assertTrue(any(item["exchange"] == "BSE" for item in result["common_companies"]))
 
     def test_preferences_persist_only_allowlisted_non_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +414,36 @@ class AppServiceTests(unittest.TestCase):
             matches = service.search_companies("acme")
 
             self.assertEqual(matches[0]["ticker"], "ACME")
+
+    def test_a_share_search_does_not_require_sec_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            market_data = _FakeMarketData()
+            service = AppService(Path(directory), market_data=market_data)
+
+            matches = service.search_companies("832982", market="CN_A")
+
+            self.assertEqual(matches[0]["ticker"], "832982.BJ")
+            self.assertEqual(matches[0]["listing_currency"], "CNY")
+            self.assertEqual(market_data.calls, [("832982", "CN_A", 15)])
+
+    def test_manual_market_snapshot_is_explicit_and_currency_aware(self) -> None:
+        company = build_company("00700.HK", "Tencent")
+
+        snapshot = _market_snapshot(
+            {
+                "price": 555.5,
+                "market_cap_billions": 5_200,
+                "currency": "HKD",
+                "as_of": "2026-08-09",
+            },
+            company,
+        )
+
+        self.assertEqual(snapshot["source"], "manual")
+        self.assertEqual(snapshot["market_cap"], 5_200_000_000_000)
+        self.assertEqual(snapshot["currency"], "HKD")
+        with self.assertRaisesRegex(ValueError, "as-of date"):
+            _market_snapshot({"price": 1}, company)
 
     def test_model_discovery_merges_recommendations_without_retaining_key(self) -> None:
         seen: dict[str, str] = {}

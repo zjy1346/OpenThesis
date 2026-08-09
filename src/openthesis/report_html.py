@@ -11,6 +11,7 @@ from .growth import (
     scenario_label,
 )
 from .i18n import EN, normalize_language
+from .report_projection import project_report_value, report_display_value, report_field_label
 from .reporting import (
     ARTIFACT_LABELS,
     SECTION_LABELS_EN,
@@ -280,6 +281,9 @@ def _metric_cell(label: str, value: str) -> str:
 def _financial_section(
     metrics: object,
     language: str,
+    currency: str = "USD",
+    market_snapshot: object = None,
+    industry_support: str = "standard",
 ) -> str:
     english = language == EN
     rows = metrics if isinstance(metrics, list) else []
@@ -293,10 +297,10 @@ def _financial_section(
     latest = rows[0] if isinstance(rows[0], dict) else {}
     kpis = (
         (
-            ("营业收入", "Revenue", format_money(latest.get("revenue"))),
+            ("营业收入", "Revenue", format_money(latest.get("revenue"), currency)),
             ("营业利润率", "Operating margin", format_percent(latest.get("operating_margin"))),
-            ("净利润", "Net income", format_money(latest.get("net_income"))),
-            ("自由现金流", "Free cash flow", format_money(latest.get("free_cash_flow"))),
+            ("净利润", "Net income", format_money(latest.get("net_income"), currency)),
+            ("自由现金流", "Free cash flow", format_money(latest.get("free_cash_flow"), currency)),
         )
     )
     kpi_html = "<table class=\"kpi-table\"><tr>" + "".join(
@@ -335,12 +339,12 @@ def _financial_section(
             continue
         values = (
             str(row.get("year", "—")),
-            format_money(row.get("revenue")),
+            format_money(row.get("revenue"), currency),
             format_percent(row.get("revenue_growth")),
             format_percent(row.get("operating_margin")),
-            format_money(row.get("net_income")),
-            format_money(row.get("operating_cash_flow")),
-            format_money(row.get("free_cash_flow")),
+            format_money(row.get("net_income"), currency),
+            format_money(row.get("operating_cash_flow"), currency),
+            format_money(row.get("free_cash_flow"), currency),
         )
         table += "<tr>" + "".join(
             f"<td class=\"{'missing' if value == '—' else ''}\">{_escape(value)}</td>"
@@ -374,9 +378,49 @@ def _financial_section(
             )
             + "</div>"
         )
+    snapshot_note = ""
+    if isinstance(market_snapshot, dict):
+        snapshot_currency = str(market_snapshot.get("currency", currency))
+        values = []
+        if isinstance(market_snapshot.get("price"), (int, float)):
+            values.append(
+                _pick(language, "手动价格", "Manual price")
+                + ": "
+                + format_money(float(market_snapshot["price"]), snapshot_currency)
+            )
+        if isinstance(market_snapshot.get("market_cap"), (int, float)):
+            values.append(
+                _pick(language, "手动市值", "Manual market cap")
+                + ": "
+                + format_money(float(market_snapshot["market_cap"]), snapshot_currency)
+            )
+        if values:
+            snapshot_note = (
+                "<div class=\"callout\">"
+                + _escape(" · ".join(values))
+                + "<br>"
+                + _escape(
+                    _pick(language, "来源：用户手动输入", "Source: user-supplied")
+                    + f" · {market_snapshot.get('as_of', '—')}"
+                )
+                + "</div>"
+            )
+    beta_note = ""
+    if industry_support == "financial_beta":
+        beta_note = (
+            "<div class=\"callout callout-warning\">"
+            + _escape(
+                _pick(
+                    language,
+                    "金融机构研究为 Beta，标准自由现金流反向 DCF 不适用。",
+                    "Financial-institution research is Beta; standard free-cash-flow reverse DCF is not applicable.",
+                )
+            )
+            + "</div>"
+        )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        kpi_html + table + note,
+        snapshot_note + beta_note + kpi_html + table + note,
         section_id="financials",
     )
 
@@ -386,14 +430,15 @@ def _valuation_section(value: object, language: str) -> str:
         return ""
     english = language == EN
     if value.get("status") == "ok":
+        currency = str(value.get("currency", "USD"))
         items = (
             (
                 "Current market-cap input",
-                f"${value['market_cap'] / 1_000_000_000:,.2f}B",
+                format_money(value["market_cap"], currency),
             ),
             (
                 "Latest free cash flow",
-                f"${value['base_free_cash_flow'] / 1_000_000_000:,.2f}B",
+                format_money(value["base_free_cash_flow"], currency),
             ),
             (
                 "Five-year implied FCF growth",
@@ -402,8 +447,8 @@ def _valuation_section(value: object, language: str) -> str:
             ("Discount rate", f"{value['discount_rate'] * 100:.1f}%"),
             ("Terminal growth", f"{value['terminal_growth'] * 100:.1f}%"),
         ) if english else (
-            ("当前市值输入", f"${value['market_cap'] / 1_000_000_000:,.2f}B"),
-            ("最新自由现金流", f"${value['base_free_cash_flow'] / 1_000_000_000:,.2f}B"),
+            ("当前市值输入", format_money(value["market_cap"], currency)),
+            ("最新自由现金流", format_money(value["base_free_cash_flow"], currency)),
             ("前五年隐含 FCF 增速", f"{value['implied_fcf_growth'] * 100:.1f}%"),
             ("折现率", f"{value['discount_rate'] * 100:.1f}%"),
             ("永续增长率", f"{value['terminal_growth'] * 100:.1f}%"),
@@ -419,8 +464,8 @@ def _valuation_section(value: object, language: str) -> str:
             + _escape(
                 _pick(
                     language,
-                    "当前数据不足，无法可靠计算市场隐含增速。",
-                    "Current data is insufficient to calculate market-implied growth reliably.",
+                    str(value.get("reason", "当前数据不足，无法可靠计算市场隐含增速。")),
+                    str(value.get("reason", "Current data is insufficient to calculate market-implied growth reliably.")),
                 )
             )
             + "</div>"
@@ -584,7 +629,7 @@ def _render_generic(value: object, language: str, level: int = 0) -> str:
     if value is None:
         return f"<span class=\"muted\">{_escape(_pick(language, '证据不足或尚未提供。', 'Insufficient evidence or not provided.'))}</span>"
     if isinstance(value, str):
-        return _paragraphs(value)
+        return _paragraphs(report_display_value(value, language))
     if isinstance(value, bool):
         return _escape(_pick(language, "是" if value else "否", "Yes" if value else "No"))
     if isinstance(value, (int, float)):
@@ -601,11 +646,7 @@ def _render_generic(value: object, language: str, level: int = 0) -> str:
         for key, item in value.items():
             if str(key).startswith("_"):
                 continue
-            label = (
-                str(key).replace("_", " ").title()
-                if language == EN
-                else str(key).replace("_", " ")
-            )
+            label = report_field_label(key, language)
             parts.append(
                 f"<div class=\"label\">{_escape(label)}</div>"
                 f"{_render_generic(item, language, level + 1)}"
@@ -636,7 +677,13 @@ def _report_sections(
         parts.append(
             _section(
                 title,
-                _render_generic(report[key], language),
+                _render_generic(
+                    project_report_value(
+                        report[key],
+                        include_technical=include_technical,
+                    ),
+                    language,
+                ),
                 section_id=key.replace("_", "-"),
             )
         )
@@ -790,6 +837,9 @@ def render_research_html(
             _financial_section(
                 deterministic.get("content", {}).get("metrics"),
                 language,
+                str(deterministic.get("content", {}).get("currency", "USD")),
+                deterministic.get("content", {}).get("market_snapshot"),
+                str(deterministic.get("content", {}).get("industry_support", "standard")),
             )
         )
     if valuation:

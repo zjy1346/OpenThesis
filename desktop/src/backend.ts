@@ -5,6 +5,7 @@ import type {
   Company,
   ModelPreset,
   ModelSelection,
+  Market,
   Preferences,
   ResearchJob,
   ResearchReport,
@@ -42,13 +43,13 @@ export function getResearchReport(
 }
 
 export function updatePreferences(
-  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents">>,
+  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market">>,
 ): Promise<Preferences> {
   return request("settings.update", { preferences });
 }
 
-export function searchCompanies(query: string): Promise<Company[]> {
-  return request("company.search", { query });
+export function searchCompanies(query: string, market: Market): Promise<Company[]> {
+  return request("company.search", { query, market });
 }
 
 export function discoverModels(params: {
@@ -81,6 +82,17 @@ export async function installResearchPack(file: File): Promise<ResearchPackSumma
 
 export function startResearch(research: ResearchRequest = { mode: "demo" }): Promise<ResearchJob> {
   return request("research.start", research);
+}
+
+export function deleteResearchRun(runId: string): Promise<{ run_id: string; deleted: boolean }> {
+  return request("research.delete", { run_id: runId });
+}
+
+export function retryResearchSynthesis(
+  runId: string,
+  model: ModelSelection,
+): Promise<ResearchReport> {
+  return request("research.retry_synthesis", { run_id: runId, model });
 }
 
 export function getResearchStatus(jobId: string): Promise<ResearchJob> {

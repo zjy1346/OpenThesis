@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openthesis"
-version = "1.1.0"
+version = "1.2.3"
 description = "Model-agnostic, evidence-grounded AI research for long-term investors"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "OpenThesis Contributors"}]
-dependencies = ["tkinterweb==4.25.3"]
+dependencies = ["pypdf>=5.0,<7.0", "tkinterweb==4.25.3"]
 
 [project.scripts]
 openthesis = "openthesis.__main__:main"

@@ -12,6 +12,7 @@ from .growth import (
     scenario_label,
 )
 from .i18n import EN, normalize_language
+from .report_projection import project_report_value, report_display_value, report_field_label
 
 
 SECTION_LABELS_ZH = {
@@ -83,7 +84,7 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
     if value is None:
         return ["Insufficient evidence or not provided." if english else "证据不足或尚未提供。"]
     if isinstance(value, str):
-        return [value]
+        return [report_display_value(value, language)]
     if isinstance(value, bool):
         return ["Yes" if value else "No"] if english else ["是" if value else "否"]
     if isinstance(value, (int, float)):
@@ -106,11 +107,7 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
             if label is None and str(key) in GROWTH_FIELD_LABELS:
                 label = growth_field_label(str(key), language)
             if label is None:
-                label = (
-                    str(key).replace("_", " ").title()
-                    if english
-                    else str(key).replace("_", " ")
-                )
+                label = report_field_label(key, language)
             rendered = _render_value(item, language, level + 1)
             if isinstance(item, (dict, list)):
                 lines.append(f"**{label}**")
@@ -330,10 +327,53 @@ def render_research_run(
         if company_name and isinstance(metrics, list):
             lines.extend(
                 [
-                    deterministic_summary(company_name, metrics, language),
+                    deterministic_summary(
+                        company_name,
+                        metrics,
+                        language,
+                        str(deterministic["content"].get("currency", "USD")),
+                    ),
                     "",
                 ]
             )
+            content = deterministic.get("content", {})
+            snapshot = content.get("market_snapshot")
+            if isinstance(snapshot, dict):
+                values: list[str] = []
+                if isinstance(snapshot.get("price"), (int, float)):
+                    values.append(
+                        ("手动价格" if language != EN else "Manual price")
+                        + f": {snapshot.get('currency', '')} {snapshot['price']:,.2f}"
+                    )
+                if isinstance(snapshot.get("market_cap"), (int, float)):
+                    values.append(
+                        ("手动市值" if language != EN else "Manual market cap")
+                        + f": {snapshot.get('currency', '')} {snapshot['market_cap']:,.0f}"
+                    )
+                if values:
+                    lines.extend(
+                        [
+                            "> "
+                            + "；".join(values)
+                            + (
+                                f"。来源：用户手动输入；日期：{snapshot.get('as_of', '—')}。"
+                                if language != EN
+                                else f". Source: user-supplied; as of {snapshot.get('as_of', '—')}."
+                            ),
+                            "",
+                        ]
+                    )
+            if content.get("industry_support") == "financial_beta":
+                lines.extend(
+                    [
+                        (
+                            "> 金融机构研究为 Beta，标准自由现金流反向 DCF 不适用。"
+                            if language != EN
+                            else "> Financial-institution research is Beta; standard free-cash-flow reverse DCF is not applicable."
+                        ),
+                        "",
+                    ]
+                )
         else:
             markdown = deterministic["content"].get("markdown")
             if markdown:
@@ -454,7 +494,13 @@ def render_research_run(
                             include_technical=include_technical,
                         )
                         if key == "growth_opportunities"
-                        else _render_value(report[key], language)
+                        else _render_value(
+                            project_report_value(
+                                report[key],
+                                include_technical=include_technical,
+                            ),
+                            language,
+                        )
                     )
                     if key == "growth_opportunities":
                         growth_rendered = True

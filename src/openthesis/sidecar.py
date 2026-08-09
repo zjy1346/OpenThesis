@@ -69,7 +69,14 @@ class JsonLineServer:
             query = params.get("query")
             if not isinstance(query, str):
                 raise ValueError("query is required")
-            return self.service.search_companies(query, limit=params.get("limit", 15))
+            market = params.get("market", "US")
+            if not isinstance(market, str):
+                raise ValueError("market must be a string")
+            return self.service.search_companies(
+                query,
+                market=market,
+                limit=params.get("limit", 15),
+            )
         if method == "models.catalog":
             return self.service.model_catalog()
         if method == "models.discover":
@@ -97,6 +104,11 @@ class JsonLineServer:
             return self.service.save_thesis_version(company_cik, content)
         if method == "research.list":
             return self.service.list_research_runs(limit=params.get("limit", 50))
+        if method == "research.delete":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            return self.service.delete_research_run(run_id)
         if method == "research.get_report":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -114,6 +126,12 @@ class JsonLineServer:
             )
         if method == "research.start":
             return self.service.start_research(params)
+        if method == "research.retry_synthesis":
+            run_id = params.get("run_id")
+            model = params.get("model")
+            if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
+                raise ValueError("run_id and model are required")
+            return self.service.retry_research_synthesis(run_id, model)
         if method in {"research.status", "research.cancel"}:
             job_id = params.get("job_id")
             if not isinstance(job_id, str) or not job_id:

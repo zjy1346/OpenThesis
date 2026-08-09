@@ -42,6 +42,15 @@ Keep facts, calculations, inferences, assumptions, forecasts, risks, and
 unknowns separate. If evidence is insufficient, say so explicitly.
 Return one valid JSON object and no markdown wrapper. This is research
 assistance, not personalized investment advice and never a trade instruction.
+Read company.market, exchange, reporting_currency, accounting_standard, and
+industry_support before analysis. For CN_A listings, explicitly examine
+controlling-shareholder and related-party exposure, pledges, subsidies,
+regulatory/delisting risks, audit opinions, and CAS reporting scope; never treat
+cumulative quarterly income or cash flow as a standalone quarter. For HK
+listings, explicitly examine listing structure, controlling shareholders,
+connected transactions, VIE exposure where evidenced, HKEX compliance, reporting
+standard, and currency differences. For financial_beta issuers, do not apply an
+ordinary-company free-cash-flow valuation framework.
 """
 
 
@@ -52,6 +61,7 @@ class ResearchContext:
     metrics: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
     valuation: dict[str, Any] | None = None
+    market_snapshot: dict[str, Any] | None = None
 
     def compact_json(self) -> str:
         return json.dumps(
@@ -60,6 +70,7 @@ class ResearchContext:
                 "metrics": self.metrics[:5],
                 "evidence": self.evidence[:30],
                 "valuation": self.valuation,
+                "market_snapshot": self.market_snapshot,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -119,14 +130,64 @@ def verify_agent_output(
             unsupported_count += 1
         elif not missing:
             verified_count += 1
+    structured_output_valid = bool(output.get("structured_output_valid", True))
+    if not structured_output_valid:
+        issues.append(
+            "Model output was not valid structured JSON"
+            if english
+            else "模型输出不是有效的结构化 JSON"
+        )
     return {
-        "structured_output_valid": bool(output.get("structured_output_valid", True)),
+        "structured_output_valid": structured_output_valid,
         "claim_count": len(claims or []),
         "verified_claim_count": verified_count,
         "unsupported_fact_count": unsupported_count,
         "issues": issues,
-        "passed": not issues and unsupported_count == 0,
+        "passed": structured_output_valid and not issues and unsupported_count == 0,
     }
+
+
+_REQUIRED_SYNTHESIS_SECTIONS = frozenset(
+    {
+        "executive_summary",
+        "business_model",
+        "financial_quality",
+        "competitive_position",
+        "growth_opportunities",
+        "counterarguments",
+        "scenarios",
+        "thesis",
+        "invalidation_conditions",
+        "leading_indicators",
+        "unresolved_questions",
+        "claims",
+    }
+)
+
+
+def validate_research_synthesis(
+    output: dict[str, Any],
+    available_evidence: set[str],
+    language: str = "zh-CN",
+) -> dict[str, Any]:
+    verification = verify_agent_output(output, available_evidence, language)
+    english = normalize_language(language) == EN
+    missing = sorted(
+        key
+        for key in _REQUIRED_SYNTHESIS_SECTIONS
+        if key not in output or output.get(key) in (None, "", [])
+    )
+    if missing:
+        prefix = "Missing required report sections: " if english else "缺少必要报告章节："
+        verification["issues"].append(prefix + ", ".join(missing))
+    if verification["claim_count"] == 0:
+        verification["issues"].append(
+            "The final report contains no verifiable claims"
+            if english
+            else "最终报告没有可验证的主要结论"
+        )
+    verification["passed"] = not verification["issues"] and verification["unsupported_fact_count"] == 0
+    return verification
 
 
 class ResearchWorkflow:
@@ -168,6 +229,7 @@ class ResearchWorkflow:
         facts: list[dict[str, Any]],
         filing_evidence: list[dict[str, Any]] | None = None,
         valuation_inputs: dict[str, float] | None = None,
+        market_snapshot: dict[str, Any] | None = None,
         progress: ProgressCallback | None = None,
     ) -> ResearchRun:
         notify = progress or (lambda _message, _percent: None)
@@ -182,6 +244,7 @@ class ResearchWorkflow:
             data_as_of=utc_now_iso(),
             status=RunStatus.RUNNING,
             report_language=self.report_language,
+            market_snapshot=market_snapshot,
         )
         self.storage.save_run(run)
         try:
@@ -190,18 +253,53 @@ class ResearchWorkflow:
             evidence = build_fact_evidence(facts)
             evidence.extend(filing_evidence or [])
             valuation = None
-            if valuation_inputs and valuation_inputs.get("market_cap", 0) > 0:
+            snapshot_currency = str((market_snapshot or {}).get("currency", ""))
+            if company.industry_support == "financial_beta" and valuation_inputs:
+                valuation = {
+                    "status": "not_applicable",
+                    "reason": self._report_text(
+                        "金融机构 Beta 暂不使用标准自由现金流反向 DCF。",
+                        "Financials Beta does not apply the standard free-cash-flow reverse DCF.",
+                    ),
+                    "currency": company.reporting_currency,
+                }
+            elif (
+                valuation_inputs
+                and snapshot_currency
+                and snapshot_currency != company.reporting_currency
+            ):
+                valuation = {
+                    "status": "currency_mismatch",
+                    "reason": self._report_text(
+                        "手动市值币种与财报币种不同；未提供汇率，因此不执行反向 DCF。",
+                        "The manual market-cap currency differs from the reporting currency; reverse DCF was skipped because no FX rate was supplied.",
+                    ),
+                    "currency": snapshot_currency,
+                    "reporting_currency": company.reporting_currency,
+                }
+            elif valuation_inputs and valuation_inputs.get("market_cap", 0) > 0:
                 valuation = reverse_dcf_analysis(
                     metrics,
                     valuation_inputs["market_cap"],
                     valuation_inputs.get("discount_rate", 0.10),
                     valuation_inputs.get("terminal_growth", 0.03),
                 )
-            context = ResearchContext(company, facts, metrics, evidence, valuation)
+                valuation["currency"] = company.reporting_currency
+            context = ResearchContext(
+                company,
+                facts,
+                metrics,
+                evidence,
+                valuation,
+                market_snapshot,
+            )
             self._check_cancelled()
             notify(self._progress_text("已完成确定性财务计算"), 15)
             summary = deterministic_summary(
-                company.name, metrics, self.report_language
+                company.name,
+                metrics,
+                self.report_language,
+                company.reporting_currency,
             )
             self._save(
                 run,
@@ -213,6 +311,10 @@ class ResearchWorkflow:
                     "markdown": summary,
                     "metrics": metrics,
                     "evidence": evidence,
+                    "currency": company.reporting_currency,
+                    "accounting_standard": company.accounting_standard,
+                    "industry_support": company.industry_support,
+                    "market_snapshot": market_snapshot,
                 },
                 agent_id="calculation-engine",
             )
@@ -490,18 +592,56 @@ class ResearchWorkflow:
                     "forecast": forecast,
                 },
             )
-            verification = verify_agent_output(
+            verification = validate_research_synthesis(
                 synthesis, available, self.report_language
             )
+            report_payload: dict[str, Any] = synthesis
+            report_mode = "synthesized"
+            if not verification["passed"]:
+                report_mode = "staged-fallback"
+                report_payload = {
+                    "executive_summary": self._report_text(
+                        "综合报告未完整生成。以下内容来自已经完成的阶段 Agent，未经过最终综合改写。",
+                        "The synthesized report was incomplete. The sections below preserve completed agent outputs without final rewriting.",
+                    ),
+                    "business_model": stage_results.get("business-analyst", {}),
+                    "financial_quality": {
+                        "financial_analysis": stage_results.get("financial-analyst", {}),
+                        "accounting_risk": stage_results.get("accounting-risk-analyst", {}),
+                    },
+                    "growth_opportunities": growth.get("opportunities", growth),
+                    "counterarguments": skeptic,
+                    "scenarios": forecast.get("scenarios", forecast),
+                    "unresolved_questions": self._report_text(
+                        "请检查模型超时、输出截断或 JSON 格式问题，然后重新生成综合报告。",
+                        "Check for model timeout, truncation, or invalid JSON, then regenerate the synthesized report.",
+                    ),
+                }
             self._save(
                 run,
                 "research-report",
                 self._report_text(
                     "完整长期研究报告", "Complete Long-term Research Report"
                 ),
-                {"report": synthesis, "verification": verification},
+                {
+                    "mode": report_mode,
+                    "report": report_payload,
+                    "verification": verification,
+                    "retryable": not verification["passed"],
+                },
                 agent_id="research-synthesizer",
             )
+            if not verification["passed"]:
+                run.status = RunStatus.PARTIAL
+                run.completed_at = utc_now_iso()
+                self.storage.save_run(run)
+                notify(
+                    self._progress_text(
+                        "综合报告生成不完整；已保留阶段研究结果，可稍后重试综合"
+                    ),
+                    100,
+                )
+                return run
             thesis_content = {
                 "thesis": synthesis.get("thesis"),
                 "claims": synthesis.get("claims", []),
@@ -548,6 +688,112 @@ class ResearchWorkflow:
             run.completed_at = utc_now_iso()
             self.storage.save_run(run)
             raise
+
+    def retry_synthesis(
+        self,
+        run: ResearchRun,
+        artifacts: list[dict[str, Any]],
+        facts: list[dict[str, Any]],
+    ) -> ResearchRun:
+        """Regenerate only the final synthesis from persisted stage artifacts."""
+
+        if self.provider is None:
+            raise RuntimeError("model provider is not configured")
+        deterministic = _latest_artifact(artifacts, "deterministic-financial-summary")
+        dossier_artifact = _latest_artifact(artifacts, "verified-research-dossier")
+        growth_artifact = _latest_artifact(artifacts, "growth-opportunities")
+        skeptic_artifact = _latest_artifact(artifacts, "counter-analysis")
+        forecast_artifact = _latest_artifact(artifacts, "forecast-scenarios")
+        required = (deterministic, dossier_artifact, growth_artifact, skeptic_artifact, forecast_artifact)
+        if any(item is None for item in required):
+            raise RuntimeError("saved research stages are incomplete")
+
+        deterministic_content = deterministic["content"]
+        evidence = deterministic_content.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = []
+        context = ResearchContext(
+            run.company,
+            facts,
+            deterministic_content.get("metrics", []),
+            evidence,
+            (_latest_artifact(artifacts, "deterministic-valuation") or {}).get("content"),
+            deterministic_content.get("market_snapshot"),
+        )
+        dossier = dossier_artifact["content"]
+        growth = growth_artifact["content"]
+        skeptic = skeptic_artifact["content"]
+        forecast = forecast_artifact["content"]
+        synthesis = self._run_agent(
+            "research-synthesizer",
+            "prompts/research-synthesizer.md",
+            context.compact_json(),
+            {
+                "research_dossier": dossier,
+                "growth_opportunities": growth,
+                "counter_analysis": skeptic,
+                "forecast": forecast,
+            },
+        )
+        available = {
+            str(item.get("evidence_id"))
+            for item in evidence
+            if isinstance(item, dict) and item.get("evidence_id")
+        }
+        verification = validate_research_synthesis(
+            synthesis, available, self.report_language
+        )
+        if verification["passed"]:
+            report_payload = synthesis
+            mode = "synthesized"
+        else:
+            previous_report = _latest_artifact(artifacts, "research-report")
+            previous_content = previous_report.get("content", {}) if previous_report else {}
+            report_payload = previous_content.get("report", {})
+            mode = "staged-fallback"
+        self._save(
+            run,
+            "research-report",
+            self._report_text("完整长期研究报告", "Complete Long-term Research Report"),
+            {
+                "mode": mode,
+                "report": report_payload,
+                "verification": verification,
+                "retryable": not verification["passed"],
+            },
+            agent_id="research-synthesizer",
+        )
+        if verification["passed"]:
+            thesis_content = {
+                "thesis": synthesis.get("thesis"),
+                "claims": synthesis.get("claims", []),
+                "invalidation_conditions": synthesis.get("invalidation_conditions", []),
+                "leading_indicators": synthesis.get("leading_indicators", []),
+                "unresolved_questions": synthesis.get("unresolved_questions", []),
+                "growth_opportunities": growth.get("opportunities", growth),
+                "scenarios": forecast.get("scenarios", forecast),
+            }
+            thesis_version = self.storage.save_thesis_version(
+                run.company.cik,
+                thesis_content,
+                run_id=run.run_id,
+                created_by=self.model_config.public_id,
+                created_at=utc_now_iso(),
+            )
+            self._save(
+                run,
+                "thesis-snapshot",
+                self._report_text(
+                    f"投资逻辑 v{thesis_version['version']}",
+                    f"Investment Thesis v{thesis_version['version']}",
+                ),
+                thesis_version,
+                agent_id="thesis-versioning",
+            )
+        run.status = RunStatus.COMPLETED if verification["passed"] else RunStatus.PARTIAL
+        run.completed_at = utc_now_iso()
+        self.storage.save_run(run)
+        return run
 
     def _set_agent_state(self, agent_id: str, state: str) -> None:
         self.agent_progress(agent_id, state)
@@ -687,3 +933,16 @@ class ResearchWorkflow:
         )
         self.storage.save_artifact(artifact)
         return artifact
+
+
+def _latest_artifact(
+    artifacts: list[dict[str, Any]], artifact_type: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in reversed(artifacts)
+            if item.get("artifact_type") == artifact_type
+        ),
+        None,
+    )

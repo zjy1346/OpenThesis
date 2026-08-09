@@ -2,6 +2,7 @@ import type {
   BootstrapResult,
   Company,
   Language,
+  Market,
   ModelPreset,
   ModelSelection,
   Preferences,
@@ -30,8 +31,10 @@ export const BACKEND_METHODS = [
   "thesis.get",
   "thesis.save",
   "research.list",
+  "research.delete",
   "research.get_report",
   "research.start",
+  "research.retry_synthesis",
   "research.status",
   "research.cancel",
 ] as const;
@@ -43,9 +46,9 @@ type EmptyParams = Record<string, never>;
 export type BackendParams = {
   "app.bootstrap": EmptyParams;
   "settings.update": {
-    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed">>;
+    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market">>;
   };
-  "company.search": { query: string };
+  "company.search": { query: string; market: Market };
   "models.catalog": EmptyParams;
   "models.discover": Omit<ModelSelection, "model"> & { model?: string };
   "models.test": ModelSelection;
@@ -54,12 +57,14 @@ export type BackendParams = {
   "thesis.get": { thesis_version_id: string };
   "thesis.save": { company_cik: string; content: Record<string, unknown> };
   "research.list": EmptyParams;
+  "research.delete": { run_id: string };
   "research.get_report": {
     run_id: string;
     language?: Language;
     include_technical?: boolean;
   };
   "research.start": ResearchRequest;
+  "research.retry_synthesis": { run_id: string; model: ModelSelection };
   "research.status": { job_id: string };
   "research.cancel": { job_id: string };
 };
@@ -82,8 +87,10 @@ export type BackendResult = {
   "thesis.get": ThesisVersion;
   "thesis.save": ThesisVersion;
   "research.list": BootstrapResult["recent_runs"];
+  "research.delete": { run_id: string; deleted: boolean };
   "research.get_report": ResearchReport;
   "research.start": ResearchJob;
+  "research.retry_synthesis": ResearchReport;
   "research.status": ResearchJob;
   "research.cancel": ResearchJob;
 };

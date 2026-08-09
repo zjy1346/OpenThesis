@@ -31,11 +31,12 @@ The first version is not optimized for:
 - institutional teams requiring proprietary datasets and collaboration;
 - traders focused on intraday or short-term price movements.
 
-### 2.2 Initial market
+### 2.2 Supported markets and official disclosure sources
 
-The first supported market is US-listed equities.
+OpenThesis 1.2 supports US-listed equities, China A-shares on SSE/SZSE/BSE,
+and Hong Kong listings on HKEX Main Board/GEM.
 
-The first document source is SEC EDGAR:
+US documents come from SEC EDGAR:
 
 - 10-K filings;
 - filing metadata and history;
@@ -46,7 +47,10 @@ Useful official references:
 - https://www.sec.gov/search-filings/edgar-application-programming-interfaces
 - https://www.sec.gov/data-research/structured-data/inline-xbrl
 
-A-share and Hong Kong support are later market adapters. They must not delay the first complete US-company research workflow.
+A-share and Hong Kong statutory financial reports are retrieved on demand from
+CNInfo and HKEXnews. Their PDF facts retain currency, accounting standard,
+consolidated scope, official URL, and page evidence. The system does not mirror
+exchange datasets or infer missing values.
 
 ### 2.3 No transaction functionality
 
@@ -161,8 +165,8 @@ The user can accept, edit, reject, or mark conclusions as unresolved. Saved thes
 
 The first usable release must:
 
-1. identify a US-listed company;
-2. download and cache its latest five annual 10-K filings;
+1. identify a US, SSE, SZSE, BSE, or HKEX listed security;
+2. download and cache up to five recent official financial reports;
 3. parse filing structure, text, tables, and available XBRL facts;
 4. normalize core financial facts across periods;
 5. support at least one local and one cloud-compatible model path;
@@ -180,7 +184,6 @@ The first usable release must:
 - real-time market data;
 - automated periodic monitoring;
 - 10-Q and earnings-call coverage beyond what is needed for the first workflow;
-- A-share and Hong Kong filing adapters;
 - brokerage integration;
 - transaction execution;
 - technical-analysis indicators;
@@ -194,7 +197,7 @@ The first usable release must:
 
 ```mermaid
 flowchart TD
-    SEC["SEC EDGAR and Inline XBRL"] --> INGEST["Filing ingestion"]
+    SEC["SEC EDGAR / CNInfo / HKEXnews"] --> INGEST["Filing ingestion"]
     INGEST --> DOC["Structured document store"]
     INGEST --> FACTS["Normalized financial facts"]
     DOC --> EVIDENCE["Evidence store"]

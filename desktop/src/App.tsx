@@ -3,6 +3,7 @@ import {
   BookOpenText,
   CircleHelp,
   ChevronLeft,
+  ExternalLink,
   FileText,
   History,
   Info,
@@ -46,8 +47,11 @@ export default function App() {
     error,
     canRetry,
     selectRun,
+    removeRun,
     beginResearch,
     retryResearch,
+    retrySynthesis,
+    openFailedDisclosure,
     stopResearch,
     savePreferences,
     refreshBootstrap,
@@ -169,9 +173,12 @@ export default function App() {
           <div><span className="eyebrow"><Sparkles size={14} /> OpenThesis</span><h1>{pageTitle[activeView]}</h1></div>
           <div className="status-cluster"><span className="status-dot" /><span>{bootstrap ? `Core ${bootstrap.contract_version}` : copy.loading}</span></div>
         </header>
-        {error && <div className="error-banner" role="alert">
+        {error && <div className="error-banner" role="alert" data-tone={error.kind === "research-failed" && error.code === "NO_FILINGS_AVAILABLE" ? "notice" : undefined}>
           <span>{error.kind === "report-unavailable" ? copy.reportUnavailable : (error.detail ?? copy.coreUnavailable)}</span>
-          {canRetry && <button type="button" onClick={() => void retryResearch()}>{copy.retry}</button>}
+          <div className="error-actions">
+            {canRetry && <button type="button" onClick={() => void retryResearch()}>{error.kind === "research-failed" ? copy.retryFetch : copy.retry}</button>}
+            {error.kind === "research-failed" && error.disclosureUrl && <button type="button" onClick={() => void openFailedDisclosure()}><ExternalLink size={14} />{copy.officialDisclosure}</button>}
+          </div>
         </div>}
         {bootstrap && bootstrap.interrupted_runs > 0 && (
           <div className="recovery-banner" role="status">
@@ -203,7 +210,7 @@ export default function App() {
             <NewResearchView bootstrap={bootstrap} copy={copy} onSavePreferences={savePreferences} onStart={startNewResearch} />
           ) : activeView === "history" && bootstrap ? (
             <HistoryView runs={bootstrap.recent_runs} language={language} copy={copy}
-              onRefresh={refreshBootstrap} onSelect={openRun} />
+              onRefresh={refreshBootstrap} onSelect={openRun} onDelete={removeRun} />
           ) : activeView === "theses" && bootstrap ? (
             <ThesisView copy={copy} />
           ) : activeView === "help" && bootstrap ? (
@@ -213,7 +220,7 @@ export default function App() {
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} />
+            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} />
           ) : (
             <EmptyState title={copy.emptyTitle} body={copy.emptyBody} demoAction={copy.startDemo}
               realAction={copy.startReal} hint={copy.demoHint}

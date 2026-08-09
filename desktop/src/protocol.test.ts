@@ -9,6 +9,7 @@ describe("platform-neutral backend contract", () => {
       "app.bootstrap",
       "models.discover",
       "research.start",
+      "research.delete",
       "research.get_report",
       "settings.update",
     ]));

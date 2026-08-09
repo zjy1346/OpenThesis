@@ -3,8 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import {
   bootstrapBackend,
   cancelResearch,
+  deleteResearchRun,
   getResearchReport,
   getResearchStatus,
+  openExternalUrl,
+  retryResearchSynthesis,
   startResearch,
   updatePreferences,
 } from "../backend";
@@ -19,6 +22,7 @@ import type {
 
 export type WorkbenchError =
   | { kind: "core-unavailable"; detail?: string }
+  | { kind: "research-failed"; detail: string; code?: string; disclosureUrl?: string }
   | { kind: "report-unavailable" };
 
 const TERMINAL_JOB_STATES = new Set<ResearchJob["state"]>(["completed", "failed", "cancelled"]);
@@ -81,7 +85,12 @@ export function useWorkbenchSession() {
             }
           } else if (next.state === "failed") {
             window.clearInterval(poll);
-            setError({ kind: "core-unavailable", detail: next.message || undefined });
+            setError({
+              kind: "research-failed",
+              detail: next.message,
+              code: next.error_code ?? undefined,
+              disclosureUrl: next.disclosure_url ?? undefined,
+            });
           } else if (next.state === "cancelled") {
             window.clearInterval(poll);
           }
@@ -149,16 +158,59 @@ export function useWorkbenchSession() {
     await beginResearch(lastRequest.current);
   };
 
+  const removeRun = async (run: ResearchRunSummary) => {
+    setError(null);
+    try {
+      await deleteResearchRun(run.run_id);
+      const nextBootstrap = await bootstrapBackend();
+      setBootstrap(nextBootstrap);
+      if (report?.run_id === run.run_id) {
+        const nextRun = nextBootstrap.recent_runs[0];
+        setReport(
+          nextRun
+            ? await getResearchReport(nextRun.run_id, nextBootstrap.preferences.report_language)
+            : null,
+        );
+      }
+    } catch {
+      setError({ kind: "core-unavailable" });
+      throw new Error("research deletion failed");
+    }
+  };
+
+  const retrySynthesis = async () => {
+    const model = lastRequest.current?.model;
+    if (!report || !model || model.preset_id === "none") {
+      throw new Error("model session is unavailable");
+    }
+    setError(null);
+    const next = await retryResearchSynthesis(report.run_id, model);
+    setReport(next);
+    setBootstrap(await bootstrapBackend());
+  };
+
+  const openFailedDisclosure = async () => {
+    if (error?.kind !== "research-failed" || !error.disclosureUrl) return;
+    try {
+      await openExternalUrl(error.disclosureUrl);
+    } catch {
+      setError({ kind: "core-unavailable" });
+    }
+  };
+
   return {
     bootstrap,
     report,
     job,
     error,
     clearError: () => setError(null),
-    canRetry: error?.kind === "core-unavailable" && lastRequest.current !== null,
+    canRetry: (error?.kind === "core-unavailable" || error?.kind === "research-failed") && lastRequest.current !== null,
     selectRun,
+    removeRun,
     beginResearch,
     retryResearch,
+    retrySynthesis,
+    openFailedDisclosure,
     stopResearch,
     savePreferences,
     refreshBootstrap,
