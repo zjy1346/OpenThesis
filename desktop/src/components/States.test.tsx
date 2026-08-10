@@ -28,6 +28,7 @@ describe("ResearchProgress", () => {
           cancelling: "Stopping…",
           agents: "Agents",
           running: "Running",
+          retrying: "Retrying separately",
           queued: "Queued",
           completed: "Completed",
           cancelled: "Cancelled",

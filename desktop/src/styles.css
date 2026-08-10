@@ -152,6 +152,7 @@ button { color: inherit; }
 .agent-progress-row > span:last-child { color: var(--ink-muted); font-size: 10px; }
 .agent-state-dot { width: 7px; height: 7px; border-radius: 50%; background: #bdc8c1; }
 .agent-state-running { background: #34845f; box-shadow: 0 0 0 3px rgba(52, 132, 95, .14); }
+.agent-state-retrying { background: #b78232; box-shadow: 0 0 0 3px rgba(183, 130, 50, .14); }
 .agent-state-completed { background: #28744f; }
 .agent-state-failed { background: #bd5549; }
 .agent-state-cancelled { background: #b68a46; }

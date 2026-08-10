@@ -194,6 +194,7 @@ export default function App() {
               cancelling: copy.cancelling,
               agents: copy.agents,
               running: copy.running,
+              retrying: copy.retrying,
               queued: copy.queued,
               completed: copy.completed,
               cancelled: copy.cancelled,

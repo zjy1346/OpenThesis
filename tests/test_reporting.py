@@ -149,7 +149,7 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("fact:market:", report)
         self.assertNotIn("filing:hidden", report)
         self.assertNotIn("类型：** inference", report)
-        self.assertIn("类型：** 推论", report)
+        self.assertIn("**推论** · 主要结论正文", report)
 
     def test_growth_fields_are_localized_and_ids_hidden_by_default(self) -> None:
         artifacts = [
@@ -184,6 +184,77 @@ class ReportingTests(unittest.TestCase):
             include_technical=True,
         )
         self.assertIn("fact:private", technical)
+
+    def test_chinese_markdown_groups_claims_and_hides_raw_validation_errors(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "research-report",
+                "title": "report",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {
+                    "mode": "staged-fallback",
+                    "report": {
+                        "business_model": {
+                            "summary": "公司通过晶圆代工获得收入。",
+                            "claims": [
+                                {"text": "高置信结论一", "kind": "calculation", "confidence": 0.9},
+                                {"text": "高置信结论二", "kind": "calculation", "confidence": 0.9},
+                                {"text": "低置信结论", "kind": "unknown", "confidence": 0.3},
+                            ],
+                        },
+                    },
+                    "verification": {
+                        "passed": False,
+                        "issues": ["Missing required report sections: raw_internal_key"],
+                    },
+                },
+            }
+        ]
+
+        report = render_research_run("run-grouped", artifacts, "zh-CN")
+
+        self.assertIn("### 高置信度 · 0.90 · 2 条", report)
+        self.assertIn("### 低置信度 · 0.30 · 1 条", report)
+        self.assertLess(report.index("高置信结论一"), report.index("低置信结论"))
+        self.assertIn("计算", report)
+        self.assertNotIn("calculation", report)
+        self.assertNotIn("raw_internal_key", report)
+        self.assertNotIn("business_model", report)
+
+    def test_markdown_renders_latest_interim_separately_from_annual_metrics(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "title": "summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "CNY",
+                    "metrics": [{"year": 2025, "revenue": 100_000_000_000}],
+                    "interim_metrics": [
+                        {
+                            "year": 2026,
+                            "period": "Q1",
+                            "comparison_period": "2025 Q1",
+                            "revenue": 30_000_000_000,
+                            "revenue_growth": 0.2,
+                            "net_income": 3_000_000_000,
+                            "operating_cash_flow": 4_000_000_000,
+                        }
+                    ],
+                    "evidence": [],
+                },
+            }
+        ]
+
+        report = render_research_run(
+            "run-interim", artifacts, "zh-CN", company_name="示例公司"
+        )
+
+        self.assertIn("最新季度及中期数据", report)
+        self.assertIn("2026 Q1 为累计期间数据，不与完整财年混算", report)
+        self.assertIn("对比 2025 Q1", report)
 
 
 if __name__ == "__main__":

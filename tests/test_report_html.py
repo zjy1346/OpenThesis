@@ -78,6 +78,47 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_chinese_fallback_report_uses_typed_sections_and_confidence_groups(self) -> None:
+        artifacts = sample_artifacts()
+        artifacts[-1]["content"] = {
+            "mode": "staged-fallback",
+            "report": {
+                "executive_summary": "最终综合未完成。",
+                "business_model": {
+                    "summary": "公司通过晶圆代工获得收入。",
+                    "possible_moats": ["规模与客户认证"],
+                    "risks": ["资本开支较高"],
+                    "unknowns": ["客户集中度尚未披露"],
+                },
+                "claims": [
+                    {"text": "收入保持增长。", "kind": "calculation", "confidence": 1.0},
+                    {"text": "规模可能构成壁垒。", "kind": "inference", "confidence": 0.7},
+                    {"text": "订单能见度不足。", "kind": "unknown", "confidence": None},
+                ],
+                "unresolved_questions": ["客户集中度尚待核实。"],
+            },
+            "verification": {
+                "passed": False,
+                "claim_count": 0,
+                "verified_claim_count": 0,
+                "unsupported_fact_count": 0,
+                "issues": ["Missing required report sections: claims"],
+            },
+            "retryable": True,
+        }
+
+        report = render_research_html("run-fallback", artifacts, "zh-CN", include_technical=False)
+
+        self.assertNotIn('<div class="label">summary</div>', report)
+        self.assertNotIn(">calculation<", report)
+        self.assertNotIn('<div class="label">unknowns</div>', report)
+        self.assertNotIn("Missing required report sections", report)
+        self.assertIn('class="confidence-group confidence-high"', report)
+        self.assertIn('class="confidence-group confidence-medium"', report)
+        self.assertIn('class="confidence-group confidence-unknown"', report)
+        self.assertLess(report.index("confidence-high"), report.index("confidence-medium"))
+        self.assertIn("阶段性研究报告", report)
+
     def test_renders_real_table_and_clean_growth_cards(self) -> None:
         report = render_research_html(
             "run-1",

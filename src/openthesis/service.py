@@ -18,11 +18,7 @@ from .domain import Company, FilingDocument, FinancialFact, ResearchRun, RunStat
 from .filing_parser import build_filing_evidence
 from .i18n import normalize_language, translate_error
 from .market_data import MarketDataError, MarketDataModule
-from .market_financials import (
-    FinancialExtractionError,
-    extract_pdf_financials,
-    financial_quality_issues,
-)
+from .financial_ingestion import FinancialExtractionError, ingest_official_pdf, prepare_facts_for_ai
 from .markets import COMMON_MARKET_COMPANIES, MARKET_PROFILES, Market, normalize_market
 from .model_catalog import (
     MODEL_PRESETS,
@@ -728,7 +724,7 @@ class AppService:
                         percent=18 + index * 4,
                     )
                     try:
-                        extracted, report_evidence, _warnings = extract_pdf_financials(
+                        extracted, report_evidence, _warnings = ingest_official_pdf(
                             filing,
                             company,
                         )
@@ -740,8 +736,8 @@ class AppService:
                 normalized_facts = list(deduplicated.values())
                 if not normalized_facts:
                     raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
-                quality_issues = financial_quality_issues(normalized_facts)
-                if quality_issues:
+                normalized_facts, validation = prepare_facts_for_ai(normalized_facts)
+                if validation.status.value == "REJECTED" or not normalized_facts:
                     raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
                 self.storage.replace_facts_for_filings(
                     company.security_id,

@@ -182,9 +182,10 @@ class ProviderTests(unittest.TestCase):
                 base_url=f"{self.base_url}/v1",
             )
         )
-        with self.assertRaises(ProviderError):
+        with self.assertRaises(ProviderError) as caught:
             provider.generate("system", "user")
         self.assertEqual(len(ProviderHandler.requests), 1)
+        self.assertFalse(caught.exception.retryable)
 
     def test_http_error_redacts_api_key_even_if_server_echoes_it(self) -> None:
         provider = OpenAICompatibleProvider(
@@ -209,8 +210,9 @@ class ProviderTests(unittest.TestCase):
                 base_url=f"{self.base_url}/v1",
             )
         )
-        with self.assertRaises(ProviderError):
+        with self.assertRaises(ProviderError) as caught:
             provider.generate("system", "user")
+        self.assertTrue(caught.exception.retryable)
 
 
 if __name__ == "__main__":

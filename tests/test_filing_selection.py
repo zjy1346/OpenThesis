@@ -50,6 +50,15 @@ class FilingSelectionTests(unittest.TestCase):
 
         self.assertEqual([item.document_id for item in result.documents], ["a-share"])
 
+    def test_explicit_revision_supersedes_original_same_period(self) -> None:
+        original = _filing("original", "ANNUAL_REPORT", "FY", "2023-12-31")
+        corrected = _filing("corrected", "ANNUAL_REPORT", "FY", "2023-12-31")
+        corrected.revision = "corrected"
+        corrected.supersedes_document_id = original.document_id
+        corrected.filed_at = "2024-05-30T00:00:00+00:00"
+        result = select_research_filings([original, corrected])
+        self.assertEqual([item.document_id for item in result.documents], ["corrected"])
+
 
 def _filing(document_id: str, form_type: str, period: str, period_end: str) -> FilingDocument:
     return FilingDocument(

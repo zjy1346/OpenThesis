@@ -20,6 +20,30 @@ _INTERNAL_FIELDS = frozenset(
 )
 
 _FIELD_LABELS: dict[str, tuple[str, str]] = {
+    "summary": ("摘要", "Summary"),
+    "analysis": ("分析", "Analysis"),
+    "claims": ("主要结论", "Key Conclusions"),
+    "unknowns": ("信息缺口", "Information Gaps"),
+    "possible_moats": ("潜在护城河", "Potential Moats"),
+    "risks": ("主要风险", "Key Risks"),
+    "conclusion": ("结论", "Conclusion"),
+    "strengths": ("优势", "Strengths"),
+    "concerns": ("关注事项", "Concerns"),
+    "risk_flags": ("风险信号", "Risk Flags"),
+    "benign_explanations": ("可能的合理解释", "Possible Benign Explanations"),
+    "follow_up_questions": ("后续核查问题", "Follow-up Questions"),
+    "strongest_counterarguments": ("核心反方观点", "Strongest Counterarguments"),
+    "unsupported_assumptions": ("证据不足的假设", "Unsupported Assumptions"),
+    "missing_evidence": ("缺失证据", "Missing Evidence"),
+    "opportunities": ("增长机会", "Growth Opportunities"),
+    "scenarios": ("情景", "Scenarios"),
+    "capital_requirements": ("资本需求", "Capital Requirements"),
+    "maturity_stage": ("成熟阶段", "Maturity Stage"),
+    "category": ("类别", "Category"),
+    "mechanism": ("增长机制", "Growth Mechanism"),
+    "time_horizon_years": ("时间跨度（年）", "Time Horizon (Years)"),
+    "leading_indicators": ("领先指标", "Leading Indicators"),
+    "invalidation_conditions": ("失效条件", "Invalidation Conditions"),
     "argument": ("反方论点", "Argument"),
     "assumption": ("假设", "Assumption"),
     "assumptions": ("关键假设", "Key Assumptions"),
@@ -37,6 +61,10 @@ _FIELD_LABELS: dict[str, tuple[str, str]] = {
 }
 
 _DISPLAY_VALUES_ZH = {
+    "calculation": "计算",
+    "assumption": "假设",
+    "forecast": "预测",
+    "risk": "风险",
     "inference": "推论",
     "fact": "事实",
     "opinion": "观点",

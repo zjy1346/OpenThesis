@@ -31,8 +31,16 @@ def select_research_filings(
     included only when no annual report exists anywhere in the discovered set.
     """
 
-    unique = {item.document_id: item for item in candidates}
-    ordered = sorted(unique.values(), key=_sort_key, reverse=True)
+    # De-duplicate by fiscal period, not announcement date/document id.  A
+    # correction/revision is a new document id but must replace the original
+    # for analysis while the original remains available to audit callers.
+    by_period: dict[tuple[int, str], FilingDocument] = {}
+    for item in candidates:
+        key = (_fiscal_year(item), (item.fiscal_period or "FY").upper())
+        current = by_period.get(key)
+        if current is None or _revision_rank(item) > _revision_rank(current):
+            by_period[key] = item
+    ordered = sorted(by_period.values(), key=_sort_key, reverse=True)
     annual_by_year: dict[int, FilingDocument] = {}
     periodic_by_year: dict[int, list[FilingDocument]] = {}
     listing: list[FilingDocument] = []
@@ -112,3 +120,14 @@ def _document_authority(filing: FilingDocument) -> int:
         if "摘要" in title or "summary" in title:
             rank -= 40
     return rank
+
+
+def _revision_rank(filing: FilingDocument) -> tuple[int, int, str]:
+    """Prefer explicit corrected versions, then the latest filed timestamp."""
+    title = (filing.primary_document or "").casefold()
+    revision = 1 if filing.revision.casefold() not in {"", "original", "orig"} else 0
+    if any(token in title for token in ("更正", "修订", "revision", "restated", "corrigendum")):
+        revision = max(revision, 1)
+    if filing.supersedes_document_id:
+        revision += 1
+    return revision, _document_authority(filing), str(filing.filed_at)
