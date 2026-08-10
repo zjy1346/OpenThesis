@@ -118,6 +118,9 @@ export function useWorkbenchSession() {
 
   const beginResearch = async (request: ResearchRequest = { mode: "demo" }) => {
     setError(null);
+    // A pending run must never leave the previous company's report visible
+    // underneath a later failure banner.
+    setReport(null);
     lastRequest.current = request;
     try {
       setJob(await startResearch(request));

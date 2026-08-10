@@ -141,6 +141,34 @@ class MarketFinancialNormalizationTests(unittest.TestCase):
 
         self.assertIn("2025:negative_revenue", financial_quality_issues(facts))
 
+    def test_quality_gate_never_combines_annual_and_first_quarter_facts(self) -> None:
+        company = build_company("688981.SH", "SMIC")
+        annual = _filing(company.security_id)
+        quarter = FilingDocument(
+            document_id="official:q1-2026",
+            company_cik=company.security_id,
+            accession_number="q1-2026",
+            form_type="QUARTERLY_REPORT",
+            fiscal_period="Q1",
+            period_end="2026-03-31",
+            filed_at="2026-05-15T00:00:00+00:00",
+            primary_document="2026 First Quarter Report",
+            source_url="https://example.invalid/q1.pdf",
+        )
+        annual_facts, _ = parse_financial_pages(
+            [(1, "单位：千元\n营业收入 57,795,570\n资产总计 367,718,196\n负债合计 121,355,828\n所有者权益合计 246,362,368")],
+            annual,
+            company,
+        )
+        quarter_facts, _ = parse_financial_pages(
+            [(1, "单位：千元\n营业收入 16,010,000\n资产总计 380,000,000\n负债合计 125,000,000\n所有者权益合计 255,000,000")],
+            quarter,
+            company,
+        )
+
+        self.assertEqual(financial_quality_issues(annual_facts + quarter_facts), [])
+        self.assertTrue(all(item.fiscal_period == "Q1" for item in quarter_facts))
+
 
 def _filing(company_id: str) -> FilingDocument:
     return FilingDocument(

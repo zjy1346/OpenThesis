@@ -36,6 +36,7 @@ export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
     cancelling: string;
     agents: string;
     running: string;
+    retrying: string;
     queued: string;
     completed: string;
     cancelled: string;
@@ -49,6 +50,7 @@ export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
     cancelling: "Stopping…",
     agents: "Agents",
     running: "Running",
+    retrying: "Retrying separately",
     queued: "Queued",
     completed: "Completed",
     cancelled: "Cancelled",
@@ -57,6 +59,7 @@ export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
   };
   const statusLabel = (state: string) => {
     if (state === "running") return copy.running;
+    if (state === "retrying") return copy.retrying;
     if (state === "queued") return copy.queued;
     if (state === "completed") return copy.completed;
     if (state === "cancelled") return copy.cancelled;

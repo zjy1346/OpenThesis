@@ -4,7 +4,7 @@ import hashlib
 import json
 import threading
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -15,11 +15,16 @@ from .domain import (
     RunStatus,
     utc_now_iso,
 )
-from .financials import calculate_metrics, deterministic_summary, reverse_dcf_analysis
+from .financials import (
+    calculate_interim_metrics,
+    calculate_metrics,
+    deterministic_summary,
+    reverse_dcf_analysis,
+)
 from .growth import normalize_growth_output
 from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, normalize_language, translate
 from .packs import ResearchPack
-from .providers import ModelConfig, ModelProvider
+from .providers import ModelConfig, ModelProvider, ProviderError
 from .storage import Storage
 
 
@@ -51,6 +56,9 @@ listings, explicitly examine listing structure, controlling shareholders,
 connected transactions, VIE exposure where evidenced, HKEX compliance, reporting
 standard, and currency differences. For financial_beta issuers, do not apply an
 ordinary-company free-cash-flow valuation framework.
+Always distinguish fiscal_period values: FY is a full year, while Q1, H1, and Q3
+are cumulative interim periods. Cover the latest supplied interim period, compare
+it only with the same prior-year period, and never combine it with FY totals.
 """
 
 
@@ -59,6 +67,7 @@ class ResearchContext:
     company: Company
     facts: list[dict[str, Any]]
     metrics: list[dict[str, Any]]
+    interim_metrics: list[dict[str, Any]]
     evidence: list[dict[str, Any]]
     valuation: dict[str, Any] | None = None
     market_snapshot: dict[str, Any] | None = None
@@ -68,6 +77,7 @@ class ResearchContext:
             {
                 "company": self.company.to_dict(),
                 "metrics": self.metrics[:5],
+                "latest_interim_metrics": self.interim_metrics[:3],
                 "evidence": self.evidence[:30],
                 "valuation": self.valuation,
                 "market_snapshot": self.market_snapshot,
@@ -88,6 +98,10 @@ def build_fact_evidence(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "value": fact["value"],
                 "unit": fact["unit"],
                 "fiscal_year": fact["fiscal_year"],
+                "fiscal_period": fact.get("fiscal_period", ""),
+                "form_type": fact.get("form_type", ""),
+                "start_date": fact.get("start_date", ""),
+                "end_date": fact.get("end_date", ""),
                 "filed_at": fact["filed_at"],
                 "source_url": fact["source_url"],
             }
@@ -190,6 +204,99 @@ def validate_research_synthesis(
     return verification
 
 
+def _presentation_stage_value(value: Any, *, remove_claims: bool = True) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _presentation_stage_value(item, remove_claims=remove_claims)
+            for key, item in value.items()
+            if not str(key).startswith("_")
+            and key != "structured_output_valid"
+            and (not remove_claims or key != "claims")
+        }
+    if isinstance(value, list):
+        return [
+            _presentation_stage_value(item, remove_claims=remove_claims)
+            for item in value
+        ]
+    return value
+
+
+def _collect_stage_claims(*values: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            claims = value.get("claims")
+            if isinstance(claims, list):
+                found.extend(item for item in claims if isinstance(item, dict))
+            for key, item in value.items():
+                if key != "claims" and not str(key).startswith("_"):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    for value in values:
+        visit(value)
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for claim in found:
+        text = str(
+            claim.get("text")
+            or claim.get("conclusion")
+            or claim.get("argument")
+            or ""
+        ).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(_presentation_stage_value(claim, remove_claims=False))
+    return unique
+
+
+def _collect_strings(value: Any, *keys: str) -> list[str]:
+    found: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            text = item.strip()
+            if text and text not in found:
+                found.append(text)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        elif isinstance(item, dict):
+            for key in keys:
+                if key in item:
+                    visit(item[key])
+            for child in item.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+    visit(value)
+    return found
+
+
+def _synthesis_prior_artifacts(
+    dossier: Any,
+    growth: Any,
+    skeptic: Any,
+    forecast: Any,
+) -> dict[str, Any]:
+    """Keep synthesis input complete without repeating company metrics and evidence."""
+
+    base_analyses = dossier.get("analyses", dossier) if isinstance(dossier, dict) else dossier
+    return _presentation_stage_value(
+        {
+            "base_analyses": base_analyses,
+            "growth_opportunities": growth,
+            "counter_analysis": skeptic,
+            "forecast": forecast,
+        },
+        remove_claims=False,
+    )
+
+
 class ResearchWorkflow:
     def __init__(
         self,
@@ -218,6 +325,64 @@ class ResearchWorkflow:
 
     def _progress_text(self, chinese: str, **params: object) -> str:
         return translate(chinese, self.ui_language, **params)
+
+    def _build_staged_fallback(
+        self,
+        stage_results: dict[str, dict[str, Any]],
+        growth: dict[str, Any],
+        skeptic: dict[str, Any],
+        forecast: dict[str, Any],
+    ) -> dict[str, Any]:
+        business_raw = stage_results.get("business-analyst", {})
+        financial_raw = stage_results.get("financial-analyst", {})
+        accounting_raw = stage_results.get("accounting-risk-analyst", {})
+        business = _presentation_stage_value(business_raw)
+        claims = _collect_stage_claims(
+            *stage_results.values(), growth, skeptic, forecast
+        )
+        possible_moats = (
+            business.get("possible_moats", []) if isinstance(business, dict) else []
+        )
+        unknowns = _collect_strings(
+            [business_raw, skeptic], "unknowns", "missing_evidence", "unresolved_questions"
+        )
+        invalidation = _collect_strings(
+            skeptic, "unsupported_assumptions", "strongest_counterarguments"
+        )
+        leading_indicators = _collect_strings(growth, "leading_indicators")
+        return {
+            "executive_summary": self._report_text(
+                "最终综合未完整生成。以下内容由已完成的研究阶段确定性整理。",
+                "Final synthesis was incomplete. The content below deterministically preserves completed research stages.",
+            ),
+            "business_model": business,
+            "financial_quality": {
+                "financial_analysis": _presentation_stage_value(financial_raw),
+                "accounting_risk": _presentation_stage_value(accounting_raw),
+            },
+            "competitive_position": possible_moats
+            or self._report_text(
+                "竞争地位尚待最终综合；请结合商业模式与信息缺口复核。",
+                "Competitive position awaits final synthesis; review the business model and information gaps.",
+            ),
+            "growth_opportunities": growth.get("opportunities", growth),
+            "counterarguments": skeptic.get("strongest_counterarguments", skeptic),
+            "scenarios": forecast.get("scenarios", forecast),
+            "thesis": self._report_text(
+                "尚未形成最终长期结论；可重试最终综合，阶段性结论已保留。",
+                "No final long-term thesis was formed; retry synthesis while preserving stage conclusions.",
+            ),
+            "invalidation_conditions": invalidation
+            or self._report_text("尚待最终综合。", "Awaiting final synthesis."),
+            "leading_indicators": leading_indicators
+            or self._report_text("尚待最终综合。", "Awaiting final synthesis."),
+            "unresolved_questions": unknowns
+            or self._report_text(
+                "最终综合输出需要重新生成。",
+                "The final synthesis output needs to be regenerated.",
+            ),
+            "claims": claims,
+        }
 
     def _check_cancelled(self) -> None:
         if self.cancel_check():
@@ -250,6 +415,7 @@ class ResearchWorkflow:
         try:
             self._check_cancelled()
             metrics = calculate_metrics(facts)
+            interim_metrics = calculate_interim_metrics(facts)
             evidence = build_fact_evidence(facts)
             evidence.extend(filing_evidence or [])
             valuation = None
@@ -289,6 +455,7 @@ class ResearchWorkflow:
                 company,
                 facts,
                 metrics,
+                interim_metrics,
                 evidence,
                 valuation,
                 market_snapshot,
@@ -310,6 +477,7 @@ class ResearchWorkflow:
                 {
                     "markdown": summary,
                     "metrics": metrics,
+                    "interim_metrics": interim_metrics,
                     "evidence": evidence,
                     "currency": company.reporting_currency,
                     "accounting_standard": company.accounting_standard,
@@ -383,17 +551,62 @@ class ResearchWorkflow:
             )
             for agent_id in stage_one:
                 self._set_agent_state(agent_id, "queued")
+
+            completed_agents = 0
+
+            def record_stage_result(agent_id: str, result: dict[str, Any]) -> None:
+                nonlocal completed_agents
+                self._check_cancelled()
+                stage_results[agent_id] = result
+                verification = verify_agent_output(
+                    result, available, self.report_language
+                )
+                self._save(
+                    run,
+                    "agent-analysis",
+                    agent_id,
+                    {"result": result, "verification": verification},
+                    agent_id=agent_id,
+                )
+                self._set_agent_state(agent_id, "completed")
+                completed_agents += 1
+                notify(
+                    self._progress_text(
+                        "基础分析 Agent 已完成 {completed}/3：{agent_id}",
+                        completed=completed_agents,
+                        agent_id=agent_id,
+                    ),
+                    25 + completed_agents * 7,
+                )
+
             if self.parallel_agents:
-                executor = ThreadPoolExecutor(max_workers=3)
-                futures = {}
+                executor = ThreadPoolExecutor(max_workers=2)
+                futures: dict[Future[dict[str, Any]], str] = {}
+                failures: dict[str, BaseException] = {}
                 try:
-                    for agent_id, prompt_path in stage_one.items():
+                    queued = iter(stage_one.items())
+
+                    def submit_next() -> Future[dict[str, Any]] | None:
+                        try:
+                            agent_id, prompt_path = next(queued)
+                        except StopIteration:
+                            return None
                         self._set_agent_state(agent_id, "running")
-                        futures[executor.submit(
-                            self._run_agent, agent_id, prompt_path, context.compact_json(), {}
-                        )] = agent_id
-                    pending = set(futures)
-                    completed_agents = 0
+                        future = executor.submit(
+                            self._run_agent,
+                            agent_id,
+                            prompt_path,
+                            context.compact_json(),
+                            {},
+                        )
+                        futures[future] = agent_id
+                        return future
+
+                    pending = {
+                        future
+                        for future in (submit_next(), submit_next())
+                        if future is not None
+                    }
                     while pending:
                         self._check_cancelled()
                         done, pending = wait(
@@ -406,38 +619,49 @@ class ResearchWorkflow:
                             except ResearchCancelled:
                                 self._set_agent_state(agent_id, "cancelled")
                                 raise
-                            except Exception:
+                            except Exception as exc:
                                 self._set_agent_state(agent_id, "failed")
-                                raise
-                            self._check_cancelled()
-                            stage_results[agent_id] = result
-                            verification = verify_agent_output(
-                                result, available, self.report_language
-                            )
-                            self._save(
-                                run,
-                                "agent-analysis",
-                                agent_id,
-                                {"result": result, "verification": verification},
-                                agent_id=agent_id,
-                            )
-                            self._set_agent_state(agent_id, "completed")
-                            completed_agents += 1
-                            notify(
-                                self._progress_text(
-                                    "基础分析 Agent 已完成 {completed}/3：{agent_id}",
-                                    completed=completed_agents,
-                                    agent_id=agent_id,
-                                ),
-                                25 + completed_agents * 7,
-                            )
+                                failures[agent_id] = exc
+                            else:
+                                record_stage_result(agent_id, result)
+                            next_future = submit_next()
+                            if next_future is not None:
+                                pending.add(next_future)
                 finally:
                     executor.shutdown(
                         wait=not self.cancel_check(),
                         cancel_futures=True,
                     )
+
+                for agent_id, error in failures.items():
+                    if not (
+                        isinstance(error, ProviderError) and error.retryable
+                    ):
+                        raise error
+                    self._check_cancelled()
+                    self._set_agent_state(agent_id, "retrying")
+                    notify(
+                        self._progress_text(
+                            "{agent_id} 暂时失败，正在单独重试",
+                            agent_id=agent_id,
+                        ),
+                        25 + completed_agents * 7,
+                    )
+                    try:
+                        result = self._run_agent(
+                            agent_id,
+                            stage_one[agent_id],
+                            context.compact_json(),
+                            {},
+                        )
+                    except ResearchCancelled:
+                        self._set_agent_state(agent_id, "cancelled")
+                        raise
+                    except Exception:
+                        self._set_agent_state(agent_id, "failed")
+                        raise
+                    record_stage_result(agent_id, result)
             else:
-                completed_agents = 0
                 for agent_id, prompt_path in stage_one.items():
                     self._check_cancelled()
                     self._set_agent_state(agent_id, "running")
@@ -451,60 +675,7 @@ class ResearchWorkflow:
                     except Exception:
                         self._set_agent_state(agent_id, "failed")
                         raise
-                    self._check_cancelled()
-                    stage_results[agent_id] = result
-                    verification = verify_agent_output(
-                        result, available, self.report_language
-                    )
-                    self._save(
-                        run,
-                        "agent-analysis",
-                        agent_id,
-                        {"result": result, "verification": verification},
-                        agent_id=agent_id,
-                    )
-                    self._set_agent_state(agent_id, "completed")
-                    completed_agents += 1
-                    notify(
-                        self._progress_text(
-                            "基础分析 Agent 已完成 {completed}/3：{agent_id}",
-                            completed=completed_agents,
-                            agent_id=agent_id,
-                        ),
-                        25 + completed_agents * 7,
-                    )
-            if False:
-                futures = {
-                    executor.submit(
-                        self._run_agent, agent_id, prompt_path, context.compact_json(), {}
-                    ): agent_id
-                    for agent_id, prompt_path in stage_one.items()
-                }
-                completed_agents = 0
-                for future in as_completed(futures):
-                    agent_id = futures[future]
-                    result = future.result()
-                    self._check_cancelled()
-                    stage_results[agent_id] = result
-                    verification = verify_agent_output(
-                        result, available, self.report_language
-                    )
-                    self._save(
-                        run,
-                        "agent-analysis",
-                        agent_id,
-                        {"result": result, "verification": verification},
-                        agent_id=agent_id,
-                    )
-                    completed_agents += 1
-                    notify(
-                        self._progress_text(
-                            "基础分析 Agent 已完成 {completed}/3：{agent_id}",
-                            completed=completed_agents,
-                            agent_id=agent_id,
-                        ),
-                        25 + completed_agents * 7,
-                    )
+                    record_stage_result(agent_id, result)
 
             dossier = {
                 "company": company.to_dict(),
@@ -585,12 +756,7 @@ class ResearchWorkflow:
                 "research-synthesizer",
                 "prompts/research-synthesizer.md",
                 context.compact_json(),
-                {
-                    "research_dossier": dossier,
-                    "growth_opportunities": growth,
-                    "counter_analysis": skeptic,
-                    "forecast": forecast,
-                },
+                _synthesis_prior_artifacts(dossier, growth, skeptic, forecast),
             )
             verification = validate_research_synthesis(
                 synthesis, available, self.report_language
@@ -599,24 +765,9 @@ class ResearchWorkflow:
             report_mode = "synthesized"
             if not verification["passed"]:
                 report_mode = "staged-fallback"
-                report_payload = {
-                    "executive_summary": self._report_text(
-                        "综合报告未完整生成。以下内容来自已经完成的阶段 Agent，未经过最终综合改写。",
-                        "The synthesized report was incomplete. The sections below preserve completed agent outputs without final rewriting.",
-                    ),
-                    "business_model": stage_results.get("business-analyst", {}),
-                    "financial_quality": {
-                        "financial_analysis": stage_results.get("financial-analyst", {}),
-                        "accounting_risk": stage_results.get("accounting-risk-analyst", {}),
-                    },
-                    "growth_opportunities": growth.get("opportunities", growth),
-                    "counterarguments": skeptic,
-                    "scenarios": forecast.get("scenarios", forecast),
-                    "unresolved_questions": self._report_text(
-                        "请检查模型超时、输出截断或 JSON 格式问题，然后重新生成综合报告。",
-                        "Check for model timeout, truncation, or invalid JSON, then regenerate the synthesized report.",
-                    ),
-                }
+                report_payload = self._build_staged_fallback(
+                    stage_results, growth, skeptic, forecast
+                )
             self._save(
                 run,
                 "research-report",
@@ -716,6 +867,7 @@ class ResearchWorkflow:
             run.company,
             facts,
             deterministic_content.get("metrics", []),
+            deterministic_content.get("interim_metrics", []),
             evidence,
             (_latest_artifact(artifacts, "deterministic-valuation") or {}).get("content"),
             deterministic_content.get("market_snapshot"),
@@ -728,12 +880,7 @@ class ResearchWorkflow:
             "research-synthesizer",
             "prompts/research-synthesizer.md",
             context.compact_json(),
-            {
-                "research_dossier": dossier,
-                "growth_opportunities": growth,
-                "counter_analysis": skeptic,
-                "forecast": forecast,
-            },
+            _synthesis_prior_artifacts(dossier, growth, skeptic, forecast),
         )
         available = {
             str(item.get("evidence_id"))

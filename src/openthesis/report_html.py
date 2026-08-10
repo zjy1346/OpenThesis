@@ -153,6 +153,26 @@ p { margin: 7px 0 12px; }
 .value { color: #1e293b; }
 .list { margin: 7px 0 12px 20px; padding: 0; }
 .list li { margin: 4px 0; }
+.confidence-group {
+  border: 1px solid #dbe4ef;
+  border-left: 4px solid #64748b;
+  background: #fbfdff;
+  padding: 14px 16px;
+  margin: 12px 0;
+}
+.confidence-high { border-left-color: #059669; background: #f0fdf7; }
+.confidence-medium { border-left-color: #d97706; background: #fffbeb; }
+.confidence-low { border-left-color: #dc2626; background: #fef2f2; }
+.confidence-unknown { border-left-color: #64748b; background: #f8fafc; }
+.confidence-heading { font-weight: 700; margin-bottom: 8px; }
+.claim-card { border-top: 1px solid #e5e7eb; padding: 10px 0 4px; }
+.claim-card:first-of-type { border-top: 0; }
+.information-gap {
+  background: #f8fafc;
+  border-left: 4px solid #64748b;
+  padding: 10px 14px;
+  margin: 8px 0;
+}
 .callout {
   background: #f8fafc;
   border-left: 4px solid #94a3b8;
@@ -278,19 +298,69 @@ def _metric_cell(label: str, value: str) -> str:
     )
 
 
+def _interim_financial_snapshot(rows: list[object], language: str, currency: str) -> str:
+    latest = next((item for item in rows if isinstance(item, dict)), None)
+    if latest is None:
+        return ""
+    period = f"{latest.get('year', '')} {latest.get('period', '')}".strip()
+    comparison = latest.get("comparison_period")
+    headers = (
+        ("Period", "Revenue", "Like-for-like growth", "Net income", "Operating cash flow")
+        if language == EN
+        else ("期间", "营业收入", "同期间增长", "净利润", "经营现金流")
+    )
+    values = (
+        period,
+        format_money(latest.get("revenue"), currency),
+        format_percent(latest.get("revenue_growth")),
+        format_money(latest.get("net_income"), currency),
+        format_money(latest.get("operating_cash_flow"), currency),
+    )
+    comparison_text = ""
+    if comparison:
+        comparison_text = " " + _escape(
+            _pick(language, f"同比基准：{comparison}", f"Comparison: {comparison}")
+        )
+    return (
+        '<div class="callout"><strong>'
+        + _escape(_pick(language, "最新季度表现", "Latest Interim Performance"))
+        + "</strong><br>"
+        + _escape(
+            _pick(
+                language,
+                "季度及中期数据不会与完整财年混算。",
+                "Interim values are never mixed with full-year metrics.",
+            )
+        )
+        + comparison_text
+        + '</div><table class="data-table interim-table"><thead><tr>'
+        + "".join(f"<th>{_escape(label)}</th>" for label in headers)
+        + "</tr></thead><tbody><tr>"
+        + "".join(
+            f'<td class="{"missing" if value == "—" else ""}">{_escape(value)}</td>'
+            for value in values
+        )
+        + "</tr></tbody></table>"
+    )
+
+
 def _financial_section(
     metrics: object,
     language: str,
     currency: str = "USD",
     market_snapshot: object = None,
     industry_support: str = "standard",
+    interim_metrics: object = None,
 ) -> str:
     english = language == EN
     rows = metrics if isinstance(metrics, list) else []
+    interim_rows = interim_metrics if isinstance(interim_metrics, list) else []
+    interim_html = _interim_financial_snapshot(interim_rows, language, currency)
     if not rows:
         return _section(
             _pick(language, "财务概览", "Financial Overview"),
-            f"<div class=\"callout callout-warning\">{_escape(_pick(language, '没有可用的标准化年度财务数据。', 'No normalized annual financial data is available.'))}</div>",
+            interim_html
+            + f"<div class=\"callout callout-warning\">{_escape(_pick(language, '没有可用的标准化年度财务数据。', 'No normalized annual financial data is available.'))}</div>",
             section_id="financials",
         )
 
@@ -420,7 +490,7 @@ def _financial_section(
         )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        snapshot_note + beta_note + kpi_html + table + note,
+        snapshot_note + beta_note + interim_html + kpi_html + table + note,
         section_id="financials",
     )
 
@@ -625,6 +695,107 @@ def _growth_section(
     )
 
 
+def _business_model_section(value: object, language: str) -> str:
+    if not isinstance(value, dict):
+        return _section(
+            _pick(language, "商业模式", "Business Model"),
+            _render_generic(value, language),
+            section_id="business-model",
+        )
+    parts: list[str] = []
+    summary = value.get("summary") or value.get("analysis")
+    if summary:
+        parts.append(_paragraphs(summary))
+    named_lists = (
+        ("possible_moats", "潜在护城河", "Potential Moats", ""),
+        ("risks", "主要风险", "Key Risks", ""),
+        ("unknowns", "信息缺口", "Information Gaps", "information-gap"),
+    )
+    for key, zh_label, en_label, css_class in named_lists:
+        items = value.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        parts.append(f"<h3>{_escape(_pick(language, zh_label, en_label))}</h3>")
+        if css_class:
+            parts.extend(
+                f'<div class="{css_class}">{_render_generic(item, language)}</div>'
+                for item in items
+            )
+        else:
+            parts.append(_render_generic(items, language))
+    if not parts:
+        parts.append(_render_generic(value, language))
+    return _section(
+        _pick(language, "商业模式", "Business Model"),
+        "".join(parts),
+        section_id="business-model",
+    )
+
+
+def _confidence_tier(confidence: float | None) -> tuple[str, str, str]:
+    if confidence is None:
+        return "unknown", "置信度未提供", "Confidence not provided"
+    if confidence >= 0.8:
+        return "high", "高置信度", "High confidence"
+    if confidence >= 0.55:
+        return "medium", "中等置信度", "Medium confidence"
+    return "low", "低置信度", "Low confidence"
+
+
+def _normalized_confidence(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _claims_section(value: object, language: str) -> str:
+    claims = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = [item for item in claims if isinstance(item, dict)]
+    if not normalized:
+        return _section(
+            _pick(language, "主要结论", "Key Conclusions"),
+            _render_generic(value, language),
+            section_id="claims",
+        )
+    grouped: dict[float | None, list[dict[str, Any]]] = {}
+    for claim in normalized:
+        confidence = _normalized_confidence(claim.get("confidence"))
+        grouped.setdefault(confidence, []).append(claim)
+    group_html: list[str] = []
+    for confidence in sorted(
+        grouped,
+        key=lambda item: (item is None, 0.0 if item is None else -item),
+    ):
+        tier, zh_label, en_label = _confidence_tier(confidence)
+        items = grouped[confidence]
+        confidence_text = "" if confidence is None else f" · {confidence:.2f}"
+        count_text = _pick(language, f" · {len(items)} 条", f" · {len(items)} items")
+        cards: list[str] = []
+        for claim in items:
+            text = claim.get("text") or claim.get("conclusion") or claim.get("argument") or ""
+            kind = report_display_value(str(claim.get("kind", "inference")), language)
+            cards.append(
+                '<div class="claim-card">'
+                f'<span class="badge">{_escape(kind)}</span>'
+                f"{_paragraphs(text)}"
+                "</div>"
+            )
+        group_html.append(
+            f'<div class="confidence-group confidence-{tier}">'
+            f'<div class="confidence-heading">{_escape(_pick(language, zh_label, en_label) + confidence_text + count_text)}</div>'
+            + "".join(cards)
+            + "</div>"
+        )
+    return _section(
+        _pick(language, "主要结论", "Key Conclusions"),
+        "".join(group_html),
+        section_id="claims",
+    )
+
+
 def _render_generic(value: object, language: str, level: int = 0) -> str:
     if value is None:
         return f"<span class=\"muted\">{_escape(_pick(language, '证据不足或尚未提供。', 'Insufficient evidence or not provided.'))}</span>"
@@ -667,19 +838,47 @@ def _report_sections(
             _paragraphs(report),
             section_id="research",
         )
+    display_report = dict(report)
+    business = display_report.get("business_model")
+    if isinstance(business, dict):
+        business = dict(business)
+        legacy_claims = business.pop("claims", None)
+        if legacy_claims and not display_report.get("claims"):
+            display_report["claims"] = legacy_claims
+        display_report["business_model"] = business
     parts: list[str] = []
     for key, title in labels.items():
-        if key not in report:
+        if key not in display_report:
+            continue
+        if key == "business_model":
+            parts.append(
+                _business_model_section(
+                    project_report_value(
+                        display_report[key], include_technical=include_technical
+                    ),
+                    language,
+                )
+            )
+            continue
+        if key == "claims":
+            parts.append(
+                _claims_section(
+                    project_report_value(
+                        display_report[key], include_technical=include_technical
+                    ),
+                    language,
+                )
+            )
             continue
         if key == "growth_opportunities":
-            parts.append(_growth_section(report[key], language, include_technical))
+            parts.append(_growth_section(display_report[key], language, include_technical))
             continue
         parts.append(
             _section(
                 title,
                 _render_generic(
                     project_report_value(
-                        report[key],
+                        display_report[key],
                         include_technical=include_technical,
                     ),
                     language,
@@ -690,7 +889,11 @@ def _report_sections(
     return "".join(parts)
 
 
-def _verification_section(value: object, language: str) -> str:
+def _verification_section(
+    value: object,
+    language: str,
+    include_technical: bool = False,
+) -> str:
     if not isinstance(value, dict):
         return ""
     passed = bool(value.get("passed"))
@@ -700,20 +903,28 @@ def _verification_section(value: object, language: str) -> str:
         "证据验证通过" if passed else "存在需要复核的内容",
         "Evidence verification passed" if passed else "Some content needs review",
     )
-    summary = _pick(
-        language,
-        (
-            f"结论 {value.get('claim_count', 0)} 条 · "
-            f"已验证 {value.get('verified_claim_count', 0)} 条 · "
-            f"无证据事实 {value.get('unsupported_fact_count', 0)} 条"
-        ),
-        (
-            f"{value.get('claim_count', 0)} claims · "
-            f"{value.get('verified_claim_count', 0)} verified · "
-            f"{value.get('unsupported_fact_count', 0)} unsupported facts"
-        ),
-    )
-    issues = _simple_list(value.get("issues", []))
+    if include_technical:
+        summary = _pick(
+            language,
+            (
+                f"结论 {value.get('claim_count', 0)} 条 · "
+                f"已验证 {value.get('verified_claim_count', 0)} 条 · "
+                f"无证据事实 {value.get('unsupported_fact_count', 0)} 条"
+            ),
+            (
+                f"{value.get('claim_count', 0)} claims · "
+                f"{value.get('verified_claim_count', 0)} verified · "
+                f"{value.get('unsupported_fact_count', 0)} unsupported facts"
+            ),
+        )
+        issues = _simple_list(value.get("issues", []))
+    else:
+        summary = _pick(
+            language,
+            "证据一致性检查已完成。" if passed else "部分内容仍需复核；已保留完成的阶段性研究结果。",
+            "Evidence checks completed." if passed else "Some content still needs review; completed stage results were preserved.",
+        )
+        issues = ""
     return _section(
         _pick(language, "验证结果", "Verification Results"),
         f"<div class=\"{css_class}\"><strong>{_escape(headline)}</strong><br>{_escape(summary)}</div>{issues}",
@@ -840,6 +1051,7 @@ def render_research_html(
                 str(deterministic.get("content", {}).get("currency", "USD")),
                 deterministic.get("content", {}).get("market_snapshot"),
                 str(deterministic.get("content", {}).get("industry_support", "standard")),
+                deterministic.get("content", {}).get("interim_metrics"),
             )
         )
     if valuation:
@@ -854,6 +1066,22 @@ def render_research_html(
                 )
             )
         else:
+            if content.get("mode") == "staged-fallback":
+                body.append(
+                    _section(
+                        _pick(language, "阶段性研究报告", "Staged Research Report"),
+                        '<div class="callout callout-warning">'
+                        + _escape(
+                            _pick(
+                                language,
+                                "最终综合未完整生成。以下内容由已完成的研究阶段整理，可重新尝试最终综合。",
+                                "Final synthesis was incomplete. The content below preserves completed research stages and can be synthesized again.",
+                            )
+                        )
+                        + "</div>",
+                        section_id="staged-report-status",
+                    )
+                )
             report = content.get("report", content)
             if isinstance(report, dict) and report.get("narrative"):
                 body.append(
@@ -875,7 +1103,11 @@ def render_research_html(
                         include_technical,
                     )
                 )
-            body.append(_verification_section(content.get("verification"), language))
+            body.append(
+                _verification_section(
+                    content.get("verification"), language, include_technical
+                )
+            )
     if growth_artifact and not growth_rendered:
         body.append(
             _growth_section(

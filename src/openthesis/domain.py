@@ -67,6 +67,8 @@ class FilingDocument:
     local_path: str = ""
     content_hash: str = ""
     ingested_at: str = field(default_factory=utc_now_iso)
+    revision: str = "original"
+    supersedes_document_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -89,6 +91,22 @@ class FinancialFact:
     accession_number: str
     source_url: str
     scope: str = "consolidated"
+    # Rich provenance retained by the financial-ingestion layer.  The legacy
+    # fields above remain the stable storage/API surface; these optional fields
+    # make the statement context explicit instead of inferring it downstream.
+    entity: str = ""
+    market: str = ""
+    statement: str = ""
+    period_start: str | None = None
+    consolidated_scope: str = "consolidated"
+    currency: str = ""
+    unit_scale: float = 1.0
+    revision: str = "original"
+    source_document: str = ""
+    source_page: int | None = None
+    raw_text: str = ""
+    parser_version: str = ""
+    validation_status: str = "unvalidated"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -104,6 +122,7 @@ class EvidenceRef:
     excerpt: str
     published_at: str
     content_hash: str = ""
+    bbox: tuple[float, float, float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

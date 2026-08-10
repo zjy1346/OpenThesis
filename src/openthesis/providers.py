@@ -9,14 +9,19 @@ from typing import Any, Protocol
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False):
+        self.retryable = retryable
+        super().__init__(message)
 
 
 class ProviderHTTPError(ProviderError):
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail[:1000]
-        super().__init__(f"模型接口返回 HTTP {status_code}：{self.detail}")
+        super().__init__(
+            f"模型接口返回 HTTP {status_code}：{self.detail}",
+            retryable=status_code in {408, 409, 425, 429} or status_code >= 500,
+        )
 
 
 @dataclass(slots=True)
@@ -69,15 +74,20 @@ def _post_json(
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        finally:
+            exc.close()
         authorization = headers.get("Authorization", "")
         if authorization:
             secret = authorization.removeprefix("Bearer ").strip()
             if secret:
                 detail = detail.replace(secret, "[REDACTED]")
         raise ProviderHTTPError(exc.code, detail) from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise ProviderError(f"模型接口请求失败：{exc}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ProviderError(f"模型接口请求失败：{exc}", retryable=True) from exc
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"模型接口返回了无效 JSON：{exc}") from exc
 
 
 def _parse_model_json(text: str) -> dict[str, Any]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .financials import deterministic_summary
+from .financials import deterministic_summary, format_money, format_percent
 from .growth import (
     GROWTH_FIELD_LABELS,
     evidence_grade_label,
@@ -17,6 +17,7 @@ from .report_projection import project_report_value, report_display_value, repor
 
 SECTION_LABELS_ZH = {
     "executive_summary": "执行摘要",
+    "claims": "主要结论",
     "business_model": "商业模式",
     "financial_quality": "财务质量",
     "balance_sheet": "资产负债表",
@@ -29,11 +30,11 @@ SECTION_LABELS_ZH = {
     "invalidation_conditions": "逻辑失效条件",
     "leading_indicators": "领先指标",
     "unresolved_questions": "未解决问题",
-    "claims": "主要结论",
 }
 
 SECTION_LABELS_EN = {
     "executive_summary": "Executive Summary",
+    "claims": "Key Claims",
     "business_model": "Business Model",
     "financial_quality": "Financial Quality",
     "balance_sheet": "Balance Sheet",
@@ -46,7 +47,6 @@ SECTION_LABELS_EN = {
     "invalidation_conditions": "Thesis Invalidation Conditions",
     "leading_indicators": "Leading Indicators",
     "unresolved_questions": "Unresolved Questions",
-    "claims": "Key Claims",
 }
 
 # Backward-compatible export used by integrations.
@@ -117,6 +117,52 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
                 lines.append(f"- **{label}{separator}** {rendered[0]}")
         return lines
     return [str(value)]
+
+
+def _render_claims(value: object, language: str) -> list[str]:
+    english = normalize_language(language) == EN
+    claims = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    if not claims:
+        return _render_value(value, language)
+    grouped: dict[float | None, list[dict[str, Any]]] = {}
+    for claim in claims:
+        raw_confidence = claim.get("confidence")
+        if isinstance(raw_confidence, bool):
+            confidence = None
+        else:
+            try:
+                confidence = max(0.0, min(1.0, float(raw_confidence)))
+            except (TypeError, ValueError):
+                confidence = None
+        grouped.setdefault(confidence, []).append(claim)
+    lines: list[str] = []
+    for confidence in sorted(
+        grouped,
+        key=lambda item: (item is None, 0.0 if item is None else -item),
+    ):
+        if confidence is None:
+            heading = "Confidence not provided" if english else "置信度未提供"
+        elif confidence >= 0.8:
+            heading = "High confidence" if english else "高置信度"
+        elif confidence >= 0.55:
+            heading = "Medium confidence" if english else "中等置信度"
+        else:
+            heading = "Low confidence" if english else "低置信度"
+        score = "" if confidence is None else f" · {confidence:.2f}"
+        count = (
+            f" · {len(grouped[confidence])} items"
+            if english
+            else f" · {len(grouped[confidence])} 条"
+        )
+        lines.extend([f"### {heading}{score}{count}", ""])
+        for claim in grouped[confidence]:
+            text = claim.get("text") or claim.get("conclusion") or claim.get("argument")
+            if not text:
+                continue
+            kind = report_display_value(str(claim.get("kind", "inference")), language)
+            lines.append(f"- **{kind}** · {text}")
+        lines.append("")
+    return lines
 
 
 def _render_growth_opportunities(
@@ -337,6 +383,51 @@ def render_research_run(
                 ]
             )
             content = deterministic.get("content", {})
+            interim_metrics = content.get("interim_metrics")
+            latest_interim = (
+                next((item for item in interim_metrics if isinstance(item, dict)), None)
+                if isinstance(interim_metrics, list)
+                else None
+            )
+            if latest_interim:
+                period = f"{latest_interim.get('year', '')} {latest_interim.get('period', '')}".strip()
+                comparison = str(latest_interim.get("comparison_period") or "")
+                currency = str(content.get("currency", "USD"))
+                lines.extend(
+                    [
+                        _pick(language, "## 最新季度及中期数据", "## Latest Interim Results"),
+                        "",
+                        _pick(
+                            language,
+                            f"> {period} 为累计期间数据，不与完整财年混算。",
+                            f"> {period} is a cumulative interim period and is not mixed with full-year totals.",
+                        ),
+                        "",
+                        _pick(
+                            language,
+                            f"- 营业收入：{format_money(latest_interim.get('revenue'), currency)}",
+                            f"- Revenue: {format_money(latest_interim.get('revenue'), currency)}",
+                        ),
+                        _pick(
+                            language,
+                            f"- 同期收入增长：{format_percent(latest_interim.get('revenue_growth'))}"
+                            + (f"（对比 {comparison}）" if comparison else ""),
+                            f"- Revenue growth: {format_percent(latest_interim.get('revenue_growth'))}"
+                            + (f" (versus {comparison})" if comparison else ""),
+                        ),
+                        _pick(
+                            language,
+                            f"- 净利润：{format_money(latest_interim.get('net_income'), currency)}",
+                            f"- Net income: {format_money(latest_interim.get('net_income'), currency)}",
+                        ),
+                        _pick(
+                            language,
+                            f"- 经营现金流：{format_money(latest_interim.get('operating_cash_flow'), currency)}",
+                            f"- Operating cash flow: {format_money(latest_interim.get('operating_cash_flow'), currency)}",
+                        ),
+                        "",
+                    ]
+                )
             snapshot = content.get("market_snapshot")
             if isinstance(snapshot, dict):
                 values: list[str] = []
@@ -484,19 +575,35 @@ def render_research_run(
                     ]
                 )
             elif isinstance(report, dict):
+                display_report = dict(report)
+                business = display_report.get("business_model")
+                if isinstance(business, dict):
+                    business = dict(business)
+                    legacy_claims = business.pop("claims", None)
+                    if legacy_claims and not display_report.get("claims"):
+                        display_report["claims"] = legacy_claims
+                    display_report["business_model"] = business
                 for key in section_labels:
-                    if key not in report:
+                    if key not in display_report:
                         continue
                     rendered = (
                         _render_growth_opportunities(
-                            report[key],
+                            display_report[key],
                             language,
                             include_technical=include_technical,
                         )
                         if key == "growth_opportunities"
+                        else _render_claims(
+                            project_report_value(
+                                display_report[key],
+                                include_technical=include_technical,
+                            ),
+                            language,
+                        )
+                        if key == "claims"
                         else _render_value(
                             project_report_value(
-                                report[key],
+                                display_report[key],
                                 include_technical=include_technical,
                             ),
                             language,
@@ -536,9 +643,16 @@ def render_research_run(
                         ]
                     )
                 )
-                issue_prefix = "- Issue: " if english else "- 问题："
-                for issue in verification.get("issues", []):
-                    lines.append(issue_prefix + str(issue))
+                if include_technical:
+                    issue_prefix = "- Issue: " if english else "- 问题："
+                    for issue in verification.get("issues", []):
+                        lines.append(issue_prefix + str(issue))
+                elif not passed:
+                    lines.append(
+                        "- Some conclusions need more evidence or a new synthesis."
+                        if english
+                        else "- 部分结论仍需补充证据或重新生成综合报告。"
+                    )
                 lines.append("")
 
     if growth_artifact and not growth_rendered:

@@ -10,7 +10,7 @@ from openthesis.demo import DEMO_COMPANY, demo_facts
 from openthesis.domain import FinancialFact, RunStatus
 from openthesis.packs import builtin_pack
 from openthesis.markets import build_company
-from openthesis.providers import ModelConfig
+from openthesis.providers import ModelConfig, ProviderError
 from openthesis.research import ResearchCancelled, ResearchWorkflow
 from openthesis.storage import Storage
 
@@ -231,7 +231,16 @@ class DeterministicWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(report["content"]["mode"], "staged-fallback")
             self.assertTrue(report["content"]["retryable"])
-            self.assertIn("business_model", report["content"]["report"])
+            fallback = report["content"]["report"]
+            required = {
+                "executive_summary", "business_model", "financial_quality",
+                "competitive_position", "growth_opportunities", "counterarguments",
+                "scenarios", "thesis", "invalidation_conditions",
+                "leading_indicators", "unresolved_questions", "claims",
+            }
+            self.assertTrue(required.issubset(fallback))
+            self.assertTrue(fallback["claims"])
+            self.assertNotIn("claims", fallback["business_model"])
             self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
 
             retried = workflow.retry_synthesis(
@@ -371,7 +380,84 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 return provider.maximum
 
         self.assertEqual(run_with(False), 1)
-        self.assertGreaterEqual(run_with(True), 2)
+        self.assertEqual(run_with(True), 2)
+
+    def test_parallel_base_agent_retries_only_temporary_failure_sequentially(self) -> None:
+        class RetryProvider:
+            def __init__(self) -> None:
+                self.active = 0
+                self.maximum = 0
+                self.calls: dict[str, int] = {}
+                self.lock = threading.Lock()
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                agent = str(json.loads(user_prompt)["agent"])
+                with self.lock:
+                    self.calls[agent] = self.calls.get(agent, 0) + 1
+                    call_number = self.calls[agent]
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                threading.Event().wait(0.02)
+                with self.lock:
+                    self.active -= 1
+                if agent == "financial-analyst" and call_number == 1:
+                    raise ProviderError("temporary timeout", retryable=True)
+                return {
+                    "executive_summary": "Summary",
+                    "business_model": "Business model",
+                    "financial_quality": "Financial quality",
+                    "competitive_position": "Competitive position",
+                    "growth_opportunities": ["Opportunity"],
+                    "counterarguments": ["Counterargument"],
+                    "scenarios": ["Scenario"],
+                    "thesis": "Thesis",
+                    "invalidation_conditions": ["Invalidation"],
+                    "leading_indicators": ["Indicator"],
+                    "unresolved_questions": ["Question"],
+                    "claims": [
+                        {
+                            "text": "Supported inference",
+                            "kind": "inference",
+                            "confidence": 0.8,
+                            "evidence_ids": [],
+                        }
+                    ],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = RetryProvider()
+            progress: list[tuple[str, int]] = []
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(
+                    provider="openai-compatible",
+                    model="fake",
+                    base_url="https://example.test/v1",
+                ),
+                parallel_agents=True,
+            )
+
+            run = workflow.run(
+                DEMO_COMPANY,
+                demo_facts(),
+                progress=lambda message, percent: progress.append((message, percent)),
+            )
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertEqual(provider.maximum, 2)
+            self.assertEqual(provider.calls["financial-analyst"], 2)
+            self.assertEqual(provider.calls["business-analyst"], 1)
+            self.assertEqual(provider.calls["accounting-risk-analyst"], 1)
+            self.assertTrue(any("单独重试" in message for message, _ in progress))
 
     def test_cancellation_is_persisted_without_calling_provider(self) -> None:
         class CountingProvider:

@@ -9,6 +9,7 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from openthesis.demo import demo_facts
 from openthesis.domain import (
@@ -146,6 +147,82 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(status["disclosure_url"], "https://www.cninfo.com.cn/new/index")
             self.assertNotIn("不代表", status["message"])
             self.assertEqual(provider_calls, [])
+
+    def test_rejected_filing_quality_stops_before_provider_and_storage_write(self) -> None:
+        company = build_company("832982.BJ", "Jinbo Bio")
+        filing = FilingDocument(
+            document_id="official:jinbo-bad",
+            company_cik=company.security_id,
+            accession_number="jinbo-bad",
+            form_type="ANNUAL_REPORT",
+            fiscal_period="FY",
+            period_end="2023-12-31",
+            filed_at="2024-04-25T00:00:00+00:00",
+            primary_document="2023 Annual Report",
+            source_url="https://example.invalid/jinbo.pdf",
+        )
+
+        class BadFilingAdapter:
+            def list_financial_filings(self, _company: Company, *, limit: int = 5):
+                return [filing][:limit]
+
+            def download_filing(self, item: FilingDocument, _target: Path) -> FilingDocument:
+                return item
+
+        provider_calls: list[str] = []
+
+        def provider_factory(config):
+            provider_calls.append(config.public_id)
+            raise AssertionError("provider must not be created for rejected facts")
+
+        bad_fact = FinancialFact(
+            fact_id="bad:revenue",
+            company_cik=company.security_id,
+            concept="revenue",
+            reported_concept="revenue",
+            value=100.0,
+            unit="CNY",
+            fiscal_year=2023,
+            fiscal_period="FY",
+            form_type="ANNUAL_REPORT",
+            start_date="2023-01-01",
+            end_date="2023-12-31",
+            filed_at=filing.filed_at,
+            accession_number=filing.accession_number,
+            source_url=filing.source_url,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "openthesis.service.ingest_official_pdf",
+            return_value=([bad_fact], [], []),
+        ):
+            service = AppService(
+                Path(directory),
+                market_data=_ResearchMarketData(BadFilingAdapter()),
+                provider_factory=provider_factory,
+            )
+            started = service.start_research(
+                {
+                    "mode": "company",
+                    "company": company.to_dict(),
+                    "download_filings": True,
+                    "model": {
+                        "preset_id": "custom",
+                        "model": "test-model",
+                        "base_url": "https://example.test/v1",
+                        "api_key": "session-only",
+                    },
+                }
+            )
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline, "quality-gate research timed out")
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+            self.assertEqual(status["state"], "failed")
+            self.assertEqual(status["error_code"], "FILING_DATA_QUALITY_FAILED")
+            self.assertEqual(provider_calls, [])
+            self.assertEqual(service.storage.get_facts(company.security_id), [])
 
     def test_unverified_official_response_is_distinct_and_skips_model(self) -> None:
         class UnverifiedAdapter:

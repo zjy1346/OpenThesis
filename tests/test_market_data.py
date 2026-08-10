@@ -60,6 +60,52 @@ class _Transport:
 
 
 class MarketDataAdapterTests(unittest.TestCase):
+    def test_cninfo_discovers_first_quarter_reports_separately(self) -> None:
+        class FirstQuarterTransport(_Transport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.categories: list[str] = []
+
+            def post_form(self, url: str, fields: dict[str, str]):
+                if "topSearch" in url:
+                    return super().post_form(url, fields)
+                if "hisAnnouncement" in url:
+                    category = fields.get("category", "")
+                    self.categories.append(category)
+                    if category == "category_ndbg_szsh;":
+                        return {
+                            "totalAnnouncement": 1,
+                            "announcements": [{
+                                "announcementId": "annual-2025",
+                                "announcementTitle": "中芯国际2025年年度报告",
+                                "announcementTime": 1774569600000,
+                                "adjunctUrl": "finalpage/2026-03-27/annual-2025.PDF",
+                            }],
+                        }
+                    if "category_yjdbg_szsh;" in category:
+                        return {
+                            "totalAnnouncement": 1,
+                            "announcements": [{
+                                "announcementId": "quarter-2026-q1",
+                                "announcementTitle": "中芯国际2026年第一季度报告",
+                                "announcementTime": 1778793600000,
+                                "adjunctUrl": "finalpage/2026-05-15/quarter-2026-q1.PDF",
+                            }],
+                        }
+                    return {"totalAnnouncement": 0, "announcements": []}
+                return super().post_form(url, fields)
+
+        transport = FirstQuarterTransport()
+        adapter = CnInfoAdapter(transport)
+        company = adapter.resolve("600519")[0]
+
+        filings = adapter.list_financial_filings(company)
+
+        self.assertIn("category_yjdbg_szsh;", "".join(transport.categories))
+        q1 = next(item for item in filings if item.accession_number == "quarter-2026-q1")
+        self.assertEqual(q1.fiscal_period, "Q1")
+        self.assertEqual(q1.period_end, "2026-03-31")
+
     def test_cninfo_treats_explicit_zero_count_with_null_list_as_no_filings(self) -> None:
         class EmptyTransport(_Transport):
             def post_form(self, url: str, fields: dict[str, str]):

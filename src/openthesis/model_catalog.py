@@ -225,21 +225,24 @@ def discover_models(
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            message = (
-                f"认证失败（HTTP {exc.code}，地址 {_safe_endpoint_label(url)}），"
-                "请检查 API Key、区域预设和账号权限。"
-            )
-        elif exc.code == 404:
-            message = (
-                f"在线模型目录不存在（HTTP 404，地址 {_safe_endpoint_label(url)}），"
-                "请检查区域预设或使用内置列表。"
-            )
-        else:
-            message = (
-                f"在线模型目录返回 HTTP {exc.code}（地址 {_safe_endpoint_label(url)}），"
-                "已保留内置列表。"
-            )
+        try:
+            if exc.code in {401, 403}:
+                message = (
+                    f"认证失败（HTTP {exc.code}，地址 {_safe_endpoint_label(url)}），"
+                    "请检查 API Key、区域预设和账号权限。"
+                )
+            elif exc.code == 404:
+                message = (
+                    f"在线模型目录不存在（HTTP 404，地址 {_safe_endpoint_label(url)}），"
+                    "请检查区域预设或使用内置列表。"
+                )
+            else:
+                message = (
+                    f"在线模型目录返回 HTTP {exc.code}（地址 {_safe_endpoint_label(url)}），"
+                    "已保留内置列表。"
+                )
+        finally:
+            exc.close()
         raise ModelDiscoveryError(message) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise ModelDiscoveryError(

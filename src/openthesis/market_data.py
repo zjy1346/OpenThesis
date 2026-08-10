@@ -229,7 +229,9 @@ class CnInfoAdapter:
                 announcements.extend(page_rows)
         periodic_fields = dict(query_fields)
         periodic_fields["pageNum"] = "1"
-        periodic_fields["category"] = "category_bndbg_szsh;category_sjdbg_szsh;"
+        periodic_fields["category"] = (
+            "category_yjdbg_szsh;category_bndbg_szsh;category_sjdbg_szsh;"
+        )
         periodic_payload = self.transport.post_form(
             "https://www.cninfo.com.cn/new/hisAnnouncement/query",
             periodic_fields,
