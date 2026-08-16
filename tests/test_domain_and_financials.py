@@ -50,6 +50,33 @@ class FinancialMetricTests(unittest.TestCase):
         self.assertAlmostEqual(interim[0]["revenue_growth"], 0.2)
         self.assertEqual(interim[0]["comparison_period"], "2025 Q1")
 
+    def test_missing_prior_interim_period_has_an_explainable_gap(self) -> None:
+        facts = [
+            {
+                "fact_id": "2026-Q1-revenue",
+                "company_cik": "fixture",
+                "concept": "revenue",
+                "reported_concept": "revenue",
+                "value": 150_225_314_000.0,
+                "unit": "CNY",
+                "fiscal_year": 2026,
+                "fiscal_period": "Q1",
+                "form_type": "QUARTERLY_REPORT",
+                "start_date": "2026-01-01",
+                "end_date": "2026-03-31",
+                "filed_at": "2026-04-28",
+                "accession_number": "q1-26",
+                "source_url": "https://example.test/q1-26.pdf",
+                "scope": "consolidated",
+            }
+        ]
+
+        interim = calculate_interim_metrics(facts)
+
+        self.assertIsNone(interim[0]["revenue_growth"])
+        self.assertIsNone(interim[0]["comparison_period"])
+        self.assertEqual(interim[0]["comparison_gap"], "prior_period_unavailable")
+
     def test_demo_metrics_are_ordered_and_calculated(self) -> None:
         metrics = calculate_metrics(demo_facts())
         self.assertEqual(metrics[0]["year"], 2025)

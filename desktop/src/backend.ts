@@ -95,12 +95,23 @@ export function retryResearchSynthesis(
   return request("research.retry_synthesis", { run_id: runId, model });
 }
 
+export function retryResearchGrowth(
+  runId: string,
+  model: ModelSelection,
+): Promise<ResearchReport> {
+  return request("research.retry_growth", { run_id: runId, model });
+}
+
 export function getResearchStatus(jobId: string): Promise<ResearchJob> {
   return request("research.status", { job_id: jobId });
 }
 
 export function cancelResearch(jobId: string): Promise<ResearchJob> {
   return request("research.cancel", { job_id: jobId });
+}
+
+export function decideVisionUpload(jobId: string, approved: boolean): Promise<ResearchJob> {
+  return request("research.vision_decision", { job_id: jobId, approved });
 }
 
 export function exportResearchReport(report: ResearchReport): Promise<boolean> {

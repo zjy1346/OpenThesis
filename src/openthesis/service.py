@@ -6,7 +6,7 @@ import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable
@@ -18,7 +18,8 @@ from .domain import Company, FilingDocument, FinancialFact, ResearchRun, RunStat
 from .filing_parser import build_filing_evidence
 from .i18n import normalize_language, translate_error
 from .market_data import MarketDataError, MarketDataModule
-from .financial_ingestion import FinancialExtractionError, ingest_official_pdf, prepare_facts_for_ai
+from .financial_ingestion import FinancialIngestionEngine, FinancialDataset, build_financial_profile, FinancialProfile
+from .market_financials import ValidationStatus
 from .markets import COMMON_MARKET_COMPANIES, MARKET_PROFILES, Market, normalize_market
 from .model_catalog import (
     MODEL_PRESETS,
@@ -41,8 +42,16 @@ from .providers import ModelConfig, create_provider
 from .report_html import render_research_html
 from .research import ResearchCancelled, ResearchWorkflow
 from .reporting import render_research_run
-from .sec_client import SecClient, SecClientError
+from .sec_client import SEC_HK_ISSUERS, SecClient, SecClientError, SecFinancialSourceAdapter
 from .storage import Storage
+from .vision_financials import (
+    CustomVisionAdapter,
+    MineruLiteAdapter,
+    MineruPrecisionAdapter,
+    VisionAdapterError,
+    VisionFallbackConfig,
+    VisionFinancialSourceAdapter,
+)
 
 
 CONTRACT_VERSION = "1.0"
@@ -88,6 +97,8 @@ class _ResearchJob:
     percent: int = 0
     run_id: str | None = None
     stage: str = "preparing"
+    stage_current: int | None = None
+    stage_total: int | None = None
     agent_states: dict[str, str] = field(default_factory=dict)
     cancel_requested: bool = False
     ui_language: str = "zh-CN"
@@ -95,6 +106,10 @@ class _ResearchJob:
     market: str | None = None
     disclosure_url: str | None = None
     started_at: float = field(default_factory=time.monotonic, repr=False)
+    vision_upload_preview: dict[str, Any] | None = None
+    vision_approval: bool | None = None
+    vision_approval_pending: bool = False
+    vision_approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -104,6 +119,8 @@ class _ResearchJob:
             "percent": self.percent,
             "run_id": self.run_id,
             "stage": self.stage,
+            "stage_current": self.stage_current,
+            "stage_total": self.stage_total,
             "agent_states": dict(self.agent_states),
             "completed_agents": sum(state == "completed" for state in self.agent_states.values()),
             "total_agents": len(self.agent_states),
@@ -112,6 +129,9 @@ class _ResearchJob:
             "error_code": self.error_code,
             "market": self.market,
             "disclosure_url": self.disclosure_url,
+            "vision_upload_preview": dict(self.vision_upload_preview) if self.vision_upload_preview else None,
+            "vision_approval": self.vision_approval,
+            "vision_approval_pending": self.vision_approval_pending,
         }
 
 
@@ -127,6 +147,8 @@ class AppService:
         model_discoverer: Callable[..., tuple[str, ...]] = discover_models,
         provider_factory: Callable[[ModelConfig], Any] = create_provider,
         market_data: Any | None = None,
+        financial_ingestion_engine: FinancialIngestionEngine | None = None,
+        vision_adapter_factory: Callable[[VisionFallbackConfig], VisionFinancialSourceAdapter] | None = None,
     ):
         self.storage = Storage(data_dir)
         self.interrupted_run_count = self.storage.interrupt_running_runs()
@@ -135,6 +157,8 @@ class AppService:
         self._model_discoverer = model_discoverer
         self._provider_factory = provider_factory
         self._market_data = market_data or MarketDataModule()
+        self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine()
+        self._vision_adapter_factory = vision_adapter_factory or _default_vision_adapter_factory
         self._jobs: dict[str, _ResearchJob] = {}
         self._jobs_lock = threading.Lock()
 
@@ -157,9 +181,11 @@ class AppService:
                 "research.delete",
                 "research.get_report",
                 "research.start",
+                "research.retry_growth",
                 "research.retry_synthesis",
                 "research.status",
                 "research.cancel",
+                "research.vision_decision",
             ],
         }
 
@@ -343,6 +369,7 @@ class AppService:
                     "market": str(company.get("market", "US")),
                     "exchange": str(company.get("exchange", "")),
                     "listing_currency": str(company.get("listing_currency", "USD")),
+                    "reporting_currency": str(company.get("reporting_currency", company.get("listing_currency", "USD"))),
                     "industry_support": str(company.get("industry_support", "standard")),
                 }
             )
@@ -406,9 +433,11 @@ class AppService:
             "market": str(company.get("market", "US")),
             "exchange": str(company.get("exchange", "")),
             "listing_currency": str(company.get("listing_currency", "USD")),
+            "reporting_currency": str(company.get("reporting_currency", company.get("listing_currency", "USD"))),
             "industry_support": str(company.get("industry_support", "standard")),
             "market_snapshot": payload.get("market_snapshot"),
             "retryable_synthesis": _report_retryable(artifacts),
+            "retryable_growth": _growth_retryable(artifacts),
             "markdown": render_research_run(
                 run_id,
                 artifacts,
@@ -474,6 +503,55 @@ class AppService:
             model["api_key"] = ""
         return self.get_report(run_id, language=run.report_language)
 
+    def retry_research_growth(
+        self, run_id: str, model: dict[str, Any]
+    ) -> dict[str, Any]:
+        stored = self.storage.get_run(run_id)
+        if stored is None:
+            raise KeyError("research run not found")
+        payload = _decode_payload(stored.get("payload_json"))
+        company_payload = payload.get("company")
+        if not isinstance(company_payload, dict):
+            raise ValueError("saved company is invalid")
+        config = _model_config_from_request(model)
+        if not config.enabled:
+            raise ValueError("an enabled model is required")
+        company = Company(**company_payload)
+        run = ResearchRun(
+            run_id=run_id,
+            company=company,
+            workflow_id=str(payload.get("workflow_id", "long-term-fundamentals")),
+            research_pack_id=str(payload.get("research_pack_id", "")),
+            research_pack_version=str(payload.get("research_pack_version", "")),
+            provider_id=config.provider,
+            model_id=config.model,
+            data_as_of=str(payload.get("data_as_of", date.today().isoformat())),
+            status=RunStatus(str(stored.get("status", "partial"))),
+            started_at=str(payload.get("started_at", stored.get("started_at", utc_now_iso()))),
+            completed_at=stored.get("completed_at"),
+            errors=list(payload.get("errors", [])),
+            report_language=normalize_language(str(payload.get("report_language", "zh-CN"))),
+            market_snapshot=payload.get("market_snapshot"),
+        )
+        workflow = ResearchWorkflow(
+            self.storage,
+            self._select_pack(run.research_pack_id),
+            self._provider_factory(config),
+            config,
+            report_language=run.report_language,
+            ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
+            parallel_agents=False,
+        )
+        try:
+            workflow.retry_growth(
+                run,
+                self.storage.get_artifacts(run_id),
+                self.storage.get_facts(company.cik),
+            )
+        finally:
+            model["api_key"] = ""
+        return self.get_report(run_id, language=run.report_language)
+
     def start_research(self, request: dict[str, Any]) -> dict[str, Any]:
         mode = request.get("mode")
         if mode not in {"demo", "company"}:
@@ -519,6 +597,10 @@ class AppService:
             if job is None:
                 raise KeyError("research job not found")
             job.cancel_event.set()
+            if job.vision_approval_pending:
+                # Wake an approval waiter immediately; the callback checks the
+                # cancellation flag before allowing any upload.
+                job.vision_approval_event.set()
             if job.state in {"queued", "running"}:
                 job.state = "cancelling"
                 job.cancel_requested = True
@@ -533,10 +615,57 @@ class AppService:
                         job.agent_states[agent_id] = "cancelled"
             return job.snapshot()
 
+    def vision_decision(self, job_id: str, approved: bool) -> dict[str, Any]:
+        """Resolve a session-only failed-page upload approval request."""
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError("research job not found")
+            if job.stage != "vision-approval" or not job.vision_approval_pending:
+                raise ValueError("vision upload approval is not pending")
+            job.vision_approval = bool(approved)
+            job.vision_approval_pending = False
+            job.vision_approval_event.set()
+            return job.snapshot()
+
     def _update_job(self, job: _ResearchJob, **updates: Any) -> None:
         with self._jobs_lock:
+            if "percent" in updates:
+                updates["percent"] = max(job.percent, min(100, max(0, int(updates["percent"]))))
+            if updates.get("stage_total") is not None:
+                updates["stage_total"] = max(0, int(updates["stage_total"]))
+            if updates.get("stage_current") is not None:
+                current = max(0, int(updates["stage_current"]))
+                total = updates.get("stage_total", job.stage_total)
+                updates["stage_current"] = min(current, int(total)) if total is not None else current
+            if "stage" in updates and updates["stage"] != job.stage:
+                updates.setdefault("stage_current", None)
+                updates.setdefault("stage_total", None)
             for key, value in updates.items():
                 setattr(job, key, value)
+
+    def _ingestion_progress(
+        self,
+        job: _ResearchJob,
+        stage: str,
+        current: int,
+        total: int,
+    ) -> None:
+        safe_total = max(1, int(total))
+        safe_current = min(safe_total, max(0, int(current)))
+        if stage == "filing-parse":
+            percent = 18 + round(safe_current * 6 / safe_total)
+        elif stage == "filing-validation":
+            percent = 24 + round(safe_current * 5 / safe_total)
+        else:
+            percent = max(job.percent, 24)
+        self._update_job(
+            job,
+            stage=stage,
+            stage_current=safe_current,
+            stage_total=safe_total,
+            percent=max(job.percent, percent),
+        )
 
     def _run_research(self, job: _ResearchJob, request: dict[str, Any]) -> None:
         preferences = self.preferences()
@@ -558,6 +687,7 @@ class AppService:
         self._update_job(
             job,
             state="running",
+            stage="preparing",
             message="Preparing research data" if ui_language == "en" else "正在准备研究数据",
             percent=2,
         )
@@ -572,6 +702,8 @@ class AppService:
             market_profile = MARKET_PROFILES[company_market]
             self._update_job(
                 job,
+                stage="company-profile",
+                percent=3,
                 market=company_market.value,
                 disclosure_url=market_profile.disclosure_home,
             )
@@ -601,6 +733,57 @@ class AppService:
                     "terminal_growth": (valuation_inputs or {}).get("terminal_growth", 0.03),
                 }
             filing_evidence: list[dict[str, Any]] = []
+            financial_profile: FinancialProfile | None = None
+            vision_config = _vision_config_from_request(request.get("vision_fallback"))
+            vision_adapter: VisionFinancialSourceAdapter | None = None
+            if vision_config is not None and vision_config.enabled:
+                if vision_config.require_page_approval:
+                    def approve_upload(summary: dict[str, Any]) -> bool:
+                        safe_summary = {
+                            key: summary.get(key)
+                            for key in ("provider", "pages", "total_bytes", "source_document", "filing_hash", "document_hashes")
+                            if key in summary
+                        }
+                        # Establish the pending state and clear stale
+                        # decisions atomically before publishing the preview.
+                        # This prevents a fast UI decision from being lost
+                        # between stage publication and event.clear().
+                        with self._jobs_lock:
+                            if job.cancel_event.is_set():
+                                return False
+                            job.vision_approval_event.clear()
+                            job.vision_approval = None
+                            job.vision_approval_pending = True
+                            job.vision_upload_preview = safe_summary
+                            job.stage = "vision-approval"
+                            job.message = "Review failed financial pages before upload"
+                        while not job.vision_approval_event.wait(0.1):
+                            if job.cancel_event.is_set():
+                                with self._jobs_lock:
+                                    job.vision_approval_pending = False
+                                return False
+                        with self._jobs_lock:
+                            approved = bool(job.vision_approval)
+                            cancelled = job.cancel_event.is_set()
+                            job.vision_approval_pending = False
+                            job.vision_upload_preview = None
+                        return approved and not cancelled
+                    vision_config = replace(vision_config, approve_upload=approve_upload)
+                try:
+                    vision_config.validate()
+                    vision_adapter = self._vision_adapter_factory(vision_config)
+                except VisionAdapterError as exc:
+                    raise _ResearchDataUnavailable(exc.code) from exc
+                self._update_job(
+                    job,
+                    stage="filing-discovery",
+                    message=(
+                        "Vision fallback is enabled; it will upload only failed financial-table pages"
+                        if ui_language == "en"
+                        else "视觉财报兜底已启用，仅在本地失败后上传失败的财务表页"
+                    ),
+                    percent=3,
+                )
 
             self.storage.save_company(company)
             if mode == "demo":
@@ -643,6 +826,9 @@ class AppService:
                             raise ResearchCancelled()
                         self._update_job(
                             job,
+                            stage="filing-download",
+                            stage_current=index,
+                            stage_total=len(filings),
                             message=(
                                 f"Downloading SEC 10-K ({index}/{len(filings)})"
                                 if ui_language == "en"
@@ -658,6 +844,9 @@ class AppService:
                     raise ResearchCancelled()
                 self._update_job(
                     job,
+                    stage="filing-parse",
+                    stage_current=0,
+                    stage_total=len(filings),
                     message=(
                         "Loading SEC Company Facts"
                         if ui_language == "en"
@@ -666,6 +855,22 @@ class AppService:
                     percent=23,
                 )
                 normalized = client.get_company_facts(company)
+                expected_period_end = max(
+                    (str(item.period_end) for item in filings if item.form_type in {"10-K", "20-F", "40-F"}),
+                    default="",
+                )
+                latest_sec = _latest_sec_verified_group(
+                    normalized, self._financial_ingestion, expected_period_end=expected_period_end
+                )
+                if latest_sec is None:
+                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                self._update_job(
+                    job,
+                    stage="filing-validation",
+                    stage_current=len(filings),
+                    stage_total=len(filings),
+                    percent=29,
+                )
                 self.storage.save_facts(normalized)
                 facts = [item.to_dict() for item in normalized]
             else:
@@ -673,6 +878,7 @@ class AppService:
                 market_label = "A/港股" if ui_language != "en" else "A/H-share"
                 self._update_job(
                     job,
+                    stage="filing-discovery",
                     message=(
                         f"Loading official {market_label} financial reports"
                         if ui_language == "en"
@@ -692,6 +898,9 @@ class AppService:
                             raise ResearchCancelled()
                         self._update_job(
                             job,
+                            stage="filing-download",
+                            stage_current=index,
+                            stage_total=len(filings),
                             message=(
                                 f"Downloading official report ({index}/{len(filings)})"
                                 if ui_language == "en"
@@ -709,42 +918,187 @@ class AppService:
                 else:
                     raise _ResearchDataUnavailable("FILING_DOWNLOAD_REQUIRED")
                 self.storage.save_filings(filings)
-                normalized_facts: list[FinancialFact] = []
                 research_reports = list(downloaded)
-                for index, filing in enumerate(research_reports, start=1):
+                self._update_job(
+                    job,
+                    stage="filing-parse",
+                    stage_current=0,
+                    stage_total=len(research_reports),
+                    percent=18,
+                )
+                structured_sources: tuple[Any, ...] = ()
+                # Dual-listed issuers may expose an official SEC Company Facts
+                # feed.  Only construct the adapter when the user has supplied
+                # a valid contact address; the address itself is never logged
+                # or persisted by this path.  PDF AST remains the fallback.
+                sec_mapping = SEC_HK_ISSUERS.get(company.ticker.upper())
+                sec_email = str(preferences.get("sec_contact_email", "")).strip()
+                if sec_mapping and "@" in sec_email and " " not in sec_email:
+                    try:
+                        sec_client = self._sec_client_factory(
+                            build_sec_user_agent(
+                                _normalize_sec_profile(preferences["sec_contact_profile"]),
+                                sec_email,
+                            ),
+                            self.storage.data_dir / "sec-cache",
+                        )
+                        structured_sources = (SecFinancialSourceAdapter(sec_client),)
+                    except Exception:
+                        structured_sources = ()
+                if structured_sources or vision_adapter is not None:
+                    try:
+                        try:
+                            dataset: FinancialDataset = self._financial_ingestion.ingest(
+                                company,
+                                research_reports,
+                                structured_sources=structured_sources,
+                                vision_fallback=vision_adapter,
+                                vision_config=vision_config,
+                                cancel_check=job.cancel_event.is_set,
+                                progress=lambda stage, current, total: self._ingestion_progress(
+                                    job, stage, current, total
+                                ),
+                            )
+                        except TypeError as exc:
+                            if "vision_fallback" not in str(exc):
+                                raise
+                            dataset = self._financial_ingestion.ingest(
+                                company, research_reports, structured_sources=structured_sources
+                            )
+                    except VisionAdapterError as exc:
+                        if job.cancel_event.is_set() or exc.code == "VISION_CANCELLED":
+                            raise ResearchCancelled() from exc
+                        raise _ResearchDataUnavailable(exc.code) from exc
                     if job.cancel_event.is_set():
                         raise ResearchCancelled()
-                    self._update_job(
-                        job,
-                        message=(
-                            f"Normalizing official disclosure ({index}/{len(research_reports)})"
-                            if ui_language == "en"
-                            else f"正在标准化官方披露文件（{index}/{len(research_reports)}）"
-                        ),
-                        percent=18 + index * 4,
-                    )
+                else:
+                    # Keep compatibility with injected test/legacy engines
+                    # that predate the structured_sources keyword.
                     try:
-                        extracted, report_evidence, _warnings = ingest_official_pdf(
-                            filing,
+                        dataset = self._financial_ingestion.ingest(
                             company,
+                            research_reports,
+                            progress=lambda stage, current, total: self._ingestion_progress(
+                                job, stage, current, total
+                            ),
                         )
-                    except FinancialExtractionError:
+                    except TypeError as exc:
+                        if "progress" not in str(exc):
+                            raise
+                        dataset = self._financial_ingestion.ingest(company, research_reports)
+                self._update_job(
+                    job,
+                    stage="filing-validation",
+                    stage_current=len(research_reports),
+                    stage_total=len(research_reports),
+                    percent=29,
+                )
+                filing_evidence.extend(item.to_dict() for item in dataset.evidence)
+                manifest_by_document = {item.document_id: item for item in dataset.manifest}
+                for filing in research_reports:
+                    manifest = manifest_by_document.get(filing.document_id)
+                    if manifest is None:
                         continue
-                    normalized_facts.extend(extracted)
-                    filing_evidence.extend(report_evidence)
-                deduplicated = {item.fact_id: item for item in normalized_facts}
-                normalized_facts = list(deduplicated.values())
-                if not normalized_facts:
-                    raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
-                normalized_facts, validation = prepare_facts_for_ai(normalized_facts)
-                if validation.status.value == "REJECTED" or not normalized_facts:
+                    filing.form_type = manifest.form_type
+                    filing.fiscal_period = manifest.fiscal_period
+                    filing.period_end = manifest.period_end
+                    filing.revision = manifest.revision
+                    filing.supersedes_document_id = manifest.supersedes_document_id
+                # Persist corrected period/form metadata, never the SEC contact.
+                self.storage.save_filings(research_reports)
+                latest_annual = max(
+                    (
+                        manifest for manifest in dataset.manifest
+                        if manifest.fiscal_period == "FY"
+                        and manifest.form_type == "ANNUAL_REPORT"
+                    ),
+                    key=lambda item: item.period_end,
+                    default=None,
+                )
+                # Promote a single disclosed reporting currency for the latest
+                # consolidated full-core FY group, while retaining HKD as the
+                # listing currency.  Mixed/ambiguous currencies fail closed.
+                latest_candidates = [
+                    item for item in dataset.group_validations
+                    if latest_annual is not None
+                    and item.identity[1] == latest_annual.period_end
+                    and item.identity[2] == "FY"
+                    and item.identity[3] == "consolidated"
+                    and getattr(item.validation.status, "value", "") in {"VERIFIED", "READY_WITH_WARNINGS"}
+                    and _group_has_required_core(item, tuple(item.validation.accepted))
+                ]
+                currencies = {str(item.identity[4]).upper() for item in latest_candidates if item.identity[4]}
+                if len(currencies) > 1:
                     raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
-                self.storage.replace_facts_for_filings(
+                if len(currencies) == 1:
+                    disclosed_currency = next(iter(currencies))
+                    if disclosed_currency != company.reporting_currency.upper():
+                        company.reporting_currency = disclosed_currency
+                        self.storage.save_company(company)
+                latest_group = next(
+                    (
+                        item for item in dataset.group_validations
+                        if item in latest_candidates
+                        if latest_annual is not None
+                        and item.identity[1] == latest_annual.period_end
+                        and item.identity[2] == "FY"
+                        and item.identity[3] == "consolidated"
+                        and item.identity[4].upper() == company.reporting_currency.upper()
+                    ),
+                    None,
+                )
+                if latest_annual is None or latest_group is None:
+                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                latest_accepted = _accepted_group_facts(latest_group, company)
+                if not _group_has_required_core(latest_group, latest_accepted):
+                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                # The ingestion engine may retain accepted facts from multiple
+                # statement scopes/currencies for auditability.  Only the
+                # consolidated facts in the issuer's reporting currency are a
+                # valid research context; parent-company and foreign-currency
+                # groups remain in the audit store but never reach an Agent.
+                accepted: list[FinancialFact] = []
+                accepted_ids: set[str] = set()
+                for group in dataset.group_validations:
+                    for fact in _accepted_group_facts(group, company):
+                        if fact.fact_id not in accepted_ids:
+                            accepted.append(fact)
+                            accepted_ids.add(fact.fact_id)
+                # Keep facts which the parser marked accepted but which do not
+                # belong to the research scope as audit-only; do not mutate
+                # their VERIFIED status into REJECTED.
+                audit_only = [
+                    fact for fact in dataset.accepted_facts
+                    if fact.fact_id not in accepted_ids
+                ]
+                quarantined = [
+                    fact for group in dataset.group_validations
+                    for fact in group.validation.quarantined
+                ]
+                known_quarantined = {fact.fact_id for fact in quarantined}
+                quarantined.extend(
+                    fact for fact in dataset.validation.quarantined
+                    if fact.fact_id not in known_quarantined
+                )
+                quarantined.extend(audit_only)
+                self.storage.replace_financial_ingestion(
                     company.security_id,
                     [item.accession_number for item in research_reports],
-                    normalized_facts,
+                    accepted,
+                    quarantined,
+                    list(dataset.group_validations),
+                    list(dataset.evidence),
                 )
-                facts = [item.to_dict() for item in normalized_facts]
+                facts = [item.to_dict() for item in accepted]
+                financial_profile = build_financial_profile(
+                    accepted,
+                    dataset.group_validations,
+                    company.reporting_currency,
+                    selected_filings=research_reports,
+                    manifests=dataset.manifest,
+                )
+                if not facts:
+                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
 
             if mode == "company" and not facts:
                 raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
@@ -752,7 +1106,14 @@ class AppService:
             def agent_progress(agent_id: str, state: str) -> None:
                 with self._jobs_lock:
                     job.agent_states[agent_id] = state
-                    job.stage = "parallel-agents"
+                    if parallel_agents:
+                        job.stage = "base-analysis"
+                    else:
+                        job.stage = {
+                            "financial-analyst": "financial-analysis",
+                            "business-analyst": "business-analysis",
+                            "accounting-risk-analyst": "risk-analysis",
+                        }.get(agent_id, job.stage)
 
             workflow = ResearchWorkflow(
                 self.storage,
@@ -778,14 +1139,14 @@ class AppService:
                     job,
                     state="running",
                     message=f"{prefix}{message}",
-                    stage=("parallel-agents" if 20 <= percent <= 50 else "research"),
+                    stage=_workflow_stage(percent, comparison=bool(prefix)),
                     percent=base
                     + round(min(100, max(0, int(percent))) * span / 100),
                 )
 
             primary = workflow.run(
                 company,
-                facts,
+                financial_profile or facts,
                 filing_evidence=filing_evidence,
                 valuation_inputs=valuation_inputs,
                 market_snapshot=market_snapshot,
@@ -817,7 +1178,7 @@ class AppService:
                 )
                 secondary = comparison_workflow.run(
                     company,
-                    facts,
+                    financial_profile or facts,
                     filing_evidence=filing_evidence,
                     valuation_inputs=valuation_inputs,
                     market_snapshot=market_snapshot,
@@ -903,6 +1264,10 @@ class AppService:
                 selection = request.get(selection_name)
                 if isinstance(selection, dict):
                     selection["api_key"] = ""
+            vision_request = request.get("vision_fallback")
+            if isinstance(vision_request, dict):
+                vision_request["token"] = ""
+                vision_request["api_key"] = ""
     def _select_pack(self, pack_id: str) -> ResearchPack:
         packs = list_installed_packs(self.storage.data_dir / "research-packs")
         if not pack_id:
@@ -923,6 +1288,13 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_DOWNLOAD_REQUIRED": "需要下载官方财报原文后才能开始研究。请启用财报原文下载并重新获取。",
             "FILING_FORMAT_UNSUPPORTED": "已找到官方公告，但当前版本无法从中生成可用的财务数据。",
             "FILING_DATA_QUALITY_FAILED": "已获取官方披露文件，但关键财务字段未通过一致性校验。为避免错误数据进入 AI，本次研究已停止。",
+            "VISION_CONSENT_REQUIRED": "视觉财报兜底需要明确上传同意。",
+            "VISION_UPLOAD_NOT_APPROVED": "视觉财报页面上传未获批准。",
+            "VISION_RATE_LIMITED": "视觉服务暂时限流，请稍后重试。",
+            "VISION_UNAUTHORIZED": "视觉服务凭证无效或已过期。",
+            "VISION_TIMEOUT": "视觉财报解析超时，未使用不完整结果。",
+            "VISION_CANCELLED": "视觉财报解析已取消。",
+            "VISION_SIZE_LIMIT": "视觉上传页面超过安全大小限制。",
         },
         "en": {
             "NO_FILINGS_AVAILABLE": "The official disclosure platform does not currently provide a usable financial report for this company. The company may not have published a periodic report yet, or no report matches the current criteria.",
@@ -932,6 +1304,13 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_DOWNLOAD_REQUIRED": "The official report must be downloaded before research can start. Enable report downloads and try again.",
             "FILING_FORMAT_UNSUPPORTED": "Official disclosures were found, but this version could not produce usable financial data from them.",
             "FILING_DATA_QUALITY_FAILED": "Official disclosures were retrieved, but critical financial fields failed consistency checks. Research stopped before any data was sent to AI.",
+            "VISION_CONSENT_REQUIRED": "Vision fallback requires explicit upload consent.",
+            "VISION_UPLOAD_NOT_APPROVED": "The selected financial pages were not approved for upload.",
+            "VISION_RATE_LIMITED": "The vision service is rate limited; try again later.",
+            "VISION_UNAUTHORIZED": "The vision service credential is invalid or expired.",
+            "VISION_TIMEOUT": "Vision parsing timed out; incomplete output was not used.",
+            "VISION_CANCELLED": "Vision parsing was cancelled.",
+            "VISION_SIZE_LIMIT": "The selected vision pages exceed the safe upload limit.",
         },
     }
     catalog = messages["en" if language == "en" else "zh-CN"]
@@ -950,12 +1329,125 @@ def _decode_payload(value: Any) -> dict[str, Any]:
     return decoded if isinstance(decoded, dict) else {}
 
 
+_RESEARCH_CORE = frozenset(
+    {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities"}
+)
+
+
+def _accepted_group_facts(
+    group: Any, company: Company
+) -> tuple[FinancialFact, ...]:
+    """Return only facts from an accepted, research-scope validation group."""
+
+    identity = tuple(getattr(group, "identity", ()))
+    if len(identity) != 5:
+        return ()
+    accession, period_end, fiscal_period, scope, currency = identity
+    if str(scope).strip().lower() != "consolidated":
+        return ()
+    if str(currency).strip().upper() != company.reporting_currency.upper():
+        return ()
+    validation = getattr(group, "validation", None)
+    status = getattr(getattr(validation, "status", None), "value", "REJECTED")
+    if status not in {"VERIFIED", "READY_WITH_WARNINGS"}:
+        return ()
+    result: list[FinancialFact] = []
+    for fact in getattr(validation, "accepted", ()):
+        if (
+            fact.accession_number == accession
+            and fact.end_date == period_end
+            and fact.fiscal_period == fiscal_period
+            and fact.consolidated_scope.strip().lower() == "consolidated"
+            and fact.currency.strip().upper() == company.reporting_currency.upper()
+        ):
+            result.append(fact)
+    return tuple(result)
+
+
+def _group_has_required_core(group: Any, facts: tuple[FinancialFact, ...]) -> bool:
+    """Require all three statements' latest-period core facts before AI."""
+
+    concepts = {fact.concept for fact in facts}
+    return _RESEARCH_CORE.issubset(concepts) and bool(
+        concepts.intersection({"equity", "total_equity"})
+    )
+
+
+def _latest_sec_verified_group(
+    facts: list[FinancialFact],
+    engine: FinancialIngestionEngine,
+    *,
+    expected_period_end: str | None = None,
+) -> tuple[FinancialFact, ...] | None:
+    """Validate SEC Company Facts by FY identity before allowing an Agent."""
+
+    # Synthetic demo mode intentionally carries a compact legacy schema and is
+    # never an external filing; preserve its deterministic report path.
+    if facts and all(fact.form_type == "DEMO" for fact in facts):
+        by_end: dict[str, list[FinancialFact]] = {}
+        for fact in facts:
+            by_end.setdefault(fact.end_date, []).append(fact)
+        for end in sorted(by_end, reverse=True):
+            group = tuple(by_end[end])
+            concepts = {fact.concept for fact in group}
+            if _RESEARCH_CORE.issubset(concepts) and concepts.intersection({"equity", "total_equity"}):
+                return group
+        return None
+
+    grouped: dict[tuple[str, str, str, str, str], list[FinancialFact]] = {}
+    for fact in facts:
+        identity = (
+            fact.accession_number,
+            fact.end_date,
+            (fact.fiscal_period or "FY").upper(),
+            fact.consolidated_scope or fact.scope or "unknown",
+            fact.currency,
+        )
+        grouped.setdefault(identity, []).append(fact)
+    valid: list[tuple[str, tuple[FinancialFact, ...]]] = []
+    if expected_period_end:
+        grouped = {
+            identity: group
+            for identity, group in grouped.items()
+            if identity[1] == expected_period_end
+        }
+        if not grouped:
+            return None
+    for identity, group in grouped.items():
+        result = engine._validate_group(group, identity)
+        accepted = tuple(result.validation.accepted)
+        if result.validation.status in {ValidationStatus.VERIFIED, ValidationStatus.READY_WITH_WARNINGS} and _group_has_required_core(result, accepted):
+            valid.append((identity[1], accepted))
+    if not valid:
+        return None
+    valid.sort(key=lambda item: item[0], reverse=True)
+    return valid[0][1]
+
+
 def _report_retryable(artifacts: list[dict[str, Any]]) -> bool:
     final = next(
         (item for item in reversed(artifacts) if item.get("artifact_type") == "research-report"),
         None,
     )
     return bool(final and final.get("content", {}).get("retryable"))
+
+
+def _growth_retryable(artifacts: list[dict[str, Any]]) -> bool:
+    growth = next(
+        (item for item in reversed(artifacts) if item.get("artifact_type") == "growth-opportunities"),
+        None,
+    )
+    if not growth:
+        return False
+    content = growth.get("content", {})
+    if not isinstance(content, dict) or content.get("opportunities"):
+        return False
+    validation = content.get("_validation")
+    return content.get("_response_error") in {
+        "empty_content",
+        "invalid_json",
+        "invalid_shape",
+    } or (isinstance(validation, dict) and validation.get("passed") is False)
 
 
 def _serialize_model_preset(preset: ModelPreset) -> dict[str, Any]:
@@ -1117,12 +1609,61 @@ def _normalize_timeout_seconds(value: Any, default: int = 180) -> int:
     return min(600, max(30, seconds))
 
 
+def _vision_config_from_request(value: Any) -> VisionFallbackConfig | None:
+    if not isinstance(value, dict):
+        return None
+    return VisionFallbackConfig(
+        enabled=bool(value.get("enabled", False)),
+        consent=bool(value.get("consent", False)),
+        provider=str(value.get("provider", "mineru_lite")),
+        token=str(value.get("token", "")),
+        api_key=str(value.get("api_key", "")),
+        endpoint=str(value.get("endpoint", "")),
+        model=str(value.get("model", "")),
+        timeout_seconds=float(value.get("timeout_seconds", 60.0) or 60.0),
+        language=str(value.get("language", "auto")),
+        require_page_approval=bool(value.get("require_page_approval", False)),
+    )
+
+
+def _default_vision_adapter_factory(config: VisionFallbackConfig) -> VisionFinancialSourceAdapter:
+    if config.provider == "mineru_lite":
+        return MineruLiteAdapter()
+    if config.provider == "mineru_precision":
+        return MineruPrecisionAdapter()
+    if config.provider == "custom_vision":
+        return CustomVisionAdapter()
+    raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
+
+
+def _workflow_stage(percent: int, *, comparison: bool = False) -> str:
+    if comparison:
+        return "comparison"
+    if percent <= 15:
+        return "financial-analysis"
+    if percent < 52:
+        return "base-analysis"
+    if percent < 67:
+        return "growth-analysis"
+    if percent < 77:
+        return "counter-analysis"
+    if percent < 90:
+        return "scenario-analysis"
+    return "synthesis"
+
+
 def _request_secrets(request: dict[str, Any]) -> tuple[str, ...]:
     values: list[str] = []
     for name in ("model", "comparison_model"):
         selection = request.get(name)
         if isinstance(selection, dict):
             secret = str(selection.get("api_key", "")).strip()
+            if secret:
+                values.append(secret)
+    vision = request.get("vision_fallback")
+    if isinstance(vision, dict):
+        for name in ("token", "api_key"):
+            secret = str(vision.get(name, "")).strip()
             if secret:
                 values.append(secret)
     return tuple(values)

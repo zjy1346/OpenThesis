@@ -51,8 +51,10 @@ export default function App() {
     beginResearch,
     retryResearch,
     retrySynthesis,
+    retryGrowth,
     openFailedDisclosure,
     stopResearch,
+    decideVisionUpload,
     savePreferences,
     refreshBootstrap,
   } = useWorkbenchSession();
@@ -188,6 +190,7 @@ export default function App() {
         {isActiveResearchJob(job) && (
           <ResearchProgress
             job={job}
+            language={bootstrap?.preferences.ui_language ?? language}
             cancelLabel={copy.cancel}
             labels={{
               cancel: copy.cancel,
@@ -200,8 +203,17 @@ export default function App() {
               cancelled: copy.cancelled,
               failed: copy.failed,
               unknown: copy.waiting,
+              visionApprovalTitle: copy.visionApprovalTitle,
+              visionApprovalProvider: copy.visionApprovalProvider,
+              visionApprovalDocument: copy.visionApprovalDocument,
+              visionApprovalPages: copy.visionApprovalPages,
+              visionApprovalSize: copy.visionApprovalSize,
+              visionApprovalFingerprint: copy.visionApprovalFingerprint,
+              visionApprovalApprove: copy.visionApprovalApprove,
+              visionApprovalDecline: copy.visionApprovalDecline,
             }}
             onCancel={() => void stopResearch()}
+            onVisionDecision={(approved) => void decideVisionUpload(approved)}
           />
         )}
         <section className="report-stage" aria-label={copy.report}>
@@ -221,7 +233,7 @@ export default function App() {
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} />
+            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} />
           ) : (
             <EmptyState title={copy.emptyTitle} body={copy.emptyBody} demoAction={copy.startDemo}
               realAction={copy.startReal} hint={copy.demoHint}

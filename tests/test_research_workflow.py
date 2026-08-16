@@ -15,7 +15,137 @@ from openthesis.research import ResearchCancelled, ResearchWorkflow
 from openthesis.storage import Storage
 
 
+def _valid_growth_output() -> dict[str, object]:
+    return {
+        "opportunities": [
+            {
+                "title": "Synthetic opportunity",
+                "category": "product expansion",
+                "mechanism": "The addressable market expands.",
+                "evidence_grade": "C",
+                "maturity_stage": "early",
+                "time_horizon_years": 3,
+                "probability_range": [0.3, 0.5],
+                "supporting_evidence_ids": [],
+                "contradicting_evidence_ids": [],
+                "scenario_eligibility": ["base"],
+            }
+        ]
+    }
+
+
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_growth_empty_response_retries_once_and_can_be_retried_in_isolation(self) -> None:
+        class GrowthRetryProvider:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.growth_calls = 0
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                self.assertTrue(json_mode)
+                agent = str(json.loads(user_prompt).get("agent", ""))
+                self.calls.append(agent)
+                if agent == "growth-opportunity-analyst":
+                    self.growth_calls += 1
+                    if self.growth_calls <= 2:
+                        return {
+                            "opportunities": [],
+                            "structured_output_valid": False,
+                            "_response_error": "empty_content",
+                        }
+                    return {
+                        "opportunities": [
+                            {
+                                "title": "New product platform",
+                                "category": "product expansion",
+                                "mechanism": "The addressable market expands.",
+                                "evidence_grade": "C",
+                                "maturity_stage": "early",
+                                "time_horizon_years": 3,
+                                "probability_range": [0.3, 0.5],
+                                "supporting_evidence_ids": [],
+                                "contradicting_evidence_ids": [],
+                                "scenario_eligibility": ["base"],
+                            }
+                        ]
+                    }
+                return {
+                    "executive_summary": "Synthetic verified research.",
+                    "business_model": "Synthetic business model.",
+                    "financial_quality": "Synthetic financial quality.",
+                    "competitive_position": "Synthetic competitive position.",
+                    "growth_opportunities": [],
+                    "counterarguments": ["Synthetic counterargument."],
+                    "scenarios": ["Synthetic scenario."],
+                    "thesis": "Synthetic thesis.",
+                    "invalidation_conditions": ["Synthetic invalidation condition."],
+                    "leading_indicators": ["Synthetic leading indicator."],
+                    "unresolved_questions": ["Synthetic unresolved question."],
+                    "claims": [
+                        {
+                            "text": "The supplied data needs further interpretation.",
+                            "kind": "inference",
+                            "evidence_ids": [],
+                        }
+                    ],
+                }
+
+            @staticmethod
+            def assertTrue(value: bool) -> None:
+                if not value:
+                    raise AssertionError("structured output must be enabled")
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = GrowthRetryProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(
+                    provider="openai-compatible",
+                    model="fake",
+                    base_url="https://example.test/v1",
+                ),
+                report_language="en",
+            )
+
+            run = workflow.run(DEMO_COMPANY, demo_facts())
+            self.assertEqual(provider.growth_calls, 2, "initial run gets one bounded growth retry")
+            before = {agent: provider.calls.count(agent) for agent in set(provider.calls)}
+
+            workflow.retry_growth(
+                run,
+                storage.get_artifacts(run.run_id),
+                demo_facts(),
+            )
+
+            self.assertEqual(provider.growth_calls, 3)
+            self.assertEqual(provider.calls.count("research-synthesizer"), before["research-synthesizer"] + 1)
+            for agent in (
+                "financial-analyst",
+                "business-analyst",
+                "accounting-risk-analyst",
+                "skeptical-analyst",
+                "forecast-analyst",
+            ):
+                self.assertEqual(provider.calls.count(agent), before[agent])
+            latest_growth = next(
+                artifact
+                for artifact in reversed(storage.get_artifacts(run.run_id))
+                if artifact["artifact_type"] == "growth-opportunities"
+            )
+            self.assertEqual(
+                latest_growth["content"]["opportunities"][0]["title"],
+                "New product platform",
+            )
+
     def test_workflow_completes_without_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))
@@ -97,6 +227,8 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 with self.lock:
                     self.count += 1
                 self.assertions(system_prompt, user_prompt, json_mode)
+                if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
+                    return _valid_growth_output()
                 return {
                     "executive_summary": "Synthetic verified research.",
                     "business_model": "Synthetic business model.",
@@ -165,16 +297,21 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 return "ok"
 
             def generate(
-                self, _system_prompt: str, _user_prompt: str, *, json_mode: bool = True
+                self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True
             ) -> dict[str, object]:
                 self.count += 1
+                if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
+                    return _valid_growth_output()
                 if self.count == 7:
                     return {
                         "narrative": "",
                         "structured_output_valid": False,
                         "_response_error": "empty_content",
                     }
-                if self.count == 8:
+                # The workflow gets one bounded repair attempt (call 8), which
+                # is deliberately still malformed; the explicit retry seam
+                # below succeeds on call 9.
+                if self.count == 9:
                     return {
                         "executive_summary": "Recovered synthesis.",
                         "business_model": "Business model.",
@@ -231,6 +368,9 @@ class DeterministicWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(report["content"]["mode"], "staged-fallback")
             self.assertTrue(report["content"]["retryable"])
+            self.assertEqual(report["content"]["diagnostics"]["initial"]["parse_error_class"], "empty_content")
+            self.assertEqual(report["content"]["diagnostics"]["repair"]["parse_error_class"], "invalid_schema")
+            self.assertNotIn("prompt", report["content"]["diagnostics"])
             fallback = report["content"]["report"]
             required = {
                 "executive_summary", "business_model", "financial_quality",
@@ -242,13 +382,14 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertTrue(fallback["claims"])
             self.assertNotIn("claims", fallback["business_model"])
             self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
+            self.assertEqual(provider.count, 8, "run performs one bounded final repair call")
 
             retried = workflow.retry_synthesis(
                 run,
                 storage.get_artifacts(run.run_id),
                 demo_facts(),
             )
-            self.assertEqual(provider.count, 8, "retry must make exactly one model call")
+            self.assertEqual(provider.count, 9, "bounded repair plus retry must make two final-only calls")
             self.assertEqual(retried.status, RunStatus.COMPLETED)
             retried_report = next(
                 item
@@ -257,6 +398,41 @@ class DeterministicWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(retried_report["content"]["mode"], "synthesized")
             self.assertFalse(retried_report["content"]["retryable"])
+
+    def test_repair_provider_error_keeps_completed_stages_partial(self) -> None:
+        class RepairUnavailableProvider:
+            def __init__(self) -> None:
+                self.count = 0
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
+                self.count += 1
+                if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
+                    return _valid_growth_output()
+                if self.count == 7:
+                    return {"narrative": "malformed", "structured_output_valid": False, "_response_error": "invalid_json"}
+                if self.count == 8:
+                    raise ProviderError("rate limited", retryable=False)
+                return {"analysis": "stage", "claims": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = RepairUnavailableProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(provider="openai-compatible", model="fake", base_url="https://example.test/v1"),
+            )
+            run = workflow.run(DEMO_COMPANY, demo_facts())
+            self.assertEqual(run.status, RunStatus.PARTIAL)
+            self.assertEqual(provider.count, 8)
+            report = next(item for item in storage.get_artifacts(run.run_id) if item["artifact_type"] == "research-report")
+            self.assertEqual(report["content"]["diagnostics"]["parse_error_class"], "provider_error")
+            self.assertEqual(report["content"]["diagnostics"]["repair"]["parse_error_class"], "provider_error")
 
     def test_failed_provider_persists_failed_run(self) -> None:
         class FailingProvider:
@@ -297,6 +473,8 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 self, system_prompt: str, user_prompt: str, *, json_mode: bool = True
             ) -> dict[str, object]:
                 self.calls.append((system_prompt, user_prompt))
+                if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
+                    return _valid_growth_output()
                 return {"executive_summary": "English output", "claims": []}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -322,7 +500,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 progress=lambda message, _percent: progress.append(message),
             )
             self.assertEqual(run.report_language, "en")
-            self.assertEqual(len(provider.calls), 7)
+            self.assertEqual(len(provider.calls), 8)
             for system_prompt, user_prompt in provider.calls:
                 self.assertIn(
                     "Write every natural-language value in English",

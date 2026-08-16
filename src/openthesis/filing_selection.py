@@ -56,13 +56,28 @@ def select_research_filings(
     kept_annual_years = tuple(sorted(annual_by_year, reverse=True)[: max(1, annual_limit)])
     selected: list[FilingDocument] = [annual_by_year[year] for year in kept_annual_years]
 
-    # A periodic filing is useful only when its fiscal year has no annual report.
-    # Keep every discovered period for such a year so a newly listed issuer can be
-    # researched from Q1/H1/Q3 instead of one arbitrarily chosen snapshot.
+    # A periodic filing is normally useful only when its fiscal year has no annual
+    # report. Keep every discovered period for such a year so a newly listed
+    # issuer can be researched from Q1/H1/Q3 instead of one arbitrarily chosen
+    # snapshot.
+    primary_periodics: list[FilingDocument] = []
     for year in sorted(periodic_by_year, reverse=True):
         if year in annual_by_year:
             continue
-        selected.extend(sorted(periodic_by_year[year], key=_period_rank))
+        current = sorted(periodic_by_year[year], key=_period_rank)
+        selected.extend(current)
+        primary_periodics.extend(current)
+
+    # Like-for-like interim growth needs the previous year's same period even if
+    # that prior year also has an annual report. Retain only that bounded
+    # comparison companion; do not reintroduce every same-year periodic filing or
+    # compare cumulative Q1/H1/Q3 values with a full fiscal year.
+    selected_ids = {item.document_id for item in selected}
+    for filing in primary_periodics:
+        companion = by_period.get((_fiscal_year(filing) - 1, filing.fiscal_period.upper()))
+        if companion is not None and companion.document_id not in selected_ids:
+            selected.append(companion)
+            selected_ids.add(companion.document_id)
 
     used_listing_fallback = not annual_by_year and bool(listing)
     if used_listing_fallback:

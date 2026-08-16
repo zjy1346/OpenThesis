@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.3.0",
+    [string]$Version = "1.4.1",
     [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis"
 )
 

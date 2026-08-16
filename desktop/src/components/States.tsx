@@ -1,6 +1,14 @@
-import { FileText } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Clock3, FileText } from "lucide-react";
 
 import type { ResearchJob } from "../types";
+import {
+  agentDisplayName,
+  formatElapsedTime,
+  progressStageCopy,
+  progressStageDetail,
+  waitingMessageAt,
+} from "../features/research/researchProgress";
 
 export function LoadingState({ label }: { label: string }) {
   return <div className="center-state" aria-live="polite"><span className="loading-ring" /><p>{label}</p></div>;
@@ -28,9 +36,10 @@ export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, 
   );
 }
 
-export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
+export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN", onCancel, onVisionDecision }: {
   job: ResearchJob;
   cancelLabel?: string;
+  language?: string;
   labels?: {
     cancel: string;
     cancelling: string;
@@ -42,8 +51,17 @@ export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
     cancelled: string;
     failed: string;
     unknown: string;
+    visionApprovalTitle?: string;
+    visionApprovalProvider?: string;
+    visionApprovalDocument?: string;
+    visionApprovalPages?: string;
+    visionApprovalSize?: string;
+    visionApprovalFingerprint?: string;
+    visionApprovalApprove?: string;
+    visionApprovalDecline?: string;
   };
   onCancel: () => void;
+  onVisionDecision?: (approved: boolean) => void;
 }) {
   const copy = labels ?? {
     cancel: cancelLabel ?? "Cancel research",
@@ -69,22 +87,87 @@ export function ResearchProgress({ job, cancelLabel, labels, onCancel }: {
   const agentStates = job.agent_states ?? {};
   const totalAgents = job.total_agents ?? Object.keys(agentStates).length;
   const completedAgents = job.completed_agents ?? Object.values(agentStates).filter((state) => state === "completed").length;
+  const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
+  const [elapsed, setElapsed] = useState(backendElapsed);
+  const elapsedAnchor = useRef({
+    jobId: job.job_id,
+    seconds: backendElapsed,
+    observedAt: Date.now(),
+  });
+  useEffect(() => {
+    const now = Date.now();
+    const anchor = elapsedAnchor.current;
+    const estimated = anchor.seconds + Math.max(0, Math.floor((now - anchor.observedAt) / 1_000));
+    if (anchor.jobId !== job.job_id || backendElapsed > estimated) {
+      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+    }
+    setElapsed((current) => Math.max(current, backendElapsed));
+  }, [backendElapsed, job.job_id]);
+  useEffect(() => {
+    const now = Date.now();
+    elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+    setElapsed(backendElapsed);
+    const update = () => {
+      const anchor = elapsedAnchor.current;
+      const actual = anchor.seconds + Math.max(0, Math.floor((Date.now() - anchor.observedAt) / 1_000));
+      setElapsed((current) => Math.max(current, actual));
+    };
+    const timer = window.setInterval(update, 1_000);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [job.job_id]);
+  const stage = job.state === "cancelling" ? "cancelling" : job.stage;
+  const stageCopy = progressStageCopy(language, stage);
+  const stageDetail = progressStageDetail(
+    language,
+    stage,
+    job.stage_current ?? undefined,
+    job.stage_total ?? undefined,
+  );
+  const waitingMessage = waitingMessageAt(language, elapsed, job.job_id);
   return (
-    <section className="research-progress" aria-live="polite" data-state={job.state}>
-      <div><strong>{job.message}</strong><span>{job.percent}%</span></div>
+    <section className="research-progress" data-state={job.state}>
+      <div className="research-progress-header">
+        <div className="research-stage-copy" aria-live="polite">
+          <strong>{stageCopy.title}</strong>
+          <span>“{stageCopy.note}”</span>
+          {stageDetail && <small>{stageDetail}</small>}
+        </div>
+        <div className="research-progress-metrics">
+          <span>{job.percent}%</span>
+          <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : "研究已用时间"}>
+            <Clock3 size={14} aria-hidden="true" />{formatElapsedTime(elapsed)}
+          </time>
+        </div>
+      </div>
       <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
+      <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>
       {totalAgents > 0 && <div className="agent-progress" aria-label={copy.agents}>
         <div className="agent-progress-heading"><span>{copy.agents}</span><span>{completedAgents}/{totalAgents}</span></div>
         <div className="agent-progress-list">
           {Object.entries(agentStates).map(([agentId, state]) => (
             <div className="agent-progress-row" key={agentId}>
               <span className={`agent-state-dot agent-state-${state}`} aria-hidden="true" />
-              <span>{agentId}</span><span>{statusLabel(state)}</span>
+              <span>{agentDisplayName(language, agentId)}</span><span>{statusLabel(state)}</span>
             </div>
           ))}
         </div>
       </div>}
-      <button type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
+      {job.vision_approval_pending && job.vision_upload_preview && <div className="vision-approval-card" role="dialog" aria-label={copy.visionApprovalTitle ?? "Vision upload approval"}>
+        <strong>{copy.visionApprovalTitle ?? "Vision upload approval"}</strong>
+        <span>{copy.visionApprovalProvider ?? "Provider"}: {job.vision_upload_preview.provider}</span><span>{copy.visionApprovalDocument ?? "Document"}: {job.vision_upload_preview.source_document || "—"}</span>
+        <span>{copy.visionApprovalPages ?? "Pages"}: {job.vision_upload_preview.pages.join(", ")} · {copy.visionApprovalSize ?? "Size"}: {Math.round(job.vision_upload_preview.total_bytes / 1024)} KB</span>
+        {job.vision_upload_preview.filing_hash && <code aria-label={copy.visionApprovalFingerprint ?? "Fingerprint"}>{copy.visionApprovalFingerprint ?? "Fingerprint"}: {job.vision_upload_preview.filing_hash.slice(0, 12)}</code>}
+        <div className="vision-approval-actions">
+          <button type="button" onClick={() => onVisionDecision?.(true)}>{copy.visionApprovalApprove ?? "Approve upload"}</button>
+          <button type="button" onClick={() => onVisionDecision?.(false)}>{copy.visionApprovalDecline ?? "Do not upload"}</button>
+          <button type="button" onClick={onCancel}>{copy.cancel}</button>
+        </div>
+      </div>}
+      <button type="button" onClick={onCancel} disabled={job.state === "cancelling" || Boolean(job.vision_approval_pending)} hidden={Boolean(job.vision_approval_pending)}>
         {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
       </button>
     </section>

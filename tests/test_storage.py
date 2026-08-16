@@ -2,15 +2,140 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
+import json
 from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
-from openthesis.domain import FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso
+from openthesis.domain import FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso, FilingDocument, EvidenceRef
+from openthesis.financial_ingestion import FinancialGroupValidation
+from openthesis.market_financials import FinancialValidation, ValidationStatus
 from openthesis.storage import Storage
 from openthesis.markets import build_company
 
 
 class StorageTests(unittest.TestCase):
+    def _fact(self, company_cik: str, status: str = "VERIFIED") -> FinancialFact:
+        return FinancialFact(
+            fact_id="rich-fact",
+            company_cik=company_cik,
+            concept="revenue",
+            reported_concept="Revenue",
+            value=123.0,
+            unit="CNY",
+            fiscal_year=2025,
+            fiscal_period="FY",
+            form_type="ANNUAL_REPORT",
+            start_date="2025-01-01",
+            end_date="2025-12-31",
+            filed_at="2026-03-01",
+            accession_number="acc-rich",
+            source_url="https://example.test/report.pdf",
+            entity="Example",
+            market="CN_A",
+            statement="income_statement",
+            period_start="2025-01-01",
+            consolidated_scope="consolidated",
+            currency="CNY",
+            unit_scale=1000.0,
+            revision="original",
+            source_document="report.pdf",
+            source_page=4,
+            source_bbox=(1.0, 2.0, 30.0, 40.0),
+            raw_text="Revenue 123",
+            parser_version="test",
+            validation_status=status,
+        )
+
+    def test_rich_fact_bbox_and_validation_group_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("rich-co", "RICH", reporting_currency="CNY")
+            storage.save_company(company)
+            fact = self._fact(company.security_id)
+            evidence = EvidenceRef("fact:rich-fact", "doc-rich", fact.source_url, "Revenue", "page:4", fact.raw_text, fact.filed_at, bbox=fact.source_bbox)
+            validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ())
+            group = FinancialGroupValidation(("acc-rich", "2025-12-31", "FY", "consolidated", "CNY"), validation)
+            storage.replace_financial_ingestion(company.security_id, ["acc-rich"], [fact], [], [group], [evidence])
+            saved = storage.get_facts(company.security_id)
+            self.assertEqual(saved[0]["source_bbox"], fact.source_bbox)
+            self.assertEqual(saved[0]["statement"], "income_statement")
+            groups = storage.get_validation_groups(company.security_id)
+            self.assertEqual(groups[0]["status"], "VERIFIED")
+            self.assertEqual(groups[0]["covered_concepts"], ["revenue"])
+
+    def test_reparse_removes_stale_evidence_for_accession(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("600519.SH", "Moutai", reporting_currency="CNY")
+            storage.save_company(company)
+            filing = FilingDocument(
+                "doc-reparse", company.security_id, "acc-reparse", "ANNUAL_REPORT", "FY",
+                "2025-12-31", "2026-03-01", "annual.pdf", "https://example.test/report",
+            )
+            storage.save_filings([filing])
+            fact = self._fact(company.security_id)
+            evidence = EvidenceRef(
+                "fact:stale", filing.document_id, filing.source_url, "Report", "page:1",
+                "old excerpt", filing.filed_at,
+            )
+            storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], [fact], [], [], [evidence]
+            )
+            self.assertEqual(len(storage.get_financial_evidence(filing.document_id)), 1)
+            storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], [], [], [], []
+            )
+            self.assertEqual(storage.get_financial_evidence(filing.document_id), [])
+
+    def test_validation_group_id_is_scoped_by_company(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            first = build_company("600036.SH", "Moutai", reporting_currency="CNY")
+            second = build_company("600519.SH", "Moutai", reporting_currency="CNY")
+            storage.save_company(first)
+            storage.save_company(second)
+            for company in (first, second):
+                fact = self._fact(company.security_id)
+                validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ())
+                group = FinancialGroupValidation(("same", "2025-12-31", "FY", "consolidated", "CNY"), validation)
+                storage.replace_financial_ingestion(company.security_id, ["same"], [fact], [], [group], [])
+            groups = storage.get_validation_groups(first.security_id) + storage.get_validation_groups(second.security_id)
+            self.assertEqual(len(groups), 2)
+
+    def test_rejected_facts_hidden_from_normal_read_but_available_in_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("reject-co", "REJECT")
+            storage.save_company(company)
+            fact = self._fact(company.security_id, "REJECTED")
+            storage.replace_financial_ingestion(company.security_id, [fact.accession_number], [], [fact])
+            self.assertEqual(storage.get_facts(company.security_id), [])
+            self.assertEqual(len(storage.get_facts_audit(company.security_id)), 1)
+
+    def test_existing_schema_is_migrated_additively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            data_dir.mkdir(exist_ok=True)
+            db_path = data_dir / "openthesis.db"
+            db = sqlite3.connect(db_path)
+            try:
+                db.executescript("""
+                    CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE companies(cik TEXT PRIMARY KEY, ticker TEXT NOT NULL, name TEXT NOT NULL, exchange_name TEXT NOT NULL DEFAULT '');
+                    CREATE TABLE filings(document_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, accession_number TEXT NOT NULL, form_type TEXT NOT NULL, fiscal_period TEXT NOT NULL, period_end TEXT NOT NULL, filed_at TEXT NOT NULL, primary_document TEXT NOT NULL, source_url TEXT NOT NULL, local_path TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', ingested_at TEXT NOT NULL);
+                    CREATE TABLE financial_facts(fact_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, concept TEXT NOT NULL, reported_concept TEXT NOT NULL, value REAL NOT NULL, unit TEXT NOT NULL, fiscal_year INTEGER NOT NULL, fiscal_period TEXT NOT NULL, form_type TEXT NOT NULL, start_date TEXT, end_date TEXT NOT NULL, filed_at TEXT NOT NULL, accession_number TEXT NOT NULL, source_url TEXT NOT NULL, scope TEXT NOT NULL);
+                    INSERT INTO metadata VALUES('schema_version','3');
+                    INSERT INTO companies VALUES('legacy','LEG','Legacy','');
+                    INSERT INTO financial_facts VALUES('legacy-fact','legacy','revenue','Revenue',1,'USD',2024,'FY','10-K','2024-01-01','2024-12-31','2025-01-01','legacy-acc','https://example.test','consolidated');
+                """)
+            finally:
+                db.close()
+            storage = Storage(data_dir)
+            self.assertEqual(storage.get_facts("legacy")[0]["fact_id"], "legacy-fact")
+            with storage.connect() as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(financial_facts)")}
+            self.assertIn("source_bbox_json", columns)
     def test_delete_run_removes_artifacts_and_generated_thesis_but_keeps_user_thesis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))

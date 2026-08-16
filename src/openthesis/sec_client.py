@@ -11,7 +11,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from .domain import Company, FilingDocument, FinancialFact
+from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 
 
 SEC_DATA_BASE = "https://data.sec.gov"
@@ -48,6 +48,35 @@ CONCEPT_MAP: dict[str, tuple[str, ...]] = {
     ),
     "inventory": ("InventoryNet",),
     "shares_outstanding": ("EntityCommonStockSharesOutstanding",),
+}
+
+# IFRS filers (including foreign private issuers) publish the same core facts
+# under ``ifrs-full``.  Keep this mapping explicit; never infer a US-GAAP tag
+# from a translated label or silently convert currencies.
+IFRS_CONCEPT_MAP: dict[str, tuple[str, ...]] = {
+    "revenue": (
+        "Revenue",
+        "RevenueAndOperatingIncome",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+    ),
+    "net_income": (
+        "ProfitLossAttributableToOwnersOfParent",
+        "ProfitLossAttributableToOrdinaryEquityHoldersOfParentEntity",
+        "ProfitLoss",
+    ),
+    "operating_cash_flow": (
+        "CashFlowsFromUsedInOperatingActivities",
+        "CashFlowsFromUsedInOperations",
+    ),
+    "assets": ("Assets",),
+    "liabilities": ("Liabilities",),
+    "equity": ("EquityAttributableToOwnersOfParent", "Equity"),
+    "total_equity": ("Equity",),
+}
+
+SEC_HK_ISSUERS: dict[str, tuple[str, str, str, str]] = {
+    "00005.HK": ("0001089113", "HSBC", "USD", "IFRS"),
+    "09988.HK": ("0001577552", "BABA", "CNY", "US_GAAP"),
 }
 
 
@@ -182,7 +211,7 @@ class SecClient:
         forms = recent.get("form", [])
         filings: list[FilingDocument] = []
         for index, form_type in enumerate(forms):
-            if form_type != "10-K":
+            if form_type not in {"10-K", "20-F", "40-F"}:
                 continue
             accession = recent["accessionNumber"][index]
             accession_plain = accession.replace("-", "")
@@ -197,7 +226,7 @@ class SecClient:
                     company_cik=company.cik,
                     accession_number=accession,
                     form_type=form_type,
-                    fiscal_period=str(recent.get("reportDate", [""])[index]),
+                    fiscal_period="FY",
                     period_end=str(recent.get("reportDate", [""])[index]),
                     filed_at=str(recent.get("filingDate", [""])[index]),
                     primary_document=primary_document,
@@ -231,21 +260,30 @@ class SecClient:
             f"{SEC_DATA_BASE}/api/xbrl/companyfacts/CIK{company.cik}.json",
             f"companyfacts-{company.cik}.json",
         )
-        us_gaap = payload.get("facts", {}).get("us-gaap", {})
-        dei = payload.get("facts", {}).get("dei", {})
+        facts_payload = payload.get("facts", {})
+        us_gaap = facts_payload.get("us-gaap", {})
+        ifrs_full = facts_payload.get("ifrs-full", {})
+        dei = facts_payload.get("dei", {})
         facts: list[FinancialFact] = []
-        for normalized, candidates in CONCEPT_MAP.items():
-            namespace = dei if normalized == "shares_outstanding" else us_gaap
+        mappings: list[tuple[str, dict[str, Any], tuple[str, ...]]] = [
+            *[(concept, us_gaap, tags) for concept, tags in CONCEPT_MAP.items()],
+            *[(concept, ifrs_full, tags) for concept, tags in IFRS_CONCEPT_MAP.items()],
+            ("shares_outstanding", dei, CONCEPT_MAP["shares_outstanding"]),
+        ]
+        seen: set[tuple[str, str, str, str]] = set()
+        for normalized, namespace, candidates in mappings:
             selected_by_year: dict[int, tuple[int, str, dict[str, Any], str]] = {}
             for priority, reported in enumerate(candidates):
                 if reported not in namespace:
                     continue
                 fact = namespace[reported]
                 units: dict[str, list[dict[str, Any]]] = fact.get("units", {})
-                preferred_unit = self._preferred_unit(normalized, units)
+                preferred_unit = self._preferred_unit(
+                    normalized, units, getattr(company, "reporting_currency", "")
+                )
                 if not preferred_unit:
                     continue
-                for row in self._select_annual_facts(units[preferred_unit]):
+                for row in self._select_annual_facts(units[preferred_unit], allow_foreign=True):
                     year = int(row["fy"])
                     current = selected_by_year.get(year)
                     candidate = (priority, reported, row, preferred_unit)
@@ -270,6 +308,18 @@ class SecClient:
                     f"{company.cik}|{normalized}|{row.get('fy')}|{row.get('end')}|"
                     f"{row.get('filed')}|{row.get('val')}"
                 )
+                key = (normalized, str(row.get("end", "")), accession, reported)
+                if key in seen:
+                    continue
+                seen.add(key)
+                namespace_name = "ifrs-full" if namespace is ifrs_full else "us-gaap" if namespace is us_gaap else "dei"
+                statement = {
+                    "revenue": "income_statement", "net_income": "income_statement",
+                    "operating_cash_flow": "cash_flow", "assets": "balance_sheet",
+                    "liabilities": "balance_sheet", "equity": "balance_sheet",
+                    "total_equity": "balance_sheet",
+                }.get(normalized, "")
+                currency = preferred_unit.upper() if preferred_unit else ""
                 facts.append(
                     FinancialFact(
                         fact_id=hashlib.sha256(fact_key.encode()).hexdigest()[:24],
@@ -286,24 +336,44 @@ class SecClient:
                         filed_at=str(row.get("filed", "")),
                         accession_number=accession,
                         source_url=source_url,
+                        scope="consolidated",
+                        entity=company.name,
+                        market=company.market,
+                        statement=statement,
+                        period_start=row.get("start"),
+                        consolidated_scope="consolidated",
+                        currency=currency,
+                        unit_scale=1.0,
+                        revision="original",
+                        source_document=f"SEC CompanyFacts {namespace_name}:{reported}",
+                        raw_text=f"{namespace_name}:{reported}={row.get('val')} {preferred_unit}",
+                        parser_version="sec-companyfacts-v2",
+                        validation_status="ready_with_warnings",
                     )
                 )
         return facts
 
     @staticmethod
-    def _preferred_unit(normalized: str, units: dict[str, Any]) -> str | None:
-        preferences = ["shares"] if normalized == "shares_outstanding" else ["USD"]
+    def _preferred_unit(
+        normalized: str, units: dict[str, Any], reporting_currency: str = ""
+    ) -> str | None:
+        preferences = ["shares"] if normalized == "shares_outstanding" else []
+        if reporting_currency:
+            preferences.append(reporting_currency.upper())
+        if normalized != "shares_outstanding":
+            preferences.append("USD")
         for unit in preferences:
             if unit in units:
                 return unit
         return next(iter(units), None)
 
     @staticmethod
-    def _select_annual_facts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _select_annual_facts(rows: list[dict[str, Any]], *, allow_foreign: bool = False) -> list[dict[str, Any]]:
+        forms = {"10-K", "20-F", "40-F"} if allow_foreign else {"10-K"}
         candidates = [
             row
             for row in rows
-            if row.get("form") == "10-K"
+            if row.get("form") in forms
             and row.get("fp") == "FY"
             and isinstance(row.get("fy"), int)
         ]
@@ -316,3 +386,59 @@ class SecClient:
             if current is None or str(row.get("end", "")) >= str(current.get("end", "")):
                 by_year[year] = row
         return [by_year[year] for year in sorted(by_year, reverse=True)[:10]]
+
+
+class SecFinancialSourceAdapter:
+    """Cached SEC Company Facts adapter used before native PDF parsing.
+
+    Facts retain the SEC accession and archive URL as their provenance.  The
+    adapter only remaps the target period to the HK filing; it never converts
+    currencies or fabricates PDF evidence.
+    """
+
+    def __init__(self, client: SecClient):
+        self.client = client
+        self._facts: dict[str, list[FinancialFact]] = {}
+
+    def fetch(
+        self, company: Company, filing: FilingDocument
+    ) -> tuple[list[FinancialFact], list[EvidenceRef], str | None]:
+        mapped = SEC_HK_ISSUERS.get(company.ticker.upper())
+        if mapped is None:
+            return [], [], "sec_structured_source_not_mapped"
+        sec_cik, sec_ticker, currency, standard = mapped
+        sec_company = Company(
+            cik=sec_cik.zfill(10), ticker=sec_ticker, name=company.name,
+            exchange="SEC", issuer_id=sec_ticker, market="US",
+            security_id=sec_cik.zfill(10), listing_currency=currency,
+            reporting_currency=currency, accounting_standard=standard,
+        )
+        try:
+            cache_key = sec_company.cik
+            if cache_key not in self._facts:
+                self._facts[cache_key] = self.client.get_company_facts(sec_company)
+            selected = [
+                fact for fact in self._facts[cache_key]
+                if fact.end_date == filing.period_end
+                and (fact.fiscal_period or "FY").upper() == (filing.fiscal_period or "FY").upper()
+                and fact.currency.upper() == currency.upper()
+            ]
+        except Exception as exc:
+            return [], [], f"sec_structured_source_failed:{type(exc).__name__}"
+        if not selected:
+            return [], [], "sec_structured_period_not_found"
+        refs = [
+            EvidenceRef(
+                evidence_id=f"sec:{fact.fact_id}",
+                document_id=filing.document_id,
+                source_url=fact.source_url,
+                title=f"SEC CompanyFacts {fact.reported_concept}",
+                locator=f"accession:{fact.accession_number}",
+                excerpt=fact.raw_text,
+                published_at=fact.filed_at,
+                content_hash="",
+                bbox=None,
+            )
+            for fact in selected
+        ]
+        return selected, refs, None

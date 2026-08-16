@@ -277,6 +277,7 @@ def _known(
 
 
 COMMON_MARKET_COMPANIES = (
+    _known("00005.HK", "HSBC Holdings", issuer_id="HK:HSBC", industry="bank", accounting_standard="IFRS", reporting_currency="USD"),
     _known("600519.SH", "贵州茅台", issuer_id="CN:KWEICHOW-MOUTAI", industry="食品饮料"),
     _known("000858.SZ", "五粮液", issuer_id="CN:WULIANGYE", industry="食品饮料"),
     _known("300750.SZ", "宁德时代", issuer_id="CN:CATL", industry="电力设备"),

@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from openthesis.domain import Company
-from openthesis.sec_client import SecClient
+from openthesis.domain import Company, FilingDocument, FinancialFact
+from openthesis.sec_client import SecClient, SecFinancialSourceAdapter
 
 
 class SecClientTests(unittest.TestCase):
@@ -145,6 +145,65 @@ class SecClientTests(unittest.TestCase):
             (1200, "RevenueFromContractWithCustomerExcludingAssessedTax"),
         )
         self.assertEqual(revenue[2024], (900, "Revenues"))
+
+    def test_foreign_private_issuer_20f_is_listed(self) -> None:
+        submissions = {
+            "filings": {"recent": {
+                "form": ["20-F"], "accessionNumber": ["0001-26-001"],
+                "primaryDocument": ["hsbc20f.htm"], "reportDate": ["2025-12-31"],
+                "filingDate": ["2026-02-20"],
+            }}
+        }
+        company = Company(cik="0001089113", ticker="HSBC", name="HSBC")
+        with patch.object(self.client, "_get_json", return_value=submissions):
+            filings = self.client.list_annual_filings(company)
+        self.assertEqual(filings[0].form_type, "20-F")
+        self.assertEqual(filings[0].fiscal_period, "FY")
+
+    def test_ifrs_companyfacts_normalizes_core_with_provenance(self) -> None:
+        def row(tag_value: float, *, start: str | None = "2025-01-01") -> dict[str, object]:
+            return {"val": tag_value, "fy": 2025, "fp": "FY", "form": "20-F",
+                    "start": start, "end": "2025-12-31", "filed": "2026-02-20",
+                    "accn": "0001-26-001"}
+        tags = {
+            "Revenue": row(68_274_000_000),
+            "ProfitLossAttributableToOwnersOfParent": row(21_102_000_000),
+            "CashFlowsFromUsedInOperatingActivities": row(29_766_000_000),
+            "Assets": row(3_233_034_000_000, start=None),
+            "Liabilities": row(3_027_368_000_000, start=None),
+            "EquityAttributableToOwnersOfParent": row(198_225_000_000, start=None),
+            "Equity": row(205_666_000_000, start=None),
+        }
+        payload = {"facts": {"ifrs-full": {name: {"units": {"USD": [value]}} for name, value in tags.items()}, "dei": {}}}
+        company = Company(cik="0001089113", ticker="HSBC", name="HSBC", reporting_currency="USD", accounting_standard="IFRS")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        by_concept = {fact.concept: fact for fact in facts}
+        self.assertEqual(set(("revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity", "total_equity")), set(by_concept))
+        self.assertEqual(by_concept["net_income"].statement, "income_statement")
+        self.assertEqual(by_concept["assets"].period_start, None)
+        self.assertEqual(by_concept["revenue"].currency, "USD")
+        self.assertIn("ifrs-full", by_concept["revenue"].raw_text)
+        self.assertEqual(by_concept["revenue"].parser_version, "sec-companyfacts-v2")
+
+    def test_structured_adapter_remaps_period_and_keeps_sec_evidence(self) -> None:
+        class FakeClient:
+            def get_company_facts(self, company):
+                return [FinancialFact(
+                    "sec-fact", company.cik, "revenue", "Revenue", 10.0, "USD", 2025,
+                    "FY", "20-F", "2025-01-01", "2025-12-31", "2026-02-20",
+                    "0001-26-001", "https://www.sec.gov/Archives/edgar/data/1089113/0001-26-001/",
+                    statement="income_statement", currency="USD", consolidated_scope="consolidated",
+                    source_document="SEC CompanyFacts ifrs-full:Revenue", raw_text="ifrs-full:Revenue=10 USD",
+                    parser_version="sec-companyfacts-v2",
+                )]
+        company = Company(cik="HK:SEHK:00005.HK", ticker="00005.HK", name="HSBC", market="HK", reporting_currency="USD")
+        filing = FilingDocument("hk:2025", company.cik, "hk-2025", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-03-01", "Annual Report", "https://hk.example/report")
+        facts, evidence, failure = SecFinancialSourceAdapter(FakeClient()).fetch(company, filing)
+        self.assertIsNone(failure)
+        self.assertEqual(facts[0].accession_number, "0001-26-001")
+        self.assertEqual(evidence[0].locator, "accession:0001-26-001")
+        self.assertIn("sec.gov", evidence[0].source_url)
 
 
 if __name__ == "__main__":

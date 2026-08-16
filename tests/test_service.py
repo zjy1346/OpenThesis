@@ -9,7 +9,6 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
 
 from openthesis.demo import demo_facts
 from openthesis.domain import (
@@ -24,7 +23,9 @@ from openthesis.domain import (
 from openthesis.model_catalog import ModelDiscoveryError
 from openthesis.markets import build_company
 from openthesis.market_data import MarketDataError
-from openthesis.service import AppService, PreferenceValidationError, _market_snapshot
+from openthesis.service import AppService, PreferenceValidationError, _latest_sec_verified_group, _market_snapshot, _request_secrets, _ResearchJob
+from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
+from openthesis.market_financials import FinancialValidation, ValidationStatus
 
 
 class _FakeSecClient:
@@ -76,6 +77,375 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_job_leaves_download_stage_before_financial_ingestion_blocks(self) -> None:
+        company = build_company("002594.SZ", "BYD")
+        filing = FilingDocument(
+            "q1-26", company.security_id, "q1-26", "QUARTERLY_REPORT", "Q1",
+            "2026-03-31", "2026-04-28", "2026 Q1.pdf", "https://example.test/q1-26.pdf",
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        download_entered = threading.Event()
+        download_release = threading.Event()
+
+        class Adapter:
+            def list_financial_filings(self, _company, *, limit=5): return [filing][:limit]
+            def download_filing(self, item, _target):
+                download_entered.set()
+                download_release.wait(timeout=2)
+                return item
+
+        class BlockingEngine:
+            def ingest(self, _company, _filings, **_kwargs):
+                entered.set()
+                release.wait(timeout=2)
+                validation = FinancialValidation(
+                    ValidationStatus.REJECTED, ("no_financial_facts",), frozenset(), (), ()
+                )
+                manifest = FilingManifest(
+                    filing.document_id, filing.accession_number, filing.source_url,
+                    filing.primary_document, filing.form_type, filing.fiscal_period,
+                    filing.period_end, filing.revision, filing.supersedes_document_id,
+                    filing.content_hash,
+                )
+                return FinancialDataset((), (), (manifest,), validation, (), ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory),
+                market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=BlockingEngine(),
+            )
+            started = service.start_research({
+                "mode": "company",
+                "company": company.to_dict(),
+                "download_filings": True,
+                "model": {"preset_id": "none"},
+            })
+            self.assertTrue(download_entered.wait(timeout=2), "download did not start")
+            downloading = service.get_research_status(started["job_id"])
+            self.assertEqual(downloading["stage"], "filing-download")
+            self.assertEqual(downloading["stage_current"], 1)
+            self.assertEqual(downloading["stage_total"], 1)
+            download_release.set()
+            self.assertTrue(entered.wait(timeout=2), "ingestion did not start")
+            status = service.get_research_status(started["job_id"])
+            self.assertEqual(status["stage"], "filing-parse")
+            self.assertEqual(status["stage_current"], 0)
+            self.assertEqual(status["stage_total"], 1)
+            self.assertGreaterEqual(status["percent"], 18)
+            release.set()
+            deadline = time.monotonic() + 3
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline, "blocked ingestion did not settle")
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+
+    def test_job_progress_is_monotonic_and_stage_counts_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            job = _ResearchJob("progress-job", percent=40)
+
+            service._update_job(
+                job,
+                stage="filing-parse",
+                percent=18,
+                stage_current=8,
+                stage_total=6,
+            )
+
+            self.assertEqual(job.percent, 40)
+            self.assertEqual(job.stage_current, 6)
+            self.assertEqual(job.stage_total, 6)
+            service._update_job(job, percent=100)
+            self.assertEqual(job.percent, 100)
+
+    def test_vision_requires_consent_and_clears_session_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            factory_calls = []
+            service = AppService(
+                Path(directory),
+                vision_adapter_factory=lambda config: factory_calls.append(config) or object(),
+            )
+            request = {
+                "mode": "demo",
+                "model": {"preset_id": "none"},
+                "vision_fallback": {"enabled": True, "consent": False, "provider": "mineru_lite", "token": "session-secret"},
+            }
+            self.assertEqual(_request_secrets(request), ("session-secret",))
+            job = service.start_research(request)
+            deadline = time.time() + 3
+            status = service.get_research_status(job["job_id"])
+            while status["state"] in {"queued", "running"} and time.time() < deadline:
+                time.sleep(0.01)
+                status = service.get_research_status(job["job_id"])
+            self.assertEqual(status["error_code"], "VISION_CONSENT_REQUIRED")
+            self.assertEqual(factory_calls, [])
+            self.assertEqual(request["vision_fallback"]["token"], "")
+
+    def test_vision_decision_is_sidecar_safe_and_snapshot_hides_sensitive_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            job = _ResearchJob("vision-job")
+            job.stage = "vision-approval"
+            job.vision_approval_pending = True
+            job.vision_upload_preview = {"provider": "mineru_lite", "pages": (3,), "total_bytes": 10, "source_document": "annual.pdf", "filing_hash": "abc"}
+            with service._jobs_lock:
+                service._jobs[job.job_id] = job
+            snapshot = service.vision_decision(job.job_id, True)
+            self.assertTrue(snapshot["vision_approval"])
+            self.assertNotIn("local_path", snapshot["vision_upload_preview"])
+            self.assertNotIn("source_url", snapshot["vision_upload_preview"])
+            self.assertNotIn("api_key", snapshot["vision_upload_preview"])
+            with self.assertRaises(ValueError):
+                service.vision_decision(job.job_id, False)
+    def test_latest_annual_rejected_does_not_fall_back_to_old_verified_group(self) -> None:
+        company = build_company("300750.SZ", "CATL")
+        old = FilingDocument(
+            document_id="old", company_cik=company.security_id, accession_number="old",
+            form_type="ANNUAL_REPORT", fiscal_period="FY", period_end="2024-12-31",
+            filed_at="2025-03-01", primary_document="old.pdf", source_url="https://example.test/old",
+        )
+        latest = FilingDocument(
+            document_id="latest", company_cik=company.security_id, accession_number="latest",
+            form_type="ANNUAL_REPORT", fiscal_period="FY", period_end="2025-12-31",
+            filed_at="2026-03-01", primary_document="latest.pdf", source_url="https://example.test/latest",
+        )
+        class Adapter:
+            def list_financial_filings(self, _company, *, limit=5): return [old, latest][:limit]
+            def download_filing(self, item, _target): return item
+        rejected = FinancialValidation(
+            ValidationStatus.REJECTED, ("core_coverage_insufficient",), frozenset(), (), ()
+        )
+        verified = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (), ())
+        class FakeEngine:
+            def ingest(self, _company, _filings):
+                manifests = tuple(
+                    FilingManifest(f.document_id, f.accession_number, f.source_url, f.primary_document,
+                                   f.form_type, f.fiscal_period, f.period_end, f.revision,
+                                   f.supersedes_document_id, f.content_hash)
+                    for f in (old, latest)
+                )
+                return FinancialDataset(
+                    (), (), manifests, FinancialValidation(ValidationStatus.READY_WITH_WARNINGS, (), frozenset(), (), ()), (),
+                    (FinancialGroupValidation(("old", "2024-12-31", "FY", "consolidated", "CNY"), verified),
+                     FinancialGroupValidation(("latest", "2025-12-31", "FY", "consolidated", "CNY"), rejected)),
+                )
+        provider_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=FakeEngine(),
+                provider_factory=lambda config: provider_calls.append(config.public_id),
+            )
+            started = service.start_research({
+                "mode": "company", "company": company.to_dict(), "download_filings": True,
+                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+            })
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+            self.assertEqual(status["error_code"], "FILING_DATA_QUALITY_FAILED")
+            self.assertEqual(provider_calls, [])
+
+    def test_latest_verified_but_missing_core_stops_before_provider(self) -> None:
+        company = build_company("300750.SZ", "CATL")
+        filing = FilingDocument(
+            "latest", company.security_id, "latest", "ANNUAL_REPORT", "FY",
+            "2025-12-31", "2026-03-01", "latest.pdf", "https://example.test/latest",
+        )
+        fact = FinancialFact(
+            "revenue-only", company.security_id, "revenue", "Revenue", 100.0, "CNY", 2025,
+            "FY", "ANNUAL_REPORT", "2025-01-01", "2025-12-31", "2026-03-01", "latest",
+            filing.source_url, currency="CNY", validation_status="VERIFIED",
+        )
+
+        class Adapter:
+            def list_financial_filings(self, _company, *, limit=5): return [filing][:limit]
+            def download_filing(self, item, _target): return item
+
+        class Engine:
+            def ingest(self, _company, _filings):
+                manifest = FilingManifest(
+                    filing.document_id, filing.accession_number, filing.source_url,
+                    filing.primary_document, filing.form_type, filing.fiscal_period,
+                    filing.period_end, filing.revision, filing.supersedes_document_id,
+                    filing.content_hash,
+                )
+                validation = FinancialValidation(
+                    ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ()
+                )
+                group = FinancialGroupValidation(
+                    ("latest", "2025-12-31", "FY", "consolidated", "CNY"), validation
+                )
+                return FinancialDataset((fact,), (), (manifest,), validation, (), (group,))
+
+        provider_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=Engine(),
+                provider_factory=lambda config: provider_calls.append(config.public_id),
+            )
+            started = service.start_research({
+                "mode": "company", "company": company.to_dict(), "download_filings": True,
+                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+            })
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+            self.assertEqual(status["error_code"], "FILING_DATA_QUALITY_FAILED")
+            self.assertEqual(provider_calls, [])
+
+    def test_parent_and_wrong_currency_groups_never_enter_research_facts(self) -> None:
+        company = build_company("300750.SZ", "CATL")
+        filing = FilingDocument(
+            "latest", company.security_id, "latest", "ANNUAL_REPORT", "FY",
+            "2025-12-31", "2026-03-01", "latest.pdf", "https://example.test/latest",
+        )
+        def fact(fid: str, concept: str, *, scope="consolidated", currency="CNY") -> FinancialFact:
+            return FinancialFact(
+                fid, company.security_id, concept, concept, 1.0, currency, 2025,
+                "FY", "ANNUAL_REPORT", "2025-01-01", "2025-12-31", "2026-03-01", "latest",
+                filing.source_url, consolidated_scope=scope, currency=currency,
+                validation_status="VERIFIED",
+            )
+        core = tuple(fact(f"core-{name}", name) for name in (
+            "revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"
+        ))
+        parent = fact("parent-revenue", "revenue", scope="parent")
+        foreign = fact("foreign-revenue", "revenue", currency="USD")
+        class Adapter:
+            def list_financial_filings(self, _company, *, limit=5): return [filing][:limit]
+            def download_filing(self, item, _target): return item
+        class Engine:
+            def ingest(self, _company, _filings):
+                manifest = FilingManifest(
+                    filing.document_id, filing.accession_number, filing.source_url,
+                    filing.primary_document, filing.form_type, filing.fiscal_period,
+                    filing.period_end, filing.revision, filing.supersedes_document_id, filing.content_hash,
+                )
+                def group(items, scope, currency):
+                    validation = FinancialValidation(
+                        ValidationStatus.VERIFIED, (), frozenset(item.concept for item in items), items, ()
+                    )
+                    return FinancialGroupValidation(("latest", "2025-12-31", "FY", scope, currency), validation)
+                groups = (group(core, "consolidated", "CNY"), group((parent,), "parent", "CNY"), group((foreign,), "consolidated", "USD"))
+                aggregate = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset(item.concept for item in (*core, parent, foreign)), (*core, parent, foreign), ())
+                return FinancialDataset((*core, parent, foreign), (), (manifest,), aggregate, (), groups)
+        class Provider:
+            def generate(self, *_args, **_kwargs): return {"claims": []}
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=Engine(), provider_factory=lambda _config: Provider(),
+            )
+            started = service.start_research({
+                "mode": "company", "company": company.to_dict(), "download_filings": True,
+                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+            })
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+            self.assertEqual(status["state"], "completed")
+            saved = service.storage.get_facts(company.security_id)
+            self.assertEqual({item["fact_id"] for item in saved}, {item.fact_id for item in core})
+            self.assertEqual({item["fact_id"] for item in service.storage.get_facts_audit(company.security_id)}, {item.fact_id for item in (*core, parent, foreign)})
+
+    def test_latest_annual_verified_allows_old_rejected_but_only_accepted_facts_continue(self) -> None:
+        company = build_company("300750.SZ", "CATL")
+        old = FilingDocument(
+            document_id="old", company_cik=company.security_id, accession_number="old",
+            form_type="ANNUAL_REPORT", fiscal_period="FY", period_end="2024-12-31",
+            filed_at="2025-03-01", primary_document="old.pdf", source_url="https://example.test/old",
+        )
+        latest = FilingDocument(
+            document_id="latest", company_cik=company.security_id, accession_number="latest",
+            form_type="ANNUAL_REPORT", fiscal_period="FY", period_end="2025-12-31",
+            filed_at="2026-03-01", primary_document="latest.pdf", source_url="https://example.test/latest",
+        )
+        class Adapter:
+            def list_financial_filings(self, _company, *, limit=5): return [old, latest][:limit]
+            def download_filing(self, item, _target): return item
+        def core_fact(fact_id: str, concept: str, value: float) -> FinancialFact:
+            return FinancialFact(
+                fact_id, company.security_id, concept, concept, value, "CNY", 2025,
+                "FY", "ANNUAL_REPORT", "2025-01-01", "2025-12-31", "2026-03-01", "latest",
+                latest.source_url, statement=(
+                    "balance_sheet" if concept in {"assets", "liabilities", "equity"}
+                    else "cash_flow" if concept == "operating_cash_flow" else "income_statement"
+                ), currency="CNY", validation_status="VERIFIED",
+            )
+        latest_core = tuple(
+            core_fact(f"accepted-{concept}", concept, value)
+            for concept, value in (
+                ("revenue", 100.0), ("net_income", 20.0),
+                ("operating_cash_flow", 25.0), ("assets", 200.0),
+                ("liabilities", 80.0), ("equity", 120.0),
+            )
+        )
+        rejected_fact = FinancialFact(
+            "rejected-old", company.security_id, "revenue", "Revenue", 90.0, "CNY", 2024,
+            "FY", "ANNUAL_REPORT", "2024-01-01", "2024-12-31", "2025-03-01", "old",
+            old.source_url, validation_status="REJECTED",
+        )
+        class FakeEngine:
+            def ingest(self, _company, _filings):
+                manifests = tuple(
+                    FilingManifest(f.document_id, f.accession_number, f.source_url, f.primary_document,
+                                   f.form_type, f.fiscal_period, f.period_end, f.revision,
+                                   f.supersedes_document_id, f.content_hash)
+                    for f in (old, latest)
+                )
+                old_validation = FinancialValidation(ValidationStatus.REJECTED, ("bad_old",), frozenset(), (), (rejected_fact,))
+                latest_validation = FinancialValidation(
+                    ValidationStatus.VERIFIED, (), frozenset(item.concept for item in latest_core), latest_core, ()
+                )
+                groups = (
+                    FinancialGroupValidation(("old", "2024-12-31", "FY", "consolidated", "CNY"), old_validation),
+                    FinancialGroupValidation(("latest", "2025-12-31", "FY", "consolidated", "CNY"), latest_validation),
+                )
+                aggregate = FinancialValidation(
+                    ValidationStatus.READY_WITH_WARNINGS, ("bad_old",),
+                    frozenset(item.concept for item in latest_core), latest_core, (rejected_fact,)
+                )
+                return FinancialDataset(latest_core, (), manifests, aggregate, ("bad_old",), groups)
+        class Provider:
+            def generate(self, *_args, **_kwargs): return {"claims": []}
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=FakeEngine(), provider_factory=lambda _config: Provider(),
+            )
+            started = service.start_research({
+                "mode": "company", "company": company.to_dict(), "download_filings": True,
+                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+            })
+            deadline = time.monotonic() + 5
+            status = started
+            while status["state"] not in {"completed", "failed", "cancelled"}:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+                status = service.get_research_status(started["job_id"])
+            saved = service.storage.get_facts(company.security_id)
+            audit = service.storage.get_facts_audit(company.security_id)
+            self.assertEqual(
+                {item["fact_id"] for item in saved},
+                {f"accepted-{concept}" for concept in ("revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity")},
+            )
+            self.assertEqual(
+                {item["fact_id"] for item in audit},
+                {f"accepted-{concept}" for concept in ("revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity")} | {"rejected-old"},
+            )
     def test_delete_research_run_removes_only_the_requested_finished_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
@@ -191,13 +561,31 @@ class AppServiceTests(unittest.TestCase):
             accession_number=filing.accession_number,
             source_url=filing.source_url,
         )
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "openthesis.service.ingest_official_pdf",
-            return_value=([bad_fact], [], []),
-        ):
+        class BadEngine:
+            def ingest(self, _company, _filings):
+                manifest = FilingManifest(
+                    filing.document_id, filing.accession_number, filing.source_url,
+                    filing.primary_document, filing.form_type, filing.fiscal_period,
+                    filing.period_end, filing.revision, filing.supersedes_document_id,
+                    filing.content_hash,
+                )
+                validation = FinancialValidation(
+                    ValidationStatus.REJECTED, ("income_statement_core_missing",),
+                    frozenset({"revenue"}), (), (bad_fact,),
+                )
+                group = FinancialGroupValidation(
+                    (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"),
+                    validation,
+                )
+                return FinancialDataset(
+                    (), (), (manifest,), validation, ("income_statement_core_missing",), (group,)
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
             service = AppService(
                 Path(directory),
                 market_data=_ResearchMarketData(BadFilingAdapter()),
+                financial_ingestion_engine=BadEngine(),
                 provider_factory=provider_factory,
             )
             started = service.start_research(
@@ -352,6 +740,45 @@ class AppServiceTests(unittest.TestCase):
             self.assertIn("fact:technical-only", technical_report["markdown"])
             self.assertNotIn("fact:technical-only", default_report["html"])
             self.assertIn("fact:technical-only", technical_report["html"])
+
+    def test_report_marks_empty_growth_model_output_as_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            company = Company(cik="0000000002", ticker="GROW", name="Growth Corp")
+            run = ResearchRun(
+                run_id="growth-retryable",
+                company=company,
+                workflow_id="test",
+                research_pack_id="test",
+                research_pack_version="1",
+                provider_id="test",
+                model_id="test",
+                data_as_of=utc_now_iso(),
+                status=RunStatus.COMPLETED,
+            )
+            service.storage.save_company(company)
+            service.storage.save_run(run)
+            service.storage.save_artifact(
+                ResearchArtifact(
+                    artifact_id="growth-empty",
+                    run_id=run.run_id,
+                    artifact_type="growth-opportunities",
+                    title="Growth opportunities",
+                    content={
+                        "opportunities": [],
+                        "structured_output_valid": False,
+                        "_response_error": "empty_content",
+                        "_validation": {"passed": False, "issues": ["empty"]},
+                    },
+                    model_id="test:model",
+                    agent_id="growth-opportunity-analyst",
+                )
+            )
+
+            report = service.get_report(run.run_id, language="en")
+
+            self.assertTrue(report["retryable_growth"])
+            self.assertIn("growth-opportunity model returned no usable content", report["markdown"])
 
     def test_demo_research_job_reports_progress_and_produces_a_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -757,6 +1184,36 @@ class AppServiceTests(unittest.TestCase):
                         },
                     }
                 )
+
+    def test_sec_latest_invalid_group_does_not_fallback_to_prior_year(self) -> None:
+        company = build_company("AAPL", "Apple")
+
+        def make_fact(accession: str, end: str, concept: str, value: float) -> FinancialFact:
+            statement = (
+                "cash_flow" if concept == "operating_cash_flow"
+                else "balance_sheet" if concept in {"assets", "liabilities", "equity", "total_equity"}
+                else "income_statement"
+            )
+            year = end[:4]
+            return FinancialFact(
+                f"{accession}:{concept}", company.cik, concept, concept, value, "USD", int(year),
+                "FY", "10-K", f"{year}-01-01", end, f"{int(year) + 1}-02-01", accession,
+                f"https://www.sec.gov/Archives/{accession}", statement=statement,
+                scope="consolidated", consolidated_scope="consolidated", currency="USD",
+                raw_text=f"{concept} {value}", validation_status="VERIFIED",
+            )
+
+        concepts = ("revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity")
+        old_values = (100.0, 20.0, 25.0, 200.0, 80.0, 120.0)
+        latest_values = (110.0, 22.0, 25.0, 200.0, 80.0, 10.0)  # broken balance equation
+        facts = [
+            *(make_fact("old-10k", "2024-12-31", concept, value) for concept, value in zip(concepts, old_values)),
+            *(make_fact("latest-10k", "2025-12-31", concept, value) for concept, value in zip(concepts, latest_values)),
+        ]
+        result = _latest_sec_verified_group(
+            facts, FinancialIngestionEngine(), expected_period_end="2025-12-31"
+        )
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

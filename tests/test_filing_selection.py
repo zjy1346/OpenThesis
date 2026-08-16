@@ -17,6 +17,21 @@ class FilingSelectionTests(unittest.TestCase):
         )
         self.assertEqual([item.document_id for item in result.documents], ["a25", "h24"])
 
+    def test_latest_periodic_keeps_prior_year_same_period_for_comparison(self) -> None:
+        result = select_research_filings(
+            [
+                _filing("q1-26", "QUARTERLY_REPORT", "Q1", "2026-03-31"),
+                _filing("fy-25", "ANNUAL_REPORT", "FY", "2025-12-31"),
+                _filing("q1-25", "QUARTERLY_REPORT", "Q1", "2025-03-31"),
+                _filing("q3-25", "QUARTERLY_REPORT", "Q3", "2025-09-30"),
+            ]
+        )
+
+        self.assertEqual(
+            [item.document_id for item in result.documents],
+            ["q1-26", "fy-25", "q1-25"],
+        )
+
     def test_new_listing_keeps_all_available_periods_and_listing_document(self) -> None:
         result = select_research_filings(
             [

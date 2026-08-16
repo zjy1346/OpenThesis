@@ -78,6 +78,15 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_empty_synthesis_growth_falls_back_to_valid_growth_artifact(self) -> None:
+        artifacts = sample_artifacts()
+        artifacts[-1]["content"]["report"]["growth_opportunities"] = []
+
+        report = render_research_html("run-growth-fallback", artifacts, "zh-CN")
+
+        self.assertIn("AI 加速计算基础设施", report)
+        self.assertNotIn("当前证据不足，未形成可展示的增长机会", report)
+
     def test_chinese_fallback_report_uses_typed_sections_and_confidence_groups(self) -> None:
         artifacts = sample_artifacts()
         artifacts[-1]["content"] = {
@@ -191,6 +200,29 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("&lt;unsafe&gt;", report)
         self.assertNotIn("<unsafe>", report)
         self.assertIn("D · Primarily inferred", report)
+
+    def test_empty_growth_model_response_is_explained_without_claiming_evidence_shortage(self) -> None:
+        report = render_research_html(
+            "run-growth-empty",
+            [
+                {
+                    "artifact_type": "growth-opportunities",
+                    "title": "Growth Opportunities",
+                    "agent_id": "growth-opportunity-analyst",
+                    "model_id": "test:model",
+                    "content": {
+                        "opportunities": [],
+                        "structured_output_valid": False,
+                        "_response_error": "empty_content",
+                        "_validation": {"passed": False, "issues": ["empty"]},
+                    },
+                }
+            ],
+            "en",
+        )
+
+        self.assertIn("The growth-opportunity model returned no usable content", report)
+        self.assertNotIn("Current evidence is insufficient", report)
 
     def test_message_renderer_escapes_untrusted_text(self) -> None:
         report = render_message_html("<script>alert(1)</script>", "en")

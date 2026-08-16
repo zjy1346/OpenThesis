@@ -3,11 +3,13 @@ import { useEffect, useRef, useState } from "react";
 import {
   bootstrapBackend,
   cancelResearch,
+  decideVisionUpload,
   deleteResearchRun,
   getResearchReport,
   getResearchStatus,
   openExternalUrl,
   retryResearchSynthesis,
+  retryResearchGrowth,
   startResearch,
   updatePreferences,
 } from "../backend";
@@ -161,6 +163,15 @@ export function useWorkbenchSession() {
     await beginResearch(lastRequest.current);
   };
 
+  const decideVision = async (approved: boolean) => {
+    if (!job) return;
+    try {
+      setJob(await decideVisionUpload(job.job_id, approved));
+    } catch {
+      setError({ kind: "core-unavailable" });
+    }
+  };
+
   const removeRun = async (run: ResearchRunSummary) => {
     setError(null);
     try {
@@ -192,6 +203,17 @@ export function useWorkbenchSession() {
     setBootstrap(await bootstrapBackend());
   };
 
+  const retryGrowth = async () => {
+    const model = lastRequest.current?.model;
+    if (!report || !model || model.preset_id === "none") {
+      throw new Error("model session is unavailable");
+    }
+    setError(null);
+    const next = await retryResearchGrowth(report.run_id, model);
+    setReport(next);
+    setBootstrap(await bootstrapBackend());
+  };
+
   const openFailedDisclosure = async () => {
     if (error?.kind !== "research-failed" || !error.disclosureUrl) return;
     try {
@@ -213,8 +235,10 @@ export function useWorkbenchSession() {
     beginResearch,
     retryResearch,
     retrySynthesis,
+    retryGrowth,
     openFailedDisclosure,
     stopResearch,
+    decideVisionUpload: decideVision,
     savePreferences,
     refreshBootstrap,
   };

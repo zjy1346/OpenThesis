@@ -142,6 +142,13 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 "period": period,
                 "period_end": period_ends.get((year, period), ""),
                 "comparison_period": f"{year - 1} {period}" if previous else None,
+                "comparison_gap": (
+                    None
+                    if previous.get("revenue") is not None
+                    else "prior_revenue_unavailable"
+                    if previous
+                    else "prior_period_unavailable"
+                ),
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
                 "operating_margin": safe_divide(operating_income, revenue),
@@ -300,6 +307,7 @@ def deterministic_summary(
     language: str = "zh-CN",
     currency: str = "USD",
 ) -> str:
+    """Render deterministic metrics from one explicit, coverage-aware schema."""
     english = normalize_language(language) == EN
     lines = (
         [
@@ -312,65 +320,64 @@ def deterministic_summary(
         else [f"# {company_name} 财务概览", "", "以下内容由确定性财务引擎生成。", ""]
     )
     if not metrics:
-        return "\n".join(
-            lines
-            + [
-                (
-                    "No normalized annual financial data is available."
-                    if english
-                    else "没有可用的标准化年度财务数据。"
-                )
-            ]
-        )
-    lines.extend(
-        (
-            [
-                "| Fiscal year | Revenue | Revenue growth | Operating margin | Net income | Operating cash flow | Free cash flow |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
-            ]
-            if english
-            else [
-                "| 财年 | 营业收入 | 收入增长 | 营业利润率 | 净利润 | 经营现金流 | 自由现金流 |",
-                "|---:|---:|---:|---:|---:|---:|---:|",
-            ]
-        )
-    )
-    for row in metrics[:5]:
         lines.append(
-            "| {year} | {revenue} | {growth} | {op_margin} | {net_income} | {ocf} | {fcf} |".format(
-                year=row["year"],
-                revenue=format_money(row.get("revenue"), currency),
-                growth=format_percent(row.get("revenue_growth")),
-                op_margin=format_percent(row.get("operating_margin")),
-                net_income=format_money(row.get("net_income"), currency),
-                ocf=format_money(row.get("operating_cash_flow"), currency),
-                fcf=format_money(row.get("free_cash_flow"), currency),
-            )
-        )
-    latest = metrics[0]
-    lines.extend(
-        (
-            [
-                "",
-                "## Latest Fiscal-Year Deterministic Metrics",
-                "",
-                f"- Cash conversion: {format_percent(latest.get('cash_conversion'))}",
-                f"- Debt to assets: {format_percent(latest.get('debt_to_assets'))}",
-                f"- Return on equity: {format_percent(latest.get('return_on_equity'))}",
-                "",
-                "> These metrics are research inputs, not investment advice.",
-            ]
+            "No normalized annual financial data is available."
             if english
-            else [
-                "",
-                "## 最新财年确定性指标",
-                "",
-                f"- 现金利润转化率：{format_percent(latest.get('cash_conversion'))}",
-                f"- 资产负债率：{format_percent(latest.get('debt_to_assets'))}",
-                f"- 净资产收益率：{format_percent(latest.get('return_on_equity'))}",
-                "",
-                "> 这些指标只是研究输入，不构成投资建议。",
-            ]
+            else "没有可用的标准化年度财务数据。"
         )
-    )
+        return "\n".join(lines)
+
+    has_operating_margin = any(row.get("operating_margin") is not None for row in metrics)
+    has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in metrics)
+    columns: list[tuple[str, str, str]] = [
+        ("year", "Fiscal year", "财年"),
+        ("revenue", "Revenue", "营业收入"),
+        ("revenue_growth", "Revenue growth", "收入增长"),
+    ]
+    if has_operating_margin:
+        columns.append(("operating_margin", "Operating margin", "营业利润率"))
+    columns.extend([
+        ("net_income", "Net income", "净利润"),
+        ("operating_cash_flow", "Operating cash flow", "经营现金流"),
+    ])
+    if has_free_cash_flow:
+        columns.append(("free_cash_flow", "Free cash flow", "自由现金流"))
+    labels = [column[1] if english else column[2] for column in columns]
+    lines.append("| " + " | ".join(labels) + " |")
+    lines.append("|" + "|".join("---:" for _ in columns) + "|")
+    for row in metrics[:5]:
+        values: list[str] = []
+        for key, _, _ in columns:
+            value = row.get(key)
+            if key == "year":
+                values.append(str(value))
+            elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
+                values.append(format_money(value, currency))
+            else:
+                values.append(format_percent(value))
+        lines.append("| " + " | ".join(values) + " |")
+
+    latest = metrics[0]
+    if english:
+        lines.extend([
+            "",
+            "## Latest Fiscal-Year Deterministic Metrics",
+            "",
+            f"- Cash conversion: {format_percent(latest.get('cash_conversion'))}",
+            f"- Debt to assets: {format_percent(latest.get('debt_to_assets'))}",
+            f"- Return on equity: {format_percent(latest.get('return_on_equity'))}",
+            "",
+            "> These metrics are research inputs, not investment advice.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "## 最新财年确定性指标",
+            "",
+            f"- 现金利润转化率：{format_percent(latest.get('cash_conversion'))}",
+            f"- 资产负债率：{format_percent(latest.get('debt_to_assets'))}",
+            f"- 净资产收益率：{format_percent(latest.get('return_on_equity'))}",
+            "",
+            "> 这些指标仅作为研究输入，不构成投资建议。",
+        ])
     return "\n".join(lines)

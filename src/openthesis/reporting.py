@@ -174,6 +174,24 @@ def _render_growth_opportunities(
     english = normalize_language(language) == EN
     opportunities = growth_opportunities_from_value(value, language)
     if not opportunities:
+        response_error = value.get("_response_error") if isinstance(value, dict) else None
+        validation = value.get("_validation") if isinstance(value, dict) else None
+        if response_error in {"empty_content", "invalid_json", "invalid_shape"}:
+            return [
+                (
+                    "The growth-opportunity model returned no usable content. You can retry only this stage."
+                    if english
+                    else "增长机会模型未返回有效内容，可单独重试该阶段。"
+                )
+            ]
+        if isinstance(validation, dict) and validation.get("passed") is False:
+            return [
+                (
+                    "The growth-opportunity output did not pass structure or evidence validation. You can retry only this stage."
+                    if english
+                    else "增长机会输出未通过结构或证据校验，可单独重试该阶段。"
+                )
+            ]
         return [
             (
                 "Current evidence is insufficient to present a growth opportunity."
@@ -392,6 +410,7 @@ def render_research_run(
             if latest_interim:
                 period = f"{latest_interim.get('year', '')} {latest_interim.get('period', '')}".strip()
                 comparison = str(latest_interim.get("comparison_period") or "")
+                comparison_gap = str(latest_interim.get("comparison_gap") or "")
                 currency = str(content.get("currency", "USD"))
                 lines.extend(
                     [
@@ -410,10 +429,18 @@ def render_research_run(
                         ),
                         _pick(
                             language,
-                            f"- 同期收入增长：{format_percent(latest_interim.get('revenue_growth'))}"
-                            + (f"（对比 {comparison}）" if comparison else ""),
-                            f"- Revenue growth: {format_percent(latest_interim.get('revenue_growth'))}"
-                            + (f" (versus {comparison})" if comparison else ""),
+                            (
+                                f"- 同期收入增长：{format_percent(latest_interim.get('revenue_growth'))}"
+                                + (f"（对比 {comparison}）" if comparison else "")
+                                if not comparison_gap
+                                else "- 同期收入增长：缺少或未通过校验的上年同期披露"
+                            ),
+                            (
+                                f"- Revenue growth: {format_percent(latest_interim.get('revenue_growth'))}"
+                                + (f" (versus {comparison})" if comparison else "")
+                                if not comparison_gap
+                                else "- Revenue growth: prior-year comparable disclosure is missing or did not pass validation"
+                            ),
                         ),
                         _pick(
                             language,
@@ -428,6 +455,24 @@ def render_research_run(
                         "",
                     ]
                 )
+            quality = content.get("financial_quality")
+            rejected = quality.get("rejected_periods", []) if isinstance(quality, dict) else []
+            continuity = quality.get("period_continuity", []) if isinstance(quality, dict) else []
+            has_continuity_gap = bool(rejected) or any(
+                isinstance(item, dict) and item.get("status") != "accepted"
+                for item in continuity
+            )
+            if has_continuity_gap:
+                lines.extend([
+                    _pick(language, "## 年度数据连续性", "## Annual Data Continuity"),
+                    "",
+                    _pick(
+                        language,
+                        "部分年度数据校验未通过，已隔离且未用于计算或模型分析。",
+                        "Some annual data failed validation and was quarantined; it was not used for metrics or model analysis.",
+                    ),
+                    "",
+                ])
             snapshot = content.get("market_snapshot")
             if isinstance(snapshot, dict):
                 values: list[str] = []
@@ -586,30 +631,31 @@ def render_research_run(
                 for key in section_labels:
                     if key not in display_report:
                         continue
+                    projected = project_report_value(
+                        display_report[key],
+                        include_technical=include_technical,
+                        section=key,
+                    )
                     rendered = (
                         _render_growth_opportunities(
-                            display_report[key],
+                            projected,
                             language,
                             include_technical=include_technical,
                         )
                         if key == "growth_opportunities"
                         else _render_claims(
-                            project_report_value(
-                                display_report[key],
-                                include_technical=include_technical,
-                            ),
+                            projected,
                             language,
                         )
                         if key == "claims"
                         else _render_value(
-                            project_report_value(
-                                display_report[key],
-                                include_technical=include_technical,
-                            ),
+                            projected,
                             language,
                         )
                     )
                     if key == "growth_opportunities":
+                        if not growth_opportunities_from_value(projected, language):
+                            continue
                         growth_rendered = True
                     lines.extend(
                         [

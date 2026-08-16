@@ -132,6 +132,18 @@ class JsonLineServer:
             if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
                 raise ValueError("run_id and model are required")
             return self.service.retry_research_synthesis(run_id, model)
+        if method == "research.retry_growth":
+            run_id = params.get("run_id")
+            model = params.get("model")
+            if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
+                raise ValueError("run_id and model are required")
+            return self.service.retry_research_growth(run_id, model)
+        if method == "research.vision_decision":
+            job_id = params.get("job_id")
+            approved = params.get("approved")
+            if not isinstance(job_id, str) or not job_id or not isinstance(approved, bool):
+                raise ValueError("job_id and approved are required")
+            return self.service.vision_decision(job_id, approved)
         if method in {"research.status", "research.cancel"}:
             job_id = params.get("job_id")
             if not isinstance(job_id, str) or not job_id:

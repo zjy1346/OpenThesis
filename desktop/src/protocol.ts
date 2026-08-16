@@ -34,9 +34,11 @@ export const BACKEND_METHODS = [
   "research.delete",
   "research.get_report",
   "research.start",
+  "research.retry_growth",
   "research.retry_synthesis",
   "research.status",
   "research.cancel",
+  "research.vision_decision",
 ] as const;
 
 export type BackendMethod = typeof BACKEND_METHODS[number];
@@ -64,9 +66,11 @@ export type BackendParams = {
     include_technical?: boolean;
   };
   "research.start": ResearchRequest;
+  "research.retry_growth": { run_id: string; model: ModelSelection };
   "research.retry_synthesis": { run_id: string; model: ModelSelection };
   "research.status": { job_id: string };
   "research.cancel": { job_id: string };
+  "research.vision_decision": { job_id: string; approved: boolean };
 };
 
 export type BackendResult = {
@@ -90,9 +94,11 @@ export type BackendResult = {
   "research.delete": { run_id: string; deleted: boolean };
   "research.get_report": ResearchReport;
   "research.start": ResearchJob;
+  "research.retry_growth": ResearchReport;
   "research.retry_synthesis": ResearchReport;
   "research.status": ResearchJob;
   "research.cancel": ResearchJob;
+  "research.vision_decision": ResearchJob;
 };
 
 export type BackendRequest<M extends BackendMethod = BackendMethod> = {

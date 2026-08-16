@@ -104,9 +104,11 @@ def _parse_model_json(text: str) -> dict[str, Any]:
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
+    parse_error_class: str | None = None
     try:
         result = json.loads(text)
     except json.JSONDecodeError:
+        parse_error_class = "invalid_json"
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
@@ -117,8 +119,14 @@ def _parse_model_json(text: str) -> dict[str, Any]:
         else:
             result = {"narrative": text, "structured_output_valid": False}
     if not isinstance(result, dict):
-        return {"result": result, "structured_output_valid": True}
+        return {
+            "result": result,
+            "structured_output_valid": False,
+            "_response_error": "invalid_shape",
+        }
     result.setdefault("structured_output_valid", True)
+    if parse_error_class and not result.get("structured_output_valid", True):
+        result.setdefault("_response_error", parse_error_class)
     return result
 
 

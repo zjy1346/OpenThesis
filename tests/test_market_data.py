@@ -2,9 +2,20 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+import urllib.parse
 from pathlib import Path
 
-from openthesis.market_data import CnInfoAdapter, HkexNewsAdapter, MarketDataError, MarketDataModule
+from openthesis.market_data import (
+    CnInfoAdapter,
+    HkexNewsAdapter,
+    MarketDataError,
+    MarketDataModule,
+    _classify_report,
+    _hkex_filings_from_json,
+    _hkex_filings_from_text,
+    _hkex_json_rows,
+)
 from openthesis.markets import Exchange, Market
 
 
@@ -59,7 +70,216 @@ class _Transport:
         return target
 
 
+class _HkexJsonTransport(_Transport):
+    """Bounded servlet fixture mirroring official nested/list result variants."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_urls: list[str] = []
+
+    def get_json(self, url: str):
+        if "titleSearchServlet.do" not in url:
+            return super().get_json(url)
+        self.search_urls.append(url)
+        title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("title", [""])[0]
+        annual = [
+            {
+                "DATE_TIME": f"{28 - index:02d}/03/{year} 12:00",
+                "TITLE": f"202{year - 2020} Annual Report",
+                "FILE_LINK": f"/listedco/listconews/sehk/{year + 1}/0328/annual-{year}.pdf",
+            }
+            for index, year in enumerate(range(2025, 2020, -1))
+        ]
+        if title == "Annual Report":
+            return {"result": json.dumps(annual)}
+        if title in {"Interim Report", "Half-Year Report"}:
+            return {
+                "result": [
+                    {
+                        "DATE_TIME": "28/08/2026 09:00",
+                        "TITLE": "Interim Report 2026",
+                        "FILE_LINK": "/listedco/listconews/sehk/2026/0828/interim-2026.pdf",
+                    }
+                ]
+            }
+        return {"result": []}
+
+
 class MarketDataAdapterTests(unittest.TestCase):
+    def test_cninfo_one_quarter_alias_maps_to_q1_period_end(self) -> None:
+        self.assertEqual(_classify_report("宁德时代2026年一季度报告"), ("QUARTERLY_REPORT", "Q1"))
+        self.assertEqual(_classify_report("宁德时代2026年1季度报告"), ("QUARTERLY_REPORT", "Q1"))
+        self.assertEqual(_classify_report("宁德时代2026年三季度报告"), ("QUARTERLY_REPORT", "Q3"))
+
+    def test_hkex_english_quarterly_aliases_map_to_period_end(self) -> None:
+        self.assertEqual(_classify_report("2026 FIRST QUARTERLY REPORT"), ("QUARTERLY_REPORT", "Q1"))
+        self.assertEqual(_classify_report("2026 1ST QUARTERLY REPORT"), ("QUARTERLY_REPORT", "Q1"))
+        self.assertEqual(_classify_report("2025 THIRD QUARTERLY REPORT"), ("QUARTERLY_REPORT", "Q3"))
+        self.assertEqual(_classify_report("EARNINGS RELEASE FOR FIRST QUARTER 2026"), ("", ""))
+
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        filings = _hkex_filings_from_json(
+            company,
+            [
+                {
+                    "DATE_TIME": "28/04/2026 09:00",
+                    "TITLE": "2026 FIRST QUARTERLY REPORT",
+                    "FILE_LINK": "/listedco/listconews/sehk/2026/0428/byd-q1-2026.pdf",
+                },
+                {
+                    "DATE_TIME": "28/10/2025 09:00",
+                    "TITLE": "2025 THIRD QUARTERLY REPORT",
+                    "FILE_LINK": "/listedco/listconews/sehk/2025/1028/byd-q3-2025.pdf",
+                },
+            ],
+        )
+        self.assertEqual(
+            [(item.fiscal_period, item.period_end) for item in filings],
+            [("Q1", "2026-03-31"), ("Q3", "2025-09-30")],
+        )
+
+    def test_hkex_link_context_strips_markup_and_uses_title_year(self) -> None:
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        text = '<div class="doc-link"><a href="/listedco/listconews/sehk/2026/0408/2026040800613.pdf">2025 Annual Report</a></div>'
+        filing = _hkex_filings_from_text(company, text, limit=1)[0]
+        self.assertEqual(filing.primary_document, "2025 Annual Report")
+        self.assertEqual(filing.period_end, "2025-12-31")
+        self.assertNotIn("<", filing.primary_document)
+
+    def test_hkex_anchor_titles_ignore_earnings_release_neighbors(self) -> None:
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        text = (
+            '<div><a href="/listedco/listconews/sehk/2026/0219/2026021900123.pdf">'
+            'Annual Report and Accounts 2025 (with employee share plans)</a></div>'
+            '<div><a href="/listedco/listconews/sehk/2026/0508/2026050800456.pdf">'
+            'EARNINGS RELEASE FOR FIRST QUARTER 2026</a></div>'
+        )
+        filings = _hkex_filings_from_text(company, text, limit=5)
+        self.assertEqual(len(filings), 1)
+        self.assertEqual(filings[0].primary_document, "Annual Report and Accounts 2025 (with employee share plans)")
+        self.assertEqual(filings[0].period_end, "2025-12-31")
+
+    def test_hkex_json_nested_result_selects_five_annuals_and_periodic(self) -> None:
+        transport = _HkexJsonTransport()
+        adapter = HkexNewsAdapter(transport)
+        company = adapter.resolve("00700")[0]
+
+        filings = adapter.list_financial_filings(company, limit=5)
+
+        annuals = [item for item in filings if item.form_type == "ANNUAL_REPORT"]
+        self.assertEqual({item.period_end[:4] for item in annuals}, {"2021", "2022", "2023", "2024", "2025"})
+        self.assertTrue(any(item.fiscal_period == "H1" for item in filings))
+        self.assertTrue(transport.search_urls)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(transport.search_urls[0]).query)
+        self.assertEqual(query["rowRange"], ["100"])
+        self.assertEqual(query["title"], ["Annual Report"])
+        for key in ("stockId", "fromDate", "toDate", "documentType", "sortByOptions", "lang"):
+            self.assertIn(key, query)
+        self.assertRegex(query["fromDate"][0], r"^20\d{6}$")
+        self.assertRegex(query["toDate"][0], r"^20\d{6}$")
+        self.assertTrue(query["fromDate"][0].endswith("0101"))
+        self.assertNotIn("/", query["fromDate"][0] + query["toDate"][0])
+        self.assertNotIn("titlesearch.xhtml", transport.search_urls[0])
+
+    def test_hkex_json_rows_support_list_and_malformed_distinction(self) -> None:
+        rows = [{"TITLE": "Annual Report 2025", "FILE_LINK": "/listedco/listconews/sehk/2026/0328/a.pdf", "DATE_TIME": "28/03/2026 10:30"}]
+        self.assertEqual(_hkex_json_rows({"result": rows}), rows)
+        self.assertEqual(_hkex_json_rows({"result": json.dumps(rows)}), rows)
+        self.assertEqual(_hkex_json_rows({"result": []}), [])
+        self.assertIsNone(_hkex_json_rows({"result": "not-json"}))
+        self.assertIsNone(_hkex_json_rows({"result": ["unexpected"]}))
+
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        filings = _hkex_filings_from_json(
+            company,
+            rows + [
+                # Duplicate URL is ignored, and a neighbouring earnings
+                # release is not a report candidate.
+                rows[0],
+                {"TITLE": "EARNINGS RELEASE FOR FIRST QUARTER 2026", "FILE_LINK": "/listedco/listconews/sehk/2026/0508/earnings.pdf", "DATE_TIME": "08/05/2026 09:00"},
+            ],
+        )
+        self.assertEqual(len(filings), 1)
+        self.assertEqual(filings[0].filed_at, "2026-03-28T10:30:00+00:00")
+
+    def test_hkex_json_hsbc_annual_and_interim_titles_are_clean(self) -> None:
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        filings = _hkex_filings_from_json(
+            company,
+            [
+                {
+                    "DATE_TIME": "19/02/2025 07:00",
+                    "TITLE": "Annual Report and Accounts 2024 (with employee share plans)",
+                    "FILE_LINK": "https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0219/hsbc-annual.pdf",
+                },
+                {
+                    "DATE_TIME": "21/02/2024 07:00",
+                    "TITLE": "2023 Annual Report",
+                    "FILE_LINK": "/listedco/listconews/sehk/2024/0221/hsbc-annual-2023.pdf",
+                },
+                {
+                    "DATE_TIME": "02/08/2024 07:00",
+                    "TITLE": "Interim Report 2024",
+                    "FILE_LINK": "/listedco/listconews/sehk/2024/0802/hsbc-interim-2024.pdf",
+                },
+            ],
+        )
+        self.assertEqual([item.primary_document for item in filings], [
+            "Annual Report and Accounts 2024 (with employee share plans)",
+            "2023 Annual Report",
+            "Interim Report 2024",
+        ])
+        self.assertEqual([item.period_end for item in filings], ["2024-12-31", "2023-12-31", "2024-06-30"])
+
+    def test_hkex_json_source_failure_falls_back_to_html(self) -> None:
+        class BrokenJsonTransport(_Transport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.json_attempts = 0
+
+            def get_json(self, url: str):
+                if "titleSearchServlet.do" in url:
+                    self.json_attempts += 1
+                    raise ValueError("malformed servlet response")
+                return super().get_json(url)
+
+        transport = BrokenJsonTransport()
+        adapter = HkexNewsAdapter(transport)
+        company = adapter.resolve("00700")[0]
+        filings = adapter.list_financial_filings(company)
+        self.assertGreaterEqual(transport.json_attempts, 1)
+        self.assertEqual(filings[0].primary_document, "2025 Annual Report")
+
+    def test_hkex_malformed_json_payload_falls_back_to_html(self) -> None:
+        class MalformedJsonTransport(_Transport):
+            def get_json(self, url: str):
+                if "titleSearchServlet.do" in url:
+                    title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("title", [""])[0]
+                    return {"result": "not-json"} if title == "Annual Report" else {"result": []}
+                return super().get_json(url)
+
+        transport = MalformedJsonTransport()
+        adapter = HkexNewsAdapter(transport)
+        company = adapter.resolve("00700")[0]
+        filings = adapter.list_financial_filings(company)
+        self.assertEqual(filings[0].primary_document, "2025 Annual Report")
+
+    def test_hkex_json_explicit_empty_does_not_scrape_unfiltered_html(self) -> None:
+        class EmptyJsonTransport(_Transport):
+            def get_json(self, url: str):
+                if "titleSearchServlet.do" in url:
+                    return {"result": []}
+                return super().get_json(url)
+
+            def get_text(self, url: str) -> str:
+                if "titlesearch.xhtml" in url:
+                    raise AssertionError("explicit JSON empty must not invoke unfiltered HTML")
+                return super().get_text(url)
+
+        transport = EmptyJsonTransport()
+        adapter = HkexNewsAdapter(transport)
+        company = adapter.resolve("00700")[0]
+        self.assertEqual(adapter.list_financial_filings(company), [])
     def test_cninfo_discovers_first_quarter_reports_separately(self) -> None:
         class FirstQuarterTransport(_Transport):
             def __init__(self) -> None:

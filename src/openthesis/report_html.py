@@ -304,6 +304,7 @@ def _interim_financial_snapshot(rows: list[object], language: str, currency: str
         return ""
     period = f"{latest.get('year', '')} {latest.get('period', '')}".strip()
     comparison = latest.get("comparison_period")
+    comparison_gap = latest.get("comparison_gap")
     headers = (
         ("Period", "Revenue", "Like-for-like growth", "Net income", "Operating cash flow")
         if language == EN
@@ -320,6 +321,14 @@ def _interim_financial_snapshot(rows: list[object], language: str, currency: str
     if comparison:
         comparison_text = " " + _escape(
             _pick(language, f"同比基准：{comparison}", f"Comparison: {comparison}")
+        )
+    elif comparison_gap:
+        comparison_text = " " + _escape(
+            _pick(
+                language,
+                "同期收入增长：缺少或未通过校验的上年同期披露",
+                "Revenue growth: prior-year comparable disclosure is missing or did not pass validation",
+            )
         )
     return (
         '<div class="callout"><strong>'
@@ -351,6 +360,7 @@ def _financial_section(
     market_snapshot: object = None,
     industry_support: str = "standard",
     interim_metrics: object = None,
+    financial_quality: object = None,
 ) -> str:
     english = language == EN
     rows = metrics if isinstance(metrics, list) else []
@@ -365,40 +375,26 @@ def _financial_section(
         )
 
     latest = rows[0] if isinstance(rows[0], dict) else {}
-    kpis = (
-        (
-            ("营业收入", "Revenue", format_money(latest.get("revenue"), currency)),
-            ("营业利润率", "Operating margin", format_percent(latest.get("operating_margin"))),
-            ("净利润", "Net income", format_money(latest.get("net_income"), currency)),
-            ("自由现金流", "Free cash flow", format_money(latest.get("free_cash_flow"), currency)),
-        )
-    )
+    has_operating_margin = any(row.get("operating_margin") is not None for row in rows if isinstance(row, dict))
+    has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in rows if isinstance(row, dict))
+    kpis = [("营业收入", "Revenue", format_money(latest.get("revenue"), currency))]
+    if has_operating_margin:
+        kpis.append(("营业利润率", "Operating margin", format_percent(latest.get("operating_margin"))))
+    kpis.append(("净利润", "Net income", format_money(latest.get("net_income"), currency)))
+    if has_free_cash_flow:
+        kpis.append(("自由现金流", "Free cash flow", format_money(latest.get("free_cash_flow"), currency)))
     kpi_html = "<table class=\"kpi-table\"><tr>" + "".join(
         _metric_cell(english_label if english else chinese_label, value)
         for chinese_label, english_label, value in kpis
     ) + "</tr></table>"
 
-    headers = (
-        (
-            "Fiscal year",
-            "Revenue",
-            "Revenue growth",
-            "Operating margin",
-            "Net income",
-            "Operating cash flow",
-            "Free cash flow",
-        )
-        if english
-        else (
-            "财年",
-            "营业收入",
-            "收入增长",
-            "营业利润率",
-            "净利润",
-            "经营现金流",
-            "自由现金流",
-        )
-    )
+    columns = [("year", "Fiscal year", "财年"), ("revenue", "Revenue", "营业收入"), ("revenue_growth", "Revenue growth", "收入增长")]
+    if has_operating_margin:
+        columns.append(("operating_margin", "Operating margin", "营业利润率"))
+    columns.extend([("net_income", "Net income", "净利润"), ("operating_cash_flow", "Operating cash flow", "经营现金流")])
+    if has_free_cash_flow:
+        columns.append(("free_cash_flow", "Free cash flow", "自由现金流"))
+    headers = tuple(column[1] if english else column[2] for column in columns)
     table = (
         "<table class=\"data-table\"><thead><tr>"
         + "".join(f"<th>{_escape(label)}</th>" for label in headers)
@@ -407,21 +403,20 @@ def _financial_section(
     for row in rows[:5]:
         if not isinstance(row, dict):
             continue
-        values = (
-            str(row.get("year", "—")),
-            format_money(row.get("revenue"), currency),
-            format_percent(row.get("revenue_growth")),
-            format_percent(row.get("operating_margin")),
-            format_money(row.get("net_income"), currency),
-            format_money(row.get("operating_cash_flow"), currency),
-            format_money(row.get("free_cash_flow"), currency),
-        )
+        values = []
+        for key, _, _ in columns:
+            value = row.get(key)
+            if key == "year":
+                values.append(str(value if value is not None else "—"))
+            elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
+                values.append(format_money(value, currency))
+            else:
+                values.append(format_percent(value))
         table += "<tr>" + "".join(
             f"<td class=\"{'missing' if value == '—' else ''}\">{_escape(value)}</td>"
             for value in values
         ) + "</tr>"
     table += "</tbody></table>"
-
     missing_count = sum(
         1
         for row in rows[:5]
@@ -488,9 +483,20 @@ def _financial_section(
             )
             + "</div>"
         )
+    continuity_note = ""
+    continuity = financial_quality.get("period_continuity", []) if isinstance(financial_quality, dict) else []
+    if isinstance(financial_quality, dict) and (
+        financial_quality.get("rejected_periods")
+        or any(isinstance(item, dict) and item.get("status") != "accepted" for item in continuity)
+    ):
+        continuity_note = (
+            "<div class=\"callout callout-warning\">"
+            + _escape(_pick(language, "部分年度数据校验未通过，已隔离且未用于计算或模型分析。", "Some annual data failed validation and was quarantined; it was not used for metrics or model analysis."))
+            + "</div>"
+        )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        snapshot_note + beta_note + interim_html + kpi_html + table + note,
+        snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + note,
         section_id="financials",
     )
 
@@ -573,9 +579,29 @@ def _growth_section(
 ) -> str:
     opportunities = growth_opportunities_from_value(value, language)
     if not opportunities:
+        response_error = value.get("_response_error") if isinstance(value, dict) else None
+        validation = value.get("_validation") if isinstance(value, dict) else None
+        if response_error in {"empty_content", "invalid_json", "invalid_shape"}:
+            message = _pick(
+                language,
+                "增长机会模型未返回有效内容，可单独重试该阶段。",
+                "The growth-opportunity model returned no usable content. You can retry only this stage.",
+            )
+        elif isinstance(validation, dict) and validation.get("passed") is False:
+            message = _pick(
+                language,
+                "增长机会输出未通过结构或证据校验，可单独重试该阶段。",
+                "The growth-opportunity output did not pass structure or evidence validation. You can retry only this stage.",
+            )
+        else:
+            message = _pick(
+                language,
+                "当前证据不足，未形成可展示的增长机会。",
+                "Current evidence is insufficient to present a growth opportunity.",
+            )
         return _section(
             _pick(language, "增长机会", "Growth Opportunities"),
-            f"<div class=\"callout\">{_escape(_pick(language, '当前证据不足，未形成可展示的增长机会。', 'Current evidence is insufficient to present a growth opportunity.'))}</div>",
+            f"<div class=\"callout\">{_escape(message)}</div>",
             section_id="growth",
         )
 
@@ -854,7 +880,9 @@ def _report_sections(
             parts.append(
                 _business_model_section(
                     project_report_value(
-                        display_report[key], include_technical=include_technical
+                        display_report[key],
+                        include_technical=include_technical,
+                        section=key,
                     ),
                     language,
                 )
@@ -864,14 +892,29 @@ def _report_sections(
             parts.append(
                 _claims_section(
                     project_report_value(
-                        display_report[key], include_technical=include_technical
+                        display_report[key],
+                        include_technical=include_technical,
+                        section=key,
                     ),
                     language,
                 )
             )
             continue
         if key == "growth_opportunities":
-            parts.append(_growth_section(display_report[key], language, include_technical))
+            projected = project_report_value(
+                display_report[key],
+                include_technical=include_technical,
+                section=key,
+            )
+            if not growth_opportunities_from_value(projected, language):
+                continue
+            parts.append(
+                _growth_section(
+                    projected,
+                    language,
+                    include_technical,
+                )
+            )
             continue
         parts.append(
             _section(
@@ -880,10 +923,11 @@ def _report_sections(
                     project_report_value(
                         display_report[key],
                         include_technical=include_technical,
+                        section=key,
                     ),
                     language,
                 ),
-                section_id=key.replace("_", "-"),
+                section_id=("opposing-views" if key == "counterarguments" else key.replace("_", "-")),
             )
         )
     return "".join(parts)
@@ -1052,6 +1096,7 @@ def render_research_html(
                 deterministic.get("content", {}).get("market_snapshot"),
                 str(deterministic.get("content", {}).get("industry_support", "standard")),
                 deterministic.get("content", {}).get("interim_metrics"),
+                deterministic.get("content", {}).get("financial_quality"),
             )
         )
     if valuation:
@@ -1092,9 +1137,18 @@ def render_research_html(
                     )
                 )
             else:
-                growth_rendered = (
-                    isinstance(report, dict)
+                projected_growth = (
+                    project_report_value(
+                        report.get("growth_opportunities"),
+                        include_technical=include_technical,
+                        section="growth_opportunities",
+                    )
+                    if isinstance(report, dict)
                     and "growth_opportunities" in report
+                    else None
+                )
+                growth_rendered = bool(
+                    growth_opportunities_from_value(projected_growth, language)
                 )
                 body.append(
                     _report_sections(

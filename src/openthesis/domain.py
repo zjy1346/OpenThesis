@@ -104,6 +104,7 @@ class FinancialFact:
     revision: str = "original"
     source_document: str = ""
     source_page: int | None = None
+    source_bbox: tuple[float, float, float, float] | None = None
     raw_text: str = ""
     parser_version: str = ""
     validation_status: str = "unvalidated"

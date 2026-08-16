@@ -3,9 +3,23 @@
 ## Roles
 
 - The primary agent keeps the model selected for the current main task. Do not override or rewrite the primary model configuration.
-- `lunahigh` is the only project-configured subagent. Never create or invoke Terra or any other custom or built-in subagent role for this repository.
+- All spawned subagents for this repository must use the project-configured `lunahigh` agent. Multiple `lunahigh` subagents may be used when parallel work is genuinely useful or necessary.
 - The primary agent owns requirement interpretation, complex diagnosis, architecture, implementation planning, tradeoff and security decisions, final diff review, and acceptance.
 - `lunahigh` owns bounded execution after the primary agent has made the necessary decisions.
+
+
+## User approval and release workflow
+
+Every user-requested software modification must follow this workflow:
+
+1. On the first conversational round for a new modification request, do not modify application code or implement the requested feature. Creating or updating the change-record Markdown file described below is allowed.
+2. During that first round, locate the source of the problem or the relevant implementation area, explain the cause or current behavior when it can be determined, and report a proposed solution to the user. The agent may ask focused questions or present implementation choices when needed.
+3. In that same first round, create a Markdown change record named after the planned target version, such as `1.4.1.md`. The file must record every requested change, the proposed solution or decisions still requiring user choice, relevant scope or files when known, and a checklist that can later be used for acceptance.
+4. Do not modify application code, add features, or begin implementation until the user explicitly approves the proposed modification.
+5. After the user approves implementation, perform the authorized code and feature changes. Delegation to `lunahigh` must still follow the role, ownership, and concurrency rules in this document.
+6. After implementation, perform acceptance against the corresponding `<version>.md` change record. Verify every recorded user requirement individually. Do not claim the work is complete while any recorded requirement is missing, only partially implemented, or unverified.
+7. Once all recorded requirements pass acceptance, build and package a release artifact for the user to test.
+8. Wait for the user to test the release artifact. Only after the user explicitly states that everything is working correctly and explicitly authorizes uploading or publishing to GitHub may the project create the final Git commit, push changes, and publish the new GitHub Release.
 
 ## Delegation policy
 
@@ -37,8 +51,9 @@ The primary agent should work directly only when the task still requires complex
 
 ## Concurrency and containment
 
-- Use at most one spawned subagent thread at a time.
-- Always select the custom agent named `lunahigh`; do not fall back to `default`, `worker`, `explorer`, Terra, or another agent.
-- Do not ask `lunahigh` to spawn further agents.
-- Avoid parallel write-heavy work. The primary agent and `lunahigh` must never modify the same file concurrently.
+- The primary agent may spawn multiple subagent threads when parallel work is genuinely useful or necessary. Do not create extra subagents when the work can be handled clearly and efficiently by fewer agents.
+- Every spawned subagent must use the custom agent named `lunahigh`, which means Luna with reasoning effort set to `high`. Do not use `default`, `worker`, `explorer`, Terra, or any other custom or built-in subagent role.
+- The primary agent is responsible for dividing parallel work into clearly separated scopes before spawning multiple `lunahigh` subagents.
+- Do not ask any `lunahigh` subagent to spawn further agents. All subagents must be created and coordinated by the primary agent.
+- Avoid overlapping write ownership. The primary agent and any `lunahigh` subagent, and multiple `lunahigh` subagents, must never modify the same file concurrently.
 

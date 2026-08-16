@@ -65,6 +65,19 @@ export type ModelSelection = {
   timeout_seconds?: number;
 };
 
+export type VisionFallbackSelection = {
+  enabled: boolean;
+  consent: boolean;
+  provider: "mineru_lite" | "mineru_precision" | "custom_vision";
+  token?: string;
+  api_key?: string;
+  endpoint?: string;
+  model?: string;
+  language?: "auto" | "ch" | "en";
+  require_page_approval: true;
+  timeout_seconds?: number;
+};
+
 export type ResearchRequest = {
   mode: "demo" | "company";
   company?: Company;
@@ -85,6 +98,7 @@ export type ResearchRequest = {
     currency: string;
     as_of: string;
   };
+  vision_fallback?: VisionFallbackSelection;
 };
 
 export type ResearchRunSummary = {
@@ -98,6 +112,7 @@ export type ResearchRunSummary = {
   market?: Market;
   exchange: string;
   listing_currency?: string;
+  reporting_currency?: string;
   industry_support?: "standard" | "financial_beta";
 };
 
@@ -123,9 +138,11 @@ export type ResearchReport = {
   market?: Market;
   exchange?: string;
   listing_currency?: string;
+  reporting_currency?: string;
   industry_support?: "standard" | "financial_beta";
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
+  retryable_growth?: boolean;
   markdown: string;
   html: string;
 };
@@ -142,9 +159,21 @@ export type ResearchJob = {
   total_agents?: number;
   cancel_requested?: boolean;
   elapsed_seconds?: number;
+  stage_current?: number | null;
+  stage_total?: number | null;
   error_code?: string | null;
   market?: Market | null;
   disclosure_url?: string | null;
+  vision_upload_preview?: {
+    provider: string;
+    pages: number[];
+    total_bytes: number;
+    source_document?: string;
+    filing_hash?: string;
+    document_hashes?: string[];
+  } | null;
+  vision_approval_pending?: boolean;
+  vision_approval?: boolean | null;
 };
 
 export type ThesisVersion = {

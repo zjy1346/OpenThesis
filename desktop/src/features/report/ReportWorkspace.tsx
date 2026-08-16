@@ -34,12 +34,22 @@ type ReportCopy = {
   exportFailed: string;
   retrySynthesis: string;
   retryingSynthesis: string;
+  retrySynthesisSucceeded: string;
   retrySynthesisFailed: string;
+  retryGrowth: string;
+  retryingGrowth: string;
+  retryGrowthSucceeded: string;
+  retryGrowthFailed: string;
+  partialReport: string;
+  listingCurrency: string;
+  reportingCurrency: string;
+  sameCurrency: string;
 };
 
 type FocusState = "normal" | "focused" | "closing";
 type ExportState = "idle" | "exporting" | "exported" | "failed";
-type RetryState = "idle" | "retrying" | "failed";
+type RetryState = "idle" | "retrying" | "succeeded" | "failed";
+type RetryTarget = "synthesis" | "growth";
 
 const MIN_ZOOM = 0.9;
 const MAX_ZOOM = 1.3;
@@ -64,7 +74,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void> }) {
+export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void> }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -73,9 +83,40 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
   const [exportState, setExportState] = useState<ExportState>("idle");
   const [focusState, setFocusState] = useState<FocusState>("normal");
   const [retryState, setRetryState] = useState<RetryState>("idle");
+  const [retryTarget, setRetryTarget] = useState<RetryTarget>("synthesis");
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
   const reportBody = stripReportPreamble(displayedReport.markdown);
+  const retryCopy = retryTarget === "growth"
+    ? {
+        retrying: copy.retryingGrowth,
+        succeeded: copy.retryGrowthSucceeded,
+        failed: copy.retryGrowthFailed,
+      }
+    : {
+        retrying: copy.retryingSynthesis,
+        succeeded: copy.retrySynthesisSucceeded,
+        failed: copy.retrySynthesisFailed,
+      };
+  const reportStatus = retryState === "retrying"
+    ? { text: retryCopy.retrying, tone: "normal", role: "status" as const }
+    : retryState === "succeeded"
+      ? { text: retryCopy.succeeded, tone: "normal", role: "status" as const }
+      : retryState === "failed"
+        ? { text: retryCopy.failed, tone: "error", role: "alert" as const }
+        : technicalError
+          ? { text: technicalError, tone: "error", role: "alert" as const }
+          : technicalLoading
+            ? { text: copy.loadingTechnical, tone: "normal", role: "status" as const }
+            : exportState === "exporting"
+              ? { text: copy.exportingReport, tone: "normal", role: "status" as const }
+              : exportState === "exported"
+                ? { text: copy.exportedReport, tone: "normal", role: "status" as const }
+                : exportState === "failed"
+                  ? { text: copy.exportFailed, tone: "error", role: "alert" as const }
+                  : displayedReport.status === "partial"
+                    ? { text: copy.partialReport, tone: "partial", role: "status" as const }
+                    : null;
   const compactRunId = displayedReport.run_id.length > 12
     ? `${displayedReport.run_id.slice(0, 12)}…`
     : displayedReport.run_id;
@@ -93,6 +134,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
     setTechnicalError("");
     setExportState("idle");
     setRetryState("idle");
+    setRetryTarget("synthesis");
   }, [report]);
 
   const enterFocus = (withoutMotion = false) => {
@@ -166,12 +208,14 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
     }
   };
 
-  const retrySynthesis = async () => {
-    if (!onRetrySynthesis) return;
+  const retryStage = async (target: RetryTarget) => {
+    const action = target === "growth" ? onRetryGrowth : onRetrySynthesis;
+    if (!action) return;
+    setRetryTarget(target);
     setRetryState("retrying");
     try {
-      await onRetrySynthesis();
-      setRetryState("idle");
+      await action();
+      setRetryState("succeeded");
     } catch {
       setRetryState("failed");
     }
@@ -180,6 +224,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
   return (
     <article
       className="report-document"
+      data-report-status={displayedReport.status}
       data-focus={focusState === "normal" ? undefined : focusState}
       data-focus-motion={skipFocusMotion ? "skip" : undefined}
       style={{ "--report-scale": String(zoom) } as CSSProperties}
@@ -190,13 +235,15 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
           <h2>{displayedReport.company_name}</h2>
           <div className="report-context">
             <span><Clock3 size={13} />{copy.report}</span>
-            <span>{displayedReport.market || "US"}{displayedReport.exchange ? ` · ${displayedReport.exchange}` : ""}{displayedReport.listing_currency ? ` · ${displayedReport.listing_currency}` : ""}</span>
+            <span>{displayedReport.market || "US"}{displayedReport.exchange ? ` · ${displayedReport.exchange}` : ""}</span>
+            {displayedReport.listing_currency && displayedReport.reporting_currency && displayedReport.listing_currency !== displayedReport.reporting_currency ? <><span>{copy.listingCurrency}: {displayedReport.listing_currency}</span><span>{copy.reportingCurrency}: {displayedReport.reporting_currency}</span></> : <span>{copy.sameCurrency}: {displayedReport.reporting_currency || displayedReport.listing_currency || "—"}</span>}
             <span className="report-run" title={displayedReport.run_id}>{copy.researchRun}: <code>{compactRunId}</code></span>
             <span>{copy.reportDisclaimer}</span>
           </div>
         </div>
         <div className="report-toolbar" role="toolbar" aria-label={copy.reportTools}>
-          {displayedReport.retryable_synthesis && <button type="button" aria-label={copy.retrySynthesis} title={copy.retrySynthesis} disabled={retryState === "retrying"} onClick={() => void retrySynthesis()}><RefreshCw size={16} /></button>}
+          {displayedReport.retryable_growth && onRetryGrowth && <button type="button" className="report-retry-button" aria-label={copy.retryGrowth} title={copy.retryGrowth} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("growth")}><RefreshCw size={16} /><span>{copy.retryGrowth}</span></button>}
+          {displayedReport.retryable_synthesis && onRetrySynthesis && <button type="button" className="report-retry-button" aria-label={copy.retrySynthesis} title={copy.retrySynthesis} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("synthesis")}><RefreshCw size={16} /><span>{copy.retrySynthesis}</span></button>}
           <button type="button" aria-label={copy.zoomOut} title={copy.zoomOut} disabled={zoom <= MIN_ZOOM} onClick={() => setZoom((value) => nextZoom(value, -ZOOM_STEP))}><ZoomOut size={16} /></button>
           <span className="zoom-value" aria-live="polite">{Math.round(zoom * 100)}%</span>
           <button type="button" aria-label={copy.zoomIn} title={copy.zoomIn} disabled={zoom >= MAX_ZOOM} onClick={() => setZoom((value) => nextZoom(value, ZOOM_STEP))}><ZoomIn size={16} /></button>
@@ -209,13 +256,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis }: { report: Re
           <button type="button" aria-label={focusState === "normal" ? copy.enterFocus : copy.exitFocus} title={focusState === "normal" ? copy.enterFocus : copy.exitFocus} onClick={focusState === "normal" ? () => enterFocus() : () => exitFocus()}>{focusState === "normal" ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
         </div>
       </header>
-      {technicalLoading && <span className="report-loading" role="status">{copy.loadingTechnical}</span>}
-      {technicalError && <span className="report-loading error" role="alert">{technicalError}</span>}
-      {exportState === "exporting" && <span className="report-loading" role="status">{copy.exportingReport}</span>}
-      {exportState === "exported" && <span className="report-loading" role="status">{copy.exportedReport}</span>}
-      {exportState === "failed" && <span className="report-loading error" role="alert">{copy.exportFailed}</span>}
-      {retryState === "retrying" && <span className="report-loading" role="status">{copy.retryingSynthesis}</span>}
-      {retryState === "failed" && <span className="report-loading error" role="alert">{copy.retrySynthesisFailed}</span>}
+      {reportStatus && <div className={`report-status report-status-${reportStatus.tone}`} role={reportStatus.role}>{reportStatus.text}</div>}
       <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown></div>
     </article>
   );

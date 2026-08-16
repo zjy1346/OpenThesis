@@ -79,6 +79,21 @@ type ResearchCopy = {
   endpoint: string;
   apiKey: string;
   refreshFailed: string;
+  visionFallback: string;
+  visionFallbackTitle: string;
+  visionFallbackBody: string;
+  visionEnable: string;
+  visionConsent: string;
+  visionProvider: string;
+  visionLiteHint: string;
+  visionPrecisionHint: string;
+  visionCustomHint: string;
+  visionToken: string;
+  visionEndpoint: string;
+  visionModel: string;
+  visionApiKey: string;
+  visionTimeout: string;
+  visionMissing: string;
 };
 
 const SEC_DEVELOPER_DOCS = "https://www.sec.gov/search-filings/edgar-application-programming-interfaces";
@@ -113,6 +128,14 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   const [marketAsOf, setMarketAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [discountRate, setDiscountRate] = useState("10");
   const [terminalGrowth, setTerminalGrowth] = useState("3");
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  const [visionConsent, setVisionConsent] = useState(false);
+  const [visionProvider, setVisionProvider] = useState<"mineru_lite" | "mineru_precision" | "custom_vision">("mineru_lite");
+  const [visionToken, setVisionToken] = useState("");
+  const [visionEndpoint, setVisionEndpoint] = useState("");
+  const [visionModel, setVisionModel] = useState("");
+  const [visionApiKey, setVisionApiKey] = useState("");
+  const [visionTimeout, setVisionTimeout] = useState(60);
   const marketCatalog = bootstrap.market_catalog ?? [
     { market: "US" as const, label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: SEC_DEVELOPER_DOCS },
   ];
@@ -152,6 +175,10 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
     }
+    if (visionEnabled && (!visionConsent || (visionProvider === "mineru_precision" && !visionToken.trim()) || (visionProvider === "custom_vision" && (!visionEndpoint.startsWith("https://") || !visionModel.trim() || !visionApiKey.trim())))) {
+      setSearchError(copy.visionMissing);
+      return;
+    }
     await onSavePreferences({
       sec_contact_profile: profile,
       sec_contact_email: email,
@@ -178,6 +205,7 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
         currency: marketCurrency,
         as_of: marketAsOf,
       },
+      ...(visionEnabled ? { vision_fallback: { enabled: true, consent: visionConsent, provider: visionProvider, require_page_approval: true, timeout_seconds: visionTimeout, language: market === "CN_A" ? "ch" : "en", ...(visionToken ? { token: visionToken } : {}), ...(visionProvider === "custom_vision" ? { endpoint: visionEndpoint, model: visionModel, api_key: visionApiKey } : {}) } } : {}),
     });
   };
 
@@ -266,6 +294,19 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
           </div>
           <label className="pack-import">{copy.importPack}<input type="file" accept=".othesis" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
+          <details className="advanced-settings"><summary>{copy.visionFallbackTitle}</summary>
+            <p className="field-caption">{copy.visionFallbackBody}</p>
+            <label className="check-row"><input type="checkbox" checked={visionEnabled} onChange={(event) => { const next = event.target.checked; setVisionEnabled(next); if (!next) { setVisionConsent(false); setVisionToken(""); setVisionApiKey(""); setVisionEndpoint(""); setVisionModel(""); } }} />{copy.visionEnable}</label>
+            {visionEnabled && <>
+              <div className="vision-config-grid field-grid two-column">
+                <label>{copy.visionProvider}<select value={visionProvider} onChange={(event) => { setVisionProvider(event.target.value as typeof visionProvider); setVisionToken(""); setVisionApiKey(""); setVisionEndpoint(""); setVisionModel(""); }}><option value="mineru_lite">{copy.visionLiteHint}</option><option value="mineru_precision">{copy.visionPrecisionHint}</option><option value="custom_vision">{copy.visionCustomHint}</option></select></label>
+                <label>{copy.visionTimeout}<select value={visionTimeout} onChange={(event) => setVisionTimeout(Number(event.target.value))}><option value={30}>30s</option><option value={60}>60s</option><option value={120}>120s</option><option value={300}>300s</option></select></label>
+                {visionProvider === "mineru_precision" && <label>{copy.visionToken}<input type="password" value={visionToken} onChange={(event) => setVisionToken(event.target.value)} autoComplete="off" /></label>}
+                {visionProvider === "custom_vision" && <div className="vision-custom-grid field-grid three-column"><label>{copy.visionEndpoint}<input value={visionEndpoint} onChange={(event) => setVisionEndpoint(event.target.value)} /></label><label>{copy.visionModel}<input value={visionModel} onChange={(event) => setVisionModel(event.target.value)} /></label><label>{copy.visionApiKey}<input type="password" value={visionApiKey} onChange={(event) => setVisionApiKey(event.target.value)} autoComplete="off" /></label></div>}
+              </div>
+              <label className="vision-consent check-row"><input type="checkbox" checked={visionConsent} onChange={(event) => setVisionConsent(event.target.checked)} />{copy.visionConsent}</label>
+            </>}
+          </details>
           <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
             <label>{copy.manualPrice}<input inputMode="decimal" value={marketPrice} onChange={(event) => setMarketPrice(event.target.value)} /></label>
             <label>{copy.manualCurrency}<select value={marketCurrency} onChange={(event) => setMarketCurrency(event.target.value)}>{[marketProfile?.default_currency, selected?.listing_currency, selected?.reporting_currency, "USD", "CNY", "HKD"].filter((item, index, all): item is string => Boolean(item) && all.indexOf(item) === index).map((currency) => <option key={currency} value={currency}>{currency}</option>)}</select></label>

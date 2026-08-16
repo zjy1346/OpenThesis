@@ -2,10 +2,142 @@ from __future__ import annotations
 
 import unittest
 
+from openthesis.report_html import render_research_html
 from openthesis.reporting import render_research_run
+from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_deterministic_summary_uses_one_explicit_column_schema(self) -> None:
+        summary = deterministic_summary(
+            "Example",
+            [{
+                "year": 2024,
+                "revenue": 10.0,
+                "revenue_growth": None,
+                "operating_margin": None,
+                "net_income": 1.0,
+                "operating_cash_flow": 2.0,
+                "free_cash_flow": None,
+            }],
+            "en-US",
+            "USD",
+        )
+        table_lines = [line for line in summary.splitlines() if line.startswith("|")]
+        self.assertEqual(len(table_lines), 3)
+        self.assertTrue(all(line.count("|") == 6 for line in table_lines))
+        self.assertNotIn("Operating margin", summary)
+        self.assertNotIn("Free cash flow", summary)
+
+    def test_html_financial_table_uses_one_explicit_column_schema(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "title": "Financial",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{
+                    "year": 2024,
+                    "revenue": 10.0,
+                    "revenue_growth": None,
+                    "operating_margin": None,
+                    "net_income": 1.0,
+                    "operating_cash_flow": 2.0,
+                    "free_cash_flow": None,
+                }],
+                "currency": "USD",
+                "evidence": [],
+            },
+        }]
+        html = render_research_html("run-schema", artifacts, "en-US", company_name="Example")
+        import re
+        table = re.search(r'<table class="data-table">(.*?)</table>', html, re.S)
+        self.assertIsNotNone(table)
+        rows = re.findall(r"<tr>(.*?)</tr>", table.group(1), re.S)
+        self.assertEqual([len(re.findall(r"<t[hd]", row)) for row in rows], [5, 5])
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", rows[1], re.S)
+        self.assertEqual(len(cells), 5)
+        self.assertIn("10", cells[1])
+        self.assertIn("1", cells[3])
+        self.assertIn("2", cells[4])
+
+    def test_html_schema_keeps_operating_margin_and_omits_only_free_cash_flow(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "title": "Financial",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{
+                    "year": 2024,
+                    "revenue": 10.0,
+                    "revenue_growth": 0.1,
+                    "operating_margin": 0.2,
+                    "net_income": 1.0,
+                    "operating_cash_flow": 2.0,
+                    "free_cash_flow": None,
+                }],
+                "currency": "USD",
+                "evidence": [],
+            },
+        }]
+        html = render_research_html("run-schema-fcf", artifacts, "en-US", company_name="Example")
+        import re
+        table = re.search(r'<table class="data-table">(.*?)</table>', html, re.S)
+        self.assertIsNotNone(table)
+        rows = re.findall(r"<tr>(.*?)</tr>", table.group(1), re.S)
+        self.assertEqual([len(re.findall(r"<t[hd]", row)) for row in rows], [6, 6])
+        self.assertIn("Operating margin", html)
+        self.assertNotIn("Free cash flow", html)
+    def test_financial_quality_gap_is_visible_and_uncovered_columns_are_hidden(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "title": "Financial",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{"year": 2022, "revenue": 10.0, "revenue_growth": None, "net_income": 1.0, "operating_cash_flow": None, "operating_margin": None, "free_cash_flow": None}],
+                "currency": "CNY",
+                "financial_quality": {"rejected_periods": [{"period_end": "2021-12-31", "issues": ("cash_flow_core_missing",)}]},
+                "evidence": [],
+            },
+        }]
+        markdown = render_research_run("run-gap", artifacts, "en-US", company_name="Example")
+        html = render_research_html("run-gap", artifacts, "en-US", company_name="Example")
+        self.assertIn("Annual Data Continuity", markdown)
+        self.assertNotIn("Operating margin", markdown)
+        self.assertNotIn("Free cash flow", markdown)
+        self.assertIn("Some annual data failed validation", html)
+        self.assertNotIn("Operating margin", html)
+        self.assertNotIn("Free cash flow", html)
+
+    def test_nontechnical_continuity_notice_hides_identifiers_and_issue_codes(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "title": "Financial",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{"year": 2024, "revenue": 10.0, "net_income": 1.0}],
+                "currency": "CNY",
+                "financial_quality": {
+                    "period_continuity": [{
+                        "accession_number": "private-accession-123",
+                        "period_end": "2023-12-31",
+                        "status": "no_facts",
+                        "issues": ("core_missing",),
+                    }],
+                },
+                "evidence": [],
+            },
+        }]
+        markdown = render_research_run("run-continuity", artifacts, "en-US", company_name="Example")
+        html = render_research_html("run-continuity", artifacts, "en-US", company_name="Example")
+        for rendered in (markdown, html):
+            self.assertIn("Some annual data failed validation", rendered)
+            self.assertNotIn("private-accession-123", rendered)
+            self.assertNotIn("core_missing", rendered)
+
     def test_renders_deterministic_and_structured_sections(self) -> None:
         artifacts = [
             {
@@ -185,6 +317,64 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertIn("fact:private", technical)
 
+    def test_empty_synthesis_growth_falls_back_to_valid_growth_artifact(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "growth-opportunities",
+                "title": "增长机会",
+                "agent_id": "growth-opportunity-analyst",
+                "model_id": "test:model",
+                "content": {
+                    "opportunities": [
+                        {
+                            "title": "海外储能扩张",
+                            "mechanism": "渠道建设扩大可服务市场。",
+                            "evidence_grade": "C",
+                        }
+                    ]
+                },
+            },
+            {
+                "artifact_type": "research-report",
+                "title": "完整长期研究报告",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {
+                    "report": {
+                        "executive_summary": "综合报告正文。",
+                        "growth_opportunities": [],
+                    },
+                    "verification": {"passed": True},
+                },
+            },
+        ]
+
+        report = render_research_run("run-growth-fallback", artifacts)
+
+        self.assertIn("海外储能扩张", report)
+        self.assertNotIn("当前证据不足，未形成可展示的增长机会", report)
+
+    def test_empty_growth_model_response_is_not_reported_as_evidence_insufficiency(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "growth-opportunities",
+                "title": "增长机会",
+                "agent_id": "growth-opportunity-analyst",
+                "model_id": "test:model",
+                "content": {
+                    "opportunities": [],
+                    "structured_output_valid": False,
+                    "_response_error": "empty_content",
+                    "_validation": {"passed": False, "issues": ["empty"]},
+                },
+            }
+        ]
+
+        report = render_research_run("run-growth-empty", artifacts)
+
+        self.assertIn("增长机会模型未返回有效内容", report)
+        self.assertNotIn("当前证据不足，未形成可展示的增长机会", report)
+
     def test_chinese_markdown_groups_claims_and_hides_raw_validation_errors(self) -> None:
         artifacts = [
             {
@@ -255,6 +445,38 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("最新季度及中期数据", report)
         self.assertIn("2026 Q1 为累计期间数据，不与完整财年混算", report)
         self.assertIn("对比 2025 Q1", report)
+
+    def test_markdown_explains_missing_prior_interim_comparison(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "title": "summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "CNY",
+                    "metrics": [],
+                    "interim_metrics": [
+                        {
+                            "year": 2026,
+                            "period": "Q1",
+                            "comparison_period": None,
+                            "comparison_gap": "prior_period_unavailable",
+                            "revenue": 150_225_314_000,
+                            "revenue_growth": None,
+                        }
+                    ],
+                    "evidence": [],
+                },
+            }
+        ]
+
+        report = render_research_run(
+            "run-interim-gap", artifacts, "zh-CN", company_name="比亚迪"
+        )
+
+        self.assertIn("缺少或未通过校验的上年同期披露", report)
+        self.assertNotIn("同期收入增长：—", report)
 
 
 if __name__ == "__main__":

@@ -248,6 +248,7 @@ describe("report-first workbench", () => {
       report_language: "zh-CN",
       markdown: "# Completed report",
       html: "<!doctype html><h1>Completed report</h1>",
+      retryable_synthesis: true,
     });
     render(<App />);
 
@@ -255,6 +256,11 @@ describe("report-first workbench", () => {
 
     expect(await screen.findByRole("heading", { name: "Synthetic Demo" }, { timeout: 2000 })).toBeVisible();
     expect(screen.getByRole("heading", { name: "Completed report" })).toBeVisible();
+    expect(screen.getByRole("article")).toHaveAttribute("data-report-status", "partial");
+    expect(screen.getByText(/Partial report:/)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Regenerate synthesized report" })).toHaveTextContent("Regenerate synthesized report");
+    expect(screen.queryByLabelText("Elapsed research time")).not.toBeInTheDocument();
+    expect(screen.queryByText(/OpenThesis is taking a few minutes/)).not.toBeInTheDocument();
 
     const reportDocument = screen.getByRole("article");
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));

@@ -10,6 +10,7 @@ from openthesis.providers import (
     OllamaProvider,
     OpenAICompatibleProvider,
     ProviderError,
+    _parse_model_json,
 )
 
 
@@ -213,6 +214,17 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderError) as caught:
             provider.generate("system", "user")
         self.assertTrue(caught.exception.retryable)
+
+    def test_malformed_model_json_keeps_a_safe_parse_error_class(self) -> None:
+        result = _parse_model_json("not-json")
+        self.assertFalse(result["structured_output_valid"])
+        self.assertEqual(result["_response_error"], "invalid_json")
+
+    def test_non_object_model_json_is_rejected_without_raw_payload_diagnostics(self) -> None:
+        result = _parse_model_json("[1, 2, 3]")
+        self.assertFalse(result["structured_output_valid"])
+        self.assertEqual(result["_response_error"], "invalid_shape")
+        self.assertNotIn("prompt", result)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -21,6 +22,7 @@ from .financials import (
     deterministic_summary,
     reverse_dcf_analysis,
 )
+from .financial_ingestion import FinancialProfile
 from .growth import normalize_growth_output
 from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, normalize_language, translate
 from .packs import ResearchPack
@@ -256,10 +258,14 @@ def _collect_stage_claims(*values: Any) -> list[dict[str, Any]]:
 
 def _collect_strings(value: Any, *keys: str) -> list[str]:
     found: list[str] = []
+    internal_id = re.compile(
+        r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
+        r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b"
+    )
 
     def visit(item: Any) -> None:
         if isinstance(item, str):
-            text = item.strip()
+            text = internal_id.sub("", item).strip()
             if text and text not in found:
                 found.append(text)
         elif isinstance(item, list):
@@ -295,6 +301,31 @@ def _synthesis_prior_artifacts(
         },
         remove_claims=False,
     )
+
+
+def _response_diagnostics(payload: Any) -> dict[str, Any]:
+    """Persist bounded provider diagnostics without response text or secrets."""
+
+    if not isinstance(payload, dict):
+        return {"finish_reason": None, "content_length": 0, "parse_error_class": "invalid_payload"}
+    meta = payload.get("_response_meta")
+    meta = meta if isinstance(meta, dict) else {}
+    error = payload.get("_response_error")
+    known_errors = {"empty_content", "invalid_json", "invalid_shape", "provider_error"}
+    parse_error_class = error if isinstance(error, str) and error in known_errors else (
+        "unknown_parse_error"
+        if error or payload.get("structured_output_valid") is False
+        else None
+    )
+    try:
+        content_length = int(meta.get("content_length") or 0)
+    except (TypeError, ValueError):
+        content_length = 0
+    return {
+        "finish_reason": meta.get("finish_reason"),
+        "content_length": content_length,
+        "parse_error_class": parse_error_class,
+    }
 
 
 class ResearchWorkflow:
@@ -391,13 +422,16 @@ class ResearchWorkflow:
     def run(
         self,
         company: Company,
-        facts: list[dict[str, Any]],
+        facts: list[dict[str, Any]] | FinancialProfile,
         filing_evidence: list[dict[str, Any]] | None = None,
         valuation_inputs: dict[str, float] | None = None,
         market_snapshot: dict[str, Any] | None = None,
         progress: ProgressCallback | None = None,
     ) -> ResearchRun:
         notify = progress or (lambda _message, _percent: None)
+        profile = facts if isinstance(facts, FinancialProfile) else None
+        if profile is not None:
+            facts = list(profile.fact_dicts)
         run = ResearchRun(
             run_id=uuid.uuid4().hex,
             company=company,
@@ -483,6 +517,11 @@ class ResearchWorkflow:
                     "accounting_standard": company.accounting_standard,
                     "industry_support": company.industry_support,
                     "market_snapshot": market_snapshot,
+                    "financial_quality": {
+                        "status": profile.status.value,
+                        "rejected_periods": list(profile.rejected_periods),
+                        "period_continuity": list(profile.period_continuity),
+                    } if profile is not None else None,
                 },
                 agent_id="calculation-engine",
             )
@@ -705,6 +744,25 @@ class ResearchWorkflow:
                 available,
                 self.report_language,
             )
+            if not growth_validation.passed or not growth_validation.output.get("opportunities"):
+                notify(self._progress_text("增长机会输出不完整，正在进行一次修复"), 58)
+                growth_raw = self._run_agent(
+                    "growth-opportunity-analyst",
+                    "prompts/growth-opportunity-analyst.md",
+                    context.compact_json(),
+                    {
+                        "research_dossier": dossier,
+                        "repair_instruction": (
+                            "Return one complete growth-opportunity JSON object with a non-empty "
+                            "opportunities array. Repair only this stage and do not invent evidence."
+                        ),
+                    },
+                )
+                growth_validation = normalize_growth_output(
+                    growth_raw,
+                    available,
+                    self.report_language,
+                )
             growth = growth_validation.output
             self._save(
                 run,
@@ -763,11 +821,66 @@ class ResearchWorkflow:
             )
             report_payload: dict[str, Any] = synthesis
             report_mode = "synthesized"
+            repair_diagnostics: dict[str, Any] | None = None
             if not verification["passed"]:
-                report_mode = "staged-fallback"
-                report_payload = self._build_staged_fallback(
-                    stage_results, growth, skeptic, forecast
+                # A malformed final payload gets exactly one bounded repair
+                # call.  The prior agents are already persisted and are never
+                # rerun; authentication, rate-limit and provider exceptions
+                # remain terminal rather than becoming hidden retries.
+                repair_input = _synthesis_prior_artifacts(dossier, growth, skeptic, forecast)
+                repair_input["invalid_synthesis"] = _presentation_stage_value(synthesis, remove_claims=False)
+                repair_input["repair_instruction"] = (
+                    "Return one complete JSON object matching the required report schema. "
+                    "Repair only the final synthesis; do not invent evidence."
                 )
+                try:
+                    repaired = self._run_agent(
+                        "research-synthesizer-repair",
+                        "prompts/research-synthesizer.md",
+                        context.compact_json(),
+                        repair_input,
+                    )
+                except ProviderError:
+                    # Authentication, rate-limit, and quota failures are not
+                    # retried. Preserve completed stages as a partial report
+                    # instead of turning a final-only failure into FAILED.
+                    repair_diagnostics = _response_diagnostics(
+                        {"_response_error": "provider_error"}
+                    )
+                    verification["issues"].append(
+                        "Final synthesis repair was unavailable; completed stages were preserved."
+                    )
+                else:
+                    repaired_verification = validate_research_synthesis(
+                        repaired, available, self.report_language
+                    )
+                    repair_diagnostics = _response_diagnostics(repaired)
+                    if not repaired_verification["passed"] and not repair_diagnostics.get("parse_error_class"):
+                        repair_diagnostics["parse_error_class"] = "invalid_schema"
+                    if repaired_verification["passed"]:
+                        synthesis = repaired
+                        verification = repaired_verification
+                        report_payload = repaired
+                    else:
+                        verification["issues"].extend(
+                            issue for issue in repaired_verification["issues"]
+                            if issue not in verification["issues"]
+                        )
+                report_mode = "staged-fallback"
+                if not verification["passed"]:
+                    report_payload = self._build_staged_fallback(
+                        stage_results, growth, skeptic, forecast
+                    )
+                else:
+                    report_mode = "synthesized"
+            diagnostics = _response_diagnostics(synthesis)
+            if repair_diagnostics is not None:
+                diagnostics = {
+                    **diagnostics,
+                    "initial": diagnostics,
+                    "repair": repair_diagnostics,
+                    **repair_diagnostics,
+                }
             self._save(
                 run,
                 "research-report",
@@ -779,6 +892,7 @@ class ResearchWorkflow:
                     "report": report_payload,
                     "verification": verification,
                     "retryable": not verification["passed"],
+                    "diagnostics": diagnostics,
                 },
                 agent_id="research-synthesizer",
             )
@@ -907,6 +1021,7 @@ class ResearchWorkflow:
                 "report": report_payload,
                 "verification": verification,
                 "retryable": not verification["passed"],
+                "diagnostics": _response_diagnostics(synthesis),
             },
             agent_id="research-synthesizer",
         )
@@ -941,6 +1056,71 @@ class ResearchWorkflow:
         run.completed_at = utc_now_iso()
         self.storage.save_run(run)
         return run
+
+    def retry_growth(
+        self,
+        run: ResearchRun,
+        artifacts: list[dict[str, Any]],
+        facts: list[dict[str, Any]],
+    ) -> ResearchRun:
+        """Regenerate only growth opportunities, then refresh final synthesis."""
+
+        if self.provider is None:
+            raise RuntimeError("model provider is not configured")
+        deterministic = _latest_artifact(artifacts, "deterministic-financial-summary")
+        dossier_artifact = _latest_artifact(artifacts, "verified-research-dossier")
+        if deterministic is None or dossier_artifact is None:
+            raise RuntimeError("saved research stages are incomplete")
+
+        deterministic_content = deterministic["content"]
+        evidence = deterministic_content.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = []
+        available = {
+            str(item.get("evidence_id"))
+            for item in evidence
+            if isinstance(item, dict) and item.get("evidence_id")
+        }
+        context = ResearchContext(
+            run.company,
+            facts,
+            deterministic_content.get("metrics", []),
+            deterministic_content.get("interim_metrics", []),
+            evidence,
+            (_latest_artifact(artifacts, "deterministic-valuation") or {}).get("content"),
+            deterministic_content.get("market_snapshot"),
+        )
+        growth_raw = self._run_agent(
+            "growth-opportunity-analyst",
+            "prompts/growth-opportunity-analyst.md",
+            context.compact_json(),
+            {
+                "research_dossier": dossier_artifact["content"],
+                "retry_instruction": (
+                    "The previous growth stage returned no usable opportunities. Regenerate only "
+                    "this stage using the persisted evidence; do not rerun or assume other stages."
+                ),
+            },
+        )
+        validation = normalize_growth_output(
+            growth_raw,
+            available,
+            self.report_language,
+        )
+        self._save(
+            run,
+            "growth-opportunities",
+            self._report_text("增长机会", "Growth Opportunities"),
+            validation.output,
+            agent_id="growth-opportunity-analyst",
+        )
+        if not validation.passed or not validation.output.get("opportunities"):
+            raise RuntimeError("growth-opportunity model returned no usable content")
+        return self.retry_synthesis(
+            run,
+            self.storage.get_artifacts(run.run_id),
+            facts,
+        )
 
     def _set_agent_state(self, agent_id: str, state: str) -> None:
         self.agent_progress(agent_id, state)
@@ -982,38 +1162,6 @@ class ResearchWorkflow:
             raise error
         if result is None:
             raise RuntimeError("model provider returned no result")
-        return result
-        if self.provider is None:
-            raise RuntimeError("模型 Provider 未配置")
-        role_prompt = self.pack.prompt(prompt_path)
-        language_instruction = OUTPUT_LANGUAGE_INSTRUCTIONS[self.report_language]
-        user_prompt = json.dumps(
-            {
-                "agent": agent_id,
-                "task_instructions": role_prompt,
-                "output_language": self.report_language,
-                "output_language_instruction": language_instruction,
-                "research_context": json.loads(context_json),
-                "prior_artifacts": prior_artifacts,
-                "required_claim_shape": {
-                    "text": "string",
-                    "kind": "fact|calculation|inference|assumption|forecast|risk|unknown",
-                    "confidence": "0..1 or null",
-                    "evidence_ids": ["fact:<id>"],
-                },
-            },
-            ensure_ascii=False,
-        )
-        try:
-            result = self.provider.generate(
-                CORE_SYSTEM_PROMPT + "\n" + language_instruction,
-                user_prompt,
-                json_mode=True,
-            )
-        except Exception:
-            self._check_cancelled()
-            raise
-        self._check_cancelled()
         return result
 
     def _run_agent(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import json
 import re
 import urllib.parse
@@ -399,19 +400,81 @@ class HkexNewsAdapter:
         stock_match = re.search(r'"stockId"\s*:\s*(\d+)', prefix_text)
         if not stock_match:
             raise MarketDataError("company is not present in the HKEX disclosure catalogue")
-        search_url = "https://www1.hkexnews.hk/search/titlesearch.xhtml?" + urllib.parse.urlencode(
-            {
+        stock_id = stock_match.group(1)
+        # The title-search servlet is the bounded, official JSON discovery
+        # interface.  Query report-type filters individually so unrelated
+        # earnings releases cannot crowd annual/interim reports out of the
+        # source page.  The old HTML page remains a conservative fallback for
+        # deployments where the servlet is unavailable.
+        titles = ("Annual Report", "Interim Report", "Quarterly Report", "Half-Year Report")
+        discovered: list[FilingDocument] = []
+        json_successes = 0
+        json_failures = 0
+        explicit_empty = 0
+        annual_count = 0
+        for title_filter in titles:
+            # Once the requested annual history is present, do not fetch more
+            # annual pages; periodic filters are still queried for a current
+            # year without an annual filing.
+            if title_filter == "Annual Report" and annual_count >= max(1, limit):
+                continue
+            now = datetime.now(timezone.utc)
+            from_date = f"{max(2000, now.year - 10):04d}0101"
+            query = {
+                "sortDir": "0",
+                "sortByOptions": "DateTime",
                 "category": "0",
-                "lang": "EN",
                 "market": "SEHK",
-                "stockId": stock_match.group(1),
+                "stockId": stock_id,
+                "documentType": "-1",
+                "fromDate": from_date,
+                "toDate": now.strftime("%Y%m%d"),
+                "title": title_filter,
+                "searchType": "0",
+                "t1code": "-2",
+                "t2Gcode": "-2",
+                "t2code": "-2",
+                "rowRange": "100",
+                "lang": "E",
             }
+            search_url = "https://www1.hkexnews.hk/search/titleSearchServlet.do?" + urllib.parse.urlencode(query)
+            try:
+                payload = self.transport.get_json(search_url)
+                rows = _hkex_json_rows(payload)
+            except Exception:
+                json_failures += 1
+                continue
+            if rows is None:
+                json_failures += 1
+                continue
+            json_successes += 1
+            if rows == []:
+                explicit_empty += 1
+                continue
+            parsed = _hkex_filings_from_json(company, rows, limit=100)
+            discovered.extend(parsed)
+            annual_count = len({item.period_end[:4] for item in discovered if item.form_type == "ANNUAL_REPORT"})
+
+        if json_successes:
+            filings = list(select_research_filings(_dedupe_hkex_filings(discovered), annual_limit=limit).documents)
+            if filings:
+                return filings
+            if explicit_empty == json_successes and not json_failures:
+                return []
+            # A valid response containing only unsupported titles is not an
+            # authorization to scrape unrelated rows; report it explicitly.
+            if not json_failures:
+                raise MarketDataError(
+                    "HKEX returned no supported financial reports",
+                    code="FILING_FORMAT_UNSUPPORTED",
+                )
+
+        # Compatibility fallback for older HKEX deployments or malformed JSON.
+        search_url = "https://www1.hkexnews.hk/search/titlesearch.xhtml?" + urllib.parse.urlencode(
+            {"category": "0", "lang": "EN", "market": "SEHK", "stockId": stock_id}
         )
         text = self.transport.get_text(search_url)
-        discovered = _hkex_filings_from_text(company, text, limit=30)
-        filings = list(
-            select_research_filings(discovered, annual_limit=limit).documents
-        )
+        filings = list(select_research_filings(_hkex_filings_from_text(company, text, limit=30), annual_limit=limit).documents)
         if filings:
             return filings
         if _is_explicit_empty_hkex_result(text):
@@ -550,45 +613,122 @@ def _is_explicit_empty_hkex_result(text: str) -> bool:
 
 def _classify_report(title: str) -> tuple[str, str]:
     lowered = title.casefold()
+    if "半年度报告" in title or "中期报告" in title or "interim report" in lowered or "half-year report" in lowered:
+        return "INTERIM_REPORT", "H1"
     if "招股说明书" in title or "prospectus" in lowered:
         return "PROSPECTUS", "IPO"
     if "上市公告书" in title or "listing document" in lowered:
         return "LISTING_REPORT", "IPO"
+    if "一季度报告" in title or "1季度报告" in title:
+        return "QUARTERLY_REPORT", "Q1"
+    if "三季度报告" in title or "3季度报告" in title:
+        return "QUARTERLY_REPORT", "Q3"
+    if re.search(r"\b(?:first|1st) quarter(?:ly)?(?:\s+financial)?\s+report\b", lowered):
+        return "QUARTERLY_REPORT", "Q1"
+    if re.search(r"\b(?:third|3rd) quarter(?:ly)?(?:\s+financial)?\s+report\b", lowered):
+        return "QUARTERLY_REPORT", "Q3"
     if "年度报告" in title or "年报" in title or "annual report" in lowered:
         return "ANNUAL_REPORT", "FY"
-    if "半年度报告" in title or "中期报告" in title or "interim report" in lowered:
-        return "INTERIM_REPORT", "H1"
     if "季度报告" in title or "quarterly report" in lowered:
-        if "第一季度" in title or "first quarter" in lowered:
-            return "QUARTERLY_REPORT", "Q1"
-        if "第三季度" in title or "third quarter" in lowered:
-            return "QUARTERLY_REPORT", "Q3"
         return "QUARTERLY_REPORT", "Q"
     return "", ""
 
 
-def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[FilingDocument]:
-    decoded = text.replace("\\/", "/").replace("\\u0026", "&")
-    urls = re.findall(
-        r"(?:https://www1?\.hkexnews\.hk)?(/listedco/listconews/(?:sehk|gem)/\d{4}/\d{4}/[A-Za-z0-9_.-]+\.pdf)",
-        decoded,
-        flags=re.IGNORECASE,
-    )
+def _hkex_json_rows(payload: Any) -> list[dict[str, Any]] | None:
+    """Normalize the HKEX servlet's list or nested JSON-string result.
+
+    ``None`` denotes a malformed/unsupported response (source failure), while
+    an empty list is an explicit, valid no-match response.
+    """
+    if not isinstance(payload, dict):
+        return None
+    result: Any = payload.get("result")
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(result, dict):
+        result = result.get("data", result.get("rows", result.get("result")))
+    if not isinstance(result, list):
+        return None
+    if any(not isinstance(item, dict) for item in result):
+        return None
+    return list(result)
+
+
+def _clean_hkex_title(value: Any) -> str:
+    text = html_lib.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _hkex_file_url(value: Any) -> tuple[str, str] | None:
+    raw = html_lib.unescape(str(value or "")).replace("\\/", "/").strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    path = parsed.path or raw
+    if not re.search(r"\.pdf$", path, re.IGNORECASE) or not path.casefold().startswith("/listedco/listconews/"):
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    host = (parsed.hostname or "www1.hkexnews.hk").lower()
+    if host not in {"www1.hkexnews.hk", "www.hkexnews.hk"}:
+        return None
+    return path, f"https://{host}{path}"
+
+
+def _hkex_date_time(value: Any, fallback_year: int | None = None) -> str:
+    text = str(value or "").strip()
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc).isoformat()
+        except ValueError:
+            continue
+    if fallback_year:
+        return f"{fallback_year:04d}-01-01T00:00:00+00:00"
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _dedupe_hkex_filings(filings: list[FilingDocument]) -> list[FilingDocument]:
+    seen: set[str] = set()
+    result: list[FilingDocument] = []
+    for filing in filings:
+        key = filing.source_url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(filing)
+    return result
+
+
+def _hkex_filings_from_json(
+    company: Company,
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = 100,
+) -> list[FilingDocument]:
     filings: list[FilingDocument] = []
-    for path in dict.fromkeys(urls):
-        context_start = max(0, decoded.find(path) - 350)
-        context = re.sub(r"<[^>]+>", " ", decoded[context_start : context_start + 700])
-        form_type, fiscal_period = _classify_report(context)
+    seen: set[str] = set()
+    for row in rows:
+        url_parts = _hkex_file_url(row.get("FILE_LINK") or row.get("fileLink") or row.get("FILELINK"))
+        if url_parts is None:
+            continue
+        path, source_url = url_parts
+        if source_url.casefold() in seen:
+            continue
+        title = _clean_hkex_title(row.get("TITLE") or row.get("title") or row.get("LONG_TEXT"))
+        form_type, fiscal_period = _classify_report(title)
         if not form_type:
             continue
+        seen.add(source_url.casefold())
         accession = Path(path).stem
-        date_match = re.search(r"/(\d{4})/(\d{4})/", path)
-        filed_at = (
-            f"{date_match.group(1)}-{date_match.group(2)[:2]}-{date_match.group(2)[2:]}T00:00:00+00:00"
-            if date_match
-            else datetime.now(timezone.utc).isoformat()
+        year_match = re.search(r"\b(20\d{2})\b", title)
+        filed_at = _hkex_date_time(
+            row.get("DATE_TIME") or row.get("dateTime"),
+            int(year_match.group(1)) if year_match else None,
         )
-        year_match = re.search(r"(20\d{2})", context)
         period_end = _report_period_end(
             int(year_match.group(1)) if year_match else int(filed_at[:4]),
             fiscal_period,
@@ -603,7 +743,59 @@ def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[
                 fiscal_period=fiscal_period,
                 period_end=period_end,
                 filed_at=filed_at,
-                primary_document=re.sub(r"\s+", " ", context).strip()[:240] or accession,
+                primary_document=title or accession,
+                source_url=source_url,
+            )
+        )
+        if len(filings) >= max(1, limit):
+            break
+    return filings
+
+
+def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[FilingDocument]:
+    decoded = html_lib.unescape(text.replace("\\/", "/").replace("\\u0026", "&"))
+    urls = re.findall(
+        r"(?:https://www1?\.hkexnews\.hk)?(/listedco/listconews/(?:sehk|gem)/\d{4}/\d{4}/[A-Za-z0-9_.-]+\.pdf)",
+        decoded,
+        flags=re.IGNORECASE,
+    )
+    filings: list[FilingDocument] = []
+    for path in dict.fromkeys(urls):
+        anchor = re.search(
+            rf"<a\b[^>]*href\s*=\s*[\"'][^\"']*{re.escape(path)}[^\"']*[\"'][^>]*>(.*?)</a>",
+            decoded,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if anchor is None:
+            continue
+        title = re.sub(r"<[^>]+>", " ", html_lib.unescape(anchor.group(1)))
+        title = re.sub(r"\s+", " ", title).strip()
+        form_type, fiscal_period = _classify_report(title)
+        if not form_type:
+            continue
+        accession = Path(path).stem
+        date_match = re.search(r"/(\d{4})/(\d{4})/", path)
+        filed_at = (
+            f"{date_match.group(1)}-{date_match.group(2)[:2]}-{date_match.group(2)[2:]}T00:00:00+00:00"
+            if date_match
+            else datetime.now(timezone.utc).isoformat()
+        )
+        year_match = re.search(r"(20\d{2})", title)
+        period_end = _report_period_end(
+            int(year_match.group(1)) if year_match else int(filed_at[:4]),
+            fiscal_period,
+            filed_at,
+        )
+        filings.append(
+            FilingDocument(
+                document_id=f"hkex:{accession}",
+                company_cik=company.cik,
+                accession_number=accession,
+                form_type=form_type,
+                fiscal_period=fiscal_period,
+                period_end=period_end,
+                filed_at=filed_at,
+                primary_document=title[:240] or accession,
                 source_url=f"https://www1.hkexnews.hk{path}",
             )
         )

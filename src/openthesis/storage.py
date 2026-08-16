@@ -17,7 +17,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Storage:
@@ -97,6 +97,8 @@ class Storage:
                     local_path TEXT NOT NULL DEFAULT '',
                     content_hash TEXT NOT NULL DEFAULT '',
                     ingested_at TEXT NOT NULL,
+                    revision TEXT NOT NULL DEFAULT 'original',
+                    supersedes_document_id TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
@@ -116,11 +118,55 @@ class Storage:
                     accession_number TEXT NOT NULL,
                     source_url TEXT NOT NULL,
                     scope TEXT NOT NULL,
+                    entity TEXT NOT NULL DEFAULT '',
+                    market TEXT NOT NULL DEFAULT '',
+                    statement TEXT NOT NULL DEFAULT '',
+                    period_start TEXT,
+                    consolidated_scope TEXT NOT NULL DEFAULT 'consolidated',
+                    currency TEXT NOT NULL DEFAULT '',
+                    unit_scale REAL NOT NULL DEFAULT 1.0,
+                    revision TEXT NOT NULL DEFAULT 'original',
+                    source_document TEXT NOT NULL DEFAULT '',
+                    source_page INTEGER,
+                    source_bbox_json TEXT,
+                    raw_text TEXT NOT NULL DEFAULT '',
+                    parser_version TEXT NOT NULL DEFAULT '',
+                    validation_status TEXT NOT NULL DEFAULT 'unvalidated',
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_facts_company_concept_year
                 ON financial_facts(company_cik, concept, fiscal_year);
+
+                CREATE TABLE IF NOT EXISTS financial_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    locator TEXT NOT NULL,
+                    excerpt TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    bbox_json TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS financial_validation_groups (
+                    group_id TEXT PRIMARY KEY,
+                    company_cik TEXT NOT NULL,
+                    accession_number TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    fiscal_period TEXT NOT NULL,
+                    consolidated_scope TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    issues_json TEXT NOT NULL,
+                    covered_concepts_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(company_cik) REFERENCES companies(cik)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_validation_groups_company
+                ON financial_validation_groups(company_cik, period_end DESC);
 
                 CREATE TABLE IF NOT EXISTS research_runs (
                     run_id TEXT PRIMARY KEY,
@@ -166,10 +212,51 @@ class Storage:
                 );
                 """
             )
+            # Existing installations are migrated in place.  ALTER TABLE is
+            # intentionally additive: historical filings/facts remain intact.
+            self._ensure_columns(
+                db,
+                "filings",
+                {
+                    "revision": "TEXT NOT NULL DEFAULT 'original'",
+                    "supersedes_document_id": "TEXT NOT NULL DEFAULT ''",
+                },
+            )
+            self._ensure_columns(
+                db,
+                "financial_facts",
+                {
+                    "entity": "TEXT NOT NULL DEFAULT ''",
+                    "market": "TEXT NOT NULL DEFAULT ''",
+                    "statement": "TEXT NOT NULL DEFAULT ''",
+                    "period_start": "TEXT",
+                    "consolidated_scope": "TEXT NOT NULL DEFAULT 'consolidated'",
+                    "currency": "TEXT NOT NULL DEFAULT ''",
+                    "unit_scale": "REAL NOT NULL DEFAULT 1.0",
+                    "revision": "TEXT NOT NULL DEFAULT 'original'",
+                    "source_document": "TEXT NOT NULL DEFAULT ''",
+                    "source_page": "INTEGER",
+                    "source_bbox_json": "TEXT",
+                    "raw_text": "TEXT NOT NULL DEFAULT ''",
+                    "parser_version": "TEXT NOT NULL DEFAULT ''",
+                    "validation_status": "TEXT NOT NULL DEFAULT 'unvalidated'",
+                },
+            )
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    @staticmethod
+    def _ensure_columns(
+        db: sqlite3.Connection, table: str, columns: dict[str, str]
+    ) -> None:
+        existing = {
+            str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def save_company(self, company: Company) -> None:
         with self.connect() as db:
@@ -250,8 +337,9 @@ class Storage:
                 INSERT OR REPLACE INTO filings(
                     document_id, company_cik, accession_number, form_type,
                     fiscal_period, period_end, filed_at, primary_document,
-                    source_url, local_path, content_hash, ingested_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_url, local_path, content_hash, ingested_at,
+                    revision, supersedes_document_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -267,6 +355,8 @@ class Storage:
                         filing.local_path,
                         filing.content_hash,
                         filing.ingested_at,
+                        filing.revision,
+                        filing.supersedes_document_id,
                     )
                     for filing in filings
                 ],
@@ -293,6 +383,100 @@ class Storage:
                 )
             self._insert_facts(db, facts)
 
+    def replace_financial_ingestion(
+        self,
+        company_cik: str,
+        accession_numbers: list[str],
+        accepted_facts: list[FinancialFact],
+        quarantined_facts: list[FinancialFact] | None = None,
+        validation_groups: list[Any] | tuple[Any, ...] = (),
+        evidence: list[Any] | tuple[Any, ...] = (),
+    ) -> None:
+        """Atomically replace facts, evidence, and validation decisions.
+
+        Rejected facts are retained with ``validation_status=REJECTED`` for
+        auditability, while normal reads hide them.  The operation is scoped
+        to the supplied accessions so prior research history is never deleted.
+        """
+        unique = sorted({value for value in accession_numbers if value})
+        with self.connect() as db:
+            for accession in unique:
+                # Evidence is keyed by filing document rather than accession.
+                # Resolve the document ids before replacing parser output so a
+                # reparse cannot leave excerpts from an older, richer parse.
+                document_ids = {
+                    str(row[0])
+                    for row in db.execute(
+                        """
+                        SELECT document_id FROM filings
+                        WHERE company_cik = ? AND accession_number = ?
+                        """,
+                        (company_cik, accession),
+                    ).fetchall()
+                }
+                document_ids.update(
+                    str(getattr(item, "document_id", ""))
+                    for item in evidence
+                    if getattr(item, "document_id", "")
+                )
+                if document_ids:
+                    placeholders = ", ".join("?" for _ in document_ids)
+                    db.execute(
+                        f"DELETE FROM financial_evidence WHERE document_id IN ({placeholders})",
+                        tuple(sorted(document_ids)),
+                    )
+                db.execute(
+                    "DELETE FROM financial_facts WHERE company_cik = ? AND accession_number = ?",
+                    (company_cik, accession),
+                )
+                db.execute(
+                    "DELETE FROM financial_validation_groups WHERE company_cik = ? AND accession_number = ?",
+                    (company_cik, accession),
+                )
+            self._insert_facts(db, list(accepted_facts) + list(quarantined_facts or ()))
+            for item in evidence:
+                bbox = getattr(item, "bbox", None)
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO financial_evidence(
+                        evidence_id, document_id, source_url, title, locator,
+                        excerpt, published_at, content_hash, bbox_json
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item.evidence_id, item.document_id, item.source_url,
+                        item.title, item.locator, item.excerpt, item.published_at,
+                        item.content_hash, json.dumps(bbox) if bbox is not None else None,
+                    ),
+                )
+            for group in validation_groups:
+                identity = tuple(getattr(group, "identity", ()))
+                if len(identity) != 5:
+                    continue
+                validation = getattr(group, "validation", None)
+                if validation is None:
+                    continue
+                status = getattr(getattr(validation, "status", None), "value", str(getattr(validation, "status", "REJECTED")))
+                # Include the issuer key to avoid collisions when two
+                # securities use the same accession/period identity.
+                group_id = "|".join((company_cik, *identity))
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO financial_validation_groups(
+                        group_id, company_cik, accession_number, period_end,
+                        fiscal_period, consolidated_scope, currency, status,
+                        issues_json, covered_concepts_json, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        group_id, company_cik, identity[0], identity[1], identity[2],
+                        identity[3], identity[4], status,
+                        json.dumps(list(getattr(validation, "issues", ())), ensure_ascii=False),
+                        json.dumps(sorted(getattr(validation, "covered_concepts", frozenset())), ensure_ascii=False),
+                        utc_now_iso(),
+                    ),
+                )
+
     @staticmethod
     def _insert_facts(db: sqlite3.Connection, facts: list[FinancialFact]) -> None:
         db.executemany(
@@ -300,8 +484,11 @@ class Storage:
             INSERT OR REPLACE INTO financial_facts(
                 fact_id, company_cik, concept, reported_concept, value,
                 unit, fiscal_year, fiscal_period, form_type, start_date,
-                end_date, filed_at, accession_number, source_url, scope
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                end_date, filed_at, accession_number, source_url, scope,
+                entity, market, statement, period_start, consolidated_scope,
+                currency, unit_scale, revision, source_document, source_page,
+                source_bbox_json, raw_text, parser_version, validation_status
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -320,6 +507,20 @@ class Storage:
                     fact.accession_number,
                     fact.source_url,
                     fact.scope,
+                    fact.entity,
+                    fact.market,
+                    fact.statement,
+                    fact.period_start,
+                    fact.consolidated_scope,
+                    fact.currency,
+                    fact.unit_scale,
+                    fact.revision,
+                    fact.source_document,
+                    fact.source_page,
+                    json.dumps(fact.source_bbox) if fact.source_bbox is not None else None,
+                    fact.raw_text,
+                    fact.parser_version,
+                    fact.validation_status,
                 )
                 for fact in facts
             ],
@@ -329,13 +530,82 @@ class Storage:
         with self.connect() as db:
             rows = db.execute(
                 """
-                SELECT * FROM financial_facts
-                WHERE company_cik = ?
+                SELECT f.* FROM financial_facts f
+                LEFT JOIN security_listings l ON l.security_id = f.company_cik
+                WHERE f.company_cik = ?
+                  AND COALESCE(f.validation_status, 'unvalidated') <> 'REJECTED'
+                  AND COALESCE(f.consolidated_scope, 'consolidated') = 'consolidated'
+                  AND (
+                      l.reporting_currency IS NULL
+                      OR COALESCE(f.currency, '') = ''
+                      OR UPPER(f.currency) = UPPER(l.reporting_currency)
+                  )
                 ORDER BY fiscal_year DESC, concept
                 """,
                 (cik,),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._fact_row(row) for row in rows]
+
+    def get_facts_audit(self, cik: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM financial_facts WHERE company_cik = ? ORDER BY fiscal_year DESC, concept",
+                (cik,),
+            ).fetchall()
+        return [self._fact_row(row) for row in rows]
+
+    @staticmethod
+    def _fact_row(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        encoded = item.pop("source_bbox_json", None)
+        if encoded:
+            try:
+                item["source_bbox"] = tuple(float(value) for value in json.loads(encoded))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["source_bbox"] = None
+        else:
+            item["source_bbox"] = None
+        return item
+
+    def get_validation_groups(self, cik: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM financial_validation_groups WHERE company_cik = ? ORDER BY period_end DESC, accession_number",
+                (cik,),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            for key in ("issues_json", "covered_concepts_json"):
+                try:
+                    item[key.removesuffix("_json")] = json.loads(item.pop(key))
+                except (TypeError, json.JSONDecodeError):
+                    item[key.removesuffix("_json")] = []
+            result.append(item)
+        return result
+
+    def get_financial_evidence(self, document_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM financial_evidence"
+        params: tuple[Any, ...] = ()
+        if document_id:
+            query += " WHERE document_id = ?"
+            params = (document_id,)
+        query += " ORDER BY evidence_id"
+        with self.connect() as db:
+            rows = db.execute(query, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            encoded = item.pop("bbox_json", None)
+            if encoded:
+                try:
+                    item["bbox"] = tuple(float(value) for value in json.loads(encoded))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    item["bbox"] = None
+            else:
+                item["bbox"] = None
+            result.append(item)
+        return result
 
     def save_run(self, run: ResearchRun) -> None:
         payload = run.to_dict()
