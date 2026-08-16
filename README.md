@@ -25,14 +25,6 @@ reproducibility layer.
 > OpenThesis does not connect to brokerage accounts, execute trades, provide
 > short-term signals, or promise investment returns.
 
-> [!NOTE]
-> **v1.2.0 is the current Windows test release.** In addition to US SEC research,
-> OpenThesis now researches China A-shares on SSE, SZSE, and BSE, plus Hong Kong
-> listings on HKEX Main Board and GEM. It keeps issuer identity separate from
-> each listed security, reads official financial-report PDFs, accepts explicitly
-> dated manual market data, and treats banks, insurers, and securities firms as
-> Financials Beta.
-
 ## Why OpenThesis?
 
 - **Bring your own model.** Use DeepSeek, Qwen, Kimi, GLM, OpenAI, Gemini,
@@ -59,24 +51,6 @@ flowchart LR
     D --> E["Synthesis and verification"]
     E --> F["Versioned investment thesis"]
 ```
-
-## Highlights in v1.2.0
-
-- Company search covers US equities, SSE, SZSE, BSE, and HKEX, including
-  `600519.SH`, `000001.SZ`, `832982.BJ`, and `00700.HK` symbol normalization.
-- A/H-share issuer identity and listed-security identity are stored separately,
-  so currency, exchange, and disclosure history do not become mixed.
-- Statutory financial reports are collected on demand from CNInfo and HKEXnews;
-  extracted values retain the official URL, report page, reporting currency,
-  accounting standard, and consolidated scope.
-- Live prices are not scraped. Users may enter price or market cap, currency, and
-  an as-of date. Those values are labelled as user-supplied in the report.
-- Financial institutions are supported as Beta for filing, business, risk,
-  growth, and scenario research. Standard free-cash-flow reverse DCF is disabled
-  for them, and cross-currency valuation is skipped unless currencies match.
-- Market-specific research instructions cover A-share ownership, subsidy,
-  pledge, audit, and regulatory risks, plus HKEX listing structure, connected
-  transactions, VIE exposure, accounting standards, and currency differences.
 
 See the consolidated architecture and product specification in
 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md).
