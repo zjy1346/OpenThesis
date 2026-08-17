@@ -4,7 +4,7 @@
 
 **以 AI 为核心、以证据为基础的长期公司研究工具**
 
-[English](https://github.com/zjy1346/OpenThesis/blob/main/README.md) · [简体中文](https://github.com/zjy1346/OpenThesis/blob/main/README.zh-CN.md) · [繁體中文](https://github.com/zjy1346/OpenThesis/blob/main/README.zh-Hant.md)
+[English](https://github.com/zjy1346/OpenThesis#readme-en) · [简体中文](https://github.com/zjy1346/OpenThesis#readme-zh-cn) · [繁體中文](https://github.com/zjy1346/OpenThesis#readme-zh-hant)
 
 [![Release](https://img.shields.io/github/v/release/zjy1346/OpenThesis?display_name=tag&sort=semver)](https://github.com/zjy1346/OpenThesis/releases/latest)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/zjy1346/OpenThesis/releases/latest)
@@ -19,15 +19,15 @@
 
 研究工作台会在同一条可追溯流程中展示确定性财务概览、来源证据和实时研究阶段。
 
-![英文确定性报告](https://github.com/zjy1346/OpenThesis/blob/main/docs/assets/screenshots/report-en.jpg?raw=1)
+![英文确定性报告](https://github.com/user-attachments/assets/30f83fa3-b441-4ba5-9ad4-79b4038456ba)
 
 _确定性财务概览与同比比较。_
 
-![来源证据](https://github.com/zjy1346/OpenThesis/blob/main/docs/assets/screenshots/evidence-zh.jpg?raw=1)
+![来源证据](https://github.com/user-attachments/assets/3032effc-434d-4a4c-987f-4c711edcc65c)
 
 _来源页和证据始终可供审计。_
 
-![研究进度](https://github.com/zjy1346/OpenThesis/blob/main/docs/assets/screenshots/research-progress-en.webp?raw=1)
+![研究进度](https://github.com/user-attachments/assets/de923fb9-d3a2-447b-b957-b455a58b8d68)
 
 _专业 Agent 会显示当前阶段，不隐藏研究进度。_
 
