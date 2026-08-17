@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .i18n import EN, normalize_language
+from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
 
 
 MAX_GROWTH_OPPORTUNITIES = 5
@@ -24,6 +24,14 @@ GROWTH_FIELD_LABELS: dict[str, tuple[str, str]] = {
     "contradicting_evidence_ids": ("相反证据", "Contradicting evidence"),
 }
 
+GROWTH_FIELD_LABELS_HANT: dict[str, str] = {
+    "title": "機會名稱", "category": "類別", "mechanism": "增長機制",
+    "evidence_grade": "證據等級", "maturity_stage": "成熟階段", "time_horizon_years": "時間跨度",
+    "probability_range": "可能性區間", "capital_requirements": "資本要求", "leading_indicators": "領先指標",
+    "invalidation_conditions": "失效條件", "scenario_eligibility": "適用情境",
+    "supporting_evidence_ids": "支援證據", "contradicting_evidence_ids": "相反證據",
+}
+
 EVIDENCE_GRADE_LABELS: dict[str, tuple[str, str]] = {
     "A": ("A · 强直接证据", "A · Strong direct evidence"),
     "B": ("B · 较强证据", "B · Good evidence"),
@@ -31,6 +39,10 @@ EVIDENCE_GRADE_LABELS: dict[str, tuple[str, str]] = {
     "D": ("D · 主要为推论", "D · Primarily inferred"),
     "E": ("E · 假设性机会", "E · Speculative opportunity"),
     "U": ("未评级", "Unrated"),
+}
+EVIDENCE_GRADE_LABELS_HANT = {
+    "A": "A · 強直接證據", "B": "B · 較強證據", "C": "C · 有限證據",
+    "D": "D · 主要為推論", "E": "E · 假設性機會", "U": "未評級",
 }
 
 SCENARIO_LABELS: dict[str, tuple[str, str]] = {
@@ -40,6 +52,7 @@ SCENARIO_LABELS: dict[str, tuple[str, str]] = {
     "bull": ("乐观情景", "Bull scenario"),
     "upside": ("乐观情景", "Upside scenario"),
 }
+SCENARIO_LABELS_HANT = {"bear": "悲觀情境", "downside": "悲觀情境", "base": "基準情境", "bull": "樂觀情境", "upside": "樂觀情境"}
 
 _ALLOWED_SCENARIOS = frozenset(SCENARIO_LABELS)
 
@@ -55,12 +68,20 @@ class GrowthValidation:
 
 
 def _pick(language: str, chinese: str, english: str) -> str:
-    return english if normalize_language(language) == EN else chinese
+    locale = normalize_language(language)
+    if locale == EN:
+        return english
+    if locale == ZH_HANT:
+        prefix = chinese[: len(chinese) - len(chinese.lstrip("# >-"))]
+        return prefix + UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+    return chinese
 
 
 def growth_field_label(field: str, language: str = "zh-CN") -> str:
     labels = GROWTH_FIELD_LABELS.get(field)
     if labels:
+        if normalize_language(language) == ZH_HANT:
+            return GROWTH_FIELD_LABELS_HANT.get(field, labels[0])
         return _pick(language, labels[0], labels[1])
     return field.replace("_", " ").title() if normalize_language(language) == EN else field.replace("_", " ")
 
@@ -68,6 +89,8 @@ def growth_field_label(field: str, language: str = "zh-CN") -> str:
 def evidence_grade_label(grade: object, language: str = "zh-CN") -> str:
     normalized = str(grade or "U").strip().upper()
     labels = EVIDENCE_GRADE_LABELS.get(normalized, EVIDENCE_GRADE_LABELS["U"])
+    if normalize_language(language) == ZH_HANT:
+        return EVIDENCE_GRADE_LABELS_HANT.get(normalized, EVIDENCE_GRADE_LABELS_HANT["U"])
     return _pick(language, labels[0], labels[1])
 
 
@@ -75,6 +98,8 @@ def scenario_label(value: object, language: str = "zh-CN") -> str:
     normalized = str(value or "").strip().lower()
     labels = SCENARIO_LABELS.get(normalized)
     if labels:
+        if normalize_language(language) == ZH_HANT:
+            return SCENARIO_LABELS_HANT.get(normalized, labels[0])
         return _pick(language, labels[0], labels[1])
     return str(value or "")
 

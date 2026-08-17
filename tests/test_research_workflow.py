@@ -516,6 +516,63 @@ class DeterministicWorkflowTests(unittest.TestCase):
             payload = json.loads(saved["payload_json"])
             self.assertEqual(payload["report_language"], "en")
 
+    def test_traditional_language_is_injected_into_every_agent_and_persisted(self) -> None:
+        class RecordingProvider:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, system_prompt: str, user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                self.calls.append((system_prompt, user_prompt))
+                if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
+                    return _valid_growth_output()
+                return {"executive_summary": "繁體中文輸出", "claims": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = RecordingProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(
+                    provider="openai-compatible",
+                    model="fake",
+                    base_url="https://example.test/v1",
+                ),
+                report_language="zh-Hant",
+                ui_language="zh-Hant",
+            )
+            progress: list[str] = []
+            run = workflow.run(
+                DEMO_COMPANY,
+                demo_facts(),
+                progress=lambda message, _percent: progress.append(message),
+            )
+            self.assertEqual(run.report_language, "zh-Hant")
+            self.assertEqual(len(provider.calls), 8)
+            for system_prompt, user_prompt in provider.calls:
+                self.assertIn(
+                    "Write every natural-language value in Traditional Chinese",
+                    system_prompt,
+                )
+                payload = json.loads(user_prompt)
+                self.assertEqual(payload["output_language"], "zh-Hant")
+                self.assertIn("Traditional Chinese", payload["output_language_instruction"])
+                self.assertIn("research_context", payload)
+            self.assertTrue(
+                any("正在依序執行" in message or "研究完成" in message for message in progress)
+            )
+            saved = storage.get_run(run.run_id)
+            self.assertIsNotNone(saved)
+            payload = json.loads(saved["payload_json"])
+            self.assertEqual(payload["report_language"], "zh-Hant")
+
     def test_parallel_agent_switch_controls_concurrency(self) -> None:
         class ConcurrencyProvider:
             def __init__(self) -> None:

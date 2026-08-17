@@ -8,6 +8,16 @@ from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_traditional_chinese_markdown_uses_traditional_section_labels(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "title": "Report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test",
+            "content": {"report": {"claims": [{"text": "\u7d50\u8ad6", "kind": "inference", "confidence": 0.9}]}, "verification": {"passed": True}},
+        }]
+        report = render_research_run("run-hant", artifacts, "zh-Hant")
+        self.assertIn("\u4e3b\u8981\u7d50\u8ad6", report)
     def test_deterministic_summary_uses_one_explicit_column_schema(self) -> None:
         summary = deterministic_summary(
             "Example",

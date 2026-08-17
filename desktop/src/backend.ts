@@ -32,7 +32,7 @@ export function bootstrapBackend(): Promise<BootstrapResult> {
 
 export function getResearchReport(
   runId: string,
-  language?: "zh-CN" | "en",
+  language?: "zh-CN" | "zh-Hant" | "en",
   includeTechnical = false,
 ): Promise<ResearchReport> {
   return request("research.get_report", {

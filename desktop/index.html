@@ -1,10 +1,22 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f5f6f3" />
     <title>OpenThesis</title>
+    <script>
+      (function () {
+        var locales = (navigator.languages || [navigator.language || "en"]).map(function (item) { return String(item).toLowerCase().replace(/_/g, "-"); });
+        var language = "en";
+        for (var i = 0; i < locales.length; i += 1) {
+          if (/^zh-(hant|tw|hk|mo)/.test(locales[i])) { language = "zh-Hant"; break; }
+          if (/^zh/.test(locales[i])) { language = "zh-CN"; break; }
+          if (/^en/.test(locales[i])) { language = "en"; break; }
+        }
+        document.documentElement.lang = language;
+      }());
+    </script>
   </head>
   <body>
     <div id="root"></div>

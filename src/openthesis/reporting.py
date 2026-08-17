@@ -11,7 +11,7 @@ from .growth import (
     growth_opportunities_from_value,
     scenario_label,
 )
-from .i18n import EN, normalize_language
+from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
 from .report_projection import project_report_value, report_display_value, report_field_label
 
 
@@ -51,6 +51,13 @@ SECTION_LABELS_EN = {
 
 # Backward-compatible export used by integrations.
 SECTION_LABELS = SECTION_LABELS_ZH
+SECTION_LABELS_HANT = {
+    "executive_summary": "\u57f7\u884c\u6458\u8981", "claims": "\u4e3b\u8981\u7d50\u8ad6", "business_model": "\u5546\u696d\u6a21\u5f0f",
+    "financial_quality": "\u8ca1\u52d9\u54c1\u8cea", "balance_sheet": "\u8cc7\u7522\u8ca0\u50b5\u8868", "competitive_position": "\u7af6\u722d\u5730\u4f4d",
+    "growth_opportunities": "\u589e\u9577\u6a5f\u6703", "counterarguments": "\u53cd\u65b9\u89c0\u9ede", "scenarios": "\u9577\u671f\u7d93\u71df\u60c5\u5883",
+    "implied_expectations": "\u4f30\u503c\u96b1\u542b\u9810\u671f", "thesis": "\u6295\u8cc7\u908f\u8f2f", "invalidation_conditions": "\u908f\u8f2f\u5931\u6548\u689d\u4ef6",
+    "leading_indicators": "\u9818\u5148\u6307\u6a19", "unresolved_questions": "\u672a\u89e3\u6c7a\u554f\u984c",
+}
 
 ARTIFACT_LABELS = {
     "deterministic-financial-summary": (
@@ -75,12 +82,18 @@ ARTIFACT_LABELS = {
 
 
 def _pick(language: str, chinese: str, english: str) -> str:
-    return english if normalize_language(language) == EN else chinese
+    locale = normalize_language(language)
+    if locale == EN:
+        return english
+    if locale == ZH_HANT:
+        prefix = chinese[: len(chinese) - len(chinese.lstrip("# >-"))]
+        return prefix + UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+    return chinese
 
 
 def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[str]:
     english = normalize_language(language) == EN
-    labels = SECTION_LABELS_EN if english else SECTION_LABELS_ZH
+    labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if normalize_language(language) == ZH_HANT else SECTION_LABELS_ZH
     if value is None:
         return ["Insufficient evidence or not provided." if english else "证据不足或尚未提供。"]
     if isinstance(value, str):
@@ -348,7 +361,7 @@ def render_research_run(
 ) -> str:
     language = normalize_language(language)
     english = language == EN
-    section_labels = SECTION_LABELS_EN if english else SECTION_LABELS_ZH
+    section_labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
     lines = [
         _pick(language, "# OpenThesis 长期公司研究", "# OpenThesis Long-term Company Research"),
         "",
@@ -478,12 +491,12 @@ def render_research_run(
                 values: list[str] = []
                 if isinstance(snapshot.get("price"), (int, float)):
                     values.append(
-                        ("手动价格" if language != EN else "Manual price")
+                        ("Manual price" if language == EN else "手動價格" if language == ZH_HANT else "手动价格")
                         + f": {snapshot.get('currency', '')} {snapshot['price']:,.2f}"
                     )
                 if isinstance(snapshot.get("market_cap"), (int, float)):
                     values.append(
-                        ("手动市值" if language != EN else "Manual market cap")
+                        ("Manual market cap" if language == EN else "手動市值" if language == ZH_HANT else "手动市值")
                         + f": {snapshot.get('currency', '')} {snapshot['market_cap']:,.0f}"
                     )
                 if values:
@@ -492,9 +505,11 @@ def render_research_run(
                             "> "
                             + "；".join(values)
                             + (
-                                f"。来源：用户手动输入；日期：{snapshot.get('as_of', '—')}。"
-                                if language != EN
+                                f"。來源：使用者手動輸入；日期：{snapshot.get('as_of', '—')}。"
+                                if language == ZH_HANT
                                 else f". Source: user-supplied; as of {snapshot.get('as_of', '—')}."
+                                if language == EN
+                                else f"。来源：用户手动输入；日期：{snapshot.get('as_of', '—')}。"
                             ),
                             "",
                         ]
@@ -503,9 +518,11 @@ def render_research_run(
                 lines.extend(
                     [
                         (
-                            "> 金融机构研究为 Beta，标准自由现金流反向 DCF 不适用。"
-                            if language != EN
+                            "> 金融機構研究為 Beta，標準自由現金流反向 DCF 不適用。"
+                            if language == ZH_HANT
                             else "> Financial-institution research is Beta; standard free-cash-flow reverse DCF is not applicable."
+                            if language == EN
+                            else "> 金融机构研究为 Beta，标准自由现金流反向 DCF 不适用。"
                         ),
                         "",
                     ]

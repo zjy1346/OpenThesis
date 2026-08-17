@@ -49,7 +49,7 @@ workflow.yaml
   }
 }`;
 
-const CONTENT: Record<Language, HelpArticle[]> = {
+const CONTENT: Partial<Record<Language, HelpArticle[]>> = {
   "zh-CN": [
     {
       id: "company-research",
@@ -142,13 +142,53 @@ const CONTENT: Record<Language, HelpArticle[]> = {
   ],
 };
 
+CONTENT["zh-Hant"] = [
+  {
+    id: "company-research", label: "入門", title: "如何開始公司研究",
+    summary: "從市場與公司選擇到模型與研究模組，以可重現流程生成第一份長期研究報告。",
+    steps: [
+      { title: "選擇市場與資料身分", body: "進入「發起研究」並選擇美股、A 股或港股。只有美股 SEC EDGAR 需要填寫可聯絡到您的電子郵件；A／港股使用各自的法定披露平台。" },
+      { title: "選擇真實公司", body: "輸入股票代碼或公司名稱，也可以使用常用公司快捷入口。確認公司名稱、完整代碼、上市市場與交易所後再繼續。" },
+      { title: "決定是否使用 AI", body: "選擇「不呼叫 AI」可先生成確定性財務概覽；選擇模型提供者時，填寫工作階段 API Key、模型名稱與端點。API Key 不會保存到本機資料庫。" },
+      { title: "選擇研究模組與執行方式", body: "預設模組涵蓋財務、商業模式、會計風險、成長機會、反方審查與長期情境。基礎 Agent 預設依序執行。" },
+      { title: "開始並閱讀報告", body: "點擊「開始研究」後可查看逐 Agent 進度並隨時取消。完成後可縮放、進入專注模式、查看技術詳情或匯出 HTML。" },
+    ],
+    note: "建議第一次先執行合成示範，確認介面、報告閱讀與匯出流程正常，再使用真實公司資料與付費模型。",
+  },
+  {
+    id: "research-pack", label: "擴充", title: "編寫自己的研究模組",
+    summary: "研究模組是 .othesis 宣告式 ZIP 套件，由清單、工作流與 Prompt 檔案組成，不執行任意程式碼。",
+    steps: [
+      { title: "建立最小目錄", body: "套件根目錄必須包含 manifest.yaml 與 workflow.yaml；Prompt 放在 prompts/ 中。" },
+      { title: "編寫清單", body: "清單必須提供 kind=ResearchPack 以及 metadata.id、name、version。相同 ID 與版本的內容不能覆蓋。" },
+      { title: "宣告工作流", body: "每個步驟應有穩定 id、agent 與 prompt 路徑；所有引用的 Prompt 檔案必須存在。" },
+      { title: "限制 Prompt 輸出", body: "要求結構化 JSON、明確表示證據不足並引用證據 ID。OpenThesis 會在執行時追加不可覆蓋的報告語言規則。" },
+      { title: "打包與匯入", body: "將目錄壓縮為 ZIP 並改為 .othesis 副檔名，再從研究模組區域匯入。" },
+    ],
+    note: "宣告式模組目前不允許 network、filesystem 或 execute_code 權限。",
+    code: PACK_EXAMPLE,
+  },
+  {
+    id: "a-h-share-research", label: "市場", title: "研究 A 股、北交所與港股",
+    summary: "依上市證券選擇市場，從法定披露平台取得財報，並正確理解手動行情與金融機構 Beta 邊界。",
+    steps: [
+      { title: "先選擇上市市場", body: "A 股包含上交所、深交所與北交所；港股包含港交所主板與 GEM。" },
+      { title: "核對官方披露來源", body: "A 股財報來自法定披露入口，港股財報來自披露易。來源不可用時不會用模型補造財務數字。" },
+      { title: "手動輸入行情", body: "1.2 不自動抓取即時價格。使用反向 DCF 時請填寫價格或市值、幣種與行情日期。" },
+      { title: "留意會計口徑", body: "報告保留報告幣種、合併口徑與頁碼證據；資料不足時會顯示缺失。" },
+      { title: "理解金融機構 Beta", body: "銀行、保險與券商可執行財報、商業、風險與長期情境研究，但不使用標準自由現金流反向 DCF。" },
+    ],
+    note: "OpenThesis 不提供交易、下單或券商連線。手動行情和 AI 輸出都只是研究輸入，不構成投資建議。",
+  },
+];
+
 export function HelpView({ language, copy }: { language: Language; copy: { helpBody: string } }) {
-  const articles = CONTENT[language];
+  const articles = CONTENT[language] ?? CONTENT.en ?? [];
   return (
     <div className="help-view">
       <header className="section-intro help-intro">
         <p>{copy.helpBody}</p>
-        <nav aria-label={language === "en" ? "Help articles" : "帮助文章"}>
+        <nav aria-label={language === "en" ? "Help articles" : language === "zh-Hant" ? "說明文章" : "帮助文章"}>
           {articles.map((article) => <a key={article.id} href={`#help-${article.id}`}>{article.title}</a>)}
         </nav>
       </header>

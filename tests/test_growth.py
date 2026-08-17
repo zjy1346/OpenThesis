@@ -38,6 +38,8 @@ class GrowthNormalizationTests(unittest.TestCase):
         self.assertEqual(format_probability_range([0.2, 0.4]), "20%–40%")
         self.assertEqual(evidence_grade_label("B", "en"), "B · Good evidence")
         self.assertEqual(scenario_label("upside"), "乐观情景")
+        self.assertEqual(evidence_grade_label("B", "zh-Hant"), "B · 較強證據")
+        self.assertEqual(scenario_label("upside", "zh-Hant"), "樂觀情境")
 
     def test_flags_malformed_and_unknown_values_without_crashing(self) -> None:
         result = normalize_growth_output(

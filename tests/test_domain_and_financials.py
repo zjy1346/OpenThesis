@@ -9,10 +9,16 @@ from openthesis.financials import (
     discounted_cash_flow_value,
     implied_fcf_growth,
     reverse_dcf_analysis,
+    deterministic_summary,
 )
 
 
 class FinancialMetricTests(unittest.TestCase):
+    def test_traditional_deterministic_summary_uses_traditional_labels(self) -> None:
+        summary = deterministic_summary("示例", [{"year": 2025, "revenue": 10.0, "revenue_growth": None, "net_income": 1.0, "operating_cash_flow": 2.0}], "zh-Hant", "CNY")
+        self.assertIn("\u71df\u696d\u6536\u5165", summary)
+        self.assertIn("\u6de8\u5229\u6f64", summary)
+
     def test_annual_and_interim_periods_are_never_mixed(self) -> None:
         def fact(year: int, period: str, concept: str, value: float, filed_at: str) -> dict[str, object]:
             return {

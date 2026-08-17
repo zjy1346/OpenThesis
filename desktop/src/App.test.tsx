@@ -147,6 +147,17 @@ describe("report-first workbench", () => {
     expect(screen.getByRole("heading", { name: "Research A-shares, BSE, and Hong Kong listings" })).toBeVisible();
   });
 
+  it("gates the first frame until a manual language preference is applied", async () => {
+    const originalLanguages = window.navigator.languages;
+    Object.defineProperty(window.navigator, "languages", { configurable: true, value: ["zh-Hant-TW"] });
+    render(<App />);
+    expect(screen.queryByRole("button", { name: "研究歷史" })).toBeNull();
+    expect(await screen.findByRole("heading", { name: "Research report" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "研究歷史" })).toBeNull();
+    expect(document.documentElement.lang).toBe("en");
+    Object.defineProperty(window.navigator, "languages", { configurable: true, value: originalLanguages });
+  });
+
   it("searches BSE without requiring an SEC email", async () => {
     vi.mocked(searchCompanies).mockResolvedValue([
       { cik: "CN_A:BSE:832982.BJ", ticker: "832982.BJ", name: "Jinbo Bio", exchange: "BSE", market: "CN_A", listing_currency: "CNY" },
@@ -221,6 +232,7 @@ describe("report-first workbench", () => {
 
     expect(updatePreferences).toHaveBeenCalledWith({
       ui_language: "en",
+      ui_language_mode: "manual",
       report_language: "zh-CN",
     });
   });

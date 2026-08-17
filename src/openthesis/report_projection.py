@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .i18n import EN, normalize_language
+from .i18n import EN, ZH_HANT, normalize_language
 
 
 _INTERNAL_FIELDS = frozenset(
@@ -84,6 +84,14 @@ _FIELD_LABELS: dict[str, tuple[str, str]] = {
     "probability_range": ("可能性区间", "Probability Range"),
     "revenue_cagr_range": ("营收复合增速区间", "Revenue CAGR Range"),
     "operating_margin_range": ("营业利润率区间", "Operating Margin Range"),
+}
+_FIELD_LABELS_HANT = {
+    "summary": "摘要", "analysis": "分析", "claims": "主要結論", "unknowns": "資訊缺口",
+    "possible_moats": "潛在護城河", "risks": "主要風險", "conclusion": "結論",
+    "strengths": "優勢", "concerns": "關注事項", "opportunities": "增長機會",
+    "leading_indicators": "領先指標", "invalidation_conditions": "失效條件",
+    "counterargument": "反方觀點", "severity": "嚴重程度", "title": "標題",
+    "confidence": "信心程度", "text": "結論", "kind": "類型",
 }
 
 _DISPLAY_VALUES_ZH = {
@@ -183,7 +191,8 @@ def report_field_label(key: object, language: str) -> str:
     normalized = str(key)
     label = _FIELD_LABELS.get(normalized)
     if label:
-        return label[1] if normalize_language(language) == EN else label[0]
+        locale = normalize_language(language)
+        return label[1] if locale == EN else _FIELD_LABELS_HANT.get(normalized, label[0]) if locale == ZH_HANT else label[0]
     # Never expose an unrecognized protocol key (for example ``severity`` in
     # an older payload) as a raw identifier in user-facing reports.  The
     # diagnostics helper below retains the path for technical inspection.

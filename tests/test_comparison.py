@@ -71,7 +71,25 @@ class ComparisonTests(unittest.TestCase):
                 "model-comparison",
             )
 
+    def test_hant_comparison_uses_traditional_title_and_method(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            left = ResearchRun("left-hant", DEMO_COMPANY, "wf", "pack", "1", "p1", "m1", "2026-01-01")
+            right = ResearchRun("right-hant", DEMO_COMPANY, "wf", "pack", "1", "p2", "m2", "2026-01-01")
+            storage.save_run(left)
+            storage.save_run(right)
+            for run in (left, right):
+                storage.save_artifact(ResearchArtifact(
+                    artifact_id=f"{run.run_id}:report", run_id=run.run_id,
+                    artifact_type="research-report", title="report",
+                    content={"report": {"claims": [{"text": "共同結論"}]}},
+                    model_id=run.model_id, agent_id="synthesis",
+                ))
+            comparison = compare_research_runs(storage, left, right, "zh-Hant")
+            self.assertEqual(comparison.title, "雙模型研究分歧")
+            self.assertIn("確定性結構比較", comparison.content["method"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,9 @@
+{
+  "fallback": "en",
+  "unknown_legacy_fallback": "zh-CN",
+  "languages": [
+    {"id":"zh-CN","aliases":["zh-cn","zh-hans","zh-hans-cn","zh-sg","zh"],"localePrefixes":["zh-hans","zh-cn","zh-sg","zh"],"htmlLang":"zh-CN","dir":"ltr","names":{"zh-CN":"简体中文","zh-Hant":"簡體中文","en":"Simplified Chinese"}},
+    {"id":"zh-Hant","aliases":["zh-hant","zh-tw","zh-hk","zh-mo","zh-hant-tw","zh-hant-hk"],"localePrefixes":["zh-hant","zh-tw","zh-hk","zh-mo"],"htmlLang":"zh-Hant","dir":"ltr","names":{"zh-CN":"繁體中文","zh-Hant":"繁體中文","en":"Traditional Chinese"}},
+    {"id":"en","aliases":["en","en-us","en-gb"],"localePrefixes":["en"],"htmlLang":"en","dir":"ltr","names":{"zh-CN":"英文","zh-Hant":"英文","en":"English"}}
+  ]
+}

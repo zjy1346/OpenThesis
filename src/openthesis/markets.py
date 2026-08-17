@@ -40,6 +40,7 @@ class IndustrySupport(StrEnum):
 class MarketProfile:
     market: Market
     label_zh: str
+    label_zh_hant: str
     label_en: str
     exchanges: tuple[Exchange, ...]
     default_currency: str
@@ -52,6 +53,7 @@ MARKET_PROFILES = {
     Market.US: MarketProfile(
         market=Market.US,
         label_zh="美股",
+        label_zh_hant="美股",
         label_en="US equities",
         exchanges=(Exchange.NASDAQ, Exchange.NYSE),
         default_currency="USD",
@@ -62,6 +64,7 @@ MARKET_PROFILES = {
     Market.CN_A: MarketProfile(
         market=Market.CN_A,
         label_zh="A 股",
+        label_zh_hant="A 股",
         label_en="China A-shares",
         exchanges=(Exchange.SSE, Exchange.SZSE, Exchange.BSE),
         default_currency="CNY",
@@ -72,6 +75,7 @@ MARKET_PROFILES = {
     Market.HK: MarketProfile(
         market=Market.HK,
         label_zh="港股",
+        label_zh_hant="港股",
         label_en="Hong Kong equities",
         exchanges=(Exchange.HKEX,),
         default_currency="HKD",

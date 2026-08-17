@@ -7,7 +7,7 @@
     "version": "0.1.0",
     "author": "OpenThesis Contributors",
     "license": "Apache-2.0",
-    "languages": ["zh-CN", "en"]
+    "languages": ["zh-CN", "zh-Hant", "en"]
   },
   "description": "官方财报、商业模式、风险、增长机会和长期情景研究框架。",
   "compatibility": {
@@ -32,4 +32,3 @@
     "execute_code": false
   }
 }
-

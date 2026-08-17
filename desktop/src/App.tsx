@@ -24,6 +24,7 @@ import { NewResearchView } from "./features/research/NewResearchView";
 import { SettingsView } from "./features/settings/SettingsView";
 import { ThesisView } from "./features/thesis/ThesisView";
 import { COPY } from "./i18n";
+import { resolveUiLanguage, setDocumentLanguage } from "./languageRegistry";
 import type {
   Language,
   ResearchRequest,
@@ -36,7 +37,7 @@ export default function App() {
   const [drawerPinned, setDrawerPinned] = useState(false);
   const [drawerHovered, setDrawerHovered] = useState(false);
   const [skipMotion, setSkipMotion] = useState(false);
-  const [language, setLanguage] = useState<Language>("zh-CN");
+  const [language, setLanguage] = useState<Language>(() => resolveUiLanguage("system", undefined, typeof navigator === "undefined" ? [] : navigator.languages));
   const initialPreferencesApplied = useRef(false);
   const suppressHoverUntilLeave = useRef(false);
   const copy = COPY[language];
@@ -62,7 +63,9 @@ export default function App() {
   useEffect(() => {
     if (!bootstrap || initialPreferencesApplied.current) return;
     initialPreferencesApplied.current = true;
-    setLanguage(bootstrap.preferences.ui_language === "en" ? "en" : "zh-CN");
+    const resolved = resolveUiLanguage(bootstrap.preferences.ui_language_mode, bootstrap.preferences.ui_language, typeof navigator === "undefined" ? [] : navigator.languages);
+    setLanguage(resolved);
+    setDocumentLanguage(resolved);
     setDrawerPinned(bootstrap.preferences.sidebar_collapsed !== "true");
   }, [bootstrap]);
 
@@ -126,6 +129,14 @@ export default function App() {
     setActiveView(id);
     if (!drawerPinned) setDrawerHovered(false);
   };
+
+  // Do not expose localized navigation before bootstrap has resolved the
+  // persisted manual preference.  The neutral shell is intentionally free of
+  // language-specific labels; bootstrap failures fall through to the normal
+  // error-visible application shell below.
+  if (!bootstrap && !error) {
+    return <div className="bootstrap-shell" role="status" aria-label="OpenThesis">OpenThesis</div>;
+  }
 
   return (
     <div className="app-shell" data-skip-motion={skipMotion || undefined}>

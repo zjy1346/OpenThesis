@@ -138,7 +138,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
         </div>
         <div className="research-progress-metrics">
           <span>{job.percent}%</span>
-          <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : "研究已用时间"}>
+          <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : language === "zh-Hant" ? "研究已用時間" : "研究已用时间"}>
             <Clock3 size={14} aria-hidden="true" />{formatElapsedTime(elapsed)}
           </time>
         </div>

@@ -1,8 +1,11 @@
-export type Language = "zh-CN" | "en";
+export type Language = "zh-CN" | "zh-Hant" | "en";
+
+export type UiLanguageMode = "system" | "manual";
 
 export type Preferences = {
   ui_language: Language;
   report_language: Language;
+  ui_language_mode?: UiLanguageMode;
   sidebar_collapsed: string;
   parallel_agents: string;
   research_market?: Market;
@@ -30,6 +33,7 @@ export type Market = "US" | "CN_A" | "HK";
 export type MarketProfile = {
   market: Market;
   label_zh: string;
+  label_zh_hant?: string;
   label_en: string;
   exchanges: string[];
   default_currency: string;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import queue
 import re
@@ -57,9 +58,12 @@ from .i18n import (
     EN,
     LANGUAGE_NAMES,
     SEC_PROFILE_IDS,
+    ZH_HANT,
     language_name,
     model_preset_label,
     normalize_language,
+    resolve_system_language,
+    resolve_ui_language,
     run_status_label,
     sec_profile_id_from_label,
     sec_profile_label,
@@ -352,13 +356,18 @@ class OpenThesisApp:
         self.root.geometry("1260x820")
         self.root.minsize(980, 680)
         self.storage = Storage(default_data_dir())
-        self.ui_language = normalize_language(
-            os.environ.get("OPENTHESIS_UI_LANGUAGE")
-            or self.storage.get_setting("ui_language", "zh-CN")
+        stored_ui = self.storage.get_setting("ui_language", "")
+        mode = self.storage.get_setting("ui_language_mode", "") or ("manual" if stored_ui else "system")
+        system_language = resolve_system_language((locale.getlocale()[0] or "en",))
+        self.ui_language = resolve_ui_language(
+            "manual" if os.environ.get("OPENTHESIS_UI_LANGUAGE") else mode,
+            os.environ.get("OPENTHESIS_UI_LANGUAGE") or stored_ui or system_language,
+            (system_language,),
         )
         self.report_language = normalize_language(
             os.environ.get("OPENTHESIS_REPORT_LANGUAGE")
-            or self.storage.get_setting("report_language", "zh-CN")
+            or self.storage.get_setting("report_language", "")
+            or self.ui_language
         )
         self._preset_labels = preset_labels(self.ui_language)
         self._sec_profile_labels = tuple(
@@ -442,8 +451,6 @@ class OpenThesisApp:
         return company.name
 
     def _translate_static_widgets(self, widget: tk.Misc) -> None:
-        if self.ui_language != EN:
-            return
         # HtmlFrame owns a native Tkhtml widget tree that is not part of our
         # translatable application controls and may expose cyclic descendants.
         if HtmlFrame is not None and isinstance(widget, HtmlFrame):
@@ -2132,14 +2139,32 @@ class OpenThesisApp:
         self.ui_language_combo.grid(
             row=1, column=1, sticky=W, padx=(18, 0), pady=6
         )
+        mode_id = "system" if self.storage.get_setting("ui_language_mode", "") == "system" else "manual"
+        self.ui_language_mode_var = tk.StringVar(value=mode_id)
+        self.ui_language_mode_display_var = tk.StringVar(
+            value=self._t("跟随系统" if mode_id == "system" else "手动选择")
+        )
+        ttk.Label(container, text=self._t("界面语言模式")).grid(row=2, column=0, sticky=W, pady=6)
+        self.ui_language_mode_combo = ttk.Combobox(
+            container, textvariable=self.ui_language_mode_display_var,
+            values=(self._t("跟随系统"), self._t("手动选择")), state="readonly", width=28,
+        )
+        self.ui_language_mode_combo.grid(row=2, column=1, sticky=W, padx=(18, 0), pady=6)
+        self.ui_language_mode_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: (
+                self.ui_language_mode_var.set(("system", "manual")[self.ui_language_mode_combo.current()]),
+                self.ui_language_mode_display_var.set(self.ui_language_mode_combo.get()),
+            ),
+        )
         ttk.Label(
             container,
             text="界面语言将在下次启动时生效。",
             style="Subtitle.TLabel",
-        ).grid(row=2, column=1, sticky=W, padx=(18, 0), pady=(0, 10))
+        ).grid(row=3, column=1, sticky=W, padx=(18, 0), pady=(0, 10))
 
         ttk.Label(container, text="研究报告语言").grid(
-            row=3, column=0, sticky=W, pady=6
+            row=4, column=0, sticky=W, pady=6
         )
         self.report_language_combo = ttk.Combobox(
             container,
@@ -2149,7 +2174,7 @@ class OpenThesisApp:
             width=28,
         )
         self.report_language_combo.grid(
-            row=3, column=1, sticky=W, padx=(18, 0), pady=6
+            row=4, column=1, sticky=W, padx=(18, 0), pady=6
         )
         ttk.Label(
             container,
@@ -2159,7 +2184,7 @@ class OpenThesisApp:
             ),
             style="Subtitle.TLabel",
             wraplength=720,
-        ).grid(row=4, column=1, sticky=W, padx=(18, 0), pady=(0, 14))
+        ).grid(row=5, column=1, sticky=W, padx=(18, 0), pady=(0, 14))
 
         self.save_language_button = ttk.Button(
             container,
@@ -2167,7 +2192,7 @@ class OpenThesisApp:
             command=self._save_language_settings,
         )
         self.save_language_button.grid(
-            row=5, column=1, sticky=W, padx=(18, 0)
+            row=6, column=1, sticky=W, padx=(18, 0)
         )
         self.language_settings_status_var = tk.StringVar()
         ttk.Label(
@@ -2175,7 +2200,7 @@ class OpenThesisApp:
             textvariable=self.language_settings_status_var,
             style="Subtitle.TLabel",
             wraplength=720,
-        ).grid(row=6, column=1, sticky=W, padx=(18, 0), pady=(10, 0))
+        ).grid(row=7, column=1, sticky=W, padx=(18, 0), pady=(10, 0))
         container.columnconfigure(1, weight=1)
 
     def _language_code_from_name(self, value: str) -> str:
@@ -2190,6 +2215,10 @@ class OpenThesisApp:
             self.report_language_var.get()
         )
         self.storage.set_setting("ui_language", selected_ui)
+        mode = self.ui_language_mode_var.get() if getattr(self, "ui_language_mode_var", None) else "manual"
+        if mode not in {"system", "manual"}:
+            mode = "manual"
+        self.storage.set_setting("ui_language_mode", mode)
         self.storage.set_setting("report_language", selected_report)
         self.report_language = selected_report
         notices = [self._t("语言设置已保存。")]
@@ -2402,6 +2431,23 @@ class OpenThesisApp:
             )
             if self.ui_language == EN
             else (
+                (
+                    "SEC 是美國證券交易委員會。EDGAR 是其公開公司申報資料庫，"
+                    "可取得 10-K、10-Q 及結構化 Company Facts 資料。\n\n"
+                    "OpenThesis 取得這些公開資料不需要 API Key，也不需要註冊 SEC 帳號。"
+                    "SEC 要求自動化請求攜帶 User-Agent，以便異常流量發生時聯絡請求者。\n\n"
+                    "正確填寫方式：\n"
+                    "1. 選擇符合你的常用請求者身份模板；\n"
+                    "2. 填寫你本人或研究團隊可以正常收信的電郵；\n"
+                    "3. 點擊「儲存本機設定」；\n"
+                    "4. 回到「公司研究」，選擇公司並點擊頂部的「開始研究」。\n\n"
+                    "不要填寫被研究公司的投資者關係電郵，也不要冒充目標公司。"
+                    "內建常用公司只用於快速選擇研究對象，與請求者聯絡電郵無關。\n\n"
+                    f"範例：OpenThesis/{__version__}（Personal Investor；"
+                    "contact: your-name@example.com）"
+                )
+                if self.ui_language == ZH_HANT
+                else (
                 "SEC 是美国证券交易委员会。EDGAR 是其公开公司申报数据库，"
                 "可获取 10-K、10-Q 和结构化 Company Facts 等资料。\n\n"
                 "OpenThesis 获取这些公开数据不需要 API Key，也不需要注册 SEC 账号。"
@@ -2415,6 +2461,7 @@ class OpenThesisApp:
                 "内置常用公司只用于快速选择研究对象，与请求者联系邮箱无关。\n\n"
                 f"示例：OpenThesis/{__version__} (Personal Investor; "
                 "contact: your-name@example.com)"
+                )
             )
         )
         help_text.insert("1.0", help_content)

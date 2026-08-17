@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from .i18n import EN, normalize_language
+from .i18n import EN, ZH_HANT, normalize_language
 
 
 _ANNUAL_PERIODS = frozenset({"", "FY", "CY", "ANNUAL"})
@@ -309,6 +309,7 @@ def deterministic_summary(
 ) -> str:
     """Render deterministic metrics from one explicit, coverage-aware schema."""
     english = normalize_language(language) == EN
+    traditional = normalize_language(language) == ZH_HANT
     lines = (
         [
             f"# {company_name} Financial Overview",
@@ -317,12 +318,14 @@ def deterministic_summary(
             "",
         ]
         if english
-        else [f"# {company_name} 财务概览", "", "以下内容由确定性财务引擎生成。", ""]
+        else [f"# {company_name} {'\u8ca1\u52d9\u6982\u89bd' if traditional else '\u8d22\u52a1\u6982\u89c8'}", "", "\u4ee5\u4e0b\u5167\u5bb9\u7531\u78ba\u5b9a\u6027\u8ca1\u52d9\u5f15\u64ce\u751f\u6210\u3002" if traditional else "以下内容由确定性财务引擎生成。", ""]
     )
     if not metrics:
         lines.append(
             "No normalized annual financial data is available."
             if english
+            else "沒有可用的標準化年度財務資料。"
+            if traditional
             else "没有可用的标准化年度财务数据。"
         )
         return "\n".join(lines)
@@ -330,18 +333,18 @@ def deterministic_summary(
     has_operating_margin = any(row.get("operating_margin") is not None for row in metrics)
     has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in metrics)
     columns: list[tuple[str, str, str]] = [
-        ("year", "Fiscal year", "财年"),
-        ("revenue", "Revenue", "营业收入"),
-        ("revenue_growth", "Revenue growth", "收入增长"),
+        ("year", "Fiscal year", "\u8ca1\u5e74" if not traditional else "\u8ca1\u653f\u5e74\u5ea6"),
+        ("revenue", "Revenue", "\u8425\u4e1a\u6536\u5165" if not traditional else "\u71df\u696d\u6536\u5165"),
+        ("revenue_growth", "Revenue growth", "\u6536\u5165\u589e\u9577" if traditional else "\u6536\u5165\u589e\u957e"),
     ]
     if has_operating_margin:
-        columns.append(("operating_margin", "Operating margin", "营业利润率"))
+        columns.append(("operating_margin", "Operating margin", "\u71df\u696d\u5229\u6f64\u7387" if traditional else "\u8425\u4e1a\u5229\u6da6\u7387"))
     columns.extend([
-        ("net_income", "Net income", "净利润"),
-        ("operating_cash_flow", "Operating cash flow", "经营现金流"),
+        ("net_income", "Net income", "\u6de8\u5229\u6f64" if traditional else "\u51c0\u5229\u6da6"),
+        ("operating_cash_flow", "Operating cash flow", "\u7d93\u71df\u73fe\u91d1\u6d41" if traditional else "\u7ecf\u8425\u73b0\u91d1\u6d41"),
     ])
     if has_free_cash_flow:
-        columns.append(("free_cash_flow", "Free cash flow", "自由现金流"))
+        columns.append(("free_cash_flow", "Free cash flow", "\u81ea\u7531\u73fe\u91d1\u6d41" if traditional else "\u81ea\u7531\u73b0\u91d1\u6d41"))
     labels = [column[1] if english else column[2] for column in columns]
     lines.append("| " + " | ".join(labels) + " |")
     lines.append("|" + "|".join("---:" for _ in columns) + "|")
@@ -368,6 +371,14 @@ def deterministic_summary(
             f"- Return on equity: {format_percent(latest.get('return_on_equity'))}",
             "",
             "> These metrics are research inputs, not investment advice.",
+        ])
+    elif traditional:
+        lines.extend([
+            "", "## \u6700\u65b0\u8ca1\u5e74\u78ba\u5b9a\u6027\u6307\u6a19", "",
+            f"- \u73fe\u91d1\u5229\u6f64\u8f49\u5316\u7387：{format_percent(latest.get('cash_conversion'))}",
+            f"- \u8cc7\u7522\u8ca0\u50b5\u7387：{format_percent(latest.get('debt_to_assets'))}",
+            f"- \u6de8\u8cc7\u7522\u5831\u916c\u7387：{format_percent(latest.get('return_on_equity'))}", "",
+            "> \u9019\u4e9b\u6307\u6a19\u50c5\u4f5c\u70ba\u7814\u7a76\u8f38\u5165\uff0c\u4e0d\u69cb\u6210\u6295\u8cc7\u5efa\u8b70\u3002",
         ])
     else:
         lines.extend([

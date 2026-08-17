@@ -661,8 +661,9 @@ class AppServiceTests(unittest.TestCase):
 
             self.assertEqual(result["contract_version"], "1.0")
             self.assertEqual(result["app_version"], "1.0.0-alpha.1")
-            self.assertEqual(result["preferences"]["ui_language"], "zh-CN")
-            self.assertEqual(result["preferences"]["report_language"], "zh-CN")
+            self.assertIn(result["preferences"]["ui_language"], {"zh-CN", "zh-Hant", "en"})
+            self.assertEqual(result["preferences"]["ui_language_mode"], "system")
+            self.assertEqual(result["preferences"]["report_language"], result["preferences"]["ui_language"])
             self.assertEqual(result["preferences"]["parallel_agents"], "false")
             self.assertEqual(result["recent_runs"], [])
             self.assertEqual(

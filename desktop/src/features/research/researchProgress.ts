@@ -1,8 +1,11 @@
-export type ProgressLanguage = "zh-CN" | "en";
+import { normalizeLanguage } from "../../languageRegistry";
+import type { Language } from "../../types";
+
+export type ProgressLanguage = Language;
 
 type StageCopy = { title: string; note: string };
 
-const STAGES: Record<ProgressLanguage, Record<string, StageCopy>> = {
+const STAGES: Record<string, Record<string, StageCopy>> = {
   "zh-CN": {
     preparing: { title: "正在准备研究任务……", note: "先确认研究对象与配置，再开始形成判断。" },
     "company-profile": { title: "正在读取公司基本信息……", note: "了解一家企业，从知道它究竟靠什么赚钱开始。" },
@@ -47,7 +50,29 @@ const STAGES: Record<ProgressLanguage, Record<string, StageCopy>> = {
   },
 };
 
-const FIXED_MESSAGES: Record<ProgressLanguage, readonly string[]> = {
+STAGES["zh-Hant"] = {
+  preparing: { title: "正在準備研究任務……", note: "先確認研究對象與設定，再開始形成判斷。" },
+  "company-profile": { title: "正在讀取公司基本資訊……", note: "了解一家企業，先從知道它究竟如何賺錢開始。" },
+  "filing-discovery": { title: "正在尋找官方披露文件……", note: "可靠的研究，應該從可靠的一手資料開始。" },
+  "filing-download": { title: "正在下載官方財報……", note: "檔案正在抵達，接下來會核對重要數據。" },
+  "filing-parse": { title: "正在識別財務報表……", note: "表格會逐頁讀取，並核對口徑、單位與期間。" },
+  "filing-validation": { title: "正在驗證財務資料……", note: "只有通過口徑與勾稽檢查的數字才會進入研究。" },
+  "vision-approval": { title: "等待確認雲端識圖頁面……", note: "只有本地識別失敗的財務表頁會在您同意後上傳。" },
+  "vision-processing": { title: "正在補充識別失敗的財務表頁……", note: "本地識別未放行的資料正在接受第二次核對。" },
+  "financial-analysis": { title: "正在分析近年財務表現……", note: "營收呈現規模，現金流往往呈現品質。" },
+  "base-analysis": { title: "正在協同分析財務、商業與會計風險……", note: "先分別研究不同觀點，再以同一套證據核對。" },
+  "business-analysis": { title: "正在理解商業模式與競爭位置……", note: "公司如何賺錢，與能否持續賺錢同樣重要。" },
+  "risk-analysis": { title: "正在整理競爭優勢與風險……", note: "好的研究不應只尋找支持結論的理由。" },
+  "growth-analysis": { title: "正在研究未來成長機會……", note: "成長需要方向、證據、時間與實現路徑。" },
+  "counter-analysis": { title: "正在進行反方審查……", note: "經不起反對意見的結論，也很難經得起市場。" },
+  "scenario-analysis": { title: "正在推演長期經營情境……", note: "長期價值來自多種可能，而不是唯一預測。" },
+  synthesis: { title: "正在整合投資結論……", note: "資料已經找到，現在需要把它們轉化為判斷。" },
+  comparison: { title: "正在執行第二模型比較……", note: "不同模型的分歧也是值得檢查的資訊。" },
+  cancelling: { title: "正在安全停止研究……", note: "正在結束未完成請求，並保留已完成階段。" },
+  waiting: { title: "研究仍在進行……", note: "正在等待目前步驟完成，並持續記錄已用時間。" },
+};
+
+const FIXED_MESSAGES: Record<string, readonly string[]> = {
   "zh-CN": [
     "巴菲特用一生寻找好公司，而 OpenThesis 正在用几分钟，为您认真研究眼前这一家。",
     "真正值得投入真金白银的公司，也值得多花几分钟看清楚。",
@@ -58,7 +83,12 @@ const FIXED_MESSAGES: Record<ProgressLanguage, readonly string[]> = {
   ],
 };
 
-const RANDOM_MESSAGES: Record<ProgressLanguage, readonly string[]> = {
+FIXED_MESSAGES["zh-Hant"] = [
+  "巴菲特用一生尋找好公司，而 OpenThesis 正在用幾分鐘，為您認真研究眼前這一家。",
+  "值得投入真金白銀的公司，也值得多花幾分鐘看清楚。",
+];
+
+const RANDOM_MESSAGES: Record<string, readonly string[]> = {
   "zh-CN": [
     "投资决策可能影响数年，多几分钟研究，往往比少几分钟等待更重要。",
     "我们正在逐项核对财务数据、公司信息与关键风险，请给研究一点时间。",
@@ -106,11 +136,34 @@ const RANDOM_MESSAGES: Record<ProgressLanguage, readonly string[]> = {
     "The research is still running—and the market will not become any simpler because we skipped a page of the filing.",
   ],
 };
+RANDOM_MESSAGES["zh-Hant"] = [
+  "投資決策可能影響數年，多幾分鐘研究，往往比少幾分鐘等待更重要。",
+  "我們正在逐項核對財務資料、公司資訊與關鍵風險，請給研究一點時間。",
+  "好的研究不是最快生成的答案，而是盡可能少遺漏重要資訊。",
+  "幾分鐘後，您看到的不只是一份結論，而是一條盡可能完整的投資邏輯。",
+  "市場每天都有雜訊，我們正在努力篩選真正重要的資訊。",
+  "財報可以在幾秒內下載，但理解一家企業需要多一點時間。",
+  "市場獎勵耐心，研究也是如此。",
+  "股價每秒都在變化，企業價值卻值得放慢幾分鐘看清。",
+  "與其快速得到一個答案，不如稍等片刻，得到一個更值得參考的答案。",
+  "投資最昂貴的成本，往往不是等待幾分鐘，而是在資訊不足時做出決定。",
+  "在點擊「買入」之前，多花幾分鐘了解一家企業，通常不是壞事。",
+  "巴菲特花了幾十年訓練判斷力，我們只希望占用您幾分鐘。",
+  "巴菲特說機會需要等待，OpenThesis 至少不會讓您等那麼久。",
+  "尋找一家好公司可能需要很多年，幸好這份研究只需要幾分鐘。",
+  "如果一家企業值得持有十年，那麼它大概也值得您多研究幾分鐘。",
+  "咖啡還沒涼，研究已經上路了。",
+  "別急著看股價，我們正在先看它究竟值不值得看。",
+  "正在翻閱財報。好消息是，您不用親自翻。",
+  "數字很多，我們正在替您留下重要的部分。",
+  "請稍候，我們正在和數十頁財報進行一場嚴肅的談判。",
+  "研究仍在進行——至少這幾分鐘裡，市場不會因為我們少看一頁財報而變得更簡單。",
+];
 
 export const WAITING_RANDOM_COUNT = RANDOM_MESSAGES.en.length;
 
-function normalizeLanguage(language: string | undefined): ProgressLanguage {
-  return language === "en" ? "en" : "zh-CN";
+function normalizeProgressLanguage(language: string | undefined): ProgressLanguage {
+  return normalizeLanguage(language) as ProgressLanguage;
 }
 
 function hashSeed(value: string): number {
@@ -152,7 +205,7 @@ function shuffledCycle(language: ProgressLanguage, jobId: string, targetCycle: n
 }
 
 export function waitingMessageAt(language: string | undefined, elapsedSeconds: number, jobId: string): string {
-  const normalized = normalizeLanguage(language);
+  const normalized = normalizeProgressLanguage(language);
   const elapsed = Math.max(0, Math.floor(elapsedSeconds));
   if (elapsed < 10) return FIXED_MESSAGES[normalized][0];
   if (elapsed < 20) return FIXED_MESSAGES[normalized][1];
@@ -172,7 +225,7 @@ export function formatElapsedTime(elapsedSeconds: number): string {
 }
 
 export function progressStageCopy(language: string | undefined, stage: string | undefined): StageCopy {
-  const normalized = normalizeLanguage(language);
+  const normalized = normalizeProgressLanguage(language);
   const aliases: Record<string, string> = {
     "parallel-agents": "base-analysis",
     research: "waiting",
@@ -189,13 +242,19 @@ export function progressStageDetail(
   total: number | undefined,
 ): string {
   if (!total || current === undefined || current < 0) return "";
-  const normalized = normalizeLanguage(language);
+  const normalized = normalizeProgressLanguage(language);
   const safeCurrent = Math.min(current, total);
   if (normalized === "en") {
     if (stage === "filing-download") return `Downloading filing ${safeCurrent}/${total}`;
     if (stage === "filing-parse") return `Reading filing ${safeCurrent}/${total}`;
     if (stage === "filing-validation") return `Validated filing ${safeCurrent}/${total}`;
     return `Completed ${safeCurrent}/${total}`;
+  }
+  if (normalized === "zh-Hant") {
+    if (stage === "filing-download") return `正在下載第 ${safeCurrent}/${total} 份官方財報`;
+    if (stage === "filing-parse") return `正在識別第 ${safeCurrent}/${total} 份財報`;
+    if (stage === "filing-validation") return `已驗證第 ${safeCurrent}/${total} 份財報`;
+    return `已完成 ${safeCurrent}/${total}`;
   }
   if (stage === "filing-download") return `正在下载第 ${safeCurrent}/${total} 份官方财报`;
   if (stage === "filing-parse") return `正在识别第 ${safeCurrent}/${total} 份财报`;
@@ -204,12 +263,13 @@ export function progressStageDetail(
 }
 
 export function agentDisplayName(language: string | undefined, agentId: string): string {
-  const normalized = normalizeLanguage(language);
+  const normalized = normalizeProgressLanguage(language);
   const labels: Record<string, readonly [string, string]> = {
     "financial-analyst": ["财务分析", "Financial analysis"],
     "business-analyst": ["商业模式", "Business analysis"],
     "accounting-risk-analyst": ["会计与风险", "Accounting and risk"],
   };
   const label = labels[agentId];
-  return label ? label[normalized === "en" ? 1 : 0] : (normalized === "en" ? "Research stage" : "研究阶段");
+  if (label) return label[normalized === "en" ? 1 : 0];
+  return normalized === "en" ? "Research stage" : normalized === "zh-Hant" ? "研究階段" : "研究阶段";
 }

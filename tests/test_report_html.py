@@ -78,6 +78,11 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_traditional_chinese_report_declares_language(self) -> None:
+        report = render_research_html("run-hant", sample_artifacts(), "zh-Hant")
+        self.assertIn('<html lang="zh-Hant">', report)
+        self.assertIn("\u589e\u9577\u6a5f\u6703", report)
+
     def test_empty_synthesis_growth_falls_back_to_valid_growth_artifact(self) -> None:
         artifacts = sample_artifacts()
         artifacts[-1]["content"]["report"]["growth_opportunities"] = []

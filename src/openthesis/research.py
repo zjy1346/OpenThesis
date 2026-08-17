@@ -24,7 +24,7 @@ from .financials import (
 )
 from .financial_ingestion import FinancialProfile
 from .growth import normalize_growth_output
-from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, normalize_language, translate
+from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, UI_HANT, ZH_HANT, normalize_language, translate
 from .packs import ResearchPack
 from .providers import ModelConfig, ModelProvider, ProviderError
 from .storage import Storage
@@ -352,7 +352,12 @@ class ResearchWorkflow:
         self.agent_progress = agent_progress or (lambda _agent_id, _state: None)
 
     def _report_text(self, chinese: str, english: str) -> str:
-        return english if self.report_language == EN else chinese
+        if self.report_language == EN:
+            return english
+        if self.report_language == ZH_HANT:
+            prefix = chinese[: len(chinese) - len(chinese.lstrip("# >-"))]
+            return prefix + UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+        return chinese
 
     def _progress_text(self, chinese: str, **params: object) -> str:
         return translate(chinese, self.ui_language, **params)
@@ -582,6 +587,10 @@ class ResearchWorkflow:
                     if self.ui_language == EN and self.parallel_agents
                     else "Running base agents sequentially (0/3)"
                     if self.ui_language == EN
+                    else "正在並行執行基礎 Agent（0/3）"
+                    if self.ui_language == ZH_HANT and self.parallel_agents
+                    else "正在依序執行基礎 Agent（0/3）"
+                    if self.ui_language == ZH_HANT
                     else "正在并行运行基础 Agent（0/3）"
                     if self.parallel_agents
                     else "正在按顺序运行基础 Agent（0/3）"

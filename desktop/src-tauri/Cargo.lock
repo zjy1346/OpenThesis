@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "openthesis-desktop"
-version = "1.4.1"
+version = "1.5.1"
 dependencies = [
  "serde",
  "serde_json",

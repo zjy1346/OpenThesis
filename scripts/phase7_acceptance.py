@@ -72,7 +72,20 @@ def _facts_dict(facts: list[Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _render(symbol: str, name: str, currency: str, facts: list[Any]) -> tuple[str, str]:
+RENDER_LANGUAGES = ("zh-CN", "zh-Hant", "en")
+INTERNAL_RENDER_KEYS = (
+    "executive_summary",
+    "evidence_ids",
+    "invalidation_conditions",
+    "leading_indicators",
+    "unresolved_questions",
+    "growth_opportunities",
+    "fact:ingest:",
+    "evidence:",
+)
+
+
+def _render(symbol: str, name: str, currency: str, facts: list[Any]) -> dict[str, str]:
     metrics = calculate_metrics(_facts_dict(facts))
     if not metrics:
         raise AssertionError(f"{symbol}: no deterministic metrics")
@@ -102,16 +115,27 @@ def _render(symbol: str, name: str, currency: str, facts: list[Any]) -> tuple[st
             },
         },
     ]
-    markdown = render_research_run(symbol, artifacts, "zh-CN", company_name=name, include_technical=False)
-    html = render_research_html(symbol, artifacts, "zh-CN", company_name=name, include_technical=False)
-    forbidden = ("counterargument", "severity", "summary", "calculation", "unknowns", "evidence_ids")
-    # Ignore HTML element ids/classes (e.g. ``executive-summary``), and check
-    # only user-visible text for protocol keys.
-    visible_html = re.sub(r"<[^>]*>", " ", html)
-    lowered = (markdown + visible_html).casefold()
-    if any(key in lowered for key in forbidden):
-        raise AssertionError(f"{symbol}: internal report key leaked")
-    return markdown, html
+    render_results: dict[str, str] = {}
+    for language in RENDER_LANGUAGES:
+        markdown = render_research_run(
+            symbol, artifacts, language, company_name=name, include_technical=False
+        )
+        html = render_research_html(
+            symbol, artifacts, language, company_name=name, include_technical=False
+        )
+        if not markdown.strip() or not html.strip():
+            raise AssertionError(f"{symbol}/{language}: empty deterministic render")
+        expected_lang = {"zh-CN": "zh-CN", "zh-Hant": "zh-Hant", "en": "en"}[language]
+        if not re.search(rf'<html\s+lang="{re.escape(expected_lang)}"', html):
+            raise AssertionError(f"{symbol}/{language}: HTML language metadata mismatch")
+        # Ignore HTML element ids/classes (for example ``executive-summary``)
+        # and inspect only user-visible text for raw protocol keys.
+        visible_html = re.sub(r"<[^>]*>", " ", html)
+        rendered = (markdown + "\n" + visible_html).casefold()
+        if any(key.casefold() in rendered for key in INTERNAL_RENDER_KEYS):
+            raise AssertionError(f"{symbol}/{language}: internal report key leaked")
+        render_results[language] = "verified"
+    return render_results
 
 
 def _pdf_rows() -> list[dict[str, Any]]:
@@ -137,15 +161,16 @@ def _pdf_rows() -> list[dict[str, Any]]:
         concepts = {fact.concept for fact in facts}
         if symbol != "00005.HK" and (dataset.status.value != "VERIFIED" or not _has_full_core(concepts)):
             raise AssertionError(f"{symbol}: {dataset.status.value} {sorted(CORE - concepts)}")
+        render_results: dict[str, str] = {}
         if symbol != "00005.HK":
-            _render(symbol, name, currency, facts)
+            render_results = _render(symbol, name, currency, facts)
         else:
             # Structured SEC facts are the accepted HSBC source; a PDF parse
             # failure is retained as fallback diagnostics, never promoted.
             facts = []
         if symbol == "00005.HK":
             continue
-        rows.append({"company": symbol, "market": "CN_A" if is_cn else "HK", "official_source": url, "latest_period": end, "currency": currency, "core_concepts": sorted(concepts & (CORE | EQUITY_ALTERNATIVES)), "status": "VERIFIED", "report_render": "deterministic_render_verified"})
+        rows.append({"company": symbol, "market": "CN_A" if is_cn else "HK", "official_source": url, "latest_period": end, "currency": currency, "core_concepts": sorted(concepts & (CORE | EQUITY_ALTERNATIVES)), "status": "VERIFIED", "report_render": render_results})
     return rows
 
 
@@ -232,8 +257,8 @@ def _sec_rows() -> list[dict[str, Any]]:
         concepts = {fact.concept for fact in latest}
         if not _has_full_core(concepts):
             raise AssertionError(f"{ticker}: latest SEC FY {latest_end} incomplete")
-        _render(ticker, name, currency, latest)
-        rows.append({"company": ticker, "market": "HK" if ticker.endswith(".HK") else "US", "official_source": f"SEC CompanyFacts CIK{cik}", "latest_period": latest_end, "currency": currency, "core_concepts": sorted(concepts & (CORE | EQUITY_ALTERNATIVES)), "status": "VERIFIED", "report_render": "deterministic_render_verified"})
+        render_results = _render(ticker, name, currency, latest)
+        rows.append({"company": ticker, "market": "HK" if ticker.endswith(".HK") else "US", "official_source": f"SEC CompanyFacts CIK{cik}", "latest_period": latest_end, "currency": currency, "core_concepts": sorted(concepts & (CORE | EQUITY_ALTERNATIVES)), "status": "VERIFIED", "report_render": render_results})
     return rows
 
 
@@ -248,6 +273,11 @@ def main() -> int:
             concepts = set(row.get("core_concepts", ()))
             if row.get("status") != "VERIFIED" or not _has_full_core(concepts):
                 raise AssertionError(f"{row.get('company')}: invalid status/core")
+            renders = row.get("report_render")
+            if not isinstance(renders, dict) or set(renders) != set(RENDER_LANGUAGES) or any(
+                renders.get(language) != "verified" for language in RENDER_LANGUAGES
+            ):
+                raise AssertionError(f"{row.get('company')}: incomplete three-language render")
         byd_q1 = payload.get("supplemental_checks", {}).get("byd_q1_yoy", {})
         if byd_q1.get("status") != "VERIFIED" or byd_q1.get("comparison_period") != "2025 Q1":
             raise AssertionError("BYD Q1 supplemental comparison is not verified")

@@ -37,6 +37,11 @@ describe("research progress experience", () => {
     expect(progressStageCopy("zh-CN", "internal-unknown").title).not.toContain("internal-unknown");
   });
 
+  it("supports Traditional Chinese stage and waiting copy", () => {
+    expect(progressStageCopy("zh-Hant", "filing-parse").title).toContain("\u8b58\u5225");
+    expect(waitingMessageAt("zh-Hant", 10, "job-hant")).toContain("\u771f\u91d1\u767d\u9280");
+  });
+
   it("has complete English copy for every public stage and waiting message", () => {
     const stages = [
       "preparing", "company-profile", "filing-discovery", "filing-download",

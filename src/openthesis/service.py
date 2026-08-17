@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import locale
 import threading
 import time
 import uuid
@@ -16,7 +17,7 @@ from .comparison import compare_research_runs
 from .demo import DEMO_COMPANY, demo_facts
 from .domain import Company, FilingDocument, FinancialFact, ResearchRun, RunStatus, utc_now_iso
 from .filing_parser import build_filing_evidence
-from .i18n import normalize_language, translate_error
+from .i18n import EN, ZH_HANT, normalize_language, resolve_system_language, resolve_ui_language, translate_error
 from .market_data import MarketDataError, MarketDataModule
 from .financial_ingestion import FinancialIngestionEngine, FinancialDataset, build_financial_profile, FinancialProfile
 from .market_financials import ValidationStatus
@@ -56,8 +57,19 @@ from .vision_financials import (
 
 CONTRACT_VERSION = "1.0"
 
+
+def _ui_message(language: str, english: str, simplified: str, traditional: str | None = None) -> str:
+    """Select a user-facing status message without binary language fallthrough."""
+    locale = normalize_language(language)
+    if locale == EN:
+        return english
+    if locale == ZH_HANT:
+        return traditional or simplified
+    return simplified
+
 PREFERENCE_DEFAULTS: dict[str, str] = {
     "ui_language": "zh-CN",
+    "ui_language_mode": "system",
     "report_language": "zh-CN",
     "sidebar_collapsed": "true",
     "parallel_agents": "false",
@@ -202,9 +214,20 @@ class AppService:
         }
 
     def preferences(self) -> dict[str, str]:
+        stored_ui = self.storage.get_setting("ui_language", "")
+        stored_mode = self.storage.get_setting("ui_language_mode", "")
+        mode = stored_mode or ("manual" if stored_ui else "system")
+        system_tag = locale.getlocale()[0] or "en"
+        system_language = resolve_system_language((system_tag,))
+        ui_language = resolve_ui_language(mode, stored_ui or system_language, (system_language,))
+        report_stored = self.storage.get_setting("report_language", "")
         return {
             key: self.storage.get_setting(key, default)
             for key, default in PREFERENCE_DEFAULTS.items()
+        } | {
+            "ui_language": ui_language,
+            "ui_language_mode": mode,
+            "report_language": normalize_language(report_stored or ui_language),
         }
 
     def update_preferences(self, updates: dict[str, Any]) -> dict[str, str]:
@@ -217,6 +240,8 @@ class AppService:
                     "preference values must be strings or booleans"
                 )
             value = str(raw_value).lower() if isinstance(raw_value, bool) else raw_value
+            if key == "ui_language_mode" and value not in {"system", "manual"}:
+                raise PreferenceValidationError("ui_language_mode must be system or manual")
             if key in {"ui_language", "report_language"}:
                 value = normalize_language(value)
             if key == "research_market":
@@ -235,6 +260,7 @@ class AppService:
             {
                 "market": profile.market.value,
                 "label_zh": profile.label_zh,
+                "label_zh_hant": profile.label_zh_hant,
                 "label_en": profile.label_en,
                 "exchanges": [exchange.value for exchange in profile.exchanges],
                 "default_currency": profile.default_currency,
@@ -605,10 +631,11 @@ class AppService:
                 job.state = "cancelling"
                 job.cancel_requested = True
                 job.stage = "cancelling"
-                job.message = (
-                    "Stopping unfinished agents…"
-                    if job.ui_language == "en"
-                    else "正在停止未完成的 Agent…"
+                job.message = _ui_message(
+                    job.ui_language,
+                    "Stopping unfinished agents…",
+                    "正在停止未完成的 Agent…",
+                    "正在停止未完成的 Agent…",
                 )
                 for agent_id, state in list(job.agent_states.items()):
                     if state in {"queued", "running"}:
@@ -677,18 +704,14 @@ class AppService:
                 job,
                 state="cancelled",
                 stage="cancelled",
-                message=(
-                    "Research cancelled"
-                    if ui_language == "en"
-                    else "研究已取消"
-                ),
+                message=_ui_message(ui_language, "Research cancelled", "研究已取消", "研究已取消"),
             )
             return
         self._update_job(
             job,
             state="running",
             stage="preparing",
-            message="Preparing research data" if ui_language == "en" else "正在准备研究数据",
+            message=_ui_message(ui_language, "Preparing research data", "正在准备研究数据", "正在準備研究資料"),
             percent=2,
         )
         try:
@@ -777,10 +800,11 @@ class AppService:
                 self._update_job(
                     job,
                     stage="filing-discovery",
-                    message=(
-                        "Vision fallback is enabled; it will upload only failed financial-table pages"
-                        if ui_language == "en"
-                        else "视觉财报兜底已启用，仅在本地失败后上传失败的财务表页"
+                    message=_ui_message(
+                        ui_language,
+                        "Vision fallback is enabled; it will upload only failed financial-table pages",
+                        "视觉财报兜底已启用，仅在本地失败后上传失败的财务表页",
+                        "雲端財報備援已啟用，只會在本地解析失敗後上傳失敗的財務表頁",
                     ),
                     percent=3,
                 )
@@ -791,11 +815,7 @@ class AppService:
                 self.storage.save_facts([FinancialFact(**item) for item in facts])
                 self._update_job(
                     job,
-                    message=(
-                        "Synthetic data ready"
-                        if ui_language == "en"
-                        else "演示数据准备完成"
-                    ),
+                    message=_ui_message(ui_language, "Synthetic data ready", "演示数据准备完成", "示範資料準備完成"),
                     percent=30,
                 )
             elif company_market == Market.US:
@@ -808,11 +828,7 @@ class AppService:
                 )
                 self._update_job(
                     job,
-                    message=(
-                        "Loading SEC annual filings"
-                        if ui_language == "en"
-                        else "正在获取 SEC 年报清单"
-                    ),
+                    message=_ui_message(ui_language, "Loading SEC annual filings", "正在获取 SEC 年报清单", "正在取得 SEC 年報清單"),
                     percent=5,
                 )
                 filings = client.list_annual_filings(company, limit=5)
@@ -829,10 +845,11 @@ class AppService:
                             stage="filing-download",
                             stage_current=index,
                             stage_total=len(filings),
-                            message=(
-                                f"Downloading SEC 10-K ({index}/{len(filings)})"
-                                if ui_language == "en"
-                                else f"正在下载 SEC 10-K（{index}/{len(filings)}）"
+                            message=_ui_message(
+                                ui_language,
+                                f"Downloading SEC 10-K ({index}/{len(filings)})",
+                                f"正在下载 SEC 10-K（{index}/{len(filings)}）",
+                                f"正在下載 SEC 10-K（{index}/{len(filings)}）",
                             ),
                             percent=6 + round(index * 10 / max(1, len(filings))),
                         )
@@ -847,11 +864,7 @@ class AppService:
                     stage="filing-parse",
                     stage_current=0,
                     stage_total=len(filings),
-                    message=(
-                        "Loading SEC Company Facts"
-                        if ui_language == "en"
-                        else "正在获取 SEC Company Facts"
-                    ),
+                    message=_ui_message(ui_language, "Loading SEC Company Facts", "正在获取 SEC Company Facts", "正在取得 SEC Company Facts"),
                     percent=23,
                 )
                 normalized = client.get_company_facts(company)
@@ -875,14 +888,15 @@ class AppService:
                 facts = [item.to_dict() for item in normalized]
             else:
                 adapter = self._market_data.adapter_for(company)
-                market_label = "A/港股" if ui_language != "en" else "A/H-share"
+                market_label = _ui_message(ui_language, "A/H-share", "A/港股", "A/港股")
                 self._update_job(
                     job,
                     stage="filing-discovery",
-                    message=(
-                        f"Loading official {market_label} financial reports"
-                        if ui_language == "en"
-                        else f"正在获取{market_label}官方财报清单"
+                    message=_ui_message(
+                        ui_language,
+                        f"Loading official {market_label} financial reports",
+                        f"正在获取{market_label}官方财报清单",
+                        f"正在取得{market_label}官方財報清單",
                     ),
                     percent=5,
                 )
@@ -901,10 +915,11 @@ class AppService:
                             stage="filing-download",
                             stage_current=index,
                             stage_total=len(filings),
-                            message=(
-                                f"Downloading official report ({index}/{len(filings)})"
-                                if ui_language == "en"
-                                else f"正在下载官方财报（{index}/{len(filings)}）"
+                            message=_ui_message(
+                                ui_language,
+                                f"Downloading official report ({index}/{len(filings)})",
+                                f"正在下载官方财报（{index}/{len(filings)}）",
+                                f"正在下載官方財報（{index}/{len(filings)}）",
                             ),
                             percent=6 + round(index * 10 / max(1, len(filings))),
                         )
@@ -1156,7 +1171,7 @@ class AppService:
                     base=30,
                     span=35 if compare_enabled else 70,
                     prefix=(
-                        ("Primary: " if ui_language == "en" else "主模型：")
+                        _ui_message(ui_language, "Primary: ", "主模型：", "主模型：")
                         if compare_enabled
                         else ""
                     ),
@@ -1187,11 +1202,7 @@ class AppService:
                         percent,
                         base=65,
                         span=35,
-                        prefix=(
-                            "Comparison: "
-                            if ui_language == "en"
-                            else "对比模型："
-                        ),
+                        prefix=_ui_message(ui_language, "Comparison: ", "对比模型：", "比較模型："),
                     ),
                 )
                 compare_research_runs(
@@ -1203,13 +1214,14 @@ class AppService:
                 stage=("partial" if primary.status.value == "partial" else "completed"),
                 percent=100,
                 message=(
-                    "Research stages completed; synthesized report needs retry"
-                    if ui_language == "en" and primary.status.value == "partial"
-                    else "研究阶段已完成；综合报告需要重试"
+                    _ui_message(
+                        ui_language,
+                        "Research stages completed; synthesized report needs retry",
+                        "研究阶段已完成；综合报告需要重试",
+                        "研究階段已完成；綜合報告需要重試",
+                    )
                     if primary.status.value == "partial"
-                    else "Research completed"
-                    if ui_language == "en"
-                    else "研究完成"
+                    else _ui_message(ui_language, "Research completed", "研究完成", "研究完成")
                 ),
                 run_id=primary.run_id,
             )
@@ -1218,7 +1230,7 @@ class AppService:
                 job,
                 state="cancelled",
                 stage="cancelled",
-                message="Research cancelled" if ui_language == "en" else "研究已取消",
+                message=_ui_message(ui_language, "Research cancelled", "研究已取消", "研究已取消"),
             )
         except _ResearchDataUnavailable as exc:
             self._update_job(
@@ -1246,10 +1258,11 @@ class AppService:
                     if isinstance(request.get("model"), dict)
                     else None
                 )
-                safe_error = (
-                    f"Model request timed out after {timeout}s; increase the timeout or retry."
-                    if ui_language == "en"
-                    else f"模型请求超过 {timeout} 秒未响应；可提高超时设置后重试。"
+                safe_error = _ui_message(
+                    ui_language,
+                    f"Model request timed out after {timeout}s; increase the timeout or retry.",
+                    f"模型请求超过 {timeout} 秒未响应；可提高超时设置后重试。",
+                    f"模型請求超過 {timeout} 秒未回應；可提高逾時設定後重試。",
                 )
             self._update_job(
                 job,
@@ -1257,7 +1270,7 @@ class AppService:
                 stage="failed",
                 error_code=("MODEL_TIMEOUT" if timed_out else "RESEARCH_FAILED"),
                 message=safe_error
-                or ("Research failed" if ui_language == "en" else "研究失败"),
+                or _ui_message(ui_language, "Research failed", "研究失败", "研究失敗"),
             )
         finally:
             for selection_name in ("model", "comparison_model"):
@@ -1312,8 +1325,24 @@ def _research_data_message(code: str, language: str) -> str:
             "VISION_CANCELLED": "Vision parsing was cancelled.",
             "VISION_SIZE_LIMIT": "The selected vision pages exceed the safe upload limit.",
         },
+        "zh-Hant": {
+            "NO_FILINGS_AVAILABLE": "官方披露平台目前沒有提供可用的財報。公司可能尚未發布定期報告，或沒有報告符合目前條件。",
+            "FILING_FETCH_FAILED": "無法取得官方財報資料。請檢查網路後重試，或在官方披露平台核對。",
+            "FILING_STATUS_UNVERIFIED": "官方來源沒有返回可驗證的財報結果。請稍後重試，或在官方披露平台核對。",
+            "FILING_DOWNLOAD_FAILED": "已找到官方財報，但下載未完成。請檢查網路後重試。",
+            "FILING_DOWNLOAD_REQUIRED": "開始研究前必須先下載官方財報原文。請啟用財報下載後重試。",
+            "FILING_FORMAT_UNSUPPORTED": "已找到官方披露，但目前版本無法從中產生可用的財務資料。",
+            "FILING_DATA_QUALITY_FAILED": "已取得官方披露，但關鍵財務欄位未通過一致性檢查。為避免錯誤資料送入 AI，本次研究已停止。",
+            "VISION_CONSENT_REQUIRED": "雲端視覺備援需要明確的上傳同意。",
+            "VISION_UPLOAD_NOT_APPROVED": "雲端視覺財報頁面未獲准上傳。",
+            "VISION_RATE_LIMITED": "雲端視覺服務目前受限流，請稍後重試。",
+            "VISION_UNAUTHORIZED": "雲端視覺服務憑證無效或已過期。",
+            "VISION_TIMEOUT": "雲端視覺財報解析逾時，未採用不完整結果。",
+            "VISION_CANCELLED": "雲端視覺財報解析已取消。",
+            "VISION_SIZE_LIMIT": "選取的雲端視覺頁面超過安全上傳限制。",
+        },
     }
-    catalog = messages["en" if language == "en" else "zh-CN"]
+    catalog = messages[ZH_HANT if normalize_language(language) == ZH_HANT else EN if normalize_language(language) == EN else "zh-CN"]
     return catalog.get(code, catalog["FILING_FETCH_FAILED"])
 
 

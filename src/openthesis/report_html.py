@@ -10,11 +10,12 @@ from .growth import (
     growth_opportunities_from_value,
     scenario_label,
 )
-from .i18n import EN, normalize_language
+from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
 from .report_projection import project_report_value, report_display_value, report_field_label
 from .reporting import (
     ARTIFACT_LABELS,
     SECTION_LABELS_EN,
+    SECTION_LABELS_HANT,
     SECTION_LABELS_ZH,
 )
 
@@ -213,7 +214,13 @@ code {
 
 
 def _pick(language: str, chinese: str, english: str) -> str:
-    return english if normalize_language(language) == EN else chinese
+    locale = normalize_language(language)
+    if locale == EN:
+        return english
+    if locale == ZH_HANT:
+        prefix = chinese[: len(chinese) - len(chinese.lstrip("# >-"))]
+        return prefix + UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+    return chinese
 
 
 def _escape(value: object) -> str:
@@ -231,9 +238,10 @@ def _paragraphs(value: object) -> str:
     )
 
 
-def _document(title: str, body: str) -> str:
+def _document(title: str, body: str, language: str = "zh-CN") -> str:
+    html_lang = "zh-Hant" if normalize_language(language) == ZH_HANT else "en" if normalize_language(language) == EN else "zh-CN"
     return (
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        f"<!DOCTYPE html><html lang=\"{html_lang}\"><head><meta charset=\"utf-8\">"
         f"<title>{_escape(title)}</title><style>{REPORT_CSS}</style></head>"
         f"<body><div class=\"page\">{body}</div></body></html>"
     )
@@ -259,7 +267,7 @@ def render_message_html(
         f"<div class=\"{callout_class}\">{_paragraphs(text)}</div>"
         "</div>"
     )
-    return _document(heading, body)
+    return _document(heading, body, language)
 
 
 def _artifact(
@@ -308,6 +316,8 @@ def _interim_financial_snapshot(rows: list[object], language: str, currency: str
     headers = (
         ("Period", "Revenue", "Like-for-like growth", "Net income", "Operating cash flow")
         if language == EN
+        else ("期間", "營業收入", "同期增長", "淨利潤", "經營現金流")
+        if language == ZH_HANT
         else ("期间", "营业收入", "同期间增长", "净利润", "经营现金流")
     )
     values = (
@@ -600,7 +610,7 @@ def _growth_section(
                 "Current evidence is insufficient to present a growth opportunity.",
             )
         return _section(
-            _pick(language, "增长机会", "Growth Opportunities"),
+            "\u589e\u9577\u6a5f\u6703" if language == ZH_HANT else _pick(language, "增长机会", "Growth Opportunities"),
             f"<div class=\"callout\">{_escape(message)}</div>",
             section_id="growth",
         )
@@ -656,7 +666,7 @@ def _growth_section(
             f"{len(supporting)} 条支持证据 · {len(contradicting)} 条相反证据",
             f"{len(supporting)} supporting · {len(contradicting)} contradicting evidence items",
         )
-        scenario_text = "、".join(scenarios) if language != EN else ", ".join(scenarios)
+        scenario_text = ", ".join(scenarios) if language == EN else "、".join(scenarios)
         if not scenario_text:
             scenario_text = _pick(language, "尚未确定", "Not determined")
 
@@ -715,7 +725,7 @@ def _growth_section(
             + "</div>"
         )
     return _section(
-        _pick(language, "增长机会", "Growth Opportunities"),
+        "\u589e\u9577\u6a5f\u6703" if language == ZH_HANT else _pick(language, "增长机会", "Growth Opportunities"),
         "".join(cards),
         section_id="growth",
     )
@@ -857,7 +867,7 @@ def _report_sections(
     language: str,
     include_technical: bool,
 ) -> str:
-    labels = SECTION_LABELS_EN if language == EN else SECTION_LABELS_ZH
+    labels = SECTION_LABELS_EN if language == EN else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
     if not isinstance(report, dict):
         return _section(
             _pick(language, "模型研究", "Model Research"),
@@ -1026,7 +1036,7 @@ def _technical_process(
         artifact_type = str(artifact.get("artifact_type", ""))
         labels = ARTIFACT_LABELS.get(artifact_type)
         title = (
-            labels[1] if language == EN else labels[0]
+            labels[1] if language == EN else UI_HANT.get(labels[0], labels[0]) if language == ZH_HANT else labels[0]
         ) if labels else str(artifact.get("title", artifact_type))
         rows.append(
             "<tr>"
@@ -1038,6 +1048,8 @@ def _technical_process(
     headers = (
         ("Artifact", "Agent", "Model")
         if language == EN
+        else ("研究產物", "Agent", "模型")
+        if language == ZH_HANT
         else ("研究产物", "Agent", "模型")
     )
     table = (
@@ -1190,4 +1202,4 @@ def render_research_html(
         )
         + "</div>"
     )
-    return _document(title, "".join(part for part in body if part))
+    return _document(title, "".join(part for part in body if part), language)
