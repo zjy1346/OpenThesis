@@ -4,7 +4,7 @@
 
 **以 AI 為核心、以證據為基礎的長期公司研究工具**
 
-[English](README.md) · [簡體中文](README.zh-CN.md) · [繁體中文](README.zh-Hant.md)
+[English](./README.md) · [簡體中文](./README.zh-CN.md) · [繁體中文](./README.zh-Hant.md)
 
 [![Release](https://img.shields.io/github/v/release/zjy1346/OpenThesis?display_name=tag&sort=semver)](https://github.com/zjy1346/OpenThesis/releases/latest)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/zjy1346/OpenThesis/releases/latest)
@@ -14,6 +14,22 @@
 研究公司，而不是預測短期價格。
 
 </div>
+
+## 介面預覽
+
+研究工作台會在同一條可追溯流程中展示確定性財務概覽、來源證據與即時研究階段。
+
+![英文確定性報告](./docs/assets/screenshots/report-en.png)
+
+_確定性財務概覽與年度比較。_
+
+![來源證據](./docs/assets/screenshots/evidence-zh.png)
+
+_來源頁與證據始終可供審計。_
+
+![研究進度](./docs/assets/screenshots/research-progress-en.webp)
+
+_專業 Agent 會顯示目前階段，不隱藏研究進度。_
 
 OpenThesis 是面向個人長期投資者的開源桌面研究系統。它將公開財報、確定性財務分析與專業 AI Agent 組合為可追溯的投資論點。模型由您選擇；OpenThesis 提供研究流程、證據協定、財務工具與可重現性。
 

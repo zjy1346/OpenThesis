@@ -4,7 +4,7 @@
 
 **AI-native, evidence-first company research for long-term investors**
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-Hant.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [繁體中文](./README.zh-Hant.md)
 
 [![Release](https://img.shields.io/github/v/release/zjy1346/OpenThesis?display_name=tag&sort=semver)](https://github.com/zjy1346/OpenThesis/releases/latest)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/zjy1346/OpenThesis/releases/latest)
@@ -14,6 +14,23 @@
 Research companies—not short-term price movements.
 
 </div>
+
+## See it in action
+
+The workspace keeps deterministic financial summaries, source evidence, and
+the live research stages visible in one traceable flow.
+
+![English deterministic report](./docs/assets/screenshots/report-en.png)
+
+_Deterministic financial overview and year-over-year comparison._
+
+![Source evidence](./docs/assets/screenshots/evidence-zh.png)
+
+_Source pages and evidence remain available for audit._
+
+![Research progress](./docs/assets/screenshots/research-progress-en.webp)
+
+_Specialist agents report their progress without hiding the current stage._
 
 OpenThesis is an open-source desktop research system for individual long-term
 investors. It turns public filings, deterministic financial analysis, and
