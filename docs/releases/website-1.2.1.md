@@ -1,6 +1,6 @@
 # OpenThesis Website 1.2.1 GitHub Pages 部署方案
 
-状态：**用户已批准正式部署实施；部署配置已实现、本地验收进行中、待提交推送与线上验证**  
+状态：**代码与 Pages 部署成功；等待 DNS CNAME 与 HTTPS 生效后最终线上验收**  
 建立日期：2026-08-18  
 目标站点：`https://openthesis.cc.cd/`  
 目标仓库：`zjy1346/OpenThesis`  
@@ -30,21 +30,24 @@
 - `website/vite.config.ts` 已显式设置 `base: '/'`。
 - 网站源代码中的产品图片使用 `/product/...` 根路径。
 - 因目标是自定义域名根路径 `https://openthesis.cc.cd/`，正确的 Vite `base` 是 `/`；不能使用 `/OpenThesis/`，否则自定义域名下会生成错误的仓库子目录资源路径。
-- 本地生产构建已验证该根路径策略；线上脚本、CSS 与图片 URL 仍待 Pages 部署后验证。
+- 本地 production preview 已验证该根路径策略及所有引用资源返回 200；自定义域名线上访问仍受 DNS CNAME 缺失阻塞。
 
 ### 2.3 GitHub Pages 与 Actions
 
 - 仓库是公开仓库，默认分支为 `main`，连接的 GitHub App 对仓库具有管理员和推送权限。
 - 独立 `.github/workflows/deploy-pages.yml` 已实现，不改动 Windows Release 流程。
-- Pages 工作流使用官方 `configure-pages`、`upload-pages-artifact@v4`、`deploy-pages@v4` 动作，设置 `pages: write` 与 `id-token: write` 权限，并部署 `website/dist`。
-- 工作流的静态触发、权限、build/deploy jobs、artifact 连接和 `github-pages` environment 已完成配置；Actions 实际运行结果待提交推送后验证。
+- Pages 工作流使用官方 `checkout@v7`、`pnpm/action-setup@v6`、`setup-node@v7`、`configure-pages@v6`、`upload-pages-artifact@v5`、`deploy-pages@v5` 动作，设置 `pages: write` 与 `id-token: write` 权限，并部署 `website/dist`。
+- Actions run `32098730209` 已成功，`Build website` 与 `Deploy website` 均成功，artifact 为 `github-pages`。
+- GitHub API 显示 Pages `source/build_type=workflow`，Custom domain 已设置为 `openthesis.cc.cd`；API 当前显示 `https_enforced=false`。
+- 当前 DNS CNAME 查询返回名称不存在，HTTPS 握手失败；最终自定义域名线上验收等待用户在 DNSHE 增加 CNAME 后继续。
 
 ### 2.4 当前 Git 状态与提交边界
 
-- 当前本地分支 `codex/financial-ingestion-v2` 与 `origin/main` 指向同一提交 `09e4af1`，尚无分支分叉。
-- 网站源码和网站变更记录目前尚未被 Git 跟踪，因此首次 Pages 部署提交必须包含网站源码本身。
+- 精确暂存范围的部署提交 `21fa1cee68e8e7a0169b5b14ab090e1d3159b2e2` 已快进推送到 `main`。
+- 官方 Action 版本升级提交 `31491af6c4a995ee137fd765cb85aea6c434d54f` 已推送到 `main`。
 - 工作区另有 `.pnpm-store/`、`tmp/` 和 `.github/release-notes/v1.4.0-rc2.md`；这些不属于官网部署，不会被暂存或提交。
 - `website/node_modules/`、`website/dist/`、`*.tsbuildinfo` 已由 `.gitignore` 排除；Actions 将从 lockfile 干净安装并重新构建。
+- 从提交导出的干净源码已完成 frozen lockfile 安装、typecheck 与 build；Pages artifact 仅包含 `index.html`、assets JS/CSS 和 5 张 WebP。Local production preview 首页及所有引用资源返回 200，`1440×900` 与 `390×844` 截图正常，未发现可见版本号；浏览器控制台检查没有可靠证据，验收清单不勾选该项。
 
 ### 2.5 发布工具与执行环境诊断
 
@@ -52,7 +55,7 @@
 - 宿主 Windows PowerShell 下，`gh 2.97.0` 已通过 Keyring 登录 `zjy1346`，`active=true`；`gh api user` 返回 `zjy1346`。
 - 宿主环境中 `GH_TOKEN` 与 `GITHUB_TOKEN` 均不存在，认证来自已登录的 Keyring。
 - 当前执行环境为 `Windows CodexSandboxOffline`，不能读取宿主 Keyring且网络受限；GitHub 网络操作（提交后的推送、Actions/Pages 检查）必须在已批准的宿主环境执行。
-- 因此部署配置已经实现，本地验收进行中，待提交推送与线上验证；认证不再是待修复阻塞项。
+- 因此代码与 Pages 部署已成功，当前只等待 DNS CNAME 与 HTTPS 生效后的最终线上验收；认证不再是阻塞项。
 
 ### 2.6 同仓库隔离结论
 
@@ -74,7 +77,7 @@
 - 构建任务：checkout、pnpm、Node、依赖缓存、`pnpm install --frozen-lockfile`、typecheck、build。
 - artifact：仅上传 `website/dist`，确保 `index.html` 位于 artifact 根目录。
 - 部署任务：使用 `github-pages` environment 与 `actions/deploy-pages`。
-- 输出：GitHub Actions 记录实际部署 URL。
+- 输出：GitHub Actions 已记录成功部署结果，artifact 为 `github-pages`。
 
 ### 3.2 Vite 配置
 
@@ -84,13 +87,13 @@
 
 ### 3.3 自定义域名
 
-- 使用 GitHub Pages Settings 中的 Custom domain 配置 `openthesis.cc.cd`。
-- 对 GitHub Actions 发布方式，仓库内 `CNAME` 文件会被忽略且不是必需项，因此不新增无效的 `CNAME` 文件。
-- 域名和 HTTPS 状态必须在 GitHub Settings → Pages 中保存；工作流文件本身不能替代这个设置。
+- GitHub 端已自动完成 Pages Source=`GitHub Actions` 和 Custom domain=`openthesis.cc.cd` 的配置，用户不需要重复设置。
+- 对 GitHub Actions 发布方式，仓库内 `CNAME` 文件不是必需项，因此不新增 `CNAME` 文件。
+- 当前仅等待 DNSHE CNAME 生效和证书就绪；API 当前为 `https_enforced=false`，后续可由我们继续启用 Enforce HTTPS，或由用户在证书就绪后手动启用。
 
-### 3.4 拟提交范围（待执行）
+### 3.4 已实施提交范围
 
-实施提交只包含：
+部署提交已按以下范围精确暂存并推送：
 
 - `.github/workflows/deploy-pages.yml`
 - `website/` 下的源码、配置、lockfile、第三方声明与页面实际引用的 WebP 产品图片；不包含重复 PNG 源图、构建缓存和依赖目录
@@ -118,14 +121,13 @@
 
 ## 4. GitHub Pages 手动设置
 
-代码推送到 `main` 后，用户需要在 GitHub 完成：
+GitHub 端已自动完成：
 
-1. 打开 `zjy1346/OpenThesis` → **Settings** → **Pages**。
-2. 在 **Build and deployment** → **Source** 选择 **GitHub Actions**。
-3. 等待 `Deploy website to GitHub Pages` 工作流首次成功。
-4. 在 **Custom domain** 输入 `openthesis.cc.cd` 并点击 **Save**。
-5. DNS 生效、GitHub 签发证书后勾选 **Enforce HTTPS**。证书选项可能需要数分钟到 24 小时才可用。
-6. 可选：在 **Settings** → **Environments** → `github-pages` 中限制只允许 `main` 部署。
+1. Pages Source=`GitHub Actions`。
+2. Custom domain=`openthesis.cc.cd`。
+3. `Deploy website to GitHub Pages` 工作流成功运行，artifact 为 `github-pages`。
+
+用户后续唯一需要手动处理的是：DNSHE 增加第 5 节所列 CNAME，等待 DNS 生效及 GitHub 证书就绪后启用 Enforce HTTPS。若 API 后续允许自动启用，则继续由我们完成。
 
 ## 5. DNSHE 手动 DNS 配置
 
@@ -146,6 +148,7 @@
 - 删除或停用同一主机名上冲突的 `A`、`AAAA` 或其他 `CNAME`。
 - 不要创建通配符 `*.cc.cd` 或 `*.openthesis.cc.cd` 指向 GitHub Pages。
 - 推荐顺序：先在 GitHub Pages 保存 Custom domain，再添加 DNS CNAME，以降低域名被他人抢占配置的风险。
+- 当前查询结果为名称不存在，HTTPS 握手失败；增加 CNAME 后重新执行 DNS 与 HTTPS 验证。
 
 DNS 生效后可验证：
 
@@ -159,11 +162,11 @@ Resolve-DnsName openthesis.cc.cd -Type CNAME
 
 ### 6.1 本地与构建
 
-- [ ] 从 lockfile 干净安装依赖成功。
-- [ ] TypeScript 检查通过。
-- [ ] Vite 生产构建通过。
-- [ ] `website/dist/index.html` 位于部署 artifact 根目录。
-- [ ] 生产 HTML 的 JS/CSS 路径以 `/assets/` 开头，产品图片路径以 `/product/` 开头。
+- [x] 从 lockfile 干净安装依赖成功。
+- [x] TypeScript 检查通过。
+- [x] Vite 生产构建通过。
+- [x] `website/dist/index.html` 位于部署 artifact 根目录。
+- [x] 生产 HTML 的 JS/CSS 路径以 `/assets/` 开头，产品图片路径以 `/product/` 开头。
 - [ ] 本地 production preview 无控制台错误或资源 404。
 
 ### 6.2 GitHub Actions
@@ -179,19 +182,19 @@ Resolve-DnsName openthesis.cc.cd -Type CNAME
 - [ ] 首页、锚点导航、语言切换和产品图片在根域路径工作。
 - [ ] `https://openthesis.cc.cd/` 返回网站首页而不是 404。
 - [ ] 静态资源全部通过 HTTPS 加载，无 mixed content。
-- [ ] GitHub Pages Custom domain 显示 `openthesis.cc.cd`。
+- [x] GitHub Pages Custom domain 显示 `openthesis.cc.cd`。
 - [ ] DNS CNAME 指向 `zjy1346.github.io`。
 - [ ] Enforce HTTPS 可用并启用。
 
 ### 6.4 提交与发布
 
-- [ ] 只暂存计划内文件，没有提交缓存、临时截图或测试版 Release Note。
-- [ ] 没有提交未被网页引用的重复 PNG 源图。
-- [ ] 提交前检查完整 staged diff。
-- [ ] 必要检查全部通过后创建部署提交。
-- [ ] 直接快进推送到 `origin/main`。
-- [ ] 推送后检查 Pages workflow 状态和部署日志。
-- [ ] 不访问或修改 DNSHE 账号。
+- [x] 只暂存计划内文件，没有提交缓存、临时截图或测试版 Release Note。
+- [x] 没有提交未被网页引用的重复 PNG 源图。
+- [x] 提交前检查完整 staged diff。
+- [x] 必要检查全部通过后创建部署提交。
+- [x] 直接快进推送到 `origin/main`。
+- [x] 推送后检查 Pages workflow 状态和部署日志。
+- [x] 不访问或修改 DNSHE 账号。
 
 ### 6.5 最终线上效果验收
 
