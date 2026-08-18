@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tsbuildinfo
+public/product/*.png
+public/product/README.md
