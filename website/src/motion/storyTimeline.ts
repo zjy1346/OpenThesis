@@ -36,9 +36,9 @@ export function mountStoryTimeline(root: HTMLElement) {
 
       handoff(evidence, market, 1)
       const evidenceCapture = evidence.querySelector<HTMLElement>('[data-story-reveal]')
-      const magnifier = evidence.querySelector<HTMLElement>('.evidence-magnifier')
+      const sourceFocus = evidence.querySelector<HTMLElement>('.source-focus')
       if (evidenceCapture) timeline.fromTo(evidenceCapture, { clipPath: 'inset(0 100% 0 0)', transform: 'scale(1.04)' }, { clipPath: 'inset(0 0 0 0)', transform: 'scale(1)', duration: .72 }, 1.08)
-      if (magnifier) timeline.fromTo(magnifier, { opacity: 0, transform: 'translate3d(28px, 28px, 0) scale(.82)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', duration: .42 }, 1.52)
+      if (sourceFocus) timeline.fromTo(sourceFocus, { opacity: 0, transform: 'translate3d(0, 16px, 0) scale(.97)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', duration: .4 }, 1.52)
       timeline.fromTo(evidence.querySelectorAll('.chain-node'), { opacity: 0, transform: 'translate3d(0, 12px, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', stagger: .06, duration: .25 }, 1.48)
 
       handoff(agents, evidence, 2)
@@ -50,9 +50,7 @@ export function mountStoryTimeline(root: HTMLElement) {
 
       handoff(workflow, agents, 3)
       timeline.fromTo(workflow.querySelector('.workflow-report'), { opacity: 0, transform: 'scale(1.08)' }, { opacity: 1, transform: 'scale(1)', duration: .52 }, 3.04)
-      timeline.fromTo(workflow.querySelector('.progress-float'), { opacity: 0, transform: 'translate3d(26px, 26px, 0) scale(.92)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', duration: .48 }, 3.25)
-      timeline.fromTo(workflow.querySelector('.timeline-line span'), { height: '0%' }, { height: '73%', duration: .55 }, 3.24)
-      timeline.fromTo(workflow.querySelectorAll('.timeline-item'), { opacity: .35, transform: 'translate3d(-16px, 0, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', stagger: .1, duration: .25 }, 3.3)
+      timeline.fromTo(workflow.querySelector('.workflow-progress'), { opacity: 0, transform: 'translate3d(0, 18px, 0) scale(.98)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', duration: .46 }, 3.25)
 
       handoff(recovery, workflow, 4)
       timeline.fromTo(recovery.querySelector('.report-window'), { opacity: .46, transform: 'translate3d(0, 14px, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', duration: .42 }, 4.08)
