@@ -13,7 +13,7 @@ type Icon = LucideIcon
 
 const copy = {
   en: {
-    nav: { product: 'Product', workflow: 'Workflow', markets: 'Markets', privacy: 'Privacy', github: 'GitHub', download: 'Download' },
+    nav: { product: 'Product', workflow: 'Workflow', markets: 'Markets', privacy: 'Privacy', ot: '.ot Ecosystem', github: 'GitHub', download: 'Download' },
     switchLanguage: '中文',
     followSystem: 'Use system language',
     eyebrow: 'OPEN SOURCE · LOCAL FIRST',
@@ -45,30 +45,37 @@ const copy = {
     recoveryBody: 'A partial report stays readable. Retry the failed growth stage or synthesis stage without downloading the filings or rerunning work that already passed.',
     retry: 'Retry only what failed',
     reportReady: 'Partial report remains available',
-    localKicker: '06 / YOUR WORKBENCH',
-    localTitle: <><span className="headline-line">Your models.</span><br /><span className="headline-line"><em>Your history.</em></span></>,
-    localBody: 'Bring the model you trust, or use deterministic mode. API keys stay in session memory. Research history and append-only thesis versions stay on your machine.',
-    localFoot: 'A private trail for public evidence.',
+    localKicker: '06 / MODEL CENTER',
+    localTitle: <><span className="headline-line">Configure once.</span><br /><span className="headline-line"><em>Keep the boundary local.</em></span></>,
+    localBody: 'Connect providers and local models in one Model Center. API keys live in the operating system credential vault; research runs and .ot files keep only non-secret references.',
+    localFoot: 'Credentials never travel with a research object.',
+    otKicker: '07 / THE .ot ECOSYSTEM',
+    otTitle: <><span className="headline-line">Research can travel.</span><br /><span className="headline-line"><em>Proof stays with it.</em></span></>,
+    otBody: '.ot carries workflows, evidence, calculations and reports in one typed, versioned and verifiable research object—without credentials or arbitrary code.',
+    otFoot: 'One object keeps the structure and the proof.',
+    otCta: 'Explore the .ot ecosystem',
+    otObjectLabel: 'Open the .ot ecosystem page',
+    otSignals: ['SCHEMA', 'EVIDENCE', 'HASH', 'PERMISSIONS'],
     finalKicker: 'OPEN SOURCE COMPANY RESEARCH',
     finalTitle: <>Take the long view<br /><em>seriously.</em></>,
-    finalBody: 'Download the Windows portable build, inspect the source, and build a research practice that compounds.',
+    finalBody: 'Download the Windows portable build, inspect the source, and carry verifiable research through the open .ot ecosystem.',
     finalDownload: 'Download for Windows',
     finalGithub: 'Read the source',
-    apache: 'Apache License 2.0 · No account · No broker connection',
+    apache: 'Apache License 2.0 · No bundled models · No broker connection',
     disclaimer: 'OpenThesis is a research tool, not investment advice. It does not execute trades or promise returns.',
     menu: 'Open menu', close: 'Close menu',
     proof: ['Official filings', 'Deterministic finance', 'Focused agents'],
     capabilities: 'The full workbench',
-    capabilitiesBody: 'A compact view of the workbench beyond the six stories above.',
+    capabilitiesBody: 'A compact view of the workbench beyond the story above.',
     capabilityGroups: [
       { title: 'Markets & sources', items: ['SEC EDGAR + XBRL', 'A-share official disclosures', 'HKEX official disclosures', 'Issuer / security identity'] },
-      { title: 'Research system', items: ['Seven specialist agents', 'Second-model comparison', 'Up to two parallel agents', 'Importable .othesis modules'] },
+      { title: 'Research system', items: ['Seven specialist agents', 'Reusable model profiles', 'Unified Model Center', 'OT Studio + .ot ecosystem'] },
       { title: 'Report & history', items: ['Technical evidence detail', 'HTML / Markdown / text export', '90–130% report zoom', 'Append-only thesis versions'] },
-      { title: 'Safety boundaries', items: ['Local-first history', 'Session-only API keys', 'User-approved vision fallback', 'Financial-institution Beta path'] }
+      { title: 'Safety boundaries', items: ['OS credential vault', '.ot carries no secrets', 'Explicit connector permissions', 'No silent paid fallback'] }
     ]
   },
   zh: {
-    nav: { product: '产品', workflow: '研究流程', markets: '市场', privacy: '隐私', github: 'GitHub', download: '下载' },
+    nav: { product: '产品', workflow: '研究流程', markets: '市场', privacy: '隐私', ot: '.ot 生态', github: 'GitHub', download: '下载' },
     switchLanguage: 'English',
     followSystem: '跟随系统语言',
     eyebrow: '开源 · 本地优先',
@@ -100,26 +107,33 @@ const copy = {
     recoveryBody: '部分报告仍然可读。只重试失败的增长或综合阶段，不重复下载财报，也不重跑已经通过的工作。',
     retry: '只重试失败部分',
     reportReady: '部分报告仍可阅读',
-    localKicker: '06 / 你的工作台',
-    localTitle: <><span className="headline-line">你的模型。</span><br /><span className="headline-line"><em>你的研究历史。</em></span></>,
-    localBody: '使用你信任的模型，或直接使用确定性模式。API Key 只留在当前会话内存，研究历史和追加式论点版本留在你的电脑上。',
-    localFoot: '为公开证据保留一条私密路径。',
+    localKicker: '06 / 模型中心',
+    localTitle: <><span className="headline-line">配置一次。</span><br /><span className="headline-line"><em>边界留在本机。</em></span></>,
+    localBody: '在统一模型中心连接云端服务商与本地模型。API Key 保存在操作系统凭据库中；研究运行与 .ot 文件只保留非秘密引用。',
+    localFoot: '凭据不会跟随研究对象流转。',
+    otKicker: '07 / .ot 生态',
+    otTitle: <><span className="headline-line">让研究流转，</span><br /><span className="headline-line"><em>证据始终随行。</em></span></>,
+    otBody: '.ot 把工作流、证据、计算与报告组织成一个类型化、版本化、可验证的研究对象；它可以跨工具流转，但不会携带凭据或任意代码。',
+    otFoot: '一个对象，保留研究的结构与证明。',
+    otCta: '探索 .ot 生态',
+    otObjectLabel: '进入 .ot 生态页面',
+    otSignals: ['SCHEMA', '证据', '哈希', '权限'],
     finalKicker: '开源公司研究',
     finalTitle: <>认真地，<br /><em>看得更远。</em></>,
-    finalBody: '下载 Windows 便携版，查看源代码，建立一套会复利的研究习惯。',
+    finalBody: '下载 Windows 便携版，查看源代码，让可验证研究在开放的 .ot 生态中持续流转。',
     finalDownload: '下载 Windows 便携版',
     finalGithub: '阅读源代码',
-    apache: 'Apache License 2.0 · 无账户 · 不连接券商',
+    apache: 'Apache License 2.0 · 不内置模型 · 不连接券商',
     disclaimer: 'OpenThesis 是研究工具，不构成投资建议。不执行交易，也不承诺收益。',
     menu: '打开菜单', close: '关闭菜单',
     proof: ['官方披露', '确定性财务', '专注 Agent'],
     capabilities: '完整工作台',
-    capabilitiesBody: '除了上面六段故事，完整工作台还提供这些能力。',
+    capabilitiesBody: '除了上面的滚动故事，完整工作台还提供这些能力。',
     capabilityGroups: [
       { title: '市场与来源', items: ['SEC EDGAR + XBRL', 'A 股官方披露', '港交所披露易', '发行人 / 证券身份'] },
-      { title: '研究系统', items: ['七个专业 Agent', '第二模型对比', '最多两个 Agent 并行', '可导入 .othesis 模块'] },
+      { title: '研究系统', items: ['七个专业 Agent', '可复用模型组合', '统一模型中心', 'OT 创作工作室与 .ot 生态'] },
       { title: '报告与历史', items: ['技术证据详情', 'HTML / Markdown / 文本导出', '90–130% 报告缩放', '追加式论点版本'] },
-      { title: '安全边界', items: ['本地优先历史', '会话级 API Key', '用户批准的识图兜底', '金融机构 Beta 路径'] }
+      { title: '安全边界', items: ['系统凭据库', '.ot 不携带秘密', 'Connector 明确授权', '不静默切换付费模型'] }
     ]
   }
 } as const
@@ -206,6 +220,7 @@ function App() {
       <a className="brand" href="#top" aria-label="OpenThesis home"><span className="brand-mark"><span /></span><span>OpenThesis</span></a>
       <nav className="desktop-nav" aria-label="Primary navigation">
         {navItems.map(([id, label]) => <a href={`#${id}`} key={id}>{label}</a>)}
+        <a href="/ot/">{t.nav.ot}</a>
         <a href="https://github.com/zjy1346/OpenThesis" target="_blank" rel="noreferrer">{t.nav.github}<ExternalLink size={13} /></a>
       </nav>
       <div className="header-actions">
@@ -213,7 +228,7 @@ function App() {
         <a className="header-download" href="https://github.com/zjy1346/OpenThesis/releases/latest" target="_blank" rel="noreferrer">{t.nav.download}<ArrowDownRight size={15} /></a>
         <button className="menu-toggle" onClick={() => setMenuOpen((current) => !current)} aria-expanded={menuOpen} aria-label={menuOpen ? t.close : t.menu}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button>
       </div>
-      {menuOpen && <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.map(([id, label]) => <a href={`#${id}`} onClick={closeMenu} key={id}>{label}<ArrowRight size={16} /></a>)}<a href="https://github.com/zjy1346/OpenThesis" target="_blank" rel="noreferrer">{t.nav.github}<ExternalLink size={16} /></a></nav>}
+      {menuOpen && <nav className="mobile-nav" aria-label="Mobile navigation">{navItems.map(([id, label]) => <a href={`#${id}`} onClick={closeMenu} key={id}>{label}<ArrowRight size={16} /></a>)}<a href="/ot/" onClick={closeMenu}>{t.nav.ot}<ArrowRight size={16} /></a><a href="https://github.com/zjy1346/OpenThesis" target="_blank" rel="noreferrer">{t.nav.github}<ExternalLink size={16} /></a></nav>}
     </header>
 
     <main id="top">
@@ -258,8 +273,22 @@ function App() {
       </section>
 
       <section id="privacy" className="chapter story-scene chapter-local section-shell" aria-labelledby="local-title">
-        <div className="chapter-copy"><p className="eyebrow">{t.localKicker}</p><h2 id="local-title">{t.localTitle}</h2><p>{t.localBody}</p><p className="section-foot">{t.localFoot}</p><div className="privacy-list"><span><KeyRound size={16} /> <b>{language === 'zh' ? '会话级密钥' : 'Session-only keys'}</b><small>{language === 'zh' ? '不写入数据库或日志' : 'Never written to database or logs'}</small></span><span><History size={16} /> <b>{language === 'zh' ? '追加式论点' : 'Append-only thesis'}</b><small>{language === 'zh' ? '每个判断都保留版本' : 'Every judgement keeps a version'}</small></span></div></div>
-        <div className="chapter-stage local-stage"><div className="local-stack"><div className="local-card local-model"><div className="local-card-head"><span><Zap size={15} /> {language === 'zh' ? '模型目录' : 'Model catalog'}</span><span className="online-dot">online</span></div><div className="model-pill"><span className="model-avatar">DS</span><b>DeepSeek</b><small>OpenAI-compatible</small><Check size={15} /></div><div className="model-pill muted"><span className="model-avatar">OT</span><b>Deterministic mode</b><small>{language === 'zh' ? '不调用 AI' : 'No AI calls'}</small><Check size={15} /></div></div><div className="local-card local-history"><div className="local-card-head"><span><Database size={15} /> {language === 'zh' ? '本地历史' : 'Local history'}</span><History size={15} /></div><div className="history-row"><span className="history-date">Apr 28</span><span><b>BYD · 01211.HK</b><small>Research run · official filings</small></span><ArrowRight size={14} /></div><div className="history-row faded"><span className="history-date">Mar 14</span><span><b>AAPL · NASDAQ</b><small>Research run · official filings</small></span><ArrowRight size={14} /></div></div></div><div className="stage-caption"><LockKeyhole size={16} /> {t.localFoot}</div></div>
+        <div className="chapter-copy"><p className="eyebrow">{t.localKicker}</p><h2 id="local-title">{t.localTitle}</h2><p>{t.localBody}</p><p className="section-foot">{t.localFoot}</p><div className="privacy-list"><span><KeyRound size={16} /> <b>{language === 'zh' ? '系统凭据库' : 'OS credential vault'}</b><small>{language === 'zh' ? '不写入 SQLite、日志或 .ot' : 'Never written to SQLite, logs or .ot'}</small></span><span><History size={16} /> <b>{language === 'zh' ? '.ot 不携带秘密' : '.ot carries no secrets'}</b><small>{language === 'zh' ? '只引用本机模型配置与能力' : 'References local model profiles and capabilities only'}</small></span></div></div>
+        <div className="chapter-stage local-stage"><div className="local-stack"><div className="local-card local-model"><div className="local-card-head"><span><Zap size={15} /> {language === 'zh' ? '模型中心' : 'Model Center'}</span><span className="online-dot">ready</span></div><div className="model-pill"><span className="model-avatar">DS</span><b>DeepSeek</b><small>{language === 'zh' ? '已配置连接' : 'Configured connection'}</small><Check size={15} /></div><div className="model-pill muted"><span className="model-avatar">OL</span><b>Ollama</b><small>{language === 'zh' ? '连接已有本地服务' : 'Connect an existing local service'}</small><Check size={15} /></div></div><div className="local-card local-history"><div className="local-card-head"><span><Database size={15} /> {language === 'zh' ? '本地历史' : 'Local history'}</span><History size={15} /></div><div className="history-row"><span className="history-date">Apr 28</span><span><b>BYD · 01211.HK</b><small>Research run · official filings</small></span><ArrowRight size={14} /></div><div className="history-row faded"><span className="history-date">Mar 14</span><span><b>AAPL · NASDAQ</b><small>Research run · official filings</small></span><ArrowRight size={14} /></div></div></div><div className="stage-caption"><LockKeyhole size={16} /> {t.localFoot}</div></div>
+      </section>
+
+      <section id="ot-ecosystem" className="chapter story-scene chapter-ot section-shell" aria-labelledby="ot-summary-title">
+        <div className="chapter-stage ot-summary-stage">
+          <svg className="ot-summary-paths" viewBox="0 0 560 430" aria-hidden="true"><path data-story-path d="M34 86 C148 86 168 166 278 216" /><path data-story-path d="M34 344 C148 344 170 266 278 216" /><path data-story-path d="M526 92 C424 92 388 166 278 216" /><path data-story-path d="M526 338 C424 338 386 264 278 216" /></svg>
+          <a className="ot-summary-object" href="/ot/" aria-label={t.otObjectLabel}>
+            <div className="ot-summary-head"><span className="ot-summary-mark">.ot</span><span>OPEN RESEARCH OBJECT</span><FileCheck2 size={17} /></div>
+            <div className="ot-summary-layers">{['workflow', 'evidence', 'calculations', 'claims', 'report'].map((item, index) => <span key={item} data-ot-summary-layer><i>0{index + 1}</i><b>{item}</b><Check size={13} /></span>)}</div>
+            <div className="ot-summary-verified"><Fingerprint size={15} /><span>SHA256 · VERIFIED</span><ArrowRight size={15} /></div>
+          </a>
+          <div className="ot-summary-signals">{t.otSignals.map((signal) => <span key={signal} data-ot-summary-signal>{signal}</span>)}</div>
+          <div className="stage-caption"><Layers3 size={16} /> {t.otFoot}</div>
+        </div>
+        <div className="chapter-copy"><p className="eyebrow">{t.otKicker}</p><h2 id="ot-summary-title">{t.otTitle}</h2><p>{t.otBody}</p><p className="section-foot">{t.otFoot}</p><a className="button button-quiet ot-summary-cta" href="/ot/">{t.otCta}<ArrowRight size={16} /></a></div>
       </section>
       </div></div>
 

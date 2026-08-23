@@ -1,5 +1,6 @@
 import gsap from 'gsap'
 import { ScrollTrigger } from 'gsap/ScrollTrigger'
+import { mountMobileStoryTimeline } from './mobileStoryTimeline'
 
 gsap.registerPlugin(ScrollTrigger)
 
@@ -7,18 +8,19 @@ export function mountStoryTimeline(root: HTMLElement) {
   const desktopMotion = window.matchMedia('(min-width: 981px) and (prefers-reduced-motion: no-preference)')
   const pin = root.querySelector<HTMLElement>('.story-pin')
   const scenes = gsap.utils.toArray<HTMLElement>('.story-scene', root)
-  if (!pin || scenes.length !== 6) return () => undefined
+  if (!pin || scenes.length !== 7) return () => undefined
+  const teardownMobile = mountMobileStoryTimeline(root, scenes)
 
   let teardown = () => undefined
   const setup = () => {
     teardown()
     if (!desktopMotion.matches) return
     const context = gsap.context(() => {
-      const [market, evidence, agents, workflow, recovery, local] = scenes
+      const [market, evidence, agents, workflow, recovery, local, ot] = scenes
       const hero = document.querySelector<HTMLElement>('.hero')
       const heroPortal = document.querySelector<HTMLElement>('.hero-portal')
       if (hero && heroPortal) gsap.fromTo(heroPortal, { opacity: .88, clipPath: 'inset(0 0 0 0)', transform: 'scale(1.04)' }, { opacity: 0, clipPath: 'inset(0 0 100% 0)', transform: 'scale(.86)', ease: 'none', scrollTrigger: { trigger: hero, start: 'top top', end: 'bottom top', scrub: .8 } })
-      const timeline = gsap.timeline({ defaults: { ease: 'none' }, scrollTrigger: { trigger: root, pin, start: 'top top', end: '+=600%', scrub: .8, anticipatePin: 1, invalidateOnRefresh: true } })
+      const timeline = gsap.timeline({ defaults: { ease: 'none' }, scrollTrigger: { trigger: root, pin, start: 'top top', end: '+=700%', scrub: .8, anticipatePin: 1, invalidateOnRefresh: true } })
       gsap.set(scenes, { autoAlpha: 0, pointerEvents: 'none' })
       gsap.set(market, { autoAlpha: 1, pointerEvents: 'auto' })
       const handoff = (scene: HTMLElement, previous: HTMLElement | null, at: number) => {
@@ -63,6 +65,16 @@ export function mountStoryTimeline(root: HTMLElement) {
       timeline.fromTo(cards[0], { opacity: 0, transform: 'translate3d(52px, 0, 90px) rotateY(-10deg)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) rotateY(0deg)', duration: .48 }, 5.08)
       timeline.fromTo(cards[1], { opacity: 0, transform: 'translate3d(-42px, 14px, -70px) rotateY(9deg)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) rotateY(0deg)', duration: .48 }, 5.28)
       timeline.fromTo(local.querySelector('.privacy-list'), { opacity: 0, transform: 'translate3d(0, 18px, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', duration: .35 }, 5.5)
+
+      handoff(ot, local, 6)
+      const otObject = ot.querySelector<HTMLElement>('.ot-summary-object')
+      const otLayers = ot.querySelectorAll<HTMLElement>('[data-ot-summary-layer]')
+      const otSignals = ot.querySelectorAll<HTMLElement>('[data-ot-summary-signal]')
+      if (otObject) timeline.fromTo(otObject, { opacity: 0, transform: 'translate3d(0, 24px, 0) scale(.96)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', duration: .48 }, 6.08)
+      ot.querySelectorAll<SVGPathElement>('[data-story-path]').forEach((path) => { const length = path.getTotalLength(); gsap.set(path, { strokeDasharray: length, strokeDashoffset: length }); timeline.to(path, { strokeDashoffset: 0, duration: .56 }, 6.12) })
+      timeline.fromTo(otLayers, { opacity: 0, transform: 'translate3d(-18px, 0, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', stagger: .06, duration: .32 }, 6.22)
+      timeline.fromTo(otSignals, { opacity: 0, transform: 'translate3d(0, 12px, 0) scale(.98)' }, { opacity: 1, transform: 'translate3d(0, 0, 0) scale(1)', stagger: .055, duration: .3 }, 6.34)
+      timeline.fromTo(ot.querySelectorAll('.chapter-copy > *'), { opacity: 0, transform: 'translate3d(0, 20px, 0)' }, { opacity: 1, transform: 'translate3d(0, 0, 0)', stagger: .055, duration: .4 }, 6.16)
     }, root)
     const refresh = () => ScrollTrigger.refresh()
     window.addEventListener('resize', refresh)
@@ -72,5 +84,5 @@ export function mountStoryTimeline(root: HTMLElement) {
   setup()
   const onMediaChange = () => setup()
   desktopMotion.addEventListener('change', onMediaChange)
-  return () => { desktopMotion.removeEventListener('change', onMediaChange); teardown() }
+  return () => { desktopMotion.removeEventListener('change', onMediaChange); teardownMobile(); teardown() }
 }
