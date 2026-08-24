@@ -3,8 +3,12 @@ import type {
   Company,
   Language,
   Market,
-  ModelPreset,
   ModelSelection,
+  ModelReference,
+  OtCompileResult,
+  OtDraft,
+  OtSuggestion,
+  OtValidationResult,
   Preferences,
   ResearchJob,
   ResearchPackSummary,
@@ -23,10 +27,10 @@ export const BACKEND_METHODS = [
   "app.bootstrap",
   "settings.update",
   "company.search",
-  "models.catalog",
-  "models.discover",
-  "models.test",
   "packs.install",
+  "ot.validate",
+  "ot.compile",
+  "ot.suggest",
   "thesis.list",
   "thesis.get",
   "thesis.save",
@@ -51,10 +55,10 @@ export type BackendParams = {
     preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market">>;
   };
   "company.search": { query: string; market: Market };
-  "models.catalog": EmptyParams;
-  "models.discover": Omit<ModelSelection, "model"> & { model?: string };
-  "models.test": ModelSelection;
   "packs.install": { filename: string; data_base64: string };
+  "ot.validate": { draft: OtDraft };
+  "ot.compile": { draft: OtDraft };
+  "ot.suggest": { draft: OtDraft; selected_path: string; instruction: string; model: ModelReference };
   "thesis.list": EmptyParams;
   "thesis.get": { thesis_version_id: string };
   "thesis.save": { company_cik: string; content: Record<string, unknown> };
@@ -77,16 +81,10 @@ export type BackendResult = {
   "app.bootstrap": BootstrapResult;
   "settings.update": Preferences;
   "company.search": Company[];
-  "models.catalog": ModelPreset[];
-  "models.discover": {
-    preset_id: string;
-    models: string[];
-    warning: string;
-    endpoint?: string;
-    source?: "online" | "builtin";
-  };
-  "models.test": { ok: boolean; message: string };
   "packs.install": ResearchPackSummary;
+  "ot.validate": OtValidationResult;
+  "ot.compile": OtCompileResult;
+  "ot.suggest": OtSuggestion;
   "thesis.list": ThesisVersion[];
   "thesis.get": ThesisVersion;
   "thesis.save": ThesisVersion;

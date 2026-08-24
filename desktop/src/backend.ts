@@ -3,10 +3,18 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BootstrapResult,
   Company,
-  ModelPreset,
+  ConfiguredModelSummary,
+  DiscoveredModel,
+  ModelReference,
+  OtCompileResult,
+  OtDraft,
+  OtSuggestion,
+  OtValidationResult,
   ModelSelection,
   Market,
   Preferences,
+  ProviderConnectionSummary,
+  ProviderDefinition,
   ResearchJob,
   ResearchReport,
   ResearchRequest,
@@ -52,24 +60,109 @@ export function searchCompanies(query: string, market: Market): Promise<Company[
   return request("company.search", { query, market });
 }
 
-export function discoverModels(params: {
-  preset_id: string;
-  base_url: string;
-  api_key: string;
-}): Promise<{ preset_id: string; models: string[]; warning: string }> {
-  return request("models.discover", params);
+export function listModelProviders(): Promise<ProviderDefinition[]> {
+  return invoke<ProviderDefinition[]>("model_center_list_providers");
 }
 
-export function getModelCatalog(): Promise<ModelPreset[]> {
-  return request("models.catalog", {});
+export function listProviderConnections(): Promise<ProviderConnectionSummary[]> {
+  return invoke<ProviderConnectionSummary[]>("model_center_list_connections");
 }
 
-export function testModelConnection(
-  selection: ModelSelection,
-): Promise<{ ok: boolean; message: string }> {
-  return request("models.test", selection);
+export function saveProviderConnection(input: {
+  connection_id: string;
+  provider_id: string;
+  display_name: string;
+  region: string;
+  endpoint: string;
+  enabled: boolean;
+}): Promise<ProviderConnectionSummary> {
+  return invoke<ProviderConnectionSummary>("model_center_save_connection", { input });
 }
 
+export function setProviderConnectionSecret(
+  connectionId: string,
+  secret: string,
+): Promise<ProviderConnectionSummary> {
+  return invoke<ProviderConnectionSummary>("model_center_set_connection_secret", { connectionId, secret });
+}
+
+export function rotateProviderConnectionSecret(
+  connectionId: string,
+  secret: string,
+): Promise<ProviderConnectionSummary> {
+  return invoke<ProviderConnectionSummary>("model_gateway_rotate_connection_secret", { connectionId, secret });
+}
+
+export function setProviderConnectionEnabled(
+  connectionId: string,
+  enabled: boolean,
+): Promise<ProviderConnectionSummary> {
+  return invoke<ProviderConnectionSummary>("model_center_set_connection_enabled", { connectionId, enabled });
+}
+
+export function deleteProviderConnection(connectionId: string): Promise<void> {
+  return invoke<void>("model_center_delete_connection", { connectionId });
+}
+
+export function listConfiguredModels(): Promise<ConfiguredModelSummary[]> {
+  return invoke<ConfiguredModelSummary[]>("model_center_list_configured_models");
+}
+
+export function saveConfiguredModel(input: {
+  configured_model_id: string;
+  connection_id: string;
+  model_id: string;
+  alias: string;
+  enabled: boolean;
+  capabilities: string[];
+}): Promise<ConfiguredModelSummary> {
+  return invoke<ConfiguredModelSummary>("model_center_save_configured_model", { input });
+}
+
+export function deleteConfiguredModel(configuredModelId: string): Promise<void> {
+  return invoke<void>("model_center_delete_configured_model", { configuredModelId });
+}
+
+export function discoverConnectionModels(connectionId: string): Promise<DiscoveredModel[]> {
+  return invoke<DiscoveredModel[]>("model_gateway_discover_connection", { connectionId });
+}
+
+export function testProviderConnection(connectionId: string, modelId?: string): Promise<{ ok: boolean; message: string }> {
+  return invoke<{ ok: boolean; message: string }>("model_gateway_test_connection", { connectionId, modelId });
+}
+
+export function testConfiguredModel(configuredModelId: string): Promise<{ ok: boolean; message: string }> {
+  return invoke<{ ok: boolean; message: string }>("model_gateway_test_model", { configuredModelId });
+}
+
+export function validateOtDraft(draft: OtDraft): Promise<OtValidationResult> {
+  return request("ot.validate", { draft });
+}
+
+export function compileOtDraft(draft: OtDraft): Promise<OtCompileResult> {
+  return request("ot.compile", { draft });
+}
+
+export function suggestOtPatch(
+  draft: OtDraft,
+  selectedPath: string,
+  instruction: string,
+  model: ModelReference,
+): Promise<OtSuggestion> {
+  return request("ot.suggest", {
+    draft,
+    selected_path: selectedPath,
+    instruction,
+    model,
+  });
+}
+
+export function exportOtPackage(
+  suggestedName: string,
+  dataBase64: string,
+): Promise<boolean> {
+  return invoke<boolean>("export_ot", { suggestedName, dataBase64 });
+}
 export async function installResearchPack(file: File): Promise<ResearchPackSummary> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const chunkSize = 0x8000;
@@ -140,3 +233,4 @@ export function saveThesis(
 ): Promise<ThesisVersion> {
   return request("thesis.save", { company_cik: companyCik, content });
 }
+

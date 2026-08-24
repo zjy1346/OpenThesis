@@ -424,6 +424,246 @@ class ResearchWorkflow:
         if self.cancel_check():
             raise ResearchCancelled()
 
+    def _run_declarative_ot_workflow(
+        self,
+        run: ResearchRun,
+        context: ResearchContext,
+        evidence: list[dict[str, Any]],
+        notify: ProgressCallback,
+    ) -> ResearchRun:
+        """Execute a non-official .ot dependency graph without hidden fixed agents."""
+        raw_steps = self.pack.workflow.get("steps", [])
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise RuntimeError("OT workflow has no executable steps")
+        steps: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for raw_step in raw_steps:
+            if not isinstance(raw_step, dict):
+                raise RuntimeError("OT workflow step is invalid")
+            step_id = str(raw_step.get("id", "")).strip()
+            prompt_path = str(raw_step.get("prompt", "")).strip()
+            role = str(raw_step.get("role", "")).strip()
+            dependencies = raw_step.get("depends_on", [])
+            if (
+                not step_id
+                or step_id in steps
+                or not prompt_path
+                or not role
+                or not isinstance(dependencies, list)
+                or any(not isinstance(item, str) for item in dependencies)
+            ):
+                raise RuntimeError("OT workflow step contract is invalid")
+            steps[step_id] = {
+                **raw_step,
+                "id": step_id,
+                "prompt": prompt_path,
+                "role": role,
+                "depends_on": list(dependencies),
+            }
+            order.append(step_id)
+        if len(steps) > 64:
+            raise RuntimeError("OT workflow exceeds the executable step limit")
+
+        run.workflow_id = f"ot:{self.pack.pack_id}"
+        run.research_configuration["ot_workflow"] = {
+            "schema": self.pack.workflow.get("schema", ""),
+            "step_ids": order,
+            "roles": [steps[step_id]["role"] for step_id in order],
+            "settings": self.pack.workflow.get("settings", {}),
+        }
+        self.storage.save_run(run)
+
+        available = {item["evidence_id"] for item in evidence}
+        remaining = set(order)
+        results: dict[str, dict[str, Any]] = {}
+        verifications: dict[str, dict[str, Any]] = {}
+        total = len(order)
+        completed = 0
+
+        def execute_step(step_id: str) -> tuple[str, dict[str, Any]]:
+            step = steps[step_id]
+            self._check_cancelled()
+            self._set_agent_state(step_id, "running")
+            prior = {
+                dependency: results[dependency]
+                for dependency in step["depends_on"]
+            }
+            output = self._run_agent(
+                step_id,
+                step["prompt"],
+                context.compact_json(),
+                {
+                    "workflow_role": step["role"],
+                    "workflow_settings": self.pack.workflow.get("settings", {}),
+                    "dependency_outputs": prior,
+                },
+            )
+            return step_id, output
+
+        while remaining:
+            ready = [
+                step_id
+                for step_id in order
+                if step_id in remaining
+                and all(dependency in results for dependency in steps[step_id]["depends_on"])
+            ]
+            if not ready:
+                raise RuntimeError("OT workflow dependencies cannot be resolved")
+            batch = ready[:2] if self.parallel_agents else ready[:1]
+            notify(
+                self._progress_text(
+                    "正在执行 .ot 工作流：{completed}/{total}",
+                    completed=completed,
+                    total=total,
+                ),
+                20 + round(completed * 68 / total),
+            )
+            for step_id in batch:
+                self._set_agent_state(step_id, "queued")
+            if len(batch) > 1:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = {executor.submit(execute_step, step_id): step_id for step_id in batch}
+                    completed_batch = []
+                    for future in futures:
+                        try:
+                            completed_batch.append(future.result())
+                        except ResearchCancelled:
+                            self._set_agent_state(futures[future], "cancelled")
+                            raise
+                        except Exception:
+                            self._set_agent_state(futures[future], "failed")
+                            raise
+            else:
+                completed_batch = [execute_step(batch[0])]
+
+            for step_id, output in completed_batch:
+                verification = verify_agent_output(output, available, self.report_language)
+                results[step_id] = output
+                verifications[step_id] = verification
+                remaining.remove(step_id)
+                completed += 1
+                self._save(
+                    run,
+                    "ot-agent-analysis",
+                    str(steps[step_id]["role"]),
+                    {
+                        "step_id": step_id,
+                        "role": steps[step_id]["role"],
+                        "depends_on": steps[step_id]["depends_on"],
+                        "output_schema": steps[step_id].get("output_schema", ""),
+                        "result": output,
+                        "verification": verification,
+                    },
+                    agent_id=step_id,
+                )
+                self._set_agent_state(step_id, "completed")
+
+        sink_ids = [
+            step_id
+            for step_id in order
+            if not any(step_id in steps[other]["depends_on"] for other in order)
+        ]
+        preferred = next(
+            (
+                step_id
+                for step_id in reversed(order)
+                if "synth" in str(steps[step_id]["role"]).lower()
+            ),
+            sink_ids[-1] if sink_ids else order[-1],
+        )
+        final_output = results[preferred]
+        claims = _collect_stage_claims(*results.values())
+        aggregate = verify_agent_output({"claims": claims}, available, self.report_language)
+        issues = list(aggregate["issues"])
+        for step_id in order:
+            for issue in verifications[step_id]["issues"]:
+                labelled = f"{step_id}: {issue}"
+                if labelled not in issues:
+                    issues.append(labelled)
+        aggregate["issues"] = issues
+        aggregate["passed"] = not issues and all(
+            item["passed"] for item in verifications.values()
+        )
+
+        if _REQUIRED_SYNTHESIS_SECTIONS.issubset(final_output):
+            report_payload = final_output
+            synthesis_verification = validate_research_synthesis(
+                final_output, available, self.report_language
+            )
+            synthesis_verification["issues"] = list(dict.fromkeys(
+                [*aggregate["issues"], *synthesis_verification["issues"]]
+            ))
+            synthesis_verification["passed"] = (
+                aggregate["passed"] and not synthesis_verification["issues"]
+            )
+            verification = synthesis_verification
+        else:
+            visible_results = {
+                step_id: {
+                    "role": steps[step_id]["role"],
+                    "output": _presentation_stage_value(results[step_id], remove_claims=False),
+                }
+                for step_id in order
+            }
+            report_payload = {
+                "narrative": "\n\n".join(
+                    f"{step_id} · {item['role']}\n"
+                    + json.dumps(item["output"], ensure_ascii=False, indent=2)
+                    for step_id, item in visible_results.items()
+                ),
+                "workflow_results": visible_results,
+                "claims": claims,
+            }
+            verification = aggregate
+
+        self._save(
+            run,
+            "research-report",
+            self._report_text(".ot 工作流研究报告", ".ot Workflow Research Report"),
+            {
+                "mode": "ot-workflow",
+                "report": report_payload,
+                "verification": verification,
+                "retryable": False,
+                "workflow": {
+                    "pack_id": self.pack.pack_id,
+                    "pack_version": self.pack.version,
+                    "content_identity": self.pack.content_hash,
+                    "selected_output_step": preferred,
+                    "steps": order,
+                },
+            },
+            agent_id=preferred,
+        )
+        if report_payload.get("thesis"):
+            thesis_version = self.storage.save_thesis_version(
+                run.company.cik,
+                {
+                    "thesis": report_payload.get("thesis"),
+                    "claims": report_payload.get("claims", claims),
+                    "invalidation_conditions": report_payload.get("invalidation_conditions", []),
+                    "leading_indicators": report_payload.get("leading_indicators", []),
+                    "unresolved_questions": report_payload.get("unresolved_questions", []),
+                },
+                run_id=run.run_id,
+                created_by=self.model_config.public_id,
+                created_at=utc_now_iso(),
+            )
+            self._save(
+                run,
+                "thesis-snapshot",
+                self._report_text(
+                    f"投资逻辑 v{thesis_version['version']}",
+                    f"Investment Thesis v{thesis_version['version']}",
+                ),
+                thesis_version,
+                agent_id="thesis-versioning",
+            )
+        run.status = RunStatus.COMPLETED if verification["passed"] else RunStatus.PARTIAL
+        run.completed_at = utc_now_iso()
+        self.storage.save_run(run)
+        notify(self._progress_text(".ot 工作流研究完成"), 100)
+        return run
     def run(
         self,
         company: Company,
@@ -432,8 +672,10 @@ class ResearchWorkflow:
         valuation_inputs: dict[str, float] | None = None,
         market_snapshot: dict[str, Any] | None = None,
         progress: ProgressCallback | None = None,
+        reproducibility: dict[str, Any] | None = None,
     ) -> ResearchRun:
         notify = progress or (lambda _message, _percent: None)
+        reproducibility = reproducibility or {}
         profile = facts if isinstance(facts, FinancialProfile) else None
         if profile is not None:
             facts = list(profile.fact_dicts)
@@ -449,6 +691,20 @@ class ResearchWorkflow:
             status=RunStatus.RUNNING,
             report_language=self.report_language,
             market_snapshot=market_snapshot,
+            model_configuration={
+                "configured_model_id": self.model_config.configured_model_id,
+                "configuration_version": self.model_config.configuration_version,
+                "role": self.model_config.role,
+            },
+            research_configuration={
+                **dict(reproducibility.get("research_configuration", {})),
+                "report_language": self.report_language,
+                "parallel_agents": self.parallel_agents,
+                "research_pack_id": self.pack.pack_id,
+                "research_pack_version": self.pack.version,
+                "research_pack_content_identity": self.pack.content_hash,
+            },
+            data_snapshot=dict(reproducibility.get("data_snapshot", {})),
         )
         self.storage.save_run(run)
         try:
@@ -567,6 +823,9 @@ class ResearchWorkflow:
                     100,
                 )
                 return run
+
+            if self.pack.pack_id != "official.long-term-fundamentals":
+                return self._run_declarative_ot_workflow(run, context, evidence, notify)
 
             available = {item["evidence_id"] for item in evidence}
             stage_one = {

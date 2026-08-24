@@ -23,7 +23,7 @@ def run_smoke_test() -> None:
         storage.save_company(DEMO_COMPANY)
         facts = demo_facts()
         storage.save_facts([FinancialFact(**item) for item in facts])
-        config = ModelConfig(provider="none", model="", base_url="")
+        config = ModelConfig()
         workflow = ResearchWorkflow(storage, builtin_pack(), None, config)
         run = workflow.run(DEMO_COMPANY, facts)
         if run.status != RunStatus.PARTIAL:

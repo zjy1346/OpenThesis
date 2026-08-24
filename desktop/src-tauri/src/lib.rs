@@ -1,5 +1,12 @@
 mod backend;
+mod credentials;
+mod model_center;
+mod model_gateway;
+mod provider_registry;
 
+pub use model_gateway::run_model_gateway_stdio;
+
+use base64::Engine as _;
 use std::path::Path;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
@@ -104,6 +111,59 @@ async fn export_report(
 }
 
 #[tauri::command]
+async fn export_ot(
+    app: AppHandle,
+    suggested_name: String,
+    data_base64: String,
+) -> Result<bool, String> {
+    const MAX_OT_BASE64_BYTES: usize = 14 * 1024 * 1024;
+    if data_base64.len() > MAX_OT_BASE64_BYTES {
+        return Err("OT package is too large to export".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|_| "OT package payload is invalid".to_string())?;
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 || !bytes.starts_with(b"PK") {
+        return Err("OT package payload is invalid".to_string());
+    }
+    let mut name = suggested_name
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+        .take(100)
+        .collect::<String>();
+    if !name.to_ascii_lowercase().ends_with(".ot") {
+        name.push_str(".ot");
+    }
+    if name == ".ot" {
+        name = "OpenThesis-package.ot".to_string();
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_title("Export OpenThesis OT package")
+            .set_file_name(name)
+            .add_filter("OpenThesis OT", &["ot"])
+            .blocking_save_file();
+        let Some(selected) = selected else {
+            return Ok(false);
+        };
+        let path = selected
+            .into_path()
+            .map_err(|_| "the selected OT export location is unavailable".to_string())?;
+        if path.extension().and_then(|value| value.to_str()) != Some("ot") {
+            return Err("OT packages must use the .ot extension".to_string());
+        }
+        std::fs::write(path, bytes)
+            .map_err(|_| "the OT package could not be written".to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|_| "the OT export dialog stopped unexpectedly".to_string())?
+}
+#[tauri::command]
 fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     if !is_allowed_external_url(&url) {
         return Err("only secure external links are allowed".to_string());
@@ -115,9 +175,7 @@ fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        content_for_export, is_allowed_external_url, sanitize_export_name,
-    };
+    use super::{content_for_export, is_allowed_external_url, sanitize_export_name};
     use std::path::PathBuf;
 
     #[test]
@@ -153,9 +211,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(backend::BackendState::default())
+        .manage(model_center::ModelCenterState::default())
         .invoke_handler(tauri::generate_handler![
             backend::backend_request,
+            model_center::model_center_list_providers,
+            model_center::model_center_list_connections,
+            model_center::model_center_save_connection,
+            model_center::model_center_set_connection_secret,
+            model_center::model_center_set_connection_enabled,
+            model_center::model_center_delete_connection,
+            model_center::model_center_list_configured_models,
+            model_center::model_center_save_configured_model,
+            model_center::model_center_delete_configured_model,
+            model_gateway::model_gateway_discover_connection,
+            model_gateway::model_gateway_test_model,
+            model_gateway::model_gateway_test_connection,
+            model_gateway::model_gateway_rotate_connection_secret,
             export_report,
+            export_ot,
             open_external_url
         ])
         .run(tauri::generate_context!())

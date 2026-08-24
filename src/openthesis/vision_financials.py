@@ -1,9 +1,8 @@
-"""Opt-in cloud vision fallbacks for failed financial-table extraction.
+"""Bounded vision fallback for approved failed financial pages.
 
-The adapters in this module are deliberately small and side-effect free: all
-payloads are held in memory, credentials are session values, and diagnostics
-contain only stable error codes.  They return candidate facts; the ingestion
-quality gate remains the authority that can accept or quarantine them.
+Configured models stay behind the Rust credential gateway. The separate MinerU
+Flash path is token-free and can run only after an explicit per-run page preview
+approval; neither path exposes long-term credentials to Python.
 """
 
 from __future__ import annotations
@@ -13,15 +12,14 @@ from datetime import date, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
-from pathlib import PurePosixPath
 import re
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-import zipfile
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .providers import ProviderError
 
 
 VISION_MAX_PAGES = 20
@@ -58,11 +56,9 @@ class VisionAdapterError(RuntimeError):
 class VisionFallbackConfig:
     enabled: bool = False
     consent: bool = False
-    provider: str = "mineru_lite"
-    token: str = ""
-    api_key: str = ""
-    endpoint: str = ""
-    model: str = ""
+    provider: str = "configured_model"
+    configured_model_id: str = ""
+    configuration_version: int = 1
     timeout_seconds: float = 60.0
     max_pages: int = VISION_MAX_PAGES
     max_bytes: int = VISION_MAX_BYTES
@@ -79,8 +75,12 @@ class VisionFallbackConfig:
             raise VisionAdapterError("VISION_PAGE_LIMIT")
         if self.max_bytes < 1 or self.max_bytes > VISION_MAX_BYTES:
             raise VisionAdapterError("VISION_SIZE_LIMIT")
-        if self.provider not in {"mineru_lite", "mineru_precision", "custom_vision"}:
+        if self.provider not in {"mineru_flash", "configured_model"}:
             raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
+        if self.provider == "configured_model" and not self.configured_model_id:
+            raise VisionAdapterError("VISION_MODEL_REQUIRED")
+        if not self.require_page_approval or self.approve_upload is None:
+            raise VisionAdapterError("VISION_UPLOAD_APPROVAL_REQUIRED")
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +118,6 @@ class VisionExtractionResult:
 
 VisionResult = VisionExtractionResult
 
-
 @dataclass(frozen=True, slots=True)
 class VisionHttpResponse:
     status: int
@@ -145,15 +144,32 @@ class VisionHttpTransport(Protocol):
 
 
 class UrllibVisionTransport:
-    """Minimal GET/POST/PUT transport; replaceable in tests and desktop builds."""
+    """Small bounded transport used only by the no-token MinerU Flash path."""
+
+    class _HttpsOnlyRedirects(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not str(newurl).startswith("https://"):
+                return None
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def __init__(self) -> None:
+        self._opener = build_opener(self._HttpsOnlyRedirects())
 
     def request(self, method: str, url: str, *, headers=None, body=None, timeout=60.0):
+        if not str(url).startswith("https://"):
+            raise VisionAdapterError("VISION_INSECURE_URL")
         request = Request(url, data=body, headers=dict(headers or {}), method=method)
         try:
-            with urlopen(request, timeout=timeout) as response:
-                return VisionHttpResponse(response.status, response.read(), dict(response.headers.items()))
+            with self._opener.open(request, timeout=timeout) as response:
+                payload = response.read(VISION_MAX_BYTES + 1)
+                if len(payload) > VISION_MAX_BYTES:
+                    raise VisionAdapterError("VISION_SIZE_LIMIT")
+                return VisionHttpResponse(response.status, payload, dict(response.headers.items()))
         except HTTPError as exc:
-            return VisionHttpResponse(exc.code, exc.read(), dict(exc.headers.items()))
+            payload = exc.read(VISION_MAX_BYTES + 1)
+            if len(payload) > VISION_MAX_BYTES:
+                raise VisionAdapterError("VISION_SIZE_LIMIT") from exc
+            return VisionHttpResponse(exc.code, payload, dict(exc.headers.items()))
         except (URLError, TimeoutError, OSError) as exc:
             raise VisionAdapterError("VISION_NETWORK_ERROR") from exc
 
@@ -181,7 +197,7 @@ def _check_request(config: VisionFallbackConfig, pages: Sequence[VisionPageReque
     if sum(len(page.pdf_bytes) for page in pages) > config.max_bytes:
         raise VisionAdapterError("VISION_SIZE_LIMIT")
     summary = {
-        "provider": config.provider,
+        "provider": config.provider if config.provider == "mineru_flash" else config.configured_model_id,
         "pages": tuple(page.original_page for page in pages),
         "total_bytes": sum(len(page.pdf_bytes) for page in pages),
         "document_hashes": tuple(page.content_hash for page in pages),
@@ -191,6 +207,7 @@ def _check_request(config: VisionFallbackConfig, pages: Sequence[VisionPageReque
     approver = config.approve_upload
     if approver is not None and not approver(summary):
         raise VisionAdapterError("VISION_UPLOAD_NOT_APPROVED")
+
 
 
 def _safe_error(response: VisionHttpResponse) -> str:
@@ -236,19 +253,28 @@ def _ensure_business_success(payload: Any) -> None:
         raise VisionAdapterError("VISION_REMOTE_FAILED")
 
 
-class _MineruBase:
-    def __init__(self, transport: VisionHttpTransport | None = None, *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
+class MineruFlashAdapter:
+    """No-token MinerU Flash adapter for approved failed PDF pages only."""
+
+    endpoint = "https://mineru.net/api/v1/agent"
+
+    def __init__(
+        self,
+        transport: VisionHttpTransport | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.transport = transport or UrllibVisionTransport()
         self.sleep = sleep
         self.clock = clock
 
-    def _poll(self, url: str, headers: Mapping[str, str], config: VisionFallbackConfig, cancel_check):
-        url = _https_url(url)
+    def _poll(self, url: str, config: VisionFallbackConfig, cancel_check):
         deadline = self.clock() + max(0.01, config.timeout_seconds)
         while self.clock() < deadline:
             if cancel_check and cancel_check():
                 raise VisionAdapterError("VISION_CANCELLED")
-            response = self.transport.request("GET", url, headers=headers, timeout=config.timeout_seconds)
+            response = self.transport.request("GET", _https_url(url), timeout=config.timeout_seconds)
             if response.status >= 400:
                 raise VisionAdapterError(_safe_error(response))
             payload = response.json()
@@ -260,13 +286,11 @@ class _MineruBase:
             self.sleep(min(2.0, max(0.01, deadline - self.clock())))
         raise VisionAdapterError("VISION_TIMEOUT")
 
-
-class MineruLiteAdapter(_MineruBase):
-    endpoint = "https://mineru.net/api/v1/agent"
-
     def extract(self, company, filing, pages, config, *, cancel_check=None):
         try:
             _check_request(config, pages, filing)
+            if config.provider != "mineru_flash":
+                raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
             facts: list[FinancialFact] = []
             refs: list[EvidenceRef] = []
             for page in pages:
@@ -274,12 +298,18 @@ class MineruLiteAdapter(_MineruBase):
                     raise VisionAdapterError("VISION_CANCELLED")
                 payload = {
                     "file_name": f"failed-page-{page.original_page}.pdf",
-                    "language": (config.language if config.language in {"ch", "en"} else ("ch" if company.market == "CN_A" else "en")),
+                    "language": config.language if config.language in {"ch", "en"} else ("ch" if company.market == "CN_A" else "en"),
                     "enable_table": True,
                     "is_ocr": False,
                     "enable_formula": False,
                 }
-                response = self.transport.request("POST", self.endpoint + "/parse/file", headers={"Content-Type": "application/json"}, body=json.dumps(payload).encode(), timeout=config.timeout_seconds)
+                response = self.transport.request(
+                    "POST",
+                    self.endpoint + "/parse/file",
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(payload).encode("utf-8"),
+                    timeout=config.timeout_seconds,
+                )
                 if response.status >= 400:
                     raise VisionAdapterError(_safe_error(response))
                 data = response.json()
@@ -290,101 +320,43 @@ class MineruLiteAdapter(_MineruBase):
                     raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
-                put = self.transport.request("PUT", file_url, body=page.pdf_bytes, timeout=config.timeout_seconds)
-                if put.status >= 400:
-                    raise VisionAdapterError(_safe_error(put))
-                result = self._poll(self.endpoint + "/parse/" + str(task_id), {}, config, cancel_check)
+                uploaded = self.transport.request("PUT", file_url, body=page.pdf_bytes, timeout=config.timeout_seconds)
+                if uploaded.status >= 400:
+                    raise VisionAdapterError(_safe_error(uploaded))
+                result = self._poll(self.endpoint + "/parse/" + str(task_id), config, cancel_check)
                 markdown_url = _https_url(_json_value(result, "data.markdown_url", "data.result.markdown_url"))
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
-                markdown_response = self.transport.request("GET", markdown_url, timeout=config.timeout_seconds)
-                if markdown_response.status >= 400:
-                    raise VisionAdapterError(_safe_error(markdown_response))
-                candidate = parse_vision_markdown(markdown_response.body.decode("utf-8", errors="strict"), company, filing, (page,))
+                markdown = self.transport.request("GET", markdown_url, timeout=config.timeout_seconds)
+                if markdown.status >= 400:
+                    raise VisionAdapterError(_safe_error(markdown))
+                candidate = parse_vision_markdown(markdown.body.decode("utf-8", errors="strict"), company, filing, (page,))
                 facts.extend(candidate.facts)
                 refs.extend(candidate.evidence)
             if not facts:
                 return VisionExtractionResult((), (), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES")
-            return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_MINERU_LITE_COMPLETED",))
+            return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_MINERU_FLASH_COMPLETED",))
+        except UnicodeDecodeError:
+            return VisionExtractionResult(diagnostics=("VISION_MALFORMED_RESPONSE",), error_code="VISION_MALFORMED_RESPONSE")
         except VisionAdapterError as exc:
             return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
+class GatewayVisionAdapter:
+    """Render failed pages locally, then call only the Rust credential gateway."""
 
-
-class MineruPrecisionAdapter(_MineruBase):
-    endpoint = "https://mineru.net/api/v4"
-
-    def extract(self, company, filing, pages, config, *, cancel_check=None):
-        try:
-            _check_request(config, pages, filing)
-            if not config.token:
-                raise VisionAdapterError("VISION_TOKEN_REQUIRED")
-            headers = {"Authorization": f"Bearer {config.token}", "Content-Type": "application/json"}
-            files = [{"name": f"failed-page-{page.original_page}.pdf", "data_id": f"page-{page.original_page}-{page.content_hash[:12]}"} for page in pages]
-            response = self.transport.request(
-                "POST", self.endpoint + "/file-urls/batch", headers=headers,
-                body=json.dumps({"model_version": "vlm", "enable_table": True, "files": files}).encode(),
-                timeout=config.timeout_seconds,
-            )
-            if response.status >= 400:
-                raise VisionAdapterError(_safe_error(response))
-            payload = response.json()
-            _ensure_business_success(payload)
-            batch_id = _json_value(payload, "batch_id", "data.batch_id", "data.id")
-            urls = _json_value(payload, "data.file_urls")
-            if not batch_id or not isinstance(urls, list) or len(urls) != len(pages):
-                raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
-            for page, item in zip(pages, urls):
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
-                signed = _https_url(item.get("file_url") if isinstance(item, dict) else item)
-                put = self.transport.request("PUT", signed, body=page.pdf_bytes, timeout=config.timeout_seconds)
-                if put.status >= 400:
-                    raise VisionAdapterError(_safe_error(put))
-            result = self._poll(self.endpoint + "/extract-results/batch/" + str(batch_id), headers, config, cancel_check)
-            results = _json_value(result, "data.extract_result")
-            if not isinstance(results, list):
-                raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
-            facts: list[FinancialFact] = []
-            refs: list[EvidenceRef] = []
-            by_id = {f"page-{page.original_page}-{page.content_hash[:12]}": page for page in pages}
-            for item in results:
-                data_id = str(item.get("data_id", "")) if isinstance(item, dict) else ""
-                page = by_id.get(data_id)
-                state = str(item.get("state", item.get("status", ""))).lower() if isinstance(item, dict) else ""
-                if state not in {"done", "success", "succeeded", "completed"}:
-                    raise VisionAdapterError("VISION_REMOTE_FAILED")
-                zip_url = _https_url(item.get("full_zip_url") if isinstance(item, dict) else "")
-                if page is None:
-                    raise VisionAdapterError("VISION_PROVENANCE_MISMATCH")
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
-                archive = self.transport.request("GET", zip_url, timeout=config.timeout_seconds)
-                if archive.status >= 400:
-                    raise VisionAdapterError(_safe_error(archive))
-                markdown = _safe_zip_markdown(archive.body, config.max_bytes)
-                candidate = parse_vision_markdown(markdown, company, filing, (page,))
-                facts.extend(candidate.facts)
-                refs.extend(candidate.evidence)
-            if not facts:
-                return VisionExtractionResult((), (), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES")
-            return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_MINERU_PRECISION_COMPLETED",))
-        except VisionAdapterError as exc:
-            return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
-
-
-class CustomVisionAdapter:
-    def __init__(self, transport: VisionHttpTransport | None = None, *, image_renderer: Callable[[bytes], bytes] | None = None):
-        self.transport = transport or UrllibVisionTransport()
+    def __init__(
+        self,
+        provider: Any,
+        *,
+        image_renderer: Callable[[bytes], bytes] | None = None,
+    ):
+        self.provider = provider
         self.image_renderer = image_renderer or default_pdf_to_png
 
     def extract(self, company, filing, pages, config, *, cancel_check=None):
         try:
             _check_request(config, pages, filing)
-            if not config.endpoint.startswith("https://"):
-                raise VisionAdapterError("VISION_HTTPS_REQUIRED")
-            if not config.model or not config.api_key:
-                raise VisionAdapterError("VISION_CREDENTIALS_REQUIRED")
-            import base64
+            if not config.configured_model_id:
+                raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
             facts: list[FinancialFact] = []
             refs: list[EvidenceRef] = []
             diagnostics: list[str] = []
@@ -394,31 +366,45 @@ class CustomVisionAdapter:
                 image = self.image_renderer(page.pdf_bytes)
                 if not image:
                     raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
-                payload = {
-                    "model": config.model,
-                    "messages": [{"role": "user", "content": [{"type": "text", "text": f"Return JSON only: {{facts:[{{concept,value,currency,unit_scale,statement,scope,period_end,original_page,raw_text}}]}}. Use only original_page {page.original_page}, consolidated scope, and the requested period."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(image).decode("ascii")}}]}],
-                    "temperature": 0,
-                }
-                response = self.transport.request("POST", config.endpoint, headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}, body=json.dumps(payload).encode(), timeout=config.timeout_seconds)
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
-                if response.status >= 400:
-                    raise VisionAdapterError(_safe_error(response))
-                parsed = response.json()
-                content = _json_value(parsed, "choices.0.message.content", "content")
-                if not isinstance(content, str):
-                    raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
+                prompt = (
+                    "Return JSON only with this shape: "
+                    "{facts:[{concept,value,currency,unit_scale,statement,scope,"
+                    "period_end,original_page,raw_text}]}. "
+                    f"Use only original_page {page.original_page}; prefer consolidated "
+                    "scope, preserve the stated period and currency, and omit uncertain values."
+                )
                 try:
-                    structured = json.loads(content)
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise VisionAdapterError("VISION_STRUCTURED_JSON_REQUIRED") from exc
+                    structured = self.provider.generate_vision(
+                        "Extract candidate financial facts from one approved filing page. "
+                        "Do not infer missing values or use outside knowledge.",
+                        prompt,
+                        image,
+                    )
+                except ProviderError as exc:
+                    if exc.code == "MODEL_TIMEOUT":
+                        raise VisionAdapterError("VISION_TIMEOUT") from exc
+                    if exc.code in {"MODEL_UNAUTHORIZED", "MODEL_CREDENTIAL_MISSING"}:
+                        raise VisionAdapterError("VISION_UNAUTHORIZED") from exc
+                    if exc.code == "MODEL_RATE_LIMITED":
+                        raise VisionAdapterError("VISION_RATE_LIMITED") from exc
+                    raise VisionAdapterError("VISION_MODEL_ERROR") from exc
+                structured.pop("_response_meta", None)
                 candidate = parse_vision_json(structured, company, filing, (page,))
                 facts.extend(candidate.facts)
                 refs.extend(candidate.evidence)
                 diagnostics.extend(candidate.diagnostics)
             if not facts:
-                return VisionExtractionResult((), (), tuple(diagnostics) or ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES")
-            return VisionExtractionResult(tuple(facts), tuple(refs), tuple(diagnostics) + ("VISION_CUSTOM_COMPLETED",))
+                return VisionExtractionResult(
+                    (),
+                    (),
+                    tuple(diagnostics) or ("VISION_NO_CANDIDATES",),
+                    "VISION_NO_CANDIDATES",
+                )
+            return VisionExtractionResult(
+                tuple(facts),
+                tuple(refs),
+                tuple(diagnostics) + ("VISION_MODEL_GATEWAY_COMPLETED",),
+            )
         except VisionAdapterError as exc:
             return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
 
@@ -451,43 +437,6 @@ def default_pdf_to_png(pdf_bytes: bytes) -> bytes:
         raise
     except Exception as exc:
         raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED") from exc
-
-
-def _safe_zip_markdown(data: bytes, max_bytes: int) -> str:
-    if len(data) > max_bytes:
-        raise VisionAdapterError("VISION_SIZE_LIMIT")
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as archive:
-            infos = archive.infolist()
-            total_uncompressed = 0
-            for info in infos:
-                if info.flag_bits & 0x1:
-                    raise VisionAdapterError("VISION_ENCRYPTED_ARCHIVE")
-                if info.file_size > max_bytes:
-                    raise VisionAdapterError("VISION_SIZE_LIMIT")
-                total_uncompressed += info.file_size
-                if total_uncompressed > max_bytes:
-                    raise VisionAdapterError("VISION_SIZE_LIMIT")
-                if info.compress_size and info.file_size / max(1, info.compress_size) > 100:
-                    raise VisionAdapterError("VISION_COMPRESSION_RATIO")
-            names = [PurePosixPath(info.filename) for info in infos]
-            if any(path.is_absolute() or ".." in path.parts or "\\" in str(path) for path in names):
-                raise VisionAdapterError("VISION_UNSAFE_ARCHIVE")
-            markdown_names = [path for path in names if path.name.lower() in {"full.md", "full.markdown"}]
-            if not markdown_names:
-                raise VisionAdapterError("VISION_MARKDOWN_MISSING")
-            info = next(item for item in infos if item.filename == str(markdown_names[0]))
-            if info.file_size > max_bytes:
-                raise VisionAdapterError("VISION_SIZE_LIMIT")
-            with archive.open(info, "r") as stream:
-                raw = stream.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                raise VisionAdapterError("VISION_SIZE_LIMIT")
-            return raw.decode("utf-8", errors="strict")
-    except VisionAdapterError:
-        raise
-    except (zipfile.BadZipFile, UnicodeError, KeyError) as exc:
-        raise VisionAdapterError("VISION_MALFORMED_ARCHIVE") from exc
 
 
 def parse_vision_markdown(

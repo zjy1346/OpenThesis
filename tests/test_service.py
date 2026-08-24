@@ -7,7 +7,6 @@ import tempfile
 import threading
 import time
 import unittest
-import zipfile
 from pathlib import Path
 
 from openthesis.demo import demo_facts
@@ -20,10 +19,10 @@ from openthesis.domain import (
     RunStatus,
     utc_now_iso,
 )
-from openthesis.model_catalog import ModelDiscoveryError
 from openthesis.markets import build_company
 from openthesis.market_data import MarketDataError
-from openthesis.service import AppService, PreferenceValidationError, _latest_sec_verified_group, _market_snapshot, _request_secrets, _ResearchJob
+from openthesis.ot import compile_studio_draft, minimal_studio_draft
+from openthesis.service import AppService, PreferenceValidationError, _latest_sec_verified_group, _market_snapshot, _request_secrets, _vision_config_from_request, _ResearchJob
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
 from openthesis.market_financials import FinancialValidation, ValidationStatus
 
@@ -120,7 +119,7 @@ class AppServiceTests(unittest.TestCase):
                 "mode": "company",
                 "company": company.to_dict(),
                 "download_filings": True,
-                "model": {"preset_id": "none"},
+                "model": {},
             })
             self.assertTrue(download_entered.wait(timeout=2), "download did not start")
             downloading = service.get_research_status(started["job_id"])
@@ -160,7 +159,7 @@ class AppServiceTests(unittest.TestCase):
             service._update_job(job, percent=100)
             self.assertEqual(job.percent, 100)
 
-    def test_vision_requires_consent_and_clears_session_secret(self) -> None:
+    def test_vision_requires_consent_without_accepting_session_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             factory_calls = []
             service = AppService(
@@ -169,10 +168,18 @@ class AppServiceTests(unittest.TestCase):
             )
             request = {
                 "mode": "demo",
-                "model": {"preset_id": "none"},
-                "vision_fallback": {"enabled": True, "consent": False, "provider": "mineru_lite", "token": "session-secret"},
+                "model": {},
+                "vision_fallback": {
+                    "enabled": True,
+                    "consent": False,
+                    "model": {
+                        "configured_model_id": "test.vision",
+                        "configuration_version": 2,
+                        "role": "vision",
+                    },
+                },
             }
-            self.assertEqual(_request_secrets(request), ("session-secret",))
+            self.assertEqual(_request_secrets(request), ())
             job = service.start_research(request)
             deadline = time.time() + 3
             status = service.get_research_status(job["job_id"])
@@ -181,15 +188,42 @@ class AppServiceTests(unittest.TestCase):
                 status = service.get_research_status(job["job_id"])
             self.assertEqual(status["error_code"], "VISION_CONSENT_REQUIRED")
             self.assertEqual(factory_calls, [])
-            self.assertEqual(request["vision_fallback"]["token"], "")
 
+    def test_mineru_flash_request_has_no_secret_or_model_and_forces_page_approval(self) -> None:
+        config = _vision_config_from_request({
+            "enabled": True,
+            "consent": True,
+            "provider": "mineru_flash",
+            "require_page_approval": True,
+        })
+        self.assertIsNotNone(config)
+        self.assertEqual(config.provider, "mineru_flash")
+        self.assertEqual(config.configured_model_id, "")
+        self.assertTrue(config.require_page_approval)
+        self.assertFalse(hasattr(config, "token"))
+        self.assertFalse(hasattr(config, "api_key"))
+
+        for secret_name in ("token", "api_key", "endpoint", "model_id"):
+            with self.subTest(secret_name=secret_name):
+                with self.assertRaises(ValueError):
+                    _vision_config_from_request({
+                        "enabled": True,
+                        "consent": True,
+                        "provider": "mineru_flash",
+                        "require_page_approval": True,
+                        secret_name: "must-not-enter-python",
+                    })
+        with self.assertRaises(ValueError):
+            _vision_config_from_request({"enabled": True, "consent": True, "provider": "mineru_flash", "require_page_approval": False})
+
+            self.assertNotIn("api_key", json.dumps(request))
     def test_vision_decision_is_sidecar_safe_and_snapshot_hides_sensitive_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
             job = _ResearchJob("vision-job")
             job.stage = "vision-approval"
             job.vision_approval_pending = True
-            job.vision_upload_preview = {"provider": "mineru_lite", "pages": (3,), "total_bytes": 10, "source_document": "annual.pdf", "filing_hash": "abc"}
+            job.vision_upload_preview = {"provider": "mineru_flash", "pages": (3,), "total_bytes": 10, "source_document": "annual.pdf", "filing_hash": "abc"}
             with service._jobs_lock:
                 service._jobs[job.job_id] = job
             snapshot = service.vision_decision(job.job_id, True)
@@ -240,7 +274,7 @@ class AppServiceTests(unittest.TestCase):
             )
             started = service.start_research({
                 "mode": "company", "company": company.to_dict(), "download_filings": True,
-                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+                "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
             })
             deadline = time.monotonic() + 5
             status = started
@@ -292,7 +326,7 @@ class AppServiceTests(unittest.TestCase):
             )
             started = service.start_research({
                 "mode": "company", "company": company.to_dict(), "download_filings": True,
-                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+                "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
             })
             deadline = time.monotonic() + 5
             status = started
@@ -348,7 +382,7 @@ class AppServiceTests(unittest.TestCase):
             )
             started = service.start_research({
                 "mode": "company", "company": company.to_dict(), "download_filings": True,
-                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+                "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
             })
             deadline = time.monotonic() + 5
             status = started
@@ -428,7 +462,7 @@ class AppServiceTests(unittest.TestCase):
             )
             started = service.start_research({
                 "mode": "company", "company": company.to_dict(), "download_filings": True,
-                "model": {"preset_id": "custom", "model": "test", "base_url": "https://example.test/v1", "api_key": "session"},
+                "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
             })
             deadline = time.monotonic() + 5
             status = started
@@ -495,12 +529,7 @@ class AppServiceTests(unittest.TestCase):
                     "mode": "company",
                     "company": company.to_dict(),
                     "download_filings": True,
-                    "model": {
-                        "preset_id": "custom",
-                        "model": "test-model",
-                        "base_url": "https://example.test/v1",
-                        "api_key": "session-only",
-                    },
+                    "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
                 }
             )
 
@@ -593,12 +622,7 @@ class AppServiceTests(unittest.TestCase):
                     "mode": "company",
                     "company": company.to_dict(),
                     "download_filings": True,
-                    "model": {
-                        "preset_id": "custom",
-                        "model": "test-model",
-                        "base_url": "https://example.test/v1",
-                        "api_key": "session-only",
-                    },
+                    "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
                 }
             )
             deadline = time.monotonic() + 5
@@ -632,12 +656,7 @@ class AppServiceTests(unittest.TestCase):
                 {
                     "mode": "company",
                     "company": company.to_dict(),
-                    "model": {
-                        "preset_id": "custom",
-                        "model": "test-model",
-                        "base_url": "https://example.test/v1",
-                        "api_key": "session-only",
-                    },
+                    "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
                 }
             )
 
@@ -659,7 +678,7 @@ class AppServiceTests(unittest.TestCase):
 
             result = service.bootstrap()
 
-            self.assertEqual(result["contract_version"], "1.0")
+            self.assertEqual(result["contract_version"], "2.0")
             self.assertEqual(result["app_version"], "1.0.0-alpha.1")
             self.assertIn(result["preferences"]["ui_language"], {"zh-CN", "zh-Hant", "en"})
             self.assertEqual(result["preferences"]["ui_language_mode"], "system")
@@ -823,12 +842,7 @@ class AppServiceTests(unittest.TestCase):
             started = service.start_research(
                 {
                     "mode": "demo",
-                    "model": {
-                        "preset_id": "custom",
-                        "model": "blocking",
-                        "base_url": "https://example.test/v1",
-                        "api_key": "session-only",
-                    },
+                    "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
                 }
             )
             self.assertIn("agent_states", started)
@@ -849,31 +863,12 @@ class AppServiceTests(unittest.TestCase):
                 time.sleep(0.01)
                 status = service.get_research_status(started["job_id"])
 
-    def test_model_timeout_is_forwarded_to_provider(self) -> None:
-        seen: dict[str, int] = {}
-
-        class Provider:
-            def test_connection(self) -> str:
-                return "connected"
-
-        def provider_factory(config):
-            seen["timeout"] = config.timeout_seconds
-            return Provider()
-
+    def test_python_service_has_no_model_connection_or_discovery_entrypoints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), provider_factory=provider_factory)
-            result = service.test_model_connection(
-                {
-                    "preset_id": "custom",
-                    "model": "timeout-model",
-                    "base_url": "https://example.test/v1",
-                    "api_key": "session-only",
-                    "timeout_seconds": 300,
-                }
-            )
-            self.assertTrue(result["ok"])
-            self.assertEqual(seen["timeout"], 300)
-
+            service = AppService(Path(directory))
+            self.assertFalse(hasattr(service, "test_model_connection"))
+            self.assertFalse(hasattr(service, "discover_models_for_session"))
+            self.assertFalse(hasattr(service, "model_catalog"))
     def test_unknown_research_job_is_not_found(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
@@ -881,34 +876,17 @@ class AppServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(KeyError, "research job not found"):
                 service.get_research_status("missing")
 
-    def test_bootstrap_exposes_common_companies_models_and_research_packs(self) -> None:
+    def test_bootstrap_exposes_common_companies_and_ot_packs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
-
             result = service.bootstrap()
-
             self.assertIn("company.search", result["capabilities"])
-            self.assertIn("models.discover", result["capabilities"])
+            self.assertIn("ot.compile", result["capabilities"])
+            self.assertNotIn("models.discover", result["capabilities"])
+            self.assertNotIn("model_catalog", result)
             self.assertEqual(result["common_companies"][0]["ticker"], "AAPL")
-            preset_ids = {item["preset_id"] for item in result["model_catalog"]}
-            self.assertEqual(
-                preset_ids,
-                {
-                    "none",
-                    "deepseek",
-                    "qwen",
-                    "kimi",
-                    "kimi-global",
-                    "glm",
-                    "openai",
-                    "gemini",
-                    "openrouter",
-                    "ollama",
-                    "custom",
-                },
-            )
             self.assertTrue(result["research_packs"])
-
+            self.assertTrue(all(item["content_hash"] for item in result["research_packs"]))
     def test_company_search_uses_saved_sec_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory), sec_client_factory=_FakeSecClient)
@@ -950,64 +928,12 @@ class AppServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "as-of date"):
             _market_snapshot({"price": 1}, company)
 
-    def test_model_discovery_merges_recommendations_without_retaining_key(self) -> None:
-        seen: dict[str, str] = {}
-
-        def discoverer(preset, base_url: str, api_key: str):
-            seen.update(preset=preset.preset_id, base_url=base_url, api_key=api_key)
-            return ("remote-model", preset.recommended_models[0])
-
+    def test_model_discovery_and_credentials_are_owned_by_rust(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), model_discoverer=discoverer)
-
-            result = service.discover_models_for_session(
-                {"preset_id": "deepseek", "api_key": "sk-session-only"}
-            )
-
-            self.assertEqual(result["models"][0], "deepseek-v4-pro")
-            self.assertIn("remote-model", result["models"])
-            self.assertEqual(seen["api_key"], "sk-session-only")
-            self.assertNotIn("sk-session-only", str(service.bootstrap()))
-            self.assertNotIn("sk-session-only", str(service.__dict__))
-
-    def test_model_discovery_failure_keeps_recommended_models(self) -> None:
-        def failing_discoverer(*_args, **_kwargs):
-            raise ModelDiscoveryError("catalog unavailable")
-
-        with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), model_discoverer=failing_discoverer)
-
-            result = service.discover_models_for_session(
-                {"preset_id": "openai", "api_key": "secret"}
-            )
-
-            self.assertEqual(result["models"][0], "gpt-5.6-terra")
-            self.assertEqual(result["warning"], "catalog unavailable")
-            self.assertNotIn("secret", str(result))
-
-    def test_legacy_kimi_endpoint_selects_matching_region_preset(self) -> None:
-        seen: dict[str, str] = {}
-
-        def discoverer(preset, base_url: str, api_key: str):
-            seen.update(preset=preset.preset_id, base_url=base_url)
-            return ("kimi-k2.7-code",)
-
-        with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), model_discoverer=discoverer)
-            result = service.discover_models_for_session(
-                {
-                    "preset_id": "kimi",
-                    "base_url": "https://api.moonshot.ai/v1",
-                    "api_key": "session-only",
-                }
-            )
-
-            self.assertEqual(seen, {
-                "preset": "kimi-global",
-                "base_url": "https://api.moonshot.ai/v1",
-            })
-            self.assertIn("kimi-k2.7-code", result["models"])
-
+            service = AppService(Path(directory))
+            self.assertFalse(hasattr(service, "discover_models_for_session"))
+            self.assertNotIn("models.discover", service.hello()["capabilities"])
+            self.assertNotIn("models.catalog", service.hello()["capabilities"])
     def test_real_company_research_uses_sec_data_and_produces_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory), sec_client_factory=_FakeSecClient)
@@ -1024,7 +950,7 @@ class AppServiceTests(unittest.TestCase):
                         "exchange": "",
                     },
                     "download_filings": False,
-                    "model": {"preset_id": "none", "api_key": ""},
+                    "model": {},
                 }
             )
 
@@ -1087,105 +1013,51 @@ class AppServiceTests(unittest.TestCase):
                 RunStatus.CANCELLED.value,
             )
 
-    def test_installs_declarative_research_pack_from_protocol_payload(self) -> None:
-        manifest = {
-            "api_version": "openthesis.io/v1alpha1",
-            "kind": "ResearchPack",
-            "metadata": {"id": "service.pack", "name": "Service Pack", "version": "1"},
-            "permissions": {"network": False, "filesystem": False, "execute_code": False},
-        }
-        workflow = {
-            "workflow": {
-                "id": "service",
-                "steps": [{"id": "one", "prompt": "prompts/one.md"}],
-            }
-        }
-        archive = io.BytesIO()
-        with zipfile.ZipFile(archive, "w") as package:
-            package.writestr("manifest.yaml", json.dumps(manifest))
-            package.writestr("workflow.yaml", json.dumps(workflow))
-            package.writestr("prompts/one.md", "Return JSON.")
-
+    def test_installs_declarative_ot_from_protocol_payload(self) -> None:
+        draft = minimal_studio_draft()
+        draft["package"]["id"] = "service.pack"
+        draft["package"]["name"] = "Service Pack"
+        raw, compiled = compile_studio_draft(draft)
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
             installed = service.install_research_pack(
-                "service.othesis", base64.b64encode(archive.getvalue()).decode("ascii")
+                "service.ot", base64.b64encode(raw).decode("ascii")
             )
-
             self.assertEqual(installed["pack_id"], "service.pack")
+            self.assertEqual(installed["content_hash"], compiled.content_identity)
             self.assertTrue(any(pack["pack_id"] == "service.pack" for pack in service.research_packs()))
-
-    def test_model_connection_test_uses_session_key_without_persisting_it(self) -> None:
-        seen: dict[str, str] = {}
-
-        class Provider:
-            def test_connection(self) -> str:
-                return "connected"
-
-        def provider_factory(config):
-            seen["api_key"] = config.api_key
-            return Provider()
-
+    def test_legacy_raw_model_credentials_are_rejected_before_provider_creation(self) -> None:
+        created = []
         with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), provider_factory=provider_factory)
-            result = service.test_model_connection(
-                {
-                    "preset_id": "openai",
-                    "model": "gpt-test",
-                    "base_url": "https://api.example.test/v1",
-                    "api_key": "sk-session-model-test",
-                }
+            service = AppService(
+                Path(directory), provider_factory=lambda config: created.append(config)
             )
-
-            self.assertEqual(result, {"ok": True, "message": "connected"})
-            self.assertEqual(seen["api_key"], "sk-session-model-test")
-            self.assertNotIn("sk-session-model-test", str(service.__dict__))
-
-    def test_model_connection_test_trims_session_key_before_provider(self) -> None:
-        seen: dict[str, str] = {}
-
-        class Provider:
-            def test_connection(self) -> str:
-                return "connected"
-
-        def provider_factory(config):
-            seen["api_key"] = config.api_key
-            return Provider()
-
-        with tempfile.TemporaryDirectory() as directory:
-            service = AppService(Path(directory), provider_factory=provider_factory)
-            service.test_model_connection(
-                {
-                    "preset_id": "kimi",
-                    "model": "kimi-k3",
-                    "base_url": "https://api.moonshot.ai/v1",
-                    "api_key": " platform-key\n",
-                }
-            )
-
-            self.assertEqual(seen["api_key"], "platform-key")
-
-    def test_model_comparison_requires_two_enabled_models(self) -> None:
+            with self.assertRaisesRegex(ValueError, "legacy model configuration"):
+                service.start_research({
+                    "mode": "demo",
+                    "model": {
+                        "provider": "openai",
+                        "model": "gpt-test",
+                        "base_url": "https://api.example.test/v1",
+                        "api_key": "must-not-enter-python",
+                    },
+                })
+            self.assertEqual(created, [])
+            self.assertNotIn("must-not-enter-python", str(service.__dict__))
+    def test_model_comparison_requires_configured_unique_comparison_models(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
-
-            with self.assertRaisesRegex(
-                ValueError, "both models require an enabled provider"
-            ):
-                service.start_research(
-                    {
-                        "mode": "demo",
-                        "model": {"preset_id": "none"},
-                        "compare_enabled": True,
-                        "comparison_model": {
-                            "preset_id": "custom",
-                            "model": "comparison-model",
-                            "base_url": "https://api.example.test/v1",
-                            "api_key": "session-only",
-                        },
-                    }
-                )
-
+            with self.assertRaisesRegex(ValueError, "comparison_models must contain between one and four models"):
+                service.start_research({
+                    "mode": "demo",
+                    "model": {
+                        "configured_model_id": "test.primary",
+                        "configuration_version": 1,
+                        "role": "primary",
+                    },
+                    "compare_enabled": True,
+                    "comparison_models": [],
+                })
     def test_sec_latest_invalid_group_does_not_fallback_to_prior_year(self) -> None:
         company = build_company("AAPL", "Apple")
 

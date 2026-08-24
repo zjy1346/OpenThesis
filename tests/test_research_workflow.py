@@ -8,7 +8,8 @@ from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
 from openthesis.domain import FinancialFact, RunStatus
-from openthesis.packs import builtin_pack
+from openthesis.ot import compile_studio_draft, minimal_studio_draft
+from openthesis.packs import builtin_pack, load_pack
 from openthesis.markets import build_company
 from openthesis.providers import ModelConfig, ProviderError
 from openthesis.research import ResearchCancelled, ResearchWorkflow
@@ -35,6 +36,75 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_compiled_custom_ot_executes_its_own_dependency_graph(self) -> None:
+        class OtProvider:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(
+                self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True
+            ) -> dict[str, object]:
+                self.assertTrue(json_mode)
+                agent = str(json.loads(user_prompt).get("agent", ""))
+                self.calls.append(agent)
+                return {
+                    "executive_summary": "Custom OT workflow output.",
+                    "business_model": "Bounded by supplied evidence.",
+                    "financial_quality": "Deterministic calculations remain separate.",
+                    "competitive_position": "Requires additional evidence.",
+                    "growth_opportunities": ["Evidence-bounded scenario"],
+                    "counterarguments": ["The evidence set is synthetic."],
+                    "scenarios": ["Continue monitoring."],
+                    "thesis": "Custom OT thesis, not investment advice.",
+                    "invalidation_conditions": ["Contradicting evidence appears."],
+                    "leading_indicators": ["Evidence coverage"],
+                    "unresolved_questions": ["How does broader evidence change the result?"],
+                    "claims": [{
+                        "text": "Further interpretation is required.",
+                        "kind": "inference",
+                        "confidence": 0.5,
+                        "evidence_ids": [],
+                    }],
+                }
+
+            @staticmethod
+            def assertTrue(value: bool) -> None:
+                if not value:
+                    raise AssertionError("structured output must be enabled")
+
+        raw, _ = compile_studio_draft(minimal_studio_draft())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package_path = root / "custom.ot"
+            package_path.write_bytes(raw)
+            storage = Storage(root / "data")
+            storage.save_company(DEMO_COMPANY)
+            provider = OtProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                load_pack(package_path),
+                provider,
+                ModelConfig(configured_model_id="test.ot", role="primary"),
+                report_language="en",
+                parallel_agents=True,
+            )
+
+            run = workflow.run(DEMO_COMPANY, demo_facts())
+
+            self.assertEqual(run.status, RunStatus.COMPLETED)
+            self.assertEqual(provider.calls, ["company-analysis", "verification"])
+            artifacts = storage.get_artifacts(run.run_id)
+            ot_steps = [item for item in artifacts if item["artifact_type"] == "ot-agent-analysis"]
+            self.assertEqual([item["content"]["step_id"] for item in ot_steps], provider.calls)
+            report = next(item for item in artifacts if item["artifact_type"] == "research-report")
+            self.assertEqual(report["content"]["mode"], "ot-workflow")
+            self.assertEqual(report["content"]["workflow"]["pack_id"], "my.company-research")
+            self.assertTrue(report["content"]["verification"]["passed"])
+            self.assertEqual(run.research_configuration["ot_workflow"]["step_ids"], provider.calls)
+
     def test_growth_empty_response_retries_once_and_can_be_retried_in_isolation(self) -> None:
         class GrowthRetryProvider:
             def __init__(self) -> None:
@@ -108,11 +178,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
                 report_language="en",
             )
 
@@ -152,7 +218,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             storage.save_company(DEMO_COMPANY)
             facts = demo_facts()
             storage.save_facts([FinancialFact(**item) for item in facts])
-            config = ModelConfig(provider="none", model="", base_url="")
+            config = ModelConfig()
             workflow = ResearchWorkflow(storage, builtin_pack(), None, config)
             run = workflow.run(DEMO_COMPANY, facts)
             self.assertEqual(run.status, RunStatus.PARTIAL)
@@ -165,7 +231,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             storage = Storage(Path(directory))
             company = build_company("600036.SH", "招商银行")
             storage.save_company(company)
-            config = ModelConfig(provider="none", model="", base_url="")
+            config = ModelConfig()
             workflow = ResearchWorkflow(storage, builtin_pack(), None, config)
 
             run = workflow.run(
@@ -196,7 +262,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 None,
-                ModelConfig(provider="none", model="", base_url=""),
+                ModelConfig(),
             )
 
             run = workflow.run(
@@ -263,11 +329,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             facts = demo_facts()
             storage.save_facts([FinancialFact(**item) for item in facts])
             provider = FakeProvider()
-            config = ModelConfig(
-                provider="openai-compatible",
-                model="fake",
-                base_url="https://example.test/v1",
-            )
+            config = ModelConfig(configured_model_id="test.fake", role="primary")
             workflow = ResearchWorkflow(storage, builtin_pack(), provider, config)
             progress: list[tuple[str, int]] = []
             run = workflow.run(
@@ -351,11 +413,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
             )
 
             run = workflow.run(DEMO_COMPANY, demo_facts())
@@ -425,7 +483,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(provider="openai-compatible", model="fake", base_url="https://example.test/v1"),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
             )
             run = workflow.run(DEMO_COMPANY, demo_facts())
             self.assertEqual(run.status, RunStatus.PARTIAL)
@@ -448,11 +506,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             storage = Storage(Path(directory))
             storage.save_company(DEMO_COMPANY)
             facts = demo_facts()
-            config = ModelConfig(
-                provider="openai-compatible",
-                model="failing",
-                base_url="https://example.test/v1",
-            )
+            config = ModelConfig(configured_model_id="test.failing", role="primary")
             workflow = ResearchWorkflow(
                 storage, builtin_pack(), FailingProvider(), config
             )
@@ -485,11 +539,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
                 report_language="en",
                 ui_language="en",
             )
@@ -540,11 +590,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
                 report_language="zh-Hant",
                 ui_language="zh-Hant",
             )
@@ -604,11 +650,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     storage,
                     builtin_pack(),
                     provider,
-                    ModelConfig(
-                        provider="openai-compatible",
-                        model="fake",
-                        base_url="https://example.test/v1",
-                    ),
+                    ModelConfig(configured_model_id="test.fake", role="primary"),
                     parallel_agents=parallel,
                 )
                 workflow.run(DEMO_COMPANY, demo_facts())
@@ -673,11 +715,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
                 parallel_agents=True,
             )
 
@@ -716,11 +754,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage,
                 builtin_pack(),
                 provider,
-                ModelConfig(
-                    provider="openai-compatible",
-                    model="fake",
-                    base_url="https://example.test/v1",
-                ),
+                ModelConfig(configured_model_id="test.fake", role="primary"),
                 cancel_check=lambda: True,
             )
             with self.assertRaises(ResearchCancelled) as caught:

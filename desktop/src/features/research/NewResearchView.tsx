@@ -1,19 +1,18 @@
-import { useRef, useState } from "react";
-import { Building2, ExternalLink, RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Building2, ExternalLink } from "lucide-react";
 
 import {
-  discoverModels,
   installResearchPack,
+  listConfiguredModels,
   openExternalUrl,
   searchCompanies,
-  testModelConnection,
 } from "../../backend";
 import type {
   BootstrapResult,
   Company,
   Market,
-  ModelPreset,
-  ModelSelection,
+  ConfiguredModelSummary,
+  ModelReference,
   Preferences,
   ResearchPackSummary,
   ResearchRequest,
@@ -44,6 +43,7 @@ type ResearchCopy = {
   secRequired: string;
   chooseCompany: string;
   primaryModel: string;
+  modelCenter: string;
   compareModels: string;
   parallelAgents: string;
   parallelAgentsHint: string;
@@ -98,9 +98,10 @@ type ResearchCopy = {
 
 const SEC_DEVELOPER_DOCS = "https://www.sec.gov/search-filings/edgar-application-programming-interfaces";
 
-export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }: {
+export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePreferences, onStart }: {
   bootstrap: BootstrapResult;
   copy: ResearchCopy;
+  onOpenModelCenter: () => void;
   onSavePreferences: (value: Partial<Preferences>) => Promise<Preferences>;
   onStart: (request: ResearchRequest) => Promise<void>;
 }) {
@@ -112,8 +113,10 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   const [results, setResults] = useState<Company[]>([]);
   const [selected, setSelected] = useState<Company | null>(null);
   const [searchError, setSearchError] = useState("");
-  const [primary, setPrimary] = useState<ModelSelection>(() => initialModel(bootstrap));
-  const [comparison, setComparison] = useState<ModelSelection>(() => initialModel(bootstrap));
+  const [configuredModels, setConfiguredModels] = useState<ConfiguredModelSummary[]>([]);
+  const [modelLoadError, setModelLoadError] = useState("");
+  const [primaryModelId, setPrimaryModelId] = useState("");
+  const [comparisonModelIds, setComparisonModelIds] = useState<string[]>([]);
   const [compareEnabled, setCompareEnabled] = useState(false);
   const [parallelAgents, setParallelAgents] = useState(
     bootstrap.preferences.parallel_agents === "true",
@@ -129,18 +132,48 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   const [discountRate, setDiscountRate] = useState("10");
   const [terminalGrowth, setTerminalGrowth] = useState("3");
   const [visionEnabled, setVisionEnabled] = useState(false);
+  const [visionSource, setVisionSource] = useState<"mineru_flash" | "configured_model">("mineru_flash");
   const [visionConsent, setVisionConsent] = useState(false);
-  const [visionProvider, setVisionProvider] = useState<"mineru_lite" | "mineru_precision" | "custom_vision">("mineru_lite");
-  const [visionToken, setVisionToken] = useState("");
-  const [visionEndpoint, setVisionEndpoint] = useState("");
-  const [visionModel, setVisionModel] = useState("");
-  const [visionApiKey, setVisionApiKey] = useState("");
-  const [visionTimeout, setVisionTimeout] = useState(60);
+  const [visionModelId, setVisionModelId] = useState("");
   const marketCatalog = bootstrap.market_catalog ?? [
     { market: "US" as const, label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: SEC_DEVELOPER_DOCS },
   ];
   const marketProfile = marketCatalog.find((item) => item.market === market);
   const requiresSecIdentity = marketProfile?.requires_sec_identity ?? market === "US";
+  const usableModels = useMemo(
+    () => configuredModels.filter((model) => model.enabled && model.health_status === "ready"),
+    [configuredModels],
+  );
+  const visionModels = useMemo(
+    () => usableModels.filter((model) => model.capabilities.includes("vision")),
+    [usableModels],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void listConfiguredModels()
+      .then((items) => {
+        if (cancelled) return;
+        setConfiguredModels(items);
+        const usable = items.filter((model) => model.enabled && model.health_status === "ready");
+        setPrimaryModelId((current) => current || usable[0]?.configured_model_id || "");
+        const vision = usable.find((model) => model.capabilities.includes("vision"));
+        setVisionModelId((current) => current || vision?.configured_model_id || "");
+      })
+      .catch((reason) => {
+        if (!cancelled) setModelLoadError(reason instanceof Error ? reason.message : copy.coreUnavailable);
+      });
+    return () => { cancelled = true; };
+  }, [copy.coreUnavailable]);
+
+  const modelReference = (configuredModelId: string, role: ModelReference["role"]): ModelReference | undefined => {
+    const model = configuredModels.find((item) => item.configured_model_id === configuredModelId);
+    return model ? {
+      configured_model_id: model.configured_model_id,
+      configuration_version: model.configuration_version ?? 1,
+      role,
+    } : undefined;
+  };
 
   const chooseMarket = (next: Market) => {
     setMarket(next);
@@ -175,9 +208,38 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
     }
-    if (visionEnabled && (!visionConsent || (visionProvider === "mineru_precision" && !visionToken.trim()) || (visionProvider === "custom_vision" && (!visionEndpoint.startsWith("https://") || !visionModel.trim() || !visionApiKey.trim())))) {
-      setSearchError(copy.visionMissing);
+    const primary = modelReference(primaryModelId, "primary");
+    if (!primary) {
+      setSearchError(modelLoadError || copy.modelsEmpty);
       return;
+    }
+    const comparisons = compareEnabled
+      ? comparisonModelIds
+          .map((id) => modelReference(id, "comparison"))
+          .filter((item): item is ModelReference => Boolean(item))
+      : [];
+    let visionFallback: ResearchRequest["vision_fallback"];
+    if (visionEnabled) {
+      if (!visionConsent) {
+        setSearchError(copy.visionMissing);
+        return;
+      }
+      if (visionSource === "configured_model") {
+        const vision = modelReference(visionModelId, "vision");
+        if (!vision) {
+          setSearchError(copy.visionMissing);
+          return;
+        }
+        visionFallback = {
+          enabled: true, consent: true, provider: "configured_model", model: vision,
+          require_page_approval: true, language: market === "CN_A" ? "ch" : "en",
+        };
+      } else {
+        visionFallback = {
+          enabled: true, consent: true, provider: "mineru_flash",
+          require_page_approval: true, language: market === "CN_A" ? "ch" : "en",
+        };
+      }
     }
     await onSavePreferences({
       sec_contact_profile: profile,
@@ -191,9 +253,9 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
       download_filings: downloadFilings,
       pack_id: packId,
       model: primary,
-      compare_enabled: compareEnabled,
+      compare_enabled: comparisons.length > 0,
+      comparison_models: comparisons,
       parallel_agents: parallelAgents,
-      ...(compareEnabled ? { comparison_model: comparison } : {}),
       valuation: {
         market_cap_billions: Number(marketCap) || 0,
         discount_rate_percent: Number(discountRate) || 10,
@@ -205,7 +267,7 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
         currency: marketCurrency,
         as_of: marketAsOf,
       },
-      ...(visionEnabled ? { vision_fallback: { enabled: true, consent: visionConsent, provider: visionProvider, require_page_approval: true, timeout_seconds: visionTimeout, language: market === "CN_A" ? "ch" : "en", ...(visionToken ? { token: visionToken } : {}), ...(visionProvider === "custom_vision" ? { endpoint: visionEndpoint, model: visionModel, api_key: visionApiKey } : {}) } } : {}),
+      ...(visionFallback ? { vision_fallback: visionFallback } : {}),
     });
   };
 
@@ -279,11 +341,34 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
 
         <section className="setup-card">
           <span className="step-label">02</span><h3>{copy.primaryModel}</h3>
-          <ModelFields catalog={bootstrap.model_catalog} selection={primary} onChange={setPrimary} copy={copy} />
-          <label className="check-row"><input type="checkbox" checked={compareEnabled} onChange={(event) => setCompareEnabled(event.target.checked)} />{copy.compareModels}</label>
-          <label className="check-row"><input type="checkbox" checked={parallelAgents} onChange={(event) => setParallelAgents(event.target.checked)} />{copy.parallelAgents}</label>
-          <p className="field-caption">{copy.parallelAgentsHint}</p>
-          {compareEnabled && <div className="comparison-fields"><h4>{copy.comparisonModel}</h4><ModelFields catalog={bootstrap.model_catalog} selection={comparison} onChange={setComparison} copy={copy} idPrefix="compare" /></div>}
+          {usableModels.length ? <>
+            <ConfiguredModelPicker
+              id="primary-configured-model"
+              label={copy.primaryModel}
+              models={usableModels}
+              value={primaryModelId}
+              onChange={setPrimaryModelId}
+            />
+            <label className="check-row"><input type="checkbox" checked={compareEnabled} onChange={(event) => setCompareEnabled(event.target.checked)} />{copy.compareModels}</label>
+            {compareEnabled && <fieldset className="comparison-model-picker">
+              <legend>{copy.comparisonModel}</legend>
+              {usableModels.filter((model) => model.configured_model_id !== primaryModelId).map((model) => <label key={model.configured_model_id}>
+                <input
+                  type="checkbox"
+                  checked={comparisonModelIds.includes(model.configured_model_id)}
+                  onChange={(event) => setComparisonModelIds((current) => event.target.checked
+                    ? Array.from(new Set([...current, model.configured_model_id]))
+                    : current.filter((id) => id !== model.configured_model_id))}
+                />
+                <span><strong>{model.alias}</strong><small>{model.model_id}{isFreeModel(model) ? " · Free" : ""}</small></span>
+              </label>)}
+            </fieldset>}
+            <label className="check-row"><input type="checkbox" checked={parallelAgents} onChange={(event) => setParallelAgents(event.target.checked)} />{copy.parallelAgents}</label>
+            <p className="field-caption">{copy.parallelAgentsHint}</p>
+          </> : <div className="model-picker-empty" role="status">
+            <p>{modelLoadError || copy.modelsEmpty}</p>
+            <button className="secondary-button" type="button" onClick={onOpenModelCenter}>{copy.modelCenter}</button>
+          </div>}
         </section>
 
         <section className="setup-card wide-card">
@@ -292,20 +377,26 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
             <label>{copy.researchPack}<select value={packId} onChange={(event) => setPackId(event.target.value)}>{packs.map((pack) => <option value={pack.pack_id} key={pack.pack_id}>{pack.name} · {pack.version}</option>)}</select></label>
             <label className="check-row standalone"><input type="checkbox" checked={downloadFilings} onChange={(event) => setDownloadFilings(event.target.checked)} />{copy.downloadFilings}</label>
           </div>
-          <label className="pack-import">{copy.importPack}<input type="file" accept=".othesis" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
+          <label className="pack-import">{copy.importPack}<input type="file" accept=".ot" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
           <details className="advanced-settings"><summary>{copy.visionFallbackTitle}</summary>
             <p className="field-caption">{copy.visionFallbackBody}</p>
-            <label className="check-row"><input type="checkbox" checked={visionEnabled} onChange={(event) => { const next = event.target.checked; setVisionEnabled(next); if (!next) { setVisionConsent(false); setVisionToken(""); setVisionApiKey(""); setVisionEndpoint(""); setVisionModel(""); } }} />{copy.visionEnable}</label>
-            {visionEnabled && <>
-              <div className="vision-config-grid field-grid two-column">
-                <label>{copy.visionProvider}<select value={visionProvider} onChange={(event) => { setVisionProvider(event.target.value as typeof visionProvider); setVisionToken(""); setVisionApiKey(""); setVisionEndpoint(""); setVisionModel(""); }}><option value="mineru_lite">{copy.visionLiteHint}</option><option value="mineru_precision">{copy.visionPrecisionHint}</option><option value="custom_vision">{copy.visionCustomHint}</option></select></label>
-                <label>{copy.visionTimeout}<select value={visionTimeout} onChange={(event) => setVisionTimeout(Number(event.target.value))}><option value={30}>30s</option><option value={60}>60s</option><option value={120}>120s</option><option value={300}>300s</option></select></label>
-                {visionProvider === "mineru_precision" && <label>{copy.visionToken}<input type="password" value={visionToken} onChange={(event) => setVisionToken(event.target.value)} autoComplete="off" /></label>}
-                {visionProvider === "custom_vision" && <div className="vision-custom-grid field-grid three-column"><label>{copy.visionEndpoint}<input value={visionEndpoint} onChange={(event) => setVisionEndpoint(event.target.value)} /></label><label>{copy.visionModel}<input value={visionModel} onChange={(event) => setVisionModel(event.target.value)} /></label><label>{copy.visionApiKey}<input type="password" value={visionApiKey} onChange={(event) => setVisionApiKey(event.target.value)} autoComplete="off" /></label></div>}
-              </div>
+            <label className="check-row"><input type="checkbox" checked={visionEnabled} onChange={(event) => { setVisionEnabled(event.target.checked); if (!event.target.checked) setVisionConsent(false); }} />{copy.visionEnable}</label>
+            {visionEnabled && <div className="vision-source-panel">
+              <label className="configured-model-picker" htmlFor="vision-source">
+                <span>{copy.visionProvider}</span>
+                <select id="vision-source" value={visionSource} onChange={(event) => setVisionSource(event.target.value as "mineru_flash" | "configured_model")}>
+                  <option value="mineru_flash">{copy.visionToken}</option>
+                  <option value="configured_model" disabled={!visionModels.length}>{copy.visionModel}</option>
+                </select>
+              </label>
+              <p className="field-caption">{visionSource === "mineru_flash" ? copy.visionLiteHint : copy.visionPrecisionHint}</p>
+              {visionSource === "configured_model" && (visionModels.length
+                ? <ConfiguredModelPicker id="vision-configured-model" label={copy.visionModel} models={visionModels} value={visionModelId} onChange={setVisionModelId} />
+                : <div className="model-picker-empty"><p>{copy.modelsEmpty}</p><button className="secondary-button" type="button" onClick={onOpenModelCenter}>{copy.modelCenter}</button></div>)}
+              <p className="field-caption">{copy.visionCustomHint}</p>
               <label className="vision-consent check-row"><input type="checkbox" checked={visionConsent} onChange={(event) => setVisionConsent(event.target.checked)} />{copy.visionConsent}</label>
-            </>}
+            </div>}
           </details>
           <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
             <label>{copy.manualPrice}<input inputMode="decimal" value={marketPrice} onChange={(event) => setMarketPrice(event.target.value)} /></label>
@@ -322,133 +413,25 @@ export function NewResearchView({ bootstrap, copy, onSavePreferences, onStart }:
   );
 }
 
-function ModelFields({ catalog, selection, onChange, copy, idPrefix = "primary" }: {
-  catalog: ModelPreset[];
-  selection: ModelSelection;
-  onChange: (value: ModelSelection) => void;
-  copy: ResearchCopy;
-  idPrefix?: string;
-}) {
-  const CUSTOM_MODEL_VALUE = "__openthesis_custom_model__";
-  const [models, setModels] = useState<string[]>(() => {
-    const preset = catalog.find((item) => item.preset_id === selection.preset_id);
-    return preset?.recommended_models ?? [];
-  });
-  const [refreshing, setRefreshing] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [message, setMessage] = useState("");
-  const [messageTone, setMessageTone] = useState<"info" | "success" | "error">("info");
-  const refreshRequestRef = useRef(0);
-  const preset = catalog.find((item) => item.preset_id === selection.preset_id) ?? catalog[0];
-
-  const choosePreset = (presetId: string) => {
-    refreshRequestRef.current += 1;
-    setRefreshing(false);
-    const next = catalog.find((item) => item.preset_id === presetId) ?? catalog[0];
-    const recommended = next?.recommended_models ?? [];
-    setModels(recommended);
-    setMessage("");
-    setMessageTone("info");
-    onChange({ preset_id: next?.preset_id ?? "none", model: recommended[0] ?? "", base_url: next?.base_url ?? "", api_key: "" });
-  };
-
-  const refresh = async () => {
-    const requestId = ++refreshRequestRef.current;
-    setRefreshing(true);
-    setMessage("");
-    try {
-      const result = await discoverModels({ preset_id: selection.preset_id, base_url: selection.base_url, api_key: selection.api_key });
-      if (requestId !== refreshRequestRef.current) return;
-      const merged = Array.from(new Set([
-        ...(preset?.recommended_models ?? []),
-        ...result.models,
-      ].map((model) => model.trim()).filter(Boolean)));
-      setModels(merged);
-      if (!selection.model.trim() && merged[0]) onChange({ ...selection, model: merged[0] });
-      setMessage(result.warning || copy.modelsUpdated);
-      setMessageTone(result.warning ? "error" : "success");
-    } catch {
-      if (requestId !== refreshRequestRef.current) return;
-      setMessage(copy.refreshFailed);
-      setMessageTone("error");
-    } finally {
-      if (requestId === refreshRequestRef.current) setRefreshing(false);
-    }
-  };
-
-  const testConnection = async () => {
-    setTesting(true);
-    setMessage("");
-    try {
-      const result = await testModelConnection(selection);
-      setMessage(result.message);
-      setMessageTone(result.ok ? "success" : "error");
-    } catch (reason) {
-      setMessage(reason instanceof Error ? reason.message : copy.coreUnavailable);
-      setMessageTone("error");
-    } finally {
-      setTesting(false);
-    }
-  };
-
-  const openHelp = async () => {
-    if (!preset?.help_url) return;
-    try {
-      await openExternalUrl(preset.help_url);
-    } catch {
-      setMessage(copy.coreUnavailable);
-      setMessageTone("error");
-    }
-  };
-
-  const isCustomModel = !selection.model || !models.includes(selection.model);
-  const selectedModel = isCustomModel ? CUSTOM_MODEL_VALUE : selection.model;
-  const modelInputId = `${idPrefix}-custom-model`;
-
-  return (
-    <div className="model-fields">
-      <label htmlFor={`${idPrefix}-provider`}>{copy.modelProvider}<select id={`${idPrefix}-provider`} value={selection.preset_id} onChange={(event) => choosePreset(event.target.value)}>{catalog.map((item) => <option key={item.preset_id} value={item.preset_id}>{item.label}</option>)}</select></label>
-      {preset?.preset_id === "none" ? <p className="offline-note">{copy.offlineModel}</p> : <>
-        <label htmlFor={`${idPrefix}-model`}>{copy.modelName}
-          {models.length > 0 ? <select id={`${idPrefix}-model`} value={selectedModel} onChange={(event) => {
-            const value = event.target.value;
-            onChange({ ...selection, model: value === CUSTOM_MODEL_VALUE ? (isCustomModel ? selection.model : "") : value });
-          }}>
-            {models.map((model) => <option key={model} value={model}>{model}</option>)}
-            <option value={CUSTOM_MODEL_VALUE}>{copy.customModel}</option>
-          </select> : <input id={`${idPrefix}-model`} aria-label={copy.customModel} placeholder={copy.modelsEmpty} value={selection.model} onChange={(event) => onChange({ ...selection, model: event.target.value })} />}
-        </label>
-        {models.length > 0 && isCustomModel && <label htmlFor={modelInputId}>{copy.customModel}<input id={modelInputId} value={selection.model} placeholder={copy.modelsEmpty} onChange={(event) => onChange({ ...selection, model: event.target.value })} /></label>}
-        <div className="model-actions">
-          <button className="refresh-button" type="button" onClick={() => void refresh()} disabled={refreshing || !preset?.models_path}><RefreshCw size={15} />{refreshing ? copy.refreshing : copy.refreshModels}</button>
-          <button className="refresh-button" type="button" onClick={() => void testConnection()} disabled={testing || !selection.model.trim()}>{testing ? copy.testingConnection : copy.testConnection}</button>
-          {preset?.help_url && <button className="refresh-button" type="button" onClick={() => void openHelp()}><ExternalLink size={15} />{copy.getKeyHelp}</button>}
-        </div>
-        <label>{copy.endpoint}<input value={selection.base_url} onChange={(event) => onChange({ ...selection, base_url: event.target.value })} /></label>
-        <label>{copy.requestTimeout}<select value={selection.timeout_seconds ?? 180} onChange={(event) => onChange({ ...selection, timeout_seconds: Number(event.target.value) })}>
-          {[60, 120, 180, 300, 600].map((seconds) => <option key={seconds} value={seconds}>{seconds}</option>)}
-        </select></label>
-        {preset?.requires_api_key && <label>{copy.apiKey}<input type="password" value={selection.api_key} autoComplete="off" onChange={(event) => onChange({ ...selection, api_key: event.target.value })} /></label>}
-        {(preset?.preset_id === "kimi" || preset?.preset_id === "kimi-global") && <p className="provider-hint">{copy.kimiKeyHint}</p>}
-        {message && <p className="catalog-message" data-tone={messageTone}>{message}</p>}
-      </>}
-    </div>
-  );
+function isFreeModel(model: ConfiguredModelSummary): boolean {
+  return model.billing_class === "free_tier"
+    || model.billing_class === "local_no_provider_fee"
+    || model.free_tier;
 }
 
-function initialModel(bootstrap: BootstrapResult): ModelSelection {
-  const savedBaseUrl = (bootstrap.preferences.base_url || "").trim();
-  const savedPresetId = bootstrap.preferences.model_preset || "none";
-  const presetId = savedPresetId === "kimi" && /api\.moonshot\.ai/i.test(savedBaseUrl)
-    ? "kimi-global"
-    : savedPresetId;
-  const preset = bootstrap.model_catalog.find((item) => item.preset_id === presetId)
-    ?? bootstrap.model_catalog.find((item) => item.preset_id === "none")
-    ?? bootstrap.model_catalog[0];
-  return {
-    preset_id: preset?.preset_id ?? "none",
-    model: bootstrap.preferences.model || preset?.recommended_models[0] || "",
-    base_url: savedBaseUrl || preset?.base_url || "",
-    api_key: "",
-  };
+function ConfiguredModelPicker({ id, label, models, value, onChange }: {
+  id: string;
+  label: string;
+  models: ConfiguredModelSummary[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return <label className="configured-model-picker" htmlFor={id}>
+    <span>{label}</span>
+    <select id={id} value={value} onChange={(event) => onChange(event.target.value)}>
+      {models.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>
+        {model.alias} · {model.model_id}{isFreeModel(model) ? " · Free" : ""}
+      </option>)}
+    </select>
+  </label>;
 }

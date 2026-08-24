@@ -7,7 +7,10 @@ describe("platform-neutral backend contract", () => {
     expect(new Set(BACKEND_METHODS).size).toBe(BACKEND_METHODS.length);
     expect(BACKEND_METHODS).toEqual(expect.arrayContaining([
       "app.bootstrap",
-      "models.discover",
+      "packs.install",
+      "ot.validate",
+      "ot.compile",
+      "ot.suggest",
       "research.start",
       "research.delete",
       "research.get_report",

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import locale
+import re
 import threading
 import time
 import uuid
@@ -22,16 +24,8 @@ from .market_data import MarketDataError, MarketDataModule
 from .financial_ingestion import FinancialIngestionEngine, FinancialDataset, build_financial_profile, FinancialProfile
 from .market_financials import ValidationStatus
 from .markets import COMMON_MARKET_COMPANIES, MARKET_PROFILES, Market, normalize_market
-from .model_catalog import (
-    MODEL_PRESETS,
-    ModelDiscoveryError,
-    ModelPreset,
-    discover_models,
-    get_model_preset,
-    infer_model_preset,
-    merge_model_ids,
-)
 from .onboarding import COMMON_COMPANIES, build_sec_user_agent
+from .ot import OtValidationError, compile_studio_draft, validate_studio_draft
 from .packs import (
     MAX_PACKAGE_BYTES,
     ResearchPack,
@@ -46,16 +40,15 @@ from .reporting import render_research_run
 from .sec_client import SEC_HK_ISSUERS, SecClient, SecClientError, SecFinancialSourceAdapter
 from .storage import Storage
 from .vision_financials import (
-    CustomVisionAdapter,
-    MineruLiteAdapter,
-    MineruPrecisionAdapter,
+    GatewayVisionAdapter,
+    MineruFlashAdapter,
     VisionAdapterError,
     VisionFallbackConfig,
     VisionFinancialSourceAdapter,
 )
 
 
-CONTRACT_VERSION = "1.0"
+CONTRACT_VERSION = "2.0"
 
 
 def _ui_message(language: str, english: str, simplified: str, traditional: str | None = None) -> str:
@@ -74,14 +67,6 @@ PREFERENCE_DEFAULTS: dict[str, str] = {
     "sidebar_collapsed": "true",
     "parallel_agents": "false",
     "research_market": "US",
-    "provider": "none",
-    "model_preset": "none",
-    "model": "",
-    "base_url": "",
-    "compare_provider": "none",
-    "compare_model_preset": "none",
-    "compare_model": "",
-    "compare_base_url": "",
     "sec_contact_profile": "personal",
     "sec_contact_email": "",
     "sec_user_agent": "",
@@ -156,7 +141,6 @@ class AppService:
         *,
         app_version: str = __version__,
         sec_client_factory: Callable[[str, Path], Any] = SecClient,
-        model_discoverer: Callable[..., tuple[str, ...]] = discover_models,
         provider_factory: Callable[[ModelConfig], Any] = create_provider,
         market_data: Any | None = None,
         financial_ingestion_engine: FinancialIngestionEngine | None = None,
@@ -166,7 +150,6 @@ class AppService:
         self.interrupted_run_count = self.storage.interrupt_running_runs()
         self.app_version = app_version
         self._sec_client_factory = sec_client_factory
-        self._model_discoverer = model_discoverer
         self._provider_factory = provider_factory
         self._market_data = market_data or MarketDataModule()
         self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine()
@@ -182,10 +165,10 @@ class AppService:
                 "app.bootstrap",
                 "settings.update",
                 "company.search",
-                "models.catalog",
-                "models.discover",
-                "models.test",
                 "packs.install",
+                "ot.validate",
+                "ot.compile",
+                "ot.suggest",
                 "thesis.list",
                 "thesis.get",
                 "thesis.save",
@@ -208,7 +191,6 @@ class AppService:
             "recent_runs": self.list_research_runs(limit=20),
             "common_companies": self.common_companies(),
             "market_catalog": self.market_catalog(),
-            "model_catalog": self.model_catalog(),
             "research_packs": self.research_packs(),
             "interrupted_runs": self.interrupted_run_count,
         }
@@ -270,9 +252,6 @@ class AppService:
             for profile in MARKET_PROFILES.values()
         ]
 
-    def model_catalog(self) -> list[dict[str, Any]]:
-        return [_serialize_model_preset(preset) for preset in MODEL_PRESETS]
-
     def research_packs(self) -> list[dict[str, str]]:
         return [
             _serialize_pack(pack)
@@ -282,8 +261,8 @@ class AppService:
     def install_research_pack(
         self, filename: str, encoded_archive: str
     ) -> dict[str, str]:
-        if Path(filename).suffix.lower() != ".othesis":
-            raise ValueError("research pack must use the .othesis extension")
+        if Path(filename).suffix.lower() != ".ot":
+            raise ValueError("research pack must use the .ot extension")
         if not isinstance(encoded_archive, str) or not encoded_archive:
             raise ValueError("research pack payload is required")
         if len(encoded_archive) > ((MAX_PACKAGE_BYTES + 2) // 3) * 4 + 8:
@@ -297,13 +276,101 @@ class AppService:
 
         incoming = self.storage.data_dir / ".incoming-packs"
         incoming.mkdir(parents=True, exist_ok=True)
-        archive = incoming / f"{uuid.uuid4().hex}.othesis"
+        archive = incoming / f"{uuid.uuid4().hex}.ot"
         try:
             archive.write_bytes(payload)
             return _serialize_pack(install_pack(archive, self.storage.packs_dir))
         finally:
             archive.unlink(missing_ok=True)
 
+    def validate_ot_draft(self, draft: Any) -> dict[str, Any]:
+        if not isinstance(draft, dict):
+            raise ValueError("OT draft must be an object")
+        diagnostics = validate_studio_draft(draft)
+        return {
+            "valid": not any(item.severity == "error" for item in diagnostics),
+            "diagnostics": [item.as_dict() for item in diagnostics],
+        }
+
+    def compile_ot_draft(self, draft: Any) -> dict[str, Any]:
+        if not isinstance(draft, dict):
+            raise ValueError("OT draft must be an object")
+        try:
+            raw, package = compile_studio_draft(draft)
+        except OtValidationError as exc:
+            return {
+                "valid": False,
+                "diagnostics": [item.as_dict() for item in exc.diagnostics],
+            }
+        return {
+            "valid": True,
+            "filename": f"{package.package_id}-{package.version}.ot",
+            "data_base64": base64.b64encode(raw).decode("ascii"),
+            "content_identity": package.content_identity,
+            "manifest": package.manifest,
+            "diagnostics": [item.as_dict() for item in package.diagnostics],
+        }
+
+    def suggest_ot_patch(
+        self,
+        draft: Any,
+        selected_path: str,
+        instruction: str,
+        model_reference: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(draft, dict):
+            raise ValueError("OT draft must be an object")
+        path = _validate_ot_suggestion_path(selected_path, draft)
+        request = instruction.strip()
+        if not request or len(request) > 2000:
+            raise ValueError("OT suggestion instruction is invalid")
+        config = _model_config_from_request(model_reference)
+        if config.role != "ot_assistant":
+            raise ValueError("OT assistant model role is required")
+        provider = create_provider(config)
+        if provider is None:
+            raise ValueError("configured OT assistant model is unavailable")
+        current_value = _read_json_pointer(draft, path)
+        payload = {
+            "editable_path": path,
+            "current_value": current_value,
+            "instruction": request,
+            "constraints": {
+                "one_path_only": True,
+                "maximum_serialized_bytes": 4096,
+                "secrets_prohibited": True,
+                "no_network_or_code_permissions": True,
+            },
+        }
+        result = provider.generate(
+            "You are a bounded OT Studio field assistant. Return JSON with one key named suggestion. Never add credentials, URLs that receive credentials, executable code, or changes outside editable_path.",
+            json.dumps(payload, ensure_ascii=False),
+            json_mode=True,
+        )
+        if "suggestion" not in result:
+            raise ValueError("model did not return a bounded OT suggestion")
+        suggestion = result["suggestion"]
+        encoded = json.dumps(suggestion, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("OT suggestion exceeds the field limit")
+        candidate = json.loads(json.dumps(draft, ensure_ascii=False))
+        _write_json_pointer(candidate, path, suggestion)
+        diagnostics = validate_studio_draft(candidate)
+        if any(item.severity == "error" for item in diagnostics):
+            return {
+                "accepted": False,
+                "path": path,
+                "before": current_value,
+                "after": suggestion,
+                "diagnostics": [item.as_dict() for item in diagnostics],
+            }
+        return {
+            "accepted": True,
+            "path": path,
+            "before": current_value,
+            "after": suggestion,
+            "diagnostics": [item.as_dict() for item in diagnostics],
+        }
     def search_companies(
         self,
         query: str,
@@ -335,43 +402,6 @@ class AppService:
             company.to_dict()
             for company in client.search_companies(normalized, limit=bounded_limit)
         ]
-
-    def discover_models_for_session(self, request: dict[str, Any]) -> dict[str, Any]:
-        preset = _preset_for_selection(request)
-        base_url = str(request.get("base_url", "")).strip() or preset.base_url
-        api_key = str(request.get("api_key", "")).strip()
-        models = preset.recommended_models
-        warning = ""
-        try:
-            discovered = self._model_discoverer(preset, base_url, api_key)
-            models = merge_model_ids(preset.recommended_models, discovered)
-        except ModelDiscoveryError as exc:
-            warning = translate_error(
-                _redact(str(exc), (api_key,)),
-                self.preferences().get("ui_language", "zh-CN"),
-            )
-        finally:
-            api_key = ""
-        return {
-            "preset_id": preset.preset_id,
-            "models": list(models),
-            "warning": warning,
-            "endpoint": base_url,
-            "source": "builtin" if warning else "online",
-        }
-
-    def test_model_connection(self, request: dict[str, Any]) -> dict[str, Any]:
-        api_key = str(request.get("api_key", "")).strip()
-        try:
-            config = _model_config_from_request(request)
-            provider = self._provider_factory(config)
-            if provider is None:
-                return {"ok": True, "message": "Deterministic mode does not call AI."}
-            return {"ok": True, "message": str(provider.test_connection())}
-        except Exception as exc:
-            return {"ok": False, "message": _redact(str(exc), (api_key,))[:800]}
-        finally:
-            api_key = ""
 
     def list_research_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         bounded_limit = min(200, max(1, int(limit)))
@@ -462,6 +492,11 @@ class AppService:
             "reporting_currency": str(company.get("reporting_currency", company.get("listing_currency", "USD"))),
             "industry_support": str(company.get("industry_support", "standard")),
             "market_snapshot": payload.get("market_snapshot"),
+            "reproducibility": {
+                "model_configuration": payload.get("model_configuration", {}),
+                "research_configuration": payload.get("research_configuration", {}),
+                "data_snapshot": payload.get("data_snapshot", {}),
+            },
             "retryable_synthesis": _report_retryable(artifacts),
             "retryable_growth": _growth_retryable(artifacts),
             "markdown": render_research_run(
@@ -519,14 +554,11 @@ class AppService:
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=False,
         )
-        try:
-            workflow.retry_synthesis(
-                run,
-                self.storage.get_artifacts(run_id),
-                self.storage.get_facts(company.cik),
-            )
-        finally:
-            model["api_key"] = ""
+        workflow.retry_synthesis(
+            run,
+            self.storage.get_artifacts(run_id),
+            self.storage.get_facts(company.cik),
+        )
         return self.get_report(run_id, language=run.report_language)
 
     def retry_research_growth(
@@ -568,14 +600,11 @@ class AppService:
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=False,
         )
-        try:
-            workflow.retry_growth(
-                run,
-                self.storage.get_artifacts(run_id),
-                self.storage.get_facts(company.cik),
-            )
-        finally:
-            model["api_key"] = ""
+        workflow.retry_growth(
+            run,
+            self.storage.get_artifacts(run_id),
+            self.storage.get_facts(company.cik),
+        )
         return self.get_report(run_id, language=run.report_language)
 
     def start_research(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -584,17 +613,16 @@ class AppService:
             raise ValueError("unsupported research mode")
         if mode == "company":
             _company_from_request(request.get("company"))
-        primary_config = _model_config_from_request(
-            request.get("model", {"preset_id": "none"})
+        primary_config = _model_config_from_request(request.get("model", {}))
+        comparison_configs = (
+            _comparison_configs_from_request(request.get("comparison_models"))
+            if request.get("compare_enabled")
+            else []
         )
-        if request.get("compare_enabled"):
-            comparison_config = _model_config_from_request(
-                request.get("comparison_model")
-            )
-            if not primary_config.enabled or not comparison_config.enabled:
-                raise ValueError(
-                    "when comparison is enabled, both models require an enabled provider"
-                )
+        if request.get("compare_enabled") and not comparison_configs:
+            raise ValueError("comparison requires at least one configured model")
+        if comparison_configs and not primary_config.enabled:
+            raise ValueError("comparison requires an enabled primary model")
 
         job = _ResearchJob(
             job_id=uuid.uuid4().hex,
@@ -730,14 +758,12 @@ class AppService:
                 market=company_market.value,
                 disclosure_url=market_profile.disclosure_home,
             )
-            config = _model_config_from_request(
-                request.get("model", {"preset_id": "none"})
-            )
+            config = _model_config_from_request(request.get("model", {}))
             compare_enabled = bool(request.get("compare_enabled"))
-            comparison_config = (
-                _model_config_from_request(request.get("comparison_model"))
+            comparison_configs = (
+                _comparison_configs_from_request(request.get("comparison_models"))
                 if compare_enabled
-                else None
+                else []
             )
             parallel_agents = _request_bool(
                 request.get("parallel_agents"),
@@ -1118,6 +1144,17 @@ class AppService:
             if mode == "company" and not facts:
                 raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
 
+            reproducibility = _build_research_snapshot(
+                company,
+                facts,
+                filing_evidence,
+                selected_pack,
+                report_language,
+                parallel_agents,
+                valuation_inputs,
+                market_snapshot,
+            )
+
             def agent_progress(agent_id: str, state: str) -> None:
                 with self._jobs_lock:
                     job.agent_states[agent_id] = state
@@ -1159,25 +1196,34 @@ class AppService:
                     + round(min(100, max(0, int(percent))) * span / 100),
                 )
 
+            run_count = 1 + len(comparison_configs)
+
+            def run_segment(index: int) -> tuple[int, int]:
+                lower = 30 + round(70 * index / run_count)
+                upper = 30 + round(70 * (index + 1) / run_count)
+                return lower, max(1, upper - lower)
+
+            primary_base, primary_span = run_segment(0)
             primary = workflow.run(
                 company,
                 financial_profile or facts,
                 filing_evidence=filing_evidence,
                 valuation_inputs=valuation_inputs,
                 market_snapshot=market_snapshot,
+                reproducibility=reproducibility,
                 progress=lambda message, percent: progress(
                     message,
                     percent,
-                    base=30,
-                    span=35 if compare_enabled else 70,
+                    base=primary_base,
+                    span=primary_span,
                     prefix=(
                         _ui_message(ui_language, "Primary: ", "主模型：", "主模型：")
-                        if compare_enabled
+                        if comparison_configs
                         else ""
                     ),
                 ),
             )
-            if compare_enabled and comparison_config is not None:
+            for index, comparison_config in enumerate(comparison_configs, start=1):
                 if job.cancel_event.is_set():
                     raise ResearchCancelled()
                 comparison_workflow = ResearchWorkflow(
@@ -1191,23 +1237,28 @@ class AppService:
                     parallel_agents=parallel_agents,
                     agent_progress=agent_progress,
                 )
+                comparison_base, comparison_span = run_segment(index)
                 secondary = comparison_workflow.run(
                     company,
                     financial_profile or facts,
                     filing_evidence=filing_evidence,
                     valuation_inputs=valuation_inputs,
                     market_snapshot=market_snapshot,
-                    progress=lambda message, percent: progress(
+                    reproducibility=reproducibility,
+                    progress=lambda message, percent, base=comparison_base, span=comparison_span, current=index: progress(
                         message,
                         percent,
-                        base=65,
-                        span=35,
-                        prefix=_ui_message(ui_language, "Comparison: ", "对比模型：", "比較模型："),
+                        base=base,
+                        span=span,
+                        prefix=_ui_message(
+                            ui_language,
+                            f"Comparison {current}/{len(comparison_configs)}: ",
+                            f"对比模型 {current}/{len(comparison_configs)}：",
+                            f"比較模型 {current}/{len(comparison_configs)}：",
+                        ),
                     ),
                 )
-                compare_research_runs(
-                    self.storage, primary, secondary, report_language
-                )
+                compare_research_runs(self.storage, primary, secondary, report_language)
             self._update_job(
                 job,
                 state="completed",
@@ -1272,15 +1323,7 @@ class AppService:
                 message=safe_error
                 or _ui_message(ui_language, "Research failed", "研究失败", "研究失敗"),
             )
-        finally:
-            for selection_name in ("model", "comparison_model"):
-                selection = request.get(selection_name)
-                if isinstance(selection, dict):
-                    selection["api_key"] = ""
-            vision_request = request.get("vision_fallback")
-            if isinstance(vision_request, dict):
-                vision_request["token"] = ""
-                vision_request["api_key"] = ""
+
     def _select_pack(self, pack_id: str) -> ResearchPack:
         packs = list_installed_packs(self.storage.data_dir / "research-packs")
         if not pack_id:
@@ -1307,7 +1350,20 @@ def _research_data_message(code: str, language: str) -> str:
             "VISION_UNAUTHORIZED": "视觉服务凭证无效或已过期。",
             "VISION_TIMEOUT": "视觉财报解析超时，未使用不完整结果。",
             "VISION_CANCELLED": "视觉财报解析已取消。",
+            "VISION_PAGE_LIMIT": "视觉上传页数超过 20 页限制。",
+            "VISION_NETWORK_ERROR": "无法连接视觉解析服务；没有使用不完整结果。请检查网络后重试。",
+            "VISION_HTTP_ERROR": "视觉解析服务暂时不可用；没有自动切换到收费模型。",
+            "VISION_FORBIDDEN": "视觉解析服务拒绝了本次请求；请稍后重试或选择已配置的视觉模型。",
+            "VISION_PROVIDER_UNSUPPORTED": "所选视觉解析方式不可用，请重新选择。",
             "VISION_SIZE_LIMIT": "视觉上传页面超过安全大小限制。",
+            "VISION_UPLOAD_APPROVAL_REQUIRED": "视觉上传安全审批未建立，本次没有发送任何页面。请重新发起研究并逐页确认。",
+            "VISION_INSECURE_URL": "视觉服务返回了不安全的传输地址，OpenThesis 已拒绝发送页面。",
+            "VISION_MALFORMED_RESPONSE": "视觉服务返回了无法验证的响应，本次结果未被采用。",
+            "VISION_REMOTE_FAILED": "视觉服务未能完成解析，请稍后重试或选择已配置的视觉模型。",
+            "VISION_NO_CANDIDATES": "视觉解析没有提取到可验证的财务候选事实，本次结果未被采用。",
+            "VISION_IMAGE_RENDER_FAILED": "待审核财报页无法安全转换为视觉模型输入，本次没有发送。",
+            "VISION_MODEL_REQUIRED": "请先在模型中心配置并测试具备视觉能力的模型。",
+            "VISION_MODEL_ERROR": "已配置的视觉模型解析失败，本次结果未被采用。",
         },
         "en": {
             "NO_FILINGS_AVAILABLE": "The official disclosure platform does not currently provide a usable financial report for this company. The company may not have published a periodic report yet, or no report matches the current criteria.",
@@ -1323,7 +1379,20 @@ def _research_data_message(code: str, language: str) -> str:
             "VISION_UNAUTHORIZED": "The vision service credential is invalid or expired.",
             "VISION_TIMEOUT": "Vision parsing timed out; incomplete output was not used.",
             "VISION_CANCELLED": "Vision parsing was cancelled.",
+            "VISION_PAGE_LIMIT": "The vision upload exceeds the 20-page limit.",
+            "VISION_NETWORK_ERROR": "The vision service could not be reached; incomplete output was not used. Check the network and retry.",
+            "VISION_HTTP_ERROR": "The vision service is unavailable; OpenThesis did not switch to a paid model.",
+            "VISION_FORBIDDEN": "The vision service rejected this request. Retry later or choose a configured vision model.",
+            "VISION_PROVIDER_UNSUPPORTED": "The selected vision path is unavailable. Choose another option.",
             "VISION_SIZE_LIMIT": "The selected vision pages exceed the safe upload limit.",
+            "VISION_UPLOAD_APPROVAL_REQUIRED": "The page-upload approval step was not established, so nothing was sent. Start the research again and approve the page preview.",
+            "VISION_INSECURE_URL": "The vision service returned an insecure transfer URL, so OpenThesis refused to send the pages.",
+            "VISION_MALFORMED_RESPONSE": "The vision service returned an unverifiable response; no result was used.",
+            "VISION_REMOTE_FAILED": "The vision service could not complete parsing. Retry later or choose a configured vision model.",
+            "VISION_NO_CANDIDATES": "Vision parsing found no verifiable financial candidates; no result was used.",
+            "VISION_IMAGE_RENDER_FAILED": "The approved filing page could not be rendered safely for the configured vision model; nothing was sent.",
+            "VISION_MODEL_REQUIRED": "Configure and test a vision-capable model in Model Center first.",
+            "VISION_MODEL_ERROR": "The configured vision model failed to parse the page; no result was used.",
         },
         "zh-Hant": {
             "NO_FILINGS_AVAILABLE": "官方披露平台目前沒有提供可用的財報。公司可能尚未發布定期報告，或沒有報告符合目前條件。",
@@ -1339,7 +1408,20 @@ def _research_data_message(code: str, language: str) -> str:
             "VISION_UNAUTHORIZED": "雲端視覺服務憑證無效或已過期。",
             "VISION_TIMEOUT": "雲端視覺財報解析逾時，未採用不完整結果。",
             "VISION_CANCELLED": "雲端視覺財報解析已取消。",
+            "VISION_PAGE_LIMIT": "視覺上傳頁數超過 20 頁限制。",
+            "VISION_NETWORK_ERROR": "無法連線視覺解析服務；未採用不完整結果。請檢查網路後重試。",
+            "VISION_HTTP_ERROR": "視覺解析服務暫時不可用；沒有自動切換到付費模型。",
+            "VISION_FORBIDDEN": "視覺解析服務拒絕了本次請求；請稍後重試或選擇已設定的視覺模型。",
+            "VISION_PROVIDER_UNSUPPORTED": "所選視覺解析方式不可用，請重新選擇。",
             "VISION_SIZE_LIMIT": "選取的雲端視覺頁面超過安全上傳限制。",
+            "VISION_UPLOAD_APPROVAL_REQUIRED": "未建立頁面上傳安全審批，本次沒有傳送任何頁面。請重新發起研究並逐頁確認。",
+            "VISION_INSECURE_URL": "視覺服務返回不安全的傳輸位址，OpenThesis 已拒絕傳送頁面。",
+            "VISION_MALFORMED_RESPONSE": "視覺服務返回無法驗證的回應，本次結果未被採用。",
+            "VISION_REMOTE_FAILED": "視覺服務未能完成解析，請稍後重試或選擇已設定的視覺模型。",
+            "VISION_NO_CANDIDATES": "視覺解析沒有擷取到可驗證的財務候選事實，本次結果未被採用。",
+            "VISION_IMAGE_RENDER_FAILED": "待審核財報頁無法安全轉換為視覺模型輸入，本次沒有傳送。",
+            "VISION_MODEL_REQUIRED": "請先在模型中心設定並測試具備視覺能力的模型。",
+            "VISION_MODEL_ERROR": "已設定的視覺模型解析失敗，本次結果未被採用。",
         },
     }
     catalog = messages[ZH_HANT if normalize_language(language) == ZH_HANT else EN if normalize_language(language) == EN else "zh-CN"]
@@ -1479,21 +1561,6 @@ def _growth_retryable(artifacts: list[dict[str, Any]]) -> bool:
     } or (isinstance(validation, dict) and validation.get("passed") is False)
 
 
-def _serialize_model_preset(preset: ModelPreset) -> dict[str, Any]:
-    return {
-        "preset_id": preset.preset_id,
-        "label": preset.label,
-        "region": preset.region,
-        "protocol": preset.protocol,
-        "base_url": preset.base_url,
-        "recommended_models": list(preset.recommended_models),
-        "models_path": preset.models_path,
-        "help_url": preset.help_url,
-        "requires_api_key": preset.requires_api_key,
-        "temperature": preset.temperature,
-    }
-
-
 def _serialize_pack(pack: ResearchPack) -> dict[str, str]:
     return {
         "pack_id": pack.pack_id,
@@ -1533,43 +1600,90 @@ def _company_from_request(value: Any) -> Company:
     return Company(**fields)
 
 
+def _comparison_configs_from_request(value: Any) -> list[ModelConfig]:
+    if not isinstance(value, list):
+        raise ValueError("comparison_models must be an array")
+    if not 1 <= len(value) <= 4:
+        raise ValueError("comparison_models must contain between one and four models")
+    configs = [_model_config_from_request(item) for item in value]
+    if any(not config.enabled for config in configs):
+        raise ValueError("comparison models must be configured")
+    if any(config.role != "comparison" for config in configs):
+        raise ValueError("comparison model role is invalid")
+    identities = {(item.configured_model_id, item.configuration_version) for item in configs}
+    if len(identities) != len(configs):
+        raise ValueError("comparison models must be unique")
+    return configs
+
+
 def _model_config_from_request(value: Any) -> ModelConfig:
     if value is None or not isinstance(value, dict):
-        raise ValueError("model configuration is required")
-    preset = _preset_for_selection(value)
-    model = str(value.get("model", "")).strip()
-    base_url = str(value.get("base_url", "")).strip() or preset.base_url
-    api_key = str(value.get("api_key", "")).strip()
-    if preset.preset_id == "none":
-        return ModelConfig(provider="none", model="", base_url="", api_key="")
-    if not model or not base_url:
-        raise ValueError("model name and endpoint are required")
-    if preset.requires_api_key and not api_key.strip():
-        raise ValueError("API Key is required for this provider")
+        raise ValueError("model reference is required")
+    forbidden = {"api_key", "base_url", "preset_id", "provider", "model"}.intersection(value)
+    if forbidden:
+        raise ValueError("legacy model configuration fields are not accepted")
+    configured_model_id = str(value.get("configured_model_id", "")).strip()
+    if not configured_model_id:
+        return ModelConfig()
+    if len(configured_model_id) > 128 or not all(
+        character.isalnum() or character in "_.-" for character in configured_model_id
+    ):
+        raise ValueError("configured model id is invalid")
+    try:
+        configuration_version = max(1, int(value.get("configuration_version", 1)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model configuration version is invalid") from exc
+    role = str(value.get("role", "primary")).strip() or "primary"
+    if role not in {"primary", "comparison", "verification", "vision", "ot_assistant"}:
+        raise ValueError("model role is invalid")
     return ModelConfig(
-        provider=preset.protocol,
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        temperature=preset.temperature,
-        timeout_seconds=_normalize_timeout_seconds(value.get("timeout_seconds")),
+        configured_model_id=configured_model_id,
+        configuration_version=configuration_version,
+        role=role,
+        timeout_seconds=600,
     )
 
 
-def _preset_for_selection(value: dict[str, Any]) -> ModelPreset:
-    """Resolve legacy Kimi settings by the saved endpoint region.
+def _validate_ot_suggestion_path(path: Any, draft: dict[str, Any]) -> str:
+    if not isinstance(path, str) or len(path) > 160 or "~" in path:
+        raise ValueError("OT suggestion path is invalid")
+    allowed = (
+        re.fullmatch(r"/package/(name|description|version)", path)
+        or re.fullmatch(r"/settings/(horizon_years|depth|risk_emphasis|report_language)", path)
+        or re.fullmatch(r"/workflow/steps/([0-9]|[1-5][0-9]|6[0-3])/(prompt|role|output_schema)", path)
+        or re.fullmatch(r"/outputs/(formats|include_evidence|deterministic_transforms)", path)
+    )
+    if not allowed:
+        raise ValueError("OT suggestion path is outside the editable scope")
+    _read_json_pointer(draft, path)
+    return path
 
-    Older settings stored only ``preset_id=kimi`` while using the international
-    endpoint.  Preserve that explicit endpoint instead of silently sending a
-    mainland key to the wrong Kimi region.
-    """
-    requested = get_model_preset(str(value.get("preset_id", "custom")))
-    base_url = str(value.get("base_url", "")).strip()
-    if requested.preset_id not in {"kimi", "kimi-global"} or not base_url:
-        return requested
-    inferred = infer_model_preset(requested.protocol, base_url)
-    return inferred if inferred.preset_id in {"kimi", "kimi-global"} else requested
 
+def _read_json_pointer(value: Any, path: str) -> Any:
+    current = value
+    for segment in path.lstrip("/").split("/"):
+        if isinstance(current, list):
+            try:
+                current = current[int(segment)]
+            except (ValueError, IndexError) as exc:
+                raise ValueError("OT suggestion path does not exist") from exc
+        elif isinstance(current, dict) and segment in current:
+            current = current[segment]
+        else:
+            raise ValueError("OT suggestion path does not exist")
+    return current
+
+
+def _write_json_pointer(value: dict[str, Any], path: str, replacement: Any) -> None:
+    segments = path.lstrip("/").split("/")
+    current: Any = value
+    for segment in segments[:-1]:
+        current = current[int(segment)] if isinstance(current, list) else current[segment]
+    final = segments[-1]
+    if isinstance(current, list):
+        current[int(final)] = replacement
+    else:
+        current[final] = replacement
 
 def _valuation_inputs(value: Any) -> dict[str, float] | None:
     if value is None or value == "":
@@ -1641,29 +1755,61 @@ def _normalize_timeout_seconds(value: Any, default: int = 180) -> int:
 def _vision_config_from_request(value: Any) -> VisionFallbackConfig | None:
     if not isinstance(value, dict):
         return None
+    forbidden = {"token", "api_key", "endpoint", "model_id"}.intersection(value)
+    if forbidden:
+        raise ValueError("legacy vision configuration fields are not accepted")
+    enabled = bool(value.get("enabled", False))
+    if not enabled:
+        return VisionFallbackConfig(enabled=False)
+    provider = str(value.get("provider", "configured_model"))
+    if provider not in {"mineru_flash", "configured_model"}:
+        raise ValueError("vision fallback provider is not supported")
+    if not bool(value.get("require_page_approval", True)):
+        raise ValueError("vision fallback requires per-run page approval")
+    if provider == "mineru_flash":
+        if value.get("model") is not None:
+            raise ValueError("MinerU Flash does not accept a configured model reference")
+        return VisionFallbackConfig(
+            enabled=True,
+            consent=bool(value.get("consent", False)),
+            provider="mineru_flash",
+            timeout_seconds=60.0,
+            language=str(value.get("language", "auto")),
+            require_page_approval=True,
+        )
+    model_config = _model_config_from_request(value.get("model"))
+    if not model_config.enabled or model_config.role != "vision":
+        raise ValueError("vision fallback requires a configured vision model")
     return VisionFallbackConfig(
-        enabled=bool(value.get("enabled", False)),
+        enabled=True,
         consent=bool(value.get("consent", False)),
-        provider=str(value.get("provider", "mineru_lite")),
-        token=str(value.get("token", "")),
-        api_key=str(value.get("api_key", "")),
-        endpoint=str(value.get("endpoint", "")),
-        model=str(value.get("model", "")),
-        timeout_seconds=float(value.get("timeout_seconds", 60.0) or 60.0),
+        provider="configured_model",
+        configured_model_id=model_config.configured_model_id,
+        configuration_version=model_config.configuration_version,
+        timeout_seconds=float(model_config.timeout_seconds),
         language=str(value.get("language", "auto")),
-        require_page_approval=bool(value.get("require_page_approval", False)),
+        require_page_approval=True,
     )
 
 
-def _default_vision_adapter_factory(config: VisionFallbackConfig) -> VisionFinancialSourceAdapter:
-    if config.provider == "mineru_lite":
-        return MineruLiteAdapter()
-    if config.provider == "mineru_precision":
-        return MineruPrecisionAdapter()
-    if config.provider == "custom_vision":
-        return CustomVisionAdapter()
-    raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
-
+def _default_vision_adapter_factory(
+    config: VisionFallbackConfig,
+) -> VisionFinancialSourceAdapter:
+    if config.provider == "mineru_flash":
+        return MineruFlashAdapter()
+    if not config.configured_model_id:
+        raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
+    provider = create_provider(
+        ModelConfig(
+            configured_model_id=config.configured_model_id,
+            configuration_version=config.configuration_version,
+            role="vision",
+            timeout_seconds=max(30, min(600, int(config.timeout_seconds))),
+        )
+    )
+    if provider is None:
+        raise VisionAdapterError("VISION_MODEL_REQUIRED")
+    return GatewayVisionAdapter(provider)
 
 def _workflow_stage(percent: int, *, comparison: bool = False) -> str:
     if comparison:
@@ -1681,21 +1827,49 @@ def _workflow_stage(percent: int, *, comparison: bool = False) -> str:
     return "synthesis"
 
 
-def _request_secrets(request: dict[str, Any]) -> tuple[str, ...]:
-    values: list[str] = []
-    for name in ("model", "comparison_model"):
-        selection = request.get(name)
-        if isinstance(selection, dict):
-            secret = str(selection.get("api_key", "")).strip()
-            if secret:
-                values.append(secret)
-    vision = request.get("vision_fallback")
-    if isinstance(vision, dict):
-        for name in ("token", "api_key"):
-            secret = str(vision.get(name, "")).strip()
-            if secret:
-                values.append(secret)
-    return tuple(values)
+def _canonical_snapshot_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _build_research_snapshot(
+    company: Company,
+    facts: list[dict[str, Any]],
+    filing_evidence: list[dict[str, Any]],
+    pack: ResearchPack,
+    report_language: str,
+    parallel_agents: bool,
+    valuation_inputs: dict[str, Any] | None,
+    market_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "data_snapshot": {
+            "captured_at": utc_now_iso(),
+            "company_identity": _canonical_snapshot_digest(company.to_dict()),
+            "financial_facts_sha256": _canonical_snapshot_digest(facts),
+            "financial_fact_count": len(facts),
+            "filing_evidence_sha256": _canonical_snapshot_digest(filing_evidence),
+            "filing_evidence_count": len(filing_evidence),
+        },
+        "research_configuration": {
+            "report_language": report_language,
+            "parallel_agents": bool(parallel_agents),
+            "valuation_inputs": valuation_inputs,
+            "market_snapshot": market_snapshot,
+            "research_pack_id": pack.pack_id,
+            "research_pack_version": pack.version,
+            "research_pack_content_identity": pack.content_hash,
+        },
+    }
+
+def _request_secrets(_request: dict[str, Any]) -> tuple[str, ...]:
+    return ()
 
 
 def _redact(message: str, secrets: tuple[str, ...]) -> str:

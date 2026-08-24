@@ -11,7 +11,7 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "1.5.1"
+$version = "2.0.1"
 
 $pythonPaths = @((Join-Path $projectRoot "src"))
 if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
@@ -88,3 +88,4 @@ try {
 } finally {
     Pop-Location
 }
+

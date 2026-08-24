@@ -1,219 +1,140 @@
 from __future__ import annotations
 
 import json
-import threading
+import subprocess
+import tempfile
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest.mock import patch
 
 from openthesis.providers import (
     ModelConfig,
-    OllamaProvider,
-    OpenAICompatibleProvider,
     ProviderError,
+    RustModelGatewayProvider,
     _parse_model_json,
+    create_provider,
 )
 
 
-class ProviderHandler(BaseHTTPRequestHandler):
-    requests: list[tuple[str, dict[str, object], str]] = []
-
-    def log_message(self, format: str, *args: object) -> None:
-        return
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        payload = json.loads(self.rfile.read(length))
-        type(self).requests.append(
-            (self.path, payload, self.headers.get("Authorization", ""))
-        )
-        if payload.get("model") == "echo-key":
-            authorization = self.headers.get("Authorization", "")
-            self.send_response(401)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"rejected {authorization}"}).encode()
-            )
-            return
-        if payload.get("model") == "format-unsupported" and "response_format" in payload:
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error":"response_format is unsupported"}')
-            return
-        if payload.get("model") == "bad-request":
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b'{"error":"invalid model"}')
-            return
-        if payload.get("model") == "fail":
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(b'{"error":"intentional"}')
-            return
-        if self.path == "/v1/chat/completions":
-            response = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '```json\n{"ok":true,"provider":"openai"}\n```'
-                        }
-                    }
-                ]
-            }
-        elif self.path == "/api/chat":
-            response = {
-                "message": {
-                    "content": '{"ok":true,"provider":"ollama"}',
-                }
-            }
-        else:
-            self.send_response(404)
-            self.end_headers()
-            return
-        encoded = json.dumps(response).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
-
-
 class ProviderTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.server.shutdown()
-        cls.server.server_close()
-
-    def test_openai_compatible_protocol(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="test",
-                base_url=f"{self.base_url}/v1",
-                api_key="session-secret",
-            )
+    def test_model_config_is_a_non_secret_versioned_reference(self) -> None:
+        config = ModelConfig(
+            configured_model_id="deepseek.personal.chat",
+            configuration_version=7,
+            role="primary",
         )
-        result = provider.generate("system", "user")
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["provider"], "openai")
-        _, payload, authorization = ProviderHandler.requests[-1]
-        self.assertEqual(authorization, "Bearer session-secret")
-        self.assertEqual(payload["temperature"], 0.2)
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.provider, "gateway")
+        self.assertEqual(config.public_id, "gateway:deepseek.personal.chat@7")
+        self.assertFalse(hasattr(config, "api_key"))
+        self.assertFalse(hasattr(config, "base_url"))
 
-    def test_api_key_whitespace_is_trimmed_before_bearer_header(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="test",
-                base_url=f"{self.base_url}/v1",
-                api_key=" session-secret \n",
-            )
-        )
-        provider.generate("system", "user")
-        self.assertEqual(ProviderHandler.requests[-1][2], "Bearer session-secret")
+    def test_create_provider_only_constructs_the_rust_gateway(self) -> None:
+        self.assertIsNone(create_provider(ModelConfig()))
+        provider = create_provider(ModelConfig(configured_model_id="local.qwen"))
+        self.assertIsInstance(provider, RustModelGatewayProvider)
 
-    def test_optional_temperature_is_omitted(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="test",
-                base_url=f"{self.base_url}/v1",
-                temperature=None,
+    def test_gateway_request_contains_only_non_secret_model_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {
+                "ok": True,
+                "result": {
+                    "content": '{"ok":true}',
+                    "meta": {
+                        "configured_model_id": "model.ready",
+                        "configuration_version": 3,
+                        "provider_id": "openai",
+                    },
+                },
+            }
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
             )
-        )
-        provider.generate("system", "user")
-        self.assertNotIn("temperature", ProviderHandler.requests[-1][1])
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                provider = RustModelGatewayProvider(
+                    ModelConfig(
+                        configured_model_id="model.ready",
+                        configuration_version=3,
+                    ),
+                    gateway_path=gateway,
+                )
+                result = provider.generate("system", "user")
 
-    def test_ollama_protocol(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OllamaProvider(
-            ModelConfig(
-                provider="ollama",
-                model="test",
-                base_url=self.base_url,
-            )
-        )
-        result = provider.generate("system", "user")
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["provider"], "ollama")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["_response_meta"]["configuration_version"], 3)
+            kwargs = invoked.call_args.kwargs
+            self.assertEqual(kwargs["args"], [str(gateway), "--model-gateway"])
+            request = json.loads(kwargs["input"])
+            self.assertEqual(request["configured_model_id"], "model.ready")
+            self.assertEqual(request["operation"], "generate")
+            serialized = json.dumps(request)
+            self.assertNotIn("api_key", serialized)
+            self.assertNotIn("base_url", serialized)
+            self.assertNotIn("secret", serialized)
 
-    def test_ollama_omits_options_when_temperature_is_none(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OllamaProvider(
-            ModelConfig(
-                provider="ollama",
-                model="test",
-                base_url=self.base_url,
-                temperature=None,
+    def test_vision_payload_is_bounded_png_and_never_uses_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {
+                "ok": True,
+                "result": {"content": '{"facts":[]}', "meta": {}},
+            }
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
             )
-        )
-        provider.generate("system", "user")
-        self.assertNotIn("options", ProviderHandler.requests[-1][1])
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="vision.ready", role="vision"),
+                    gateway_path=gateway,
+                )
+                provider.generate_vision("system", "user", b"\x89PNG\r\n\x1a\ncontent")
 
-    def test_response_format_unsupported_retries_once_without_it(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="format-unsupported",
-                base_url=f"{self.base_url}/v1",
-            )
-        )
-        result = provider.generate("system", "user")
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(ProviderHandler.requests), 2)
-        self.assertIn("response_format", ProviderHandler.requests[0][1])
-        self.assertNotIn("response_format", ProviderHandler.requests[1][1])
+            kwargs = invoked.call_args.kwargs
+            request = json.loads(kwargs["input"])
+            self.assertEqual(request["operation"], "vision")
+            self.assertEqual(request["image_media_type"], "image/png")
+            self.assertNotIn(request["image_base64"], " ".join(kwargs["args"]))
+            with self.assertRaises(ProviderError) as caught:
+                provider.generate_vision("system", "user", b"not-png")
+            self.assertEqual(caught.exception.code, "MODEL_VISION_PAYLOAD_INVALID")
 
-    def test_other_400_is_not_retried(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="bad-request",
-                base_url=f"{self.base_url}/v1",
+    def test_gateway_errors_are_typed_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {
+                "ok": False,
+                "error": {
+                    "code": "MODEL_RATE_LIMITED",
+                    "message": "quota exhausted",
+                    "retryable": True,
+                },
+            }
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout=json.dumps(response).encode(), stderr=b"ignored"
             )
-        )
-        with self.assertRaises(ProviderError) as caught:
-            provider.generate("system", "user")
-        self.assertEqual(len(ProviderHandler.requests), 1)
-        self.assertFalse(caught.exception.retryable)
+            with patch("openthesis.providers.subprocess.run", return_value=completed):
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="model.ready"),
+                    gateway_path=gateway,
+                )
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate("system", "user")
+            self.assertEqual(caught.exception.code, "MODEL_RATE_LIMITED")
+            self.assertTrue(caught.exception.retryable)
+            self.assertNotIn("ignored", str(caught.exception))
 
-    def test_http_error_redacts_api_key_even_if_server_echoes_it(self) -> None:
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="echo-key",
-                base_url=f"{self.base_url}/v1",
-                api_key="must-never-appear",
-            )
+    def test_gateway_path_must_be_absolute_existing_file(self) -> None:
+        provider = RustModelGatewayProvider(
+            ModelConfig(configured_model_id="model.ready"),
+            gateway_path=Path("relative.exe"),
         )
         with self.assertRaises(ProviderError) as caught:
             provider.generate("system", "user")
-        self.assertNotIn("must-never-appear", str(caught.exception))
-        self.assertIn("[REDACTED]", str(caught.exception))
-
-    def test_http_error_is_reported(self) -> None:
-        ProviderHandler.requests.clear()
-        provider = OpenAICompatibleProvider(
-            ModelConfig(
-                provider="openai-compatible",
-                model="fail",
-                base_url=f"{self.base_url}/v1",
-            )
-        )
-        with self.assertRaises(ProviderError) as caught:
-            provider.generate("system", "user")
-        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(caught.exception.code, "MODEL_GATEWAY_UNAVAILABLE")
 
     def test_malformed_model_json_keeps_a_safe_parse_error_class(self) -> None:
         result = _parse_model_json("not-json")

@@ -194,7 +194,7 @@ export function useWorkbenchSession() {
 
   const retrySynthesis = async () => {
     const model = lastRequest.current?.model;
-    if (!report || !model || model.preset_id === "none") {
+    if (!report || !model) {
       throw new Error("model session is unavailable");
     }
     setError(null);
@@ -205,7 +205,7 @@ export function useWorkbenchSession() {
 
   const retryGrowth = async () => {
     const model = lastRequest.current?.model;
-    if (!report || !model || model.preset_id === "none") {
+    if (!report || !model) {
       throw new Error("model session is unavailable");
     }
     setError(null);

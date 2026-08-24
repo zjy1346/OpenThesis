@@ -19,6 +19,13 @@ class FinancialMetricTests(unittest.TestCase):
         self.assertIn("\u71df\u696d\u6536\u5165", summary)
         self.assertIn("\u6de8\u5229\u6f64", summary)
 
+    def test_simplified_deterministic_summary_uses_exact_simplified_headers(self) -> None:
+        summary = deterministic_summary("示例", [{"year": 2025, "revenue": 10.0, "revenue_growth": 0.1, "net_income": 1.0, "operating_cash_flow": 2.0}], "zh-CN", "CNY")
+        self.assertIn("财年", summary)
+        self.assertIn("收入增长", summary)
+        self.assertNotIn("財年", summary)
+        self.assertNotIn("镾", summary)
+
     def test_annual_and_interim_periods_are_never_mixed(self) -> None:
         def fact(year: int, period: str, concept: str, value: float, filed_at: str) -> dict[str, object]:
             return {

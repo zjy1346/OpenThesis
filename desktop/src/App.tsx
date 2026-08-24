@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   BookOpenText,
+  Boxes,
   CircleHelp,
+  Code2,
   ChevronLeft,
   ExternalLink,
   FileText,
@@ -19,6 +21,8 @@ import { EmptyState, LoadingState, ResearchProgress } from "./components/States"
 import { AboutView } from "./features/about/AboutView";
 import { HelpView } from "./features/help/HelpView";
 import { HistoryView } from "./features/history/HistoryView";
+import { ModelCenterView } from "./features/models/ModelCenterView";
+import { OtStudioView } from "./features/ot-studio/OtStudioView";
 import { ReportWorkspace } from "./features/report/ReportWorkspace";
 import { NewResearchView } from "./features/research/NewResearchView";
 import { SettingsView } from "./features/settings/SettingsView";
@@ -30,7 +34,7 @@ import type {
   ResearchRequest,
 } from "./types";
 
-type ViewId = "workspace" | "new-research" | "history" | "theses" | "settings" | "help" | "about";
+type ViewId = "workspace" | "new-research" | "history" | "theses" | "models" | "ot-studio" | "settings" | "help" | "about";
 
 export default function App() {
   const [activeView, setActiveView] = useState<ViewId>("workspace");
@@ -109,6 +113,8 @@ export default function App() {
     { id: "workspace" as const, label: copy.workspace, icon: BookOpenText },
     { id: "history" as const, label: copy.history, icon: History },
     { id: "theses" as const, label: copy.theses, icon: FileText },
+    { id: "models" as const, label: copy.modelCenter, icon: Boxes },
+    { id: "ot-studio" as const, label: copy.otStudio, icon: Code2 },
     { id: "settings" as const, label: copy.settings, icon: Settings },
     { id: "help" as const, label: copy.help, icon: CircleHelp },
     { id: "about" as const, label: copy.about, icon: Info },
@@ -120,6 +126,8 @@ export default function App() {
     "new-research": copy.newResearch,
     history: copy.history,
     theses: copy.theses,
+    models: copy.modelCenter,
+    "ot-studio": copy.otStudio,
     settings: copy.settings,
     help: copy.help,
     about: copy.about,
@@ -230,8 +238,12 @@ export default function App() {
         <section className="report-stage" aria-label={copy.report}>
           {activeView === "settings" && bootstrap ? (
             <SettingsView language={language} preferences={bootstrap.preferences} copy={copy} onSave={savePreferences} />
+          ) : activeView === "models" ? (
+            <ModelCenterView language={language} />
+          ) : activeView === "ot-studio" ? (
+            <OtStudioView language={language} onOpenModelCenter={() => setActiveView("models")} />
           ) : activeView === "new-research" && bootstrap ? (
-            <NewResearchView bootstrap={bootstrap} copy={copy} onSavePreferences={savePreferences} onStart={startNewResearch} />
+            <NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={() => setActiveView("models")} onSavePreferences={savePreferences} onStart={startNewResearch} />
           ) : activeView === "history" && bootstrap ? (
             <HistoryView runs={bootstrap.recent_runs} language={language} copy={copy}
               onRefresh={refreshBootstrap} onSelect={openRun} onDelete={removeRun} />

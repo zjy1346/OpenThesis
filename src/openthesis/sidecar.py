@@ -77,12 +77,17 @@ class JsonLineServer:
                 market=market,
                 limit=params.get("limit", 15),
             )
-        if method == "models.catalog":
-            return self.service.model_catalog()
-        if method == "models.discover":
-            return self.service.discover_models_for_session(params)
-        if method == "models.test":
-            return self.service.test_model_connection(params)
+        if method == "ot.validate":
+            return self.service.validate_ot_draft(params.get("draft"))
+        if method == "ot.compile":
+            return self.service.compile_ot_draft(params.get("draft"))
+        if method == "ot.suggest":
+            return self.service.suggest_ot_patch(
+                params.get("draft"),
+                params.get("selected_path"),
+                params.get("instruction", ""),
+                params.get("model"),
+            )
         if method == "packs.install":
             filename = params.get("filename")
             encoded_archive = params.get("data_base64")

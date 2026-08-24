@@ -137,6 +137,21 @@ class ArchitectureContractTests(unittest.TestCase):
         self.assertIn("Mobile is explicitly outside the 1.0 scope.", adr)
         self.assertNotIn("cfg_attr(mobile", rust_adapter)
 
+    def test_provider_logos_are_emitted_as_local_files_under_strict_csp(self) -> None:
+        vite_config = (
+            PROJECT_ROOT / "desktop" / "vite.config.ts"
+        ).read_text(encoding="utf-8")
+        tauri_config = json.loads(
+            (PROJECT_ROOT / "desktop" / "src-tauri" / "tauri.conf.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        image_policy = tauri_config["app"]["security"]["csp"]
+
+        self.assertIn("assetsInlineLimit: 0", vite_config)
+        self.assertIn("img-src 'self'", image_policy)
+        self.assertNotIn("data:", image_policy)
+
     def test_portable_packaging_runs_an_archive_privacy_gate(self) -> None:
         package_script = (
             PROJECT_ROOT / "scripts" / "package-desktop.ps1"

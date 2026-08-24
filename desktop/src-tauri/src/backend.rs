@@ -34,6 +34,7 @@ enum BackendError {
 impl BackendProcess {
     fn start(app: &AppHandle) -> Result<Self, String> {
         let mut command = backend_command(app)?;
+        configure_model_gateway_environment(app, &mut command)?;
         configure_backend_command(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -99,6 +100,38 @@ impl BackendProcess {
             BackendError::Transport("research core response is missing a result".to_string())
         })
     }
+}
+
+fn resolve_gateway_data_dir(
+    override_dir: Option<&str>,
+    app_data_dir: PathBuf,
+) -> Result<PathBuf, String> {
+    let path = match override_dir.map(str::trim) {
+        None | Some("") => app_data_dir,
+        Some(value) => PathBuf::from(value),
+    };
+    if !path.is_absolute() {
+        return Err("model gateway data directory must be absolute".to_string());
+    }
+    Ok(path)
+}
+
+fn configure_model_gateway_environment(
+    app: &AppHandle,
+    command: &mut Command,
+) -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|_| "model gateway executable is unavailable".to_string())?;
+    let app_data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|_| "model gateway data directory is unavailable".to_string())?;
+    let override_dir = std::env::var("OPENTHESIS_DATA_DIR").ok();
+    let data_dir = resolve_gateway_data_dir(override_dir.as_deref(), app_data_dir)?;
+    command
+        .env("OPENTHESIS_MODEL_GATEWAY_PATH", executable)
+        .env("OPENTHESIS_DATA_DIR", data_dir);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

@@ -217,6 +217,9 @@ class ResearchRun:
     errors: list[str] = field(default_factory=list)
     report_language: str = "zh-CN"
     market_snapshot: dict[str, Any] | None = None
+    model_configuration: dict[str, Any] = field(default_factory=dict)
+    research_configuration: dict[str, Any] = field(default_factory=dict)
+    data_snapshot: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowUpRight, CalendarDays, RefreshCw, Trash2 } from "lucide-react";
 
 import type { Language, ResearchRunSummary } from "../../types";
@@ -17,6 +17,12 @@ type HistoryCopy = {
   deleteResearchCancel: string;
   deletingResearch: string;
   deleteResearchFailed: string;
+  running: string;
+  queued: string;
+  completed: string;
+  cancelled: string;
+  failed: string;
+  partial: string;
 };
 
 export function HistoryView({ runs, language, copy, onRefresh, onSelect, onDelete }: {
@@ -31,6 +37,44 @@ export function HistoryView({ runs, language, copy, onRefresh, onSelect, onDelet
   const [pendingDelete, setPendingDelete] = useState<ResearchRunSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+
+  const closeDelete = () => {
+    setPendingDelete(null);
+    window.setTimeout(() => returnFocusRef.current?.focus(), 0);
+  };
+
+  const openDelete = (run: ResearchRunSummary, trigger: HTMLElement) => {
+    returnFocusRef.current = trigger;
+    setDeleteError("");
+    setPendingDelete(run);
+  };
+
+  useEffect(() => {
+    if (!pendingDelete) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !deleting) {
+        event.preventDefault();
+        closeDelete();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...(dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? [])];
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [deleting, pendingDelete]);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -47,7 +91,7 @@ export function HistoryView({ runs, language, copy, onRefresh, onSelect, onDelet
     setDeleteError("");
     try {
       await onDelete(pendingDelete);
-      setPendingDelete(null);
+      closeDelete();
     } catch {
       setDeleteError(copy.deleteResearchFailed);
     } finally {
@@ -78,10 +122,10 @@ export function HistoryView({ runs, language, copy, onRefresh, onSelect, onDelet
                   <small><CalendarDays size={13} />{new Date(run.started_at).toLocaleString(language)}</small>
                 </span>
               </button>
-              <span className="history-card-status" data-status={run.status}>{run.status}</span>
+              <span className="history-card-status" data-status={run.status}>{copy[run.status as keyof Pick<HistoryCopy, "running" | "queued" | "completed" | "cancelled" | "failed" | "partial">] ?? run.status}</span>
               <span className="history-card-action">{copy.viewReport}<ArrowUpRight size={15} /></span>
               <button className="history-delete" type="button" aria-label={`${copy.deleteResearch}: ${run.company_name}`}
-                title={copy.deleteResearch} onClick={() => { setDeleteError(""); setPendingDelete(run); }}>
+                title={copy.deleteResearch} onClick={(event) => openDelete(run, event.currentTarget)}>
                 <Trash2 size={15} />
               </button>
             </article>
@@ -90,18 +134,18 @@ export function HistoryView({ runs, language, copy, onRefresh, onSelect, onDelet
       )}
       {pendingDelete && (
         <div className="history-dialog-backdrop" role="presentation" onMouseDown={(event) => {
-          if (event.target === event.currentTarget && !deleting) setPendingDelete(null);
+          if (event.target === event.currentTarget && !deleting) closeDelete();
         }}>
-          <div className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-history-title">
+          <div ref={dialogRef} className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-history-title" aria-describedby="delete-history-description">
             <div className="history-dialog-icon"><Trash2 size={19} /></div>
             <h2 id="delete-history-title">{copy.deleteResearchTitle}</h2>
-            <p>{copy.deleteResearchBody
+            <p id="delete-history-description">{copy.deleteResearchBody
               .replace("{company}", pendingDelete.company_name)
               .replace("{ticker}", pendingDelete.ticker || "—")}</p>
             <small>{new Date(pendingDelete.started_at).toLocaleString(language)}</small>
             {deleteError && <div className="history-dialog-error" role="alert">{deleteError}</div>}
             <div className="history-dialog-actions">
-              <button className="secondary-button" type="button" disabled={deleting} onClick={() => setPendingDelete(null)}>{copy.deleteResearchCancel}</button>
+              <button autoFocus className="secondary-button" type="button" disabled={deleting} onClick={closeDelete}>{copy.deleteResearchCancel}</button>
               <button className="danger-button" type="button" disabled={deleting} onClick={() => void confirmDelete()}>{deleting ? copy.deletingResearch : copy.deleteResearchConfirm}</button>
             </div>
           </div>

@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
+from openthesis.ot import minimal_studio_draft
 from openthesis.service import AppService
 from openthesis.sidecar import JsonLineServer
 
@@ -35,7 +36,7 @@ class JsonLineServerTests(unittest.TestCase):
             response = json.loads(output.getvalue())
             self.assertEqual(response["jsonrpc"], "2.0")
             self.assertEqual(response["id"], "request-1")
-            self.assertEqual(response["result"]["contract_version"], "1.0")
+            self.assertEqual(response["result"]["contract_version"], "2.0")
 
     def test_errors_do_not_echo_secret_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -98,21 +99,27 @@ class JsonLineServerTests(unittest.TestCase):
                     }
                 )
 
-    def test_catalog_methods_are_available_over_json_rpc(self) -> None:
+    def test_ot_validation_is_available_over_json_rpc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = JsonLineServer(AppService(Path(directory)))
-
             result = server.dispatch(
                 {
                     "jsonrpc": "2.0",
                     "id": 8,
-                    "method": "models.catalog",
-                    "params": {},
+                    "method": "ot.validate",
+                    "params": {"draft": minimal_studio_draft()},
                 }
             )
-
-            self.assertTrue(any(item["preset_id"] == "ollama" for item in result))
-
+            self.assertTrue(result["valid"])
+            with self.assertRaises(Exception):
+                server.dispatch(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 9,
+                        "method": "models.catalog",
+                        "params": {},
+                    }
+                )
 
 if __name__ == "__main__":
     unittest.main()

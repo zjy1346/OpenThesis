@@ -4,12 +4,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   bootstrapBackend,
-  discoverModels,
   exportResearchReport,
   installResearchPack,
+  listConfiguredModels,
   openExternalUrl,
   searchCompanies,
-  testModelConnection,
   getResearchReport,
   getResearchStatus,
   startResearch,
@@ -24,11 +23,12 @@ vi.mock("./backend", () => ({
   listTheses: vi.fn(),
   saveThesis: vi.fn(),
   updatePreferences: vi.fn(),
-  discoverModels: vi.fn(),
   exportResearchReport: vi.fn(),
   installResearchPack: vi.fn(),
+  listConfiguredModels: vi.fn(),
+  listModelProviders: vi.fn(),
+  listProviderConnections: vi.fn(),
   openExternalUrl: vi.fn(),
-  testModelConnection: vi.fn(),
   searchCompanies: vi.fn(),
   startResearch: vi.fn(),
   getResearchStatus: vi.fn(),
@@ -38,9 +38,47 @@ vi.mock("./backend", () => ({
 describe("report-first workbench", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(listConfiguredModels).mockResolvedValue([
+      {
+        configured_model_id: "openai-primary",
+        connection_id: "openai-main",
+        model_id: "gpt-test",
+        alias: "Primary GPT",
+        free_tier: false,
+        billing_class: "paid",
+        enabled: true,
+        health_status: "ready",
+        configuration_version: 3,
+        free_source_url: null,
+        free_verified_at: null,
+        last_discovered_at: null,
+        context_window_hint: null,
+        temperature: null,
+        timeout_seconds: 180,
+        capabilities: ["text_chat", "structured_json"],
+      },
+      {
+        configured_model_id: "openrouter-free",
+        connection_id: "openrouter-main",
+        model_id: "openrouter/free",
+        alias: "OpenRouter Free",
+        free_tier: true,
+        billing_class: "free_tier",
+        enabled: true,
+        health_status: "ready",
+        configuration_version: 1,
+        free_source_url: null,
+        free_verified_at: null,
+        last_discovered_at: null,
+        context_window_hint: null,
+        temperature: null,
+        timeout_seconds: 180,
+        capabilities: ["text_chat", "structured_json"],
+      },
+    ]);
     vi.mocked(bootstrapBackend).mockResolvedValue({
-      contract_version: "1.0",
-      app_version: "1.2.0",
+      contract_version: "2",
+      app_version: "2.0.0",
       capabilities: [],
       preferences: {
         ui_language: "en",
@@ -58,32 +96,6 @@ describe("report-first workbench", () => {
         { market: "US", label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: "https://www.sec.gov/edgar/search/" },
         { market: "CN_A", label_zh: "A 股", label_en: "China A-shares", exchanges: ["SSE", "SZSE", "BSE"], default_currency: "CNY", requires_sec_identity: false, disclosure_home: "https://www.cninfo.com.cn/new/index" },
         { market: "HK", label_zh: "港股", label_en: "Hong Kong equities", exchanges: ["HKEX"], default_currency: "HKD", requires_sec_identity: false, disclosure_home: "https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh" },
-      ],
-      model_catalog: [
-        {
-          preset_id: "none",
-          label: "No AI",
-          region: "Offline",
-          protocol: "none",
-          base_url: "",
-          recommended_models: [],
-          models_path: null,
-          help_url: "",
-          requires_api_key: false,
-          temperature: null,
-        },
-        {
-          preset_id: "openai",
-          label: "OpenAI",
-          region: "Global",
-          protocol: "openai-compatible",
-          base_url: "https://api.openai.com/v1",
-          recommended_models: ["gpt-test"],
-          models_path: "/models",
-          help_url: "https://platform.openai.com/api-keys",
-          requires_api_key: true,
-          temperature: null,
-        },
       ],
       research_packs: [
         { pack_id: "official.long-term-fundamentals", name: "Long-term", version: "1", content_hash: "hash" },
@@ -142,9 +154,9 @@ describe("report-first workbench", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Help" }));
     expect(screen.getByRole("heading", { name: "Help" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Start a company research run" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Write your own research pack" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Research A-shares, BSE, and Hong Kong listings" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "From model setup to a first research report" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Author .ot files in OT Studio" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Research US, mainland China, and Hong Kong listings" })).toBeVisible();
   });
 
   it("gates the first frame until a manual language preference is applied", async () => {
@@ -299,60 +311,25 @@ describe("report-first workbench", () => {
     await waitFor(() => expect(exportResearchReport).toHaveBeenCalled());
   });
 
-  it("keeps API keys session-only while refreshing models", async () => {
-    vi.mocked(discoverModels).mockResolvedValue({
-      preset_id: "openai",
-      models: ["gpt-test", "gpt-remote"],
-      warning: "",
-    });
-    vi.mocked(testModelConnection).mockResolvedValue({ ok: true, message: "connected" });
+  it("shows only configured tested models and no credential fields in research", async () => {
     render(<App />);
 
     fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
-    fireEvent.change(screen.getByLabelText("Model provider"), {
-      target: { value: "openai" },
-    });
-    fireEvent.change(screen.getByLabelText("API Key (session only)"), {
-      target: { value: "sk-session" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Refresh online models" }));
-    fireEvent.click(screen.getByRole("button", { name: "Test model connection" }));
-    fireEvent.click(screen.getByRole("button", { name: "Get API Key help" }));
-
-    expect(discoverModels).toHaveBeenCalledWith({
-      preset_id: "openai",
-      base_url: "https://api.openai.com/v1",
-      api_key: "sk-session",
-    });
-    expect(testModelConnection).toHaveBeenCalledWith({
-      preset_id: "openai",
-      model: "gpt-test",
-      base_url: "https://api.openai.com/v1",
-      api_key: "sk-session",
-    });
-    expect(openExternalUrl).toHaveBeenCalledWith("https://platform.openai.com/api-keys");
-    expect(updatePreferences).not.toHaveBeenCalledWith(
-      expect.objectContaining({ api_key: expect.anything() }),
-    );
+    const modelSelect = await screen.findByRole("combobox", { name: "Primary model" });
+    expect(within(modelSelect).getByRole("option", { name: "Primary GPT · gpt-test" })).toBeInTheDocument();
+    expect(within(modelSelect).getByRole("option", { name: "OpenRouter Free · openrouter/free · Free" })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/API Key/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Endpoint")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Model provider")).not.toBeInTheDocument();
   });
 
-  it("shows every recommended and refreshed model in the visible selector", async () => {
-    vi.mocked(discoverModels).mockResolvedValue({
-      preset_id: "openai",
-      models: ["gpt-test", "gpt-remote"],
-      warning: "",
-    });
+  it("supports explicitly selecting multiple configured comparison models", async () => {
     render(<App />);
 
     fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
-    fireEvent.change(screen.getByLabelText("Model provider"), { target: { value: "openai" } });
-
-    const modelSelect = screen.getByRole("combobox", { name: "Model name" });
-    expect(within(modelSelect).getByRole("option", { name: "gpt-test" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Refresh online models" }));
-    await waitFor(() => expect(within(modelSelect).getByRole("option", { name: "gpt-remote" })).toBeInTheDocument());
-    expect(screen.getByText("Model catalog updated.")).toBeVisible();
+    fireEvent.click(await screen.findByLabelText("Enable second-model comparison"));
+    expect(screen.getByText("Comparison model")).toBeVisible();
+    expect(screen.getByText("OpenRouter Free")).toBeVisible();
   });
 
   it("opens SEC guidance through the native external-link adapter", async () => {
@@ -397,8 +374,8 @@ describe("report-first workbench", () => {
     fireEvent.click(await screen.findByRole("button", { name: "About OpenThesis" }));
 
     expect(screen.getByRole("heading", { name: "About OpenThesis", level: 1 })).toBeVisible();
-    expect(screen.getByText("1.2.0")).toBeVisible();
-    expect(screen.getByText("JSON-RPC 1.0")).toBeVisible();
+    expect(screen.getByText("2.0.0")).toBeVisible();
+    expect(screen.getByText("JSON-RPC 2")).toBeVisible();
   });
 
   it("imports a declarative research pack without native path access", async () => {
@@ -411,8 +388,8 @@ describe("report-first workbench", () => {
     render(<App />);
     fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
 
-    const file = new File(["pack"], "custom.othesis", { type: "application/zip" });
-    fireEvent.change(screen.getByLabelText("Import .othesis research pack"), {
+    const file = new File(["pack"], "custom.ot", { type: "application/zip" });
+    fireEvent.change(screen.getByLabelText("Import .ot research pack"), {
       target: { files: [file] },
     });
 

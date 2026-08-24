@@ -16,7 +16,7 @@ describe("desktop localization catalog", () => {
   it("contains a complete Traditional Chinese catalog", () => {
     expect(Object.keys(COPY["zh-Hant"]).sort()).toEqual(Object.keys(COPY["zh-CN"]).sort());
     expect(COPY["zh-Hant"].settings).toContain("\u8a2d\u5b9a");
-    expect(COPY["zh-Hant"].visionFallback).toContain("\u96f2\u7aef");
+    expect(COPY["zh-Hant"].visionFallback).toContain("\u8996\u89ba");
   });
 
   it("does not fall back to common Simplified-only UI glyphs", () => {

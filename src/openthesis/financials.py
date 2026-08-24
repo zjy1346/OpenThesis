@@ -333,9 +333,9 @@ def deterministic_summary(
     has_operating_margin = any(row.get("operating_margin") is not None for row in metrics)
     has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in metrics)
     columns: list[tuple[str, str, str]] = [
-        ("year", "Fiscal year", "\u8ca1\u5e74" if not traditional else "\u8ca1\u653f\u5e74\u5ea6"),
+        ("year", "Fiscal year", "\u8d22\u5e74" if not traditional else "\u8ca1\u653f\u5e74\u5ea6"),
         ("revenue", "Revenue", "\u8425\u4e1a\u6536\u5165" if not traditional else "\u71df\u696d\u6536\u5165"),
-        ("revenue_growth", "Revenue growth", "\u6536\u5165\u589e\u9577" if traditional else "\u6536\u5165\u589e\u957e"),
+        ("revenue_growth", "Revenue growth", "\u6536\u5165\u589e\u9577" if traditional else "\u6536\u5165\u589e\u957f"),
     ]
     if has_operating_margin:
         columns.append(("operating_margin", "Operating margin", "\u71df\u696d\u5229\u6f64\u7387" if traditional else "\u8425\u4e1a\u5229\u6da6\u7387"))

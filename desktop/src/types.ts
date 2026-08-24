@@ -41,19 +41,72 @@ export type MarketProfile = {
   disclosure_home: string;
 };
 
-export type ModelPreset = {
-  preset_id: string;
-  label: string;
-  region: string;
-  protocol: string;
-  base_url: string;
-  recommended_models: string[];
-  models_path: string | null;
-  help_url: string;
-  requires_api_key: boolean;
-  temperature: number | null;
+export type OtDiagnostic = {
+  code: string;
+  severity: "error" | "warning" | "info";
+  path: string;
+  message: string;
 };
 
+export type OtDraft = {
+  package: {
+    id: string;
+    name: string;
+    version: string;
+    kind: string;
+    description: string;
+    license: string;
+  };
+  settings: {
+    horizon_years: number;
+    depth: number;
+    risk_emphasis: number;
+    report_language: Language;
+    [key: string]: unknown;
+  };
+  workflow: {
+    steps: Array<{
+      id: string;
+      role: string;
+      depends_on: string[];
+      prompt: string;
+      output_schema: string;
+    }>;
+  };
+  outputs: {
+    formats: string[];
+    include_evidence: boolean;
+    deterministic_transforms: string[];
+  };
+  ui: Record<string, unknown>;
+  model_requirements: {
+    capabilities: string[];
+    preferred_profile_alias: string | null;
+  };
+  dependencies: unknown[];
+  relationships: unknown[];
+  optional_extensions: Record<string, unknown>;
+};
+
+export type OtValidationResult = {
+  valid: boolean;
+  diagnostics: OtDiagnostic[];
+};
+
+export type OtCompileResult = OtValidationResult & {
+  filename?: string;
+  data_base64?: string;
+  content_identity?: string;
+  manifest?: Record<string, unknown>;
+};
+
+export type OtSuggestion = {
+  accepted: boolean;
+  path: string;
+  before: unknown;
+  after: unknown;
+  diagnostics: OtDiagnostic[];
+};
 export type ResearchPackSummary = {
   pack_id: string;
   name: string;
@@ -61,25 +114,87 @@ export type ResearchPackSummary = {
   content_hash: string;
 };
 
-export type ModelSelection = {
-  preset_id: string;
-  model: string;
+export type ModelRole = "primary" | "comparison" | "verification" | "vision" | "ot_assistant";
+
+export type ModelReference = {
+  configured_model_id: string;
+  configuration_version: number;
+  role: ModelRole;
+};
+
+export type ModelSelection = ModelReference;
+
+export type ProviderModelPreset = {
+  model_id: string;
+  alias: string;
+  capabilities: string[];
+  billing_class: string;
+};
+
+export type ProviderDefinition = {
+  provider_id: string;
+  display_name: string;
+  category: "cloud" | "local" | "custom";
+  region: string;
   base_url: string;
-  api_key: string;
-  timeout_seconds?: number;
+  help_url: string;
+  requires_api_key: boolean;
+  supports_discovery: boolean;
+  free_hint: boolean;
+  allowed_hosts: string[];
+  recommended_models?: ProviderModelPreset[];
+  models_path?: string | null;
+  default_test_model_id?: string | null;
+};
+
+export type ProviderConnectionSummary = {
+  connection_id: string;
+  provider_id: string;
+  display_name: string;
+  region: string;
+  endpoint: string;
+  credential_version: number;
+  has_secret: boolean;
+  enabled: boolean;
+  status?: string;
+  last_tested_at?: number | null;
+  last_error_code?: string | null;
+  configuration_version?: number;
+};
+
+export type ConfiguredModelSummary = {
+  configured_model_id: string;
+  connection_id: string;
+  model_id: string;
+  alias: string;
+  free_tier: boolean;
+  billing_class: "local_no_provider_fee" | "free_tier" | "paid" | "unknown";
+  free_source_url: string | null;
+  free_verified_at: number | null;
+  enabled: boolean;
+  capabilities: string[];
+  health_status: "unverified" | "ready" | "error" | string;
+  last_discovered_at: number | null;
+  context_window_hint: number | null;
+  temperature: number | null;
+  timeout_seconds: number;
+  configuration_version: number;
+};
+
+export type DiscoveredModel = {
+  model_id: string;
+  alias: string;
+  billing_class: string;
+  capabilities: string[];
 };
 
 export type VisionFallbackSelection = {
   enabled: boolean;
   consent: boolean;
-  provider: "mineru_lite" | "mineru_precision" | "custom_vision";
-  token?: string;
-  api_key?: string;
-  endpoint?: string;
-  model?: string;
+  provider: "mineru_flash" | "configured_model";
+  model?: ModelReference;
   language?: "auto" | "ch" | "en";
   require_page_approval: true;
-  timeout_seconds?: number;
 };
 
 export type ResearchRequest = {
@@ -89,7 +204,7 @@ export type ResearchRequest = {
   pack_id?: string;
   model?: ModelSelection;
   compare_enabled?: boolean;
-  comparison_model?: ModelSelection;
+  comparison_models?: ModelSelection[];
   parallel_agents?: boolean;
   valuation?: {
     market_cap_billions: number;
@@ -128,7 +243,6 @@ export type BootstrapResult = {
   recent_runs: ResearchRunSummary[];
   common_companies: Company[];
   market_catalog?: MarketProfile[];
-  model_catalog: ModelPreset[];
   research_packs: ResearchPackSummary[];
   interrupted_runs: number;
 };
@@ -147,7 +261,11 @@ export type ResearchReport = {
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
   retryable_growth?: boolean;
-  markdown: string;
+  reproducibility?: {
+    model_configuration: Record<string, unknown>;
+    research_configuration: Record<string, unknown>;
+    data_snapshot: Record<string, unknown>;
+  };  markdown: string;
   html: string;
 };
 

@@ -21,6 +21,14 @@ Every user-requested software modification must follow this workflow:
 7. Once all recorded requirements pass acceptance, build and package a release artifact for the user to test.
 8. Wait for the user to test the release artifact. Only after the user explicitly states that everything is working correctly and explicitly authorizes uploading or publishing to GitHub may the project create the final Git commit, push changes, and publish the new GitHub Release.
 
+## Minimal release-call principle
+
+- If the application code, dependencies, packaging-affecting configuration, and existing artifact hash are unchanged, do not rebuild or package again.
+- If the same code and the same artifact already have a trustworthy privacy-scan record, do not repeat that identical scan.
+- Any change that can affect the shipped artifact invalidates the previous build and scan evidence; rerun the necessary validation for the changed artifact.
+- Prefer delegating mechanical staging, committing, uploading, and remote verification to `lunahigh`; the primary agent retains scope, security, and final-review ownership.
+- The minimal-call principle must never be used to skip the first necessary validation.
+
 ## Delegation policy
 
 After understanding the request and defining a clear plan, the primary agent should delegate to `lunahigh` whenever the remaining work is primarily mechanical or implementation-oriented, including:
@@ -56,4 +64,3 @@ The primary agent should work directly only when the task still requires complex
 - The primary agent is responsible for dividing parallel work into clearly separated scopes before spawning multiple `lunahigh` subagents.
 - Do not ask any `lunahigh` subagent to spawn further agents. All subagents must be created and coordinated by the primary agent.
 - Avoid overlapping write ownership. The primary agent and any `lunahigh` subagent, and multiple `lunahigh` subagents, must never modify the same file concurrently.
-

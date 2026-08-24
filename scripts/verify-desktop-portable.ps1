@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "1.5.1",
+    [string]$Version = "2.0.1",
     [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis"
 )
 
@@ -70,3 +70,4 @@ try {
     MainSubsystem = "Windows GUI"
     RequiredEntries = "present"
 } | ConvertTo-Json -Compress
+
