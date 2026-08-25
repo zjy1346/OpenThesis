@@ -4,7 +4,7 @@
 
 **以 AI 為核心、以證據為基礎的長期公司研究工具**
 
-[English](https://github.com/zjy1346/OpenThesis#readme-en) · [簡體中文](https://github.com/zjy1346/OpenThesis#readme-zh-cn) · [繁體中文](https://github.com/zjy1346/OpenThesis#readme-zh-hant)
+[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-Hant.md)
 
 [![Release](https://img.shields.io/github/v/release/zjy1346/OpenThesis?display_name=tag&sort=semver)](https://github.com/zjy1346/OpenThesis/releases/latest)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)](https://github.com/zjy1346/OpenThesis/releases/latest)
