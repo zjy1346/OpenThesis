@@ -57,9 +57,13 @@ describe("OtStudioView", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Use as description" }));
     fireEvent.change(screen.getByLabelText("Package name"), { target: { value: "Durable cash research" } });
-    const horizon = screen.getByRole("slider", { name: "Horizon" });
+    const horizon = screen.getByRole("slider", { name: "Conclusion / scenario horizon" });
     fireEvent.change(horizon, { target: { value: "8" } });
     expect(horizon).toHaveValue("8");
+    const evidenceHistory = screen.getByRole("slider", { name: "Financial evidence history" });
+    fireEvent.change(evidenceHistory, { target: { value: "7" } });
+    expect(evidenceHistory).toHaveValue("7");
+    expect(screen.getByText("Plan: 7 displayed fiscal years + 1 comparison fiscal year (8 annual reports)." )).toBeVisible();
 
     fireEvent.click(screen.getByRole("button", { name: "Validate" }));
     await waitFor(() => expect(validateOtDraft).toHaveBeenCalled());
@@ -74,6 +78,7 @@ describe("OtStudioView", () => {
     expect(compiledDraft.package.kind).toBe("openthesis.research-pack");
     expect(compiledDraft.package.description).toBe("Investigate durable cash generation using traceable filings.");
     expect(compiledDraft.settings.horizon_years).toBe(8);
+    expect(compiledDraft.settings.evidence_policy?.annual_history_years).toBe(7);
 
     fireEvent.click(screen.getByRole("button", { name: "Open Model Center" }));
     expect(onOpenModelCenter).toHaveBeenCalledTimes(1);
@@ -85,7 +90,8 @@ describe("OtStudioView", () => {
     await screen.findByText("No tested assistant model is configured. Manual editing and export remain available.");
 
     const cases = [
-      ["About: Horizon", "It does not decide how many years of filings are downloaded"],
+      ["About: Conclusion / scenario horizon", "independent from the financial evidence history"],
+      ["About: Financial evidence history", "one hidden comparison year"],
       ["About: Analysis depth", "they never create missing evidence"],
       ["About: Risk emphasis", "It does not change source facts"],
     ];
@@ -104,7 +110,7 @@ describe("OtStudioView", () => {
   it("renders tooltip in document body and keeps action controls as a stable pair", async () => {
     render(<OtStudioView language="en" onOpenModelCenter={vi.fn()} />);
     await screen.findByText("No tested assistant model is configured. Manual editing and export remain available.");
-    const trigger = screen.getByRole("button", { name: "About: Horizon" });
+    const trigger = screen.getByRole("button", { name: "About: Conclusion / scenario horizon" });
     trigger.focus();
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip.parentElement).toBe(document.body);

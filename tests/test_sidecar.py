@@ -13,6 +13,11 @@ from openthesis.sidecar import JsonLineServer
 
 
 class JsonLineServerTests(unittest.TestCase):
+    def test_retry_financials_method_is_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = JsonLineServer(AppService(Path(directory)))
+            with self.assertRaises(Exception):
+                server.dispatch({"jsonrpc": "2.0", "id": 1, "method": "research.retry_financials", "params": {"run_id": "missing"}})
     def test_hello_uses_versioned_json_rpc_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
@@ -98,6 +103,45 @@ class JsonLineServerTests(unittest.TestCase):
                         "params": {"job_id": started["job_id"]},
                     }
                 )
+
+    def test_retry_financials_is_exposed_without_model_parameters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            class Service(AppService):
+                def retry_financials(self, run_id: str):
+                    self.seen_run_id = run_id
+                    return {"run_id": run_id, "model_called": False}
+
+            service = Service(Path(directory))
+            self.assertIn("research.retry_financials", service.hello()["capabilities"])
+            result = JsonLineServer(service).dispatch({
+                "jsonrpc": "2.0", "id": 11, "method": "research.retry_financials",
+                "params": {"run_id": "run-1"},
+            })
+            self.assertEqual(result["run_id"], "run-1")
+            self.assertFalse(result["model_called"])
+
+    def test_rebuild_financials_requires_explicit_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            class Service(AppService):
+                def rebuild_financials(self, run_id: str, *, confirmed: bool = False):
+                    self.seen = (run_id, confirmed)
+                    return {"run_id": run_id, "confirmed": confirmed}
+
+            service = Service(Path(directory))
+            self.assertIn("research.rebuild_financials", service.hello()["capabilities"])
+            with self.assertRaises(Exception):
+                JsonLineServer(service).dispatch({
+                    "jsonrpc": "2.0", "id": 12,
+                    "method": "research.rebuild_financials",
+                    "params": {"run_id": "run-1"},
+                })
+            result = JsonLineServer(service).dispatch({
+                "jsonrpc": "2.0", "id": 13,
+                "method": "research.rebuild_financials",
+                "params": {"run_id": "run-1", "confirmed": True},
+            })
+            self.assertEqual(service.seen, ("run-1", True))
+            self.assertTrue(result["confirmed"])
 
     def test_ot_validation_is_available_over_json_rpc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

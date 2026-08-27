@@ -59,6 +59,7 @@ export type OtDraft = {
   };
   settings: {
     horizon_years: number;
+    evidence_policy?: { annual_history_years: number };
     depth: number;
     risk_emphasis: number;
     report_language: Language;
@@ -261,6 +262,25 @@ export type ResearchReport = {
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
   retryable_growth?: boolean;
+  financial_status?: {
+    state: "complete" | "incomplete" | "warning" | "unavailable";
+    retryable: boolean;
+    history_years: number;
+    expected_periods: string[];
+    available_periods: string[];
+    missing_periods: string[];
+    unverified_periods?: string[];
+    nodes: Array<{ period: string; state: string; comparison_only: boolean }>;
+    issues: Array<{ period: string; stage: string; code: string; status: string }>;
+    attempt_count: number;
+    last_stage: string;
+    last_error: string;
+    updated_at: string;
+    next_action: string;
+    model_calls: number;
+    token_delta: number;
+    snapshot_stale?: boolean;
+  };
   reproducibility?: {
     model_configuration: Record<string, unknown>;
     research_configuration: Record<string, unknown>;
@@ -281,6 +301,8 @@ export type ResearchJob = {
   total_agents?: number;
   cancel_requested?: boolean;
   elapsed_seconds?: number;
+  stage_elapsed_seconds?: number;
+  stage_timings?: Record<string, number>;
   stage_current?: number | null;
   stage_total?: number | null;
   error_code?: string | null;

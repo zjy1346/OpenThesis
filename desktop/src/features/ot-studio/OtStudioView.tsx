@@ -15,8 +15,10 @@ const EN = {
   intent: "Research intent", goal: "What should this package investigate?",
   goalHint: "For example: evaluate durable growth, accounting quality, and downside risk over five years.",
   applyGoal: "Use as description", name: "Package name", packageId: "Package ID", version: "Version",
-  horizon: "Horizon", years: "years", depth: "Analysis depth", risk: "Risk emphasis",
-  helpLabel: "About", horizonHelp: "Sets the time span emphasized by research and scenario analysis. It does not decide how many years of filings are downloaded; available evidence and the .ot package still bound the data range.",
+  horizon: "Conclusion / scenario horizon", years: "years", depth: "Analysis depth", risk: "Risk emphasis",
+  evidenceHistory: "Financial evidence history", evidencePlan: "Plan: {display} displayed fiscal years + 1 comparison fiscal year ({total} annual reports).",
+  helpLabel: "About", horizonHelp: "Sets the time span emphasized by conclusions and scenario analysis. It is independent from the financial evidence history below and never creates missing filings.",
+  evidenceHistoryHelp: "Sets how many complete fiscal years appear in deterministic analysis. OpenThesis also fetches one hidden comparison year for year-over-year calculations, subject to official availability.",
   depthHelp: "Sets the breadth, detail, and instruction intensity of the analysis. Higher values may use more time and model tokens, but they never create missing evidence.",
   riskHelp: "Sets how strongly risk, counter-arguments, and uncertainty are emphasized during synthesis. It does not change source facts or guarantee a more conservative or accurate conclusion.",
   workflow: "Workflow", role: "Role", schema: "Output schema", prompt: "Bounded instruction",
@@ -41,8 +43,10 @@ const ZH: StudioText = {
   intent: "研究意图", goal: "这个研究包应该研究什么？",
   goalHint: "例如：从五年视角评估增长质量、会计质量和下行风险。",
   applyGoal: "用作项目说明", name: "研究包名称", packageId: "研究包 ID", version: "版本",
-  horizon: "研究周期", years: "年", depth: "分析深度", risk: "风险权重",
-  helpLabel: "了解", horizonHelp: "控制研究与情景分析重点关注的时间跨度。它不等同于自动下载多少年财报；最终数据范围仍受可用证据和 .ot 研究包约束。",
+  horizon: "结论 / 情景周期", years: "年", depth: "分析深度", risk: "风险权重",
+  evidenceHistory: "财报证据历史", evidencePlan: "预计采集：展示 {display} 个财年 + 1 个同比基期（共 {total} 份年报）。",
+  helpLabel: "了解", horizonHelp: "控制结论与情景分析重点关注的时间跨度。它与下方财报证据历史相互独立，也不会创造缺失财报。",
+  evidenceHistoryHelp: "控制确定性分析展示多少个完整财年。OpenThesis 会额外获取 1 个隐藏同比基期，最终数量仍以官方披露为准。",
   depthHelp: "控制分析覆盖面、细节程度和指令约束强度。更高的值可能增加耗时和模型用量，但不会自动创造缺失证据。",
   riskHelp: "控制风险、反方观点和不确定性在综合过程中的强调程度。它不会修改原始事实，也不保证结论一定更保守或更准确。",
   workflow: "研究流程", role: "角色", schema: "输出 Schema", prompt: "有边界的任务指令",
@@ -67,8 +71,10 @@ const ZH_HANT: StudioText = {
   intent: "研究意圖", goal: "這個研究套件應該研究什麼？",
   goalHint: "例如：從五年視角評估成長品質、會計品質和下行風險。",
   applyGoal: "用作套件說明", name: "研究套件名稱", packageId: "研究套件 ID", version: "版本",
-  horizon: "研究週期", years: "年", depth: "分析深度", risk: "風險權重",
-  helpLabel: "瞭解", horizonHelp: "控制研究與情境分析重點關注的時間跨度。它不等同於自動下載多少年財報；最終資料範圍仍受可用證據和 .ot 研究套件約束。",
+  horizon: "結論 / 情境週期", years: "年", depth: "分析深度", risk: "風險權重",
+  evidenceHistory: "財報證據歷史", evidencePlan: "預計擷取：顯示 {display} 個財年 + 1 個同比基期（共 {total} 份年報）。",
+  helpLabel: "瞭解", horizonHelp: "控制結論與情境分析重點關注的時間跨度。它與下方財報證據歷史相互獨立，也不會創造缺失財報。",
+  evidenceHistoryHelp: "控制確定性分析顯示多少個完整財年。OpenThesis 會額外取得 1 個隱藏同比基期，最終數量仍以官方披露為準。",
   depthHelp: "控制分析覆蓋面、細節程度和指令約束強度。更高的值可能增加耗時和模型用量，但不會自動創造缺失證據。",
   riskHelp: "控制風險、反方觀點和不確定性在綜合過程中的強調程度。它不會修改原始事實，也不保證結論一定更保守或更準確。",
   workflow: "研究流程", role: "角色", schema: "輸出 Schema", prompt: "有邊界的任務指令",
@@ -100,7 +106,7 @@ function initialDraft(): OtDraft {
       kind: "openthesis.research-pack", description: "Evidence-first company research with deterministic financial analysis.",
       license: "Apache-2.0",
     },
-    settings: { horizon_years: 5, depth: 3, risk_emphasis: 3, report_language: "en" },
+    settings: { horizon_years: 5, evidence_policy: { annual_history_years: 5 }, depth: 3, risk_emphasis: 3, report_language: "en" },
     workflow: { steps: [
       { id: "financial-analysis", role: "financial_analysis", depends_on: [], prompt: "Analyze the validated financial facts. Cite evidence IDs and distinguish reported facts from interpretation.", output_schema: "analysis.financial.v1" },
       { id: "risk-review", role: "skeptic", depends_on: ["financial-analysis"], prompt: "Challenge the thesis using the same evidence set. Do not invent missing facts or values.", output_schema: "analysis.risk.v1" },
@@ -243,6 +249,7 @@ function InlineHelp({ id, label, children }: { id: string; label: string; childr
 export function OtStudioView({ language, onOpenModelCenter }: { language: Language; onOpenModelCenter: () => void }) {
   const text = language === "en" ? EN : language === "zh-Hant" ? ZH_HANT : ZH;
   const [draft, setDraft] = useState<OtDraft>(() => initialDraft());
+  const annualHistoryYears = draft.settings.evidence_policy?.annual_history_years ?? 5;
   const [past, setPast] = useState<OtDraft[]>([]);
   const [future, setFuture] = useState<OtDraft[]>([]);
   const [mode, setMode] = useState<Mode>("guided");
@@ -378,6 +385,11 @@ export function OtStudioView({ language, onOpenModelCenter }: { language: Langua
             <div className="studio-slider-field">
               <div className="studio-slider-heading"><span>{text.horizon}<InlineHelp id="horizon-help" label={`${text.helpLabel}: ${text.horizon}`}>{text.horizonHelp}</InlineHelp></span><output>{draft.settings.horizon_years} {text.years}</output></div>
               <input aria-label={text.horizon} type="range" min="1" max="20" value={draft.settings.horizon_years} onChange={(event) => update((value) => { value.settings.horizon_years = Number(event.target.value); })} />
+            </div>
+            <div className="studio-slider-field">
+              <div className="studio-slider-heading"><span>{text.evidenceHistory}<InlineHelp id="evidence-history-help" label={`${text.helpLabel}: ${text.evidenceHistory}`}>{text.evidenceHistoryHelp}</InlineHelp></span><output>{annualHistoryYears} {text.years}</output></div>
+              <input aria-label={text.evidenceHistory} type="range" min="2" max="10" value={annualHistoryYears} onChange={(event) => update((value) => { value.settings.evidence_policy = { annual_history_years: Number(event.target.value) }; })} />
+              <small>{text.evidencePlan.replace("{display}", String(annualHistoryYears)).replace("{total}", String(annualHistoryYears + 1))}</small>
             </div>
             <div className="studio-slider-field">
               <div className="studio-slider-heading"><span>{text.depth}<InlineHelp id="depth-help" label={`${text.helpLabel}: ${text.depth}`}>{text.depthHelp}</InlineHelp></span><output>{draft.settings.depth}/5</output></div>

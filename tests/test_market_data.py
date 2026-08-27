@@ -146,6 +146,21 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertEqual(filing.period_end, "2025-12-31")
         self.assertNotIn("<", filing.primary_document)
 
+    def test_hkex_annual_period_uses_explicit_non_calendar_year_end(self) -> None:
+        company = CnInfoAdapter(_Transport()).resolve("300750")[0]
+        filings = _hkex_filings_from_json(
+            company,
+            [
+                {
+                    "DATE_TIME": "08/04/2026 09:00",
+                    "TITLE": "2026 Annual Report for the year ended 31 March 2025",
+                    "FILE_LINK": "/listedco/listconews/sehk/2026/0408/annual-2025-mar.pdf",
+                }
+            ],
+        )
+        self.assertEqual(filings[0].period_end, "2025-03-31")
+        self.assertEqual(filings[0].revision, "period_end_verified")
+
     def test_hkex_anchor_titles_ignore_earnings_release_neighbors(self) -> None:
         company = CnInfoAdapter(_Transport()).resolve("300750")[0]
         text = (
@@ -180,6 +195,15 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertTrue(query["fromDate"][0].endswith("0101"))
         self.assertNotIn("/", query["fromDate"][0] + query["toDate"][0])
         self.assertNotIn("titlesearch.xhtml", transport.search_urls[0])
+
+    def test_hkex_discovery_keeps_n_plus_one_annual_comparator(self) -> None:
+        adapter = HkexNewsAdapter(_HkexJsonTransport())
+        company = adapter.resolve("00700")[0]
+
+        filings = adapter.list_financial_filings(company, limit=2)
+
+        annuals = [item for item in filings if item.form_type == "ANNUAL_REPORT"]
+        self.assertEqual([item.period_end[:4] for item in annuals], ["2025", "2024", "2023"])
 
     def test_hkex_json_rows_support_list_and_malformed_distinction(self) -> None:
         rows = [{"TITLE": "Annual Report 2025", "FILE_LINK": "/listedco/listconews/sehk/2026/0328/a.pdf", "DATE_TIME": "28/03/2026 10:30"}]

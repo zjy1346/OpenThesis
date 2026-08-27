@@ -78,6 +78,19 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_financial_metric_gaps_show_specific_retry_relevant_reasons(self) -> None:
+        artifacts = sample_artifacts()
+        metric = artifacts[0]["content"]["metrics"][0]
+        metric["revenue_growth"] = None
+        metric["comparison_gap"] = "missing_2024"
+        metric["return_on_equity"] = None
+        metric["return_on_equity_gap"] = "missing_equity"
+
+        report = render_research_html("run-quality-gaps", artifacts, "zh-CN")
+
+        self.assertIn("2025 财年收入增长缺少 2024 财年已验证收入", report)
+        self.assertIn("净资产收益率无法计算：缺少权益数据", report)
+
     def test_traditional_chinese_report_declares_language(self) -> None:
         report = render_research_html("run-hant", sample_artifacts(), "zh-Hant")
         self.assertIn('<html lang="zh-Hant">', report)

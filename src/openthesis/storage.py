@@ -17,7 +17,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Storage:
@@ -167,6 +167,15 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS idx_validation_groups_company
                 ON financial_validation_groups(company_cik, period_end DESC);
+
+                CREATE TABLE IF NOT EXISTS financial_retry_state (
+                    company_cik TEXT PRIMARY KEY,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_stage TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(company_cik) REFERENCES companies(cik)
+                );
 
                 CREATE TABLE IF NOT EXISTS research_runs (
                     run_id TEXT PRIMARY KEY,
@@ -361,6 +370,60 @@ class Storage:
                     for filing in filings
                 ],
             )
+
+    def get_filings(self, company_cik: str) -> list[FilingDocument]:
+        """Return stored official filings in deterministic newest-first order."""
+
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM filings
+                WHERE company_cik = ?
+                ORDER BY period_end DESC, filed_at DESC, document_id
+                """,
+                (company_cik,),
+            ).fetchall()
+        return [FilingDocument(**dict(row)) for row in rows]
+
+    def get_financial_retry_state(self, company_cik: str) -> dict[str, Any]:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM financial_retry_state WHERE company_cik = ?",
+                (company_cik,),
+            ).fetchone()
+        if row is None:
+            return {
+                "company_cik": company_cik,
+                "attempt_count": 0,
+                "last_stage": "",
+                "last_error": "",
+                "updated_at": "",
+            }
+        return dict(row)
+
+    def record_financial_retry_attempt(
+        self, company_cik: str, *, stage: str, error: str
+    ) -> dict[str, Any]:
+        updated_at = utc_now_iso()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO financial_retry_state(
+                    company_cik, attempt_count, last_stage, last_error, updated_at
+                ) VALUES(?, 1, ?, ?, ?)
+                ON CONFLICT(company_cik) DO UPDATE SET
+                    attempt_count=financial_retry_state.attempt_count + 1,
+                    last_stage=excluded.last_stage,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+                """,
+                (company_cik, stage, error, updated_at),
+            )
+            row = db.execute(
+                "SELECT * FROM financial_retry_state WHERE company_cik = ?",
+                (company_cik,),
+            ).fetchone()
+        return dict(row)
 
     def save_facts(self, facts: list[FinancialFact]) -> None:
         with self.connect() as db:

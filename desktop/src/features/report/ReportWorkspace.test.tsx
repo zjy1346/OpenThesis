@@ -64,4 +64,31 @@ describe("report presentation", () => {
     expect(screen.getAllByRole("status")).toHaveLength(1);
     resolveRetry?.();
   });
+
+  it("keeps a zero-token financial retry visible with missing periods and no model selection", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const retryFinancials = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve; }));
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "9988", company_name: "Alibaba", status: "completed", report_language: "en", financial_status: { state: "incomplete", retryable: true, history_years: 2, expected_periods: ["2026", "2025", "2024"], available_periods: ["2026", "2024"], missing_periods: ["2025"], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-download", last_error: "temporary_timeout", updated_at: "", next_action: "retry_missing_periods", model_calls: 0, token_delta: 0, snapshot_stale: true }, markdown: "# Report", html: "" }} copy={COPY.en} onRetryFinancials={retryFinancials} />);
+
+    expect(screen.getByText("Missing fiscal years: 2025")).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.financialZeroToken)).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.financialSnapshotStale)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.retryFinancials }));
+    expect(retryFinancials).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(COPY.en.retryingFinancials)).toBeInTheDocument();
+    resolveRetry?.();
+  });
+
+  it("requires explicit confirmation before a full financial rebuild", () => {
+    const rebuild = vi.fn(async () => undefined);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "9988", company_name: "Alibaba", status: "completed", report_language: "en", financial_status: { state: "incomplete", retryable: true, history_years: 2, expected_periods: ["2026", "2025", "2024"], available_periods: ["2026", "2024"], missing_periods: ["2025"], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-validation", last_error: "quality", updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0 }, markdown: "# Report", html: "" }} copy={COPY.en} onRebuildFinancials={rebuild} />);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.rebuildFinancials }));
+    expect(rebuild).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.rebuildFinancials }));
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    confirm.mockRestore();
+  });
 });

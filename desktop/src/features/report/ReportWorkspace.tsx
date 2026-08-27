@@ -40,6 +40,19 @@ type ReportCopy = {
   retryingGrowth: string;
   retryGrowthSucceeded: string;
   retryGrowthFailed: string;
+  financialEvidenceStatus: string;
+  financialComplete: string;
+  financialIncomplete: string;
+  financialMissingPeriods: string;
+  financialAttempts: string;
+  financialZeroToken: string;
+  retryFinancials: string;
+  retryingFinancials: string;
+  retryFinancialsSucceeded: string;
+  retryFinancialsFailed: string;
+  rebuildFinancials: string;
+  rebuildFinancialsConfirm: string;
+  financialSnapshotStale: string;
   partialReport: string;
   listingCurrency: string;
   reportingCurrency: string;
@@ -49,7 +62,7 @@ type ReportCopy = {
 type FocusState = "normal" | "focused" | "closing";
 type ExportState = "idle" | "exporting" | "exported" | "failed";
 type RetryState = "idle" | "retrying" | "succeeded" | "failed";
-type RetryTarget = "synthesis" | "growth";
+type RetryTarget = "synthesis" | "growth" | "financials" | "rebuild-financials";
 
 const MIN_ZOOM = 0.9;
 const MAX_ZOOM = 1.3;
@@ -74,7 +87,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void> }) {
+export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void> }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -87,7 +100,13 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth 
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
   const reportBody = stripReportPreamble(displayedReport.markdown);
-  const retryCopy = retryTarget === "growth"
+  const retryCopy = retryTarget === "financials" || retryTarget === "rebuild-financials"
+    ? {
+        retrying: copy.retryingFinancials,
+        succeeded: copy.retryFinancialsSucceeded,
+        failed: copy.retryFinancialsFailed,
+      }
+    : retryTarget === "growth"
     ? {
         retrying: copy.retryingGrowth,
         succeeded: copy.retryGrowthSucceeded,
@@ -209,7 +228,11 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth 
   };
 
   const retryStage = async (target: RetryTarget) => {
-    const action = target === "growth" ? onRetryGrowth : onRetrySynthesis;
+    const action = target === "rebuild-financials"
+      ? onRebuildFinancials
+      : target === "financials"
+      ? onRetryFinancials
+      : target === "growth" ? onRetryGrowth : onRetrySynthesis;
     if (!action) return;
     setRetryTarget(target);
     setRetryState("retrying");
@@ -256,6 +279,40 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth 
           <button type="button" aria-label={focusState === "normal" ? copy.enterFocus : copy.exitFocus} title={focusState === "normal" ? copy.enterFocus : copy.exitFocus} onClick={focusState === "normal" ? () => enterFocus() : () => exitFocus()}>{focusState === "normal" ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
         </div>
       </header>
+      {displayedReport.financial_status && (
+        <section className="financial-health" data-state={displayedReport.financial_status.state} aria-label={copy.financialEvidenceStatus}>
+          <div className="financial-health-copy">
+            <strong>{copy.financialEvidenceStatus}</strong>
+            <span>{displayedReport.financial_status.state === "complete" ? copy.financialComplete : copy.financialIncomplete}</span>
+            {displayedReport.financial_status.missing_periods.length > 0 && (
+              <span>{copy.financialMissingPeriods.replace("{periods}", displayedReport.financial_status.missing_periods.join(", "))}</span>
+            )}
+            {displayedReport.financial_status.attempt_count > 0 && (
+              <span>{copy.financialAttempts.replace("{count}", String(displayedReport.financial_status.attempt_count))}{displayedReport.financial_status.last_stage ? ` · ${displayedReport.financial_status.last_stage}` : ""}</span>
+            )}
+            <small>{copy.financialZeroToken}</small>
+            {displayedReport.financial_status.snapshot_stale && (
+              <small className="financial-snapshot-warning">{copy.financialSnapshotStale}</small>
+            )}
+          </div>
+          {displayedReport.financial_status.retryable && (
+            <div className="financial-health-actions">
+              {onRetryFinancials && (
+                <button type="button" className="report-retry-button" aria-label={copy.retryFinancials} disabled={retryState === "retrying"} onClick={() => void retryStage("financials")}>
+                  <RefreshCw size={16} /><span>{copy.retryFinancials}</span>
+                </button>
+              )}
+              {onRebuildFinancials && (
+                <button type="button" className="report-retry-button report-rebuild-button" aria-label={copy.rebuildFinancials} disabled={retryState === "retrying"} onClick={() => {
+                  if (window.confirm(copy.rebuildFinancialsConfirm)) void retryStage("rebuild-financials");
+                }}>
+                  <RefreshCw size={16} /><span>{copy.rebuildFinancials}</span>
+                </button>
+              )}
+            </div>
+          )}
+        </section>
+      )}
       {reportStatus && <div className={`report-status report-status-${reportStatus.tone}`} role={reportStatus.role}>{reportStatus.text}</div>}
       <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown></div>
     </article>

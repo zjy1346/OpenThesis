@@ -21,6 +21,11 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Universal CRT is a Windows system component on every supported OpenThesis
+# release target. Some development environments expose a third-party copy on
+# PATH; collecting it risks version skew and can trip real-time protection.
+a.binaries = [entry for entry in a.binaries if entry[0].lower() != "ucrtbase.dll"]
+
 exe = EXE(
     pyz,
     a.scripts,

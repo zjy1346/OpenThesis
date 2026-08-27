@@ -70,13 +70,69 @@ def growth_rate(current: float | None, previous: float | None) -> float | None:
     return current / previous - 1
 
 
+def _equity_value(values: dict[str, float]) -> float | None:
+    """Normalize parser/source aliases without losing the reported concept."""
+    equity = values.get("equity")
+    return equity if equity is not None else values.get("total_equity")
+
+
+def _annual_roe_details(
+    values: dict[str, float], previous: dict[str, float]
+) -> dict[str, Any]:
+    net_income = values.get("net_income")
+    closing_equity = _equity_value(values)
+    opening_equity = _equity_value(previous)
+    reported_roe = values.get("reported_roe")
+    inputs = {
+        "net_income": net_income,
+        "opening_equity": opening_equity,
+        "closing_equity": closing_equity,
+    }
+    if reported_roe is not None:
+        return {
+            "return_on_equity": reported_roe,
+            "return_on_equity_basis": "reported_weighted_average",
+            "return_on_equity_formula": "reported_roe",
+            "return_on_equity_inputs": inputs,
+            "return_on_equity_gap": None,
+        }
+    if net_income is None:
+        gap = "missing_net_income"
+    elif closing_equity in (None, 0):
+        gap = "missing_equity"
+    elif opening_equity not in (None, 0) and (opening_equity + closing_equity) != 0:
+        return {
+            "return_on_equity": net_income / ((opening_equity + closing_equity) / 2),
+            "return_on_equity_basis": "average_equity",
+            "return_on_equity_formula": "net_income / average(opening_equity, closing_equity)",
+            "return_on_equity_inputs": inputs,
+            "return_on_equity_gap": None,
+        }
+    else:
+        return {
+            "return_on_equity": net_income / closing_equity,
+            "return_on_equity_basis": "ending_equity_proxy",
+            "return_on_equity_formula": "net_income / closing_equity",
+            "return_on_equity_inputs": inputs,
+            "return_on_equity_gap": None,
+        }
+    return {
+        "return_on_equity": None,
+        "return_on_equity_basis": None,
+        "return_on_equity_formula": None,
+        "return_on_equity_inputs": inputs,
+        "return_on_equity_gap": gap,
+    }
+
+
 def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     matrix = latest_by_year(facts)
     years = sorted(matrix, reverse=True)
     results: list[dict[str, Any]] = []
     for index, year in enumerate(years):
         values = matrix[year]
-        previous = matrix.get(years[index + 1]) if index + 1 < len(years) else {}
+        comparison_year = year - 1 if year - 1 in matrix else None
+        previous = matrix.get(comparison_year, {}) if comparison_year is not None else {}
         revenue = values.get("revenue")
         operating_income = values.get("operating_income")
         net_income = values.get("net_income")
@@ -84,8 +140,7 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         capex = values.get("capital_expenditure")
         assets = values.get("assets")
         liabilities = values.get("liabilities")
-        equity = values.get("equity")
-        reported_roe = values.get("reported_roe")
+        roe_details = _annual_roe_details(values, previous)
         free_cash_flow = (
             operating_cash_flow - capex
             if operating_cash_flow is not None and capex is not None
@@ -96,15 +151,20 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "year": year,
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
+                "comparison_year": comparison_year,
+                "comparison_gap": (
+                    None
+                    if previous.get("revenue") is not None
+                    else "prior_revenue_unavailable"
+                    if comparison_year is not None
+                    else f"missing_{year - 1}"
+                ),
                 "operating_margin": safe_divide(operating_income, revenue),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": safe_divide(operating_cash_flow, net_income),
                 "free_cash_flow": free_cash_flow,
                 "debt_to_assets": safe_divide(liabilities, assets),
-                # Prefer the issuer's disclosed weighted-average ROE. The
-                # fallback uses ending attributable equity and is explicitly a
-                # less precise approximation when average equity is unavailable.
-                "return_on_equity": reported_roe if reported_roe is not None else safe_divide(net_income, equity),
+                **roe_details,
             }
         )
     return results
@@ -134,7 +194,7 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
         capex = values.get("capital_expenditure")
         assets = values.get("assets")
         liabilities = values.get("liabilities")
-        equity = values.get("equity")
+        equity = _equity_value(values)
         reported_roe = values.get("reported_roe")
         results.append(
             {
@@ -189,6 +249,34 @@ def format_money(value: float | None, currency: str = "USD") -> str:
 
 def format_percent(value: float | None) -> str:
     return "—" if value is None else f"{value * 100:.1f}%"
+
+
+def _format_roe(metric: dict[str, Any], language: str) -> str:
+    value = metric.get("return_on_equity")
+    if value is not None:
+        suffix = {
+            "en": " (ending-equity proxy)",
+            "zh-CN": "（期末权益近似）",
+            "zh-Hant": "（期末權益近似）",
+        }.get(language, "") if metric.get("return_on_equity_basis") == "ending_equity_proxy" else ""
+        return format_percent(value) + suffix
+    gap = str(metric.get("return_on_equity_gap") or "")
+    reasons = {
+        "missing_net_income": {
+            "en": "net income is missing",
+            "zh-CN": "缺少净利润数据",
+            "zh-Hant": "缺少淨利潤資料",
+        },
+        "missing_equity": {
+            "en": "equity data is missing",
+            "zh-CN": "缺少权益数据",
+            "zh-Hant": "缺少權益資料",
+        },
+    }
+    reason = reasons.get(gap, {}).get(language, "")
+    if not reason:
+        return "—"
+    return f"— ({reason})" if language == "en" else f"—（{reason}）"
 
 
 def discounted_cash_flow_value(
@@ -368,7 +456,7 @@ def deterministic_summary(
             "",
             f"- Cash conversion: {format_percent(latest.get('cash_conversion'))}",
             f"- Debt to assets: {format_percent(latest.get('debt_to_assets'))}",
-            f"- Return on equity: {format_percent(latest.get('return_on_equity'))}",
+            f"- Return on equity: {_format_roe(latest, 'en')}",
             "",
             "> These metrics are research inputs, not investment advice.",
         ])
@@ -377,7 +465,7 @@ def deterministic_summary(
             "", "## \u6700\u65b0\u8ca1\u5e74\u78ba\u5b9a\u6027\u6307\u6a19", "",
             f"- \u73fe\u91d1\u5229\u6f64\u8f49\u5316\u7387：{format_percent(latest.get('cash_conversion'))}",
             f"- \u8cc7\u7522\u8ca0\u50b5\u7387：{format_percent(latest.get('debt_to_assets'))}",
-            f"- \u6de8\u8cc7\u7522\u5831\u916c\u7387：{format_percent(latest.get('return_on_equity'))}", "",
+            f"- \u6de8\u8cc7\u7522\u5831\u916c\u7387：{_format_roe(latest, 'zh-Hant')}", "",
             "> \u9019\u4e9b\u6307\u6a19\u50c5\u4f5c\u70ba\u7814\u7a76\u8f38\u5165\uff0c\u4e0d\u69cb\u6210\u6295\u8cc7\u5efa\u8b70\u3002",
         ])
     else:
@@ -387,7 +475,7 @@ def deterministic_summary(
             "",
             f"- 现金利润转化率：{format_percent(latest.get('cash_conversion'))}",
             f"- 资产负债率：{format_percent(latest.get('debt_to_assets'))}",
-            f"- 净资产收益率：{format_percent(latest.get('return_on_equity'))}",
+            f"- 净资产收益率：{_format_roe(latest, 'zh-CN')}",
             "",
             "> 这些指标仅作为研究输入，不构成投资建议。",
         ])

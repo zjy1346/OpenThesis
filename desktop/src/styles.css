@@ -226,6 +226,16 @@ button { color: inherit; }
 .report-status { width: fit-content; max-width: min(100%, 720px); margin: 14px 0 0 auto; padding: 8px 11px; border: 1px solid #dbe8df; border-radius: 10px; background: #edf4ef; color: #456151; font-size: 11px; line-height: 1.5; }
 .report-status-error { border-color: #f0cbc6; background: #fff1ef; color: #8c342d; }
 .report-status-partial { border-color: #d6e3da; background: #f2f6f3; color: #53645a; }
+.financial-health { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 14px; padding: 11px 13px; border: 1px solid #dbe8df; border-radius: 12px; background: #f3f7f4; color: #405249; font-size: 11px; }
+.financial-health[data-state="incomplete"], .financial-health[data-state="warning"], .financial-health[data-state="unavailable"] { border-color: #efd6bf; background: #fff8f0; color: #775132; }
+.financial-health-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px; }
+.financial-health-copy strong { color: #25352c; font-size: 12px; }
+.financial-health-copy small { flex-basis: 100%; color: var(--ink-muted); line-height: 1.45; }
+.financial-health .report-retry-button { flex: none; min-height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid #cba982; border-radius: 9px; background: #fff; color: #704821; cursor: pointer; }
+.financial-health .report-retry-button:disabled { cursor: default; opacity: .45; }
+.financial-health-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.financial-health .report-rebuild-button { border-color: var(--line-strong); color: var(--ink-soft); background: transparent; }
+.financial-snapshot-warning { color: #8a5a23; font-weight: 650; }
 .report-markdown { max-width: 980px; margin: 26px auto; color: #303733; font-family: "Source Serif 4", "Noto Serif SC", Georgia, serif; font-size: calc(16px * var(--report-scale)); line-height: 1.76; }
 .report-markdown h1, .report-markdown h2, .report-markdown h3 { color: #1f2722; font-family: Inter, "Segoe UI", sans-serif; letter-spacing: -0.03em; }
 .report-markdown h1 { margin-top: 0; font-size: 28px; }
@@ -419,6 +429,7 @@ button { color: inherit; }
   .report-document { padding: 22px 18px; }
   .report-meta { display: grid; }
   .report-toolbar { justify-self: start; }
+  .financial-health { align-items: flex-start; flex-direction: column; }
   .report-context span + span::before { display: none; }
   .report-markdown { font-size: 15px; overflow-x: auto; }
   .history-view, .help-view { padding: 22px 18px; }

@@ -416,7 +416,7 @@ class HkexNewsAdapter:
             # Once the requested annual history is present, do not fetch more
             # annual pages; periodic filters are still queried for a current
             # year without an annual filing.
-            if title_filter == "Annual Report" and annual_count >= max(1, limit):
+            if title_filter == "Annual Report" and annual_count >= max(1, limit) + 1:
                 continue
             now = datetime.now(timezone.utc)
             from_date = f"{max(2000, now.year - 10):04d}0101"
@@ -592,9 +592,50 @@ def _optional_nonnegative_int(value: Any) -> int | None:
     return parsed if parsed >= 0 else None
 
 
-def _report_period_end(year: int, fiscal_period: str, filed_at: str) -> str:
+def _report_period_end(year: int, fiscal_period: str, filed_at: str, title: str = "") -> str:
+    if fiscal_period == "FY":
+        explicit = re.search(
+            r"(?:year\s+ended|year\s+ending|for\s+the\s+year\s+ended)\s+"
+            r"(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
+            title,
+            flags=re.IGNORECASE,
+        )
+        if explicit:
+            day, month_name, explicit_year = explicit.groups()
+            month = datetime.strptime(month_name[:3], "%b").month
+            return f"{int(explicit_year):04d}-{month:02d}-{int(day):02d}"
+        chinese = re.search(r"截至\s*(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", title)
+        if chinese:
+            explicit_year, month, day = chinese.groups()
+            return f"{int(explicit_year):04d}-{int(month):02d}-{int(day):02d}"
     suffix = {"FY": "12-31", "H1": "06-30", "Q1": "03-31", "Q3": "09-30"}.get(fiscal_period)
     return f"{year:04d}-{suffix}" if suffix else filed_at[:10]
+
+
+def _report_period_revision(fiscal_period: str, title: str) -> str:
+    """Mark annual dates without a title-level month/day as provisional."""
+    if fiscal_period != "FY":
+        return "original"
+    explicit = re.search(
+        r"(?:year\s+ended|year\s+ending|for\s+the\s+year\s+ended)\s+\d{1,2}\s+"
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}",
+        title,
+        flags=re.IGNORECASE,
+    ) or re.search(r"截至\s*20\d{2}年\s*\d{1,2}月\s*\d{1,2}日", title)
+    return "period_end_verified" if explicit else "period_end_provisional"
+
+
+def _title_period_year(title: str) -> int | None:
+    explicit = re.search(
+        r"(?:year\s+ended|year\s+ending|for\s+the\s+year\s+ended)\s+\d{1,2}\s+"
+        r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
+        title,
+        flags=re.IGNORECASE,
+    ) or re.search(r"截至\s*(20\d{2})年\s*\d{1,2}月\s*\d{1,2}日", title)
+    if explicit:
+        return int(explicit.group(1))
+    year_match = re.search(r"\b(20\d{2})\b", title)
+    return int(year_match.group(1)) if year_match else None
 
 
 def _is_explicit_empty_hkex_result(text: str) -> bool:
@@ -724,15 +765,16 @@ def _hkex_filings_from_json(
             continue
         seen.add(source_url.casefold())
         accession = Path(path).stem
-        year_match = re.search(r"\b(20\d{2})\b", title)
+        period_year = _title_period_year(title)
         filed_at = _hkex_date_time(
             row.get("DATE_TIME") or row.get("dateTime"),
-            int(year_match.group(1)) if year_match else None,
+            period_year,
         )
         period_end = _report_period_end(
-            int(year_match.group(1)) if year_match else int(filed_at[:4]),
+            period_year if period_year is not None else int(filed_at[:4]),
             fiscal_period,
             filed_at,
+            title,
         )
         filings.append(
             FilingDocument(
@@ -745,6 +787,7 @@ def _hkex_filings_from_json(
                 filed_at=filed_at,
                 primary_document=title or accession,
                 source_url=source_url,
+                revision=_report_period_revision(fiscal_period, title),
             )
         )
         if len(filings) >= max(1, limit):
@@ -780,11 +823,12 @@ def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[
             if date_match
             else datetime.now(timezone.utc).isoformat()
         )
-        year_match = re.search(r"(20\d{2})", title)
+        period_year = _title_period_year(title)
         period_end = _report_period_end(
-            int(year_match.group(1)) if year_match else int(filed_at[:4]),
+            period_year if period_year is not None else int(filed_at[:4]),
             fiscal_period,
             filed_at,
+            title,
         )
         filings.append(
             FilingDocument(
@@ -797,6 +841,7 @@ def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[
                 filed_at=filed_at,
                 primary_document=title[:240] or accession,
                 source_url=f"https://www1.hkexnews.hk{path}",
+                revision=_report_period_revision(fiscal_period, title),
             )
         )
         if len(filings) >= limit:

@@ -115,6 +115,7 @@ def verify_agent_output(
     output: dict[str, Any],
     available_evidence: set[str],
     language: str = "zh-CN",
+    evidence_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     english = normalize_language(language) == EN
     issues: list[str] = []
@@ -146,6 +147,27 @@ def verify_agent_output(
             unsupported_count += 1
         elif not missing:
             verified_count += 1
+        asserted = {
+            key: claim.get(key)
+            for key in ("concept", "value", "unit", "fiscal_year", "fiscal_period", "end_date")
+            if claim.get(key) not in (None, "")
+        }
+        if asserted and evidence_records and not missing:
+            financial_records = [
+                evidence_records[item]
+                for item in evidence_ids
+                if item in evidence_records
+                and evidence_records[item].get("kind") == "financial_fact"
+            ]
+            if financial_records and not any(
+                _claim_matches_financial_evidence(asserted, record)
+                for record in financial_records
+            ):
+                issues.append(
+                    "Claim period/value does not match its cited financial evidence"
+                    if english
+                    else "结论中的期间或数值与引用的财务证据不一致"
+                )
     structured_output_valid = bool(output.get("structured_output_valid", True))
     if not structured_output_valid:
         issues.append(
@@ -161,6 +183,25 @@ def verify_agent_output(
         "issues": issues,
         "passed": structured_output_valid and not issues and unsupported_count == 0,
     }
+
+
+def _claim_matches_financial_evidence(
+    asserted: dict[str, Any], evidence: dict[str, Any]
+) -> bool:
+    for key, expected in asserted.items():
+        actual = evidence.get(key)
+        if key == "value":
+            try:
+                left = float(expected)
+                right = float(actual)
+            except (TypeError, ValueError):
+                return False
+            tolerance = max(1e-6, abs(right) * 1e-9)
+            if abs(left - right) > tolerance:
+                return False
+        elif str(expected).strip().casefold() != str(actual).strip().casefold():
+            return False
+    return True
 
 
 _REQUIRED_SYNTHESIS_SECTIONS = frozenset(
@@ -185,8 +226,11 @@ def validate_research_synthesis(
     output: dict[str, Any],
     available_evidence: set[str],
     language: str = "zh-CN",
+    evidence_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    verification = verify_agent_output(output, available_evidence, language)
+    verification = verify_agent_output(
+        output, available_evidence, language, evidence_records
+    )
     english = normalize_language(language) == EN
     missing = sorted(
         key
@@ -474,6 +518,7 @@ class ResearchWorkflow:
         self.storage.save_run(run)
 
         available = {item["evidence_id"] for item in evidence}
+        evidence_records = {item["evidence_id"]: item for item in evidence}
         remaining = set(order)
         results: dict[str, dict[str, Any]] = {}
         verifications: dict[str, dict[str, Any]] = {}
@@ -537,7 +582,9 @@ class ResearchWorkflow:
                 completed_batch = [execute_step(batch[0])]
 
             for step_id, output in completed_batch:
-                verification = verify_agent_output(output, available, self.report_language)
+                verification = verify_agent_output(
+                    output, available, self.report_language, evidence_records
+                )
                 results[step_id] = output
                 verifications[step_id] = verification
                 remaining.remove(step_id)
@@ -573,7 +620,9 @@ class ResearchWorkflow:
         )
         final_output = results[preferred]
         claims = _collect_stage_claims(*results.values())
-        aggregate = verify_agent_output({"claims": claims}, available, self.report_language)
+        aggregate = verify_agent_output(
+            {"claims": claims}, available, self.report_language, evidence_records
+        )
         issues = list(aggregate["issues"])
         for step_id in order:
             for issue in verifications[step_id]["issues"]:
@@ -588,7 +637,7 @@ class ResearchWorkflow:
         if _REQUIRED_SYNTHESIS_SECTIONS.issubset(final_output):
             report_payload = final_output
             synthesis_verification = validate_research_synthesis(
-                final_output, available, self.report_language
+                final_output, available, self.report_language, evidence_records
             )
             synthesis_verification["issues"] = list(dict.fromkeys(
                 [*aggregate["issues"], *synthesis_verification["issues"]]
@@ -828,6 +877,7 @@ class ResearchWorkflow:
                 return self._run_declarative_ot_workflow(run, context, evidence, notify)
 
             available = {item["evidence_id"] for item in evidence}
+            evidence_records = {item["evidence_id"]: item for item in evidence}
             stage_one = {
                 "financial-analyst": "prompts/financial-analyst.md",
                 "business-analyst": "prompts/business-analyst.md",
@@ -866,7 +916,7 @@ class ResearchWorkflow:
                 self._check_cancelled()
                 stage_results[agent_id] = result
                 verification = verify_agent_output(
-                    result, available, self.report_language
+                    result, available, self.report_language, evidence_records
                 )
                 self._save(
                     run,
@@ -1085,7 +1135,7 @@ class ResearchWorkflow:
                 _synthesis_prior_artifacts(dossier, growth, skeptic, forecast),
             )
             verification = validate_research_synthesis(
-                synthesis, available, self.report_language
+                synthesis, available, self.report_language, evidence_records
             )
             report_payload: dict[str, Any] = synthesis
             report_mode = "synthesized"
@@ -1120,7 +1170,7 @@ class ResearchWorkflow:
                     )
                 else:
                     repaired_verification = validate_research_synthesis(
-                        repaired, available, self.report_language
+                        repaired, available, self.report_language, evidence_records
                     )
                     repair_diagnostics = _response_diagnostics(repaired)
                     if not repaired_verification["passed"] and not repair_diagnostics.get("parse_error_class"):
@@ -1269,8 +1319,13 @@ class ResearchWorkflow:
             for item in evidence
             if isinstance(item, dict) and item.get("evidence_id")
         }
+        evidence_records = {
+            str(item.get("evidence_id")): item
+            for item in evidence
+            if isinstance(item, dict) and item.get("evidence_id")
+        }
         verification = validate_research_synthesis(
-            synthesis, available, self.report_language
+            synthesis, available, self.report_language, evidence_records
         )
         if verification["passed"]:
             report_payload = synthesis

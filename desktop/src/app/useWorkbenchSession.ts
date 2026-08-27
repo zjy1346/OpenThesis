@@ -10,6 +10,8 @@ import {
   openExternalUrl,
   retryResearchSynthesis,
   retryResearchGrowth,
+  retryResearchFinancials,
+  rebuildResearchFinancials,
   startResearch,
   updatePreferences,
 } from "../backend";
@@ -214,6 +216,22 @@ export function useWorkbenchSession() {
     setBootstrap(await bootstrapBackend());
   };
 
+  const retryFinancials = async () => {
+    if (!report) throw new Error("report is unavailable");
+    setError(null);
+    const next = await retryResearchFinancials(report.run_id);
+    setReport(next);
+    setBootstrap(await bootstrapBackend());
+  };
+
+  const rebuildFinancials = async () => {
+    if (!report) throw new Error("report is unavailable");
+    setError(null);
+    const next = await rebuildResearchFinancials(report.run_id);
+    setReport(next);
+    setBootstrap(await bootstrapBackend());
+  };
+
   const openFailedDisclosure = async () => {
     if (error?.kind !== "research-failed" || !error.disclosureUrl) return;
     try {
@@ -236,6 +254,8 @@ export function useWorkbenchSession() {
     retryResearch,
     retrySynthesis,
     retryGrowth,
+    retryFinancials,
+    rebuildFinancials,
     openFailedDisclosure,
     stopResearch,
     decideVisionUpload: decideVision,

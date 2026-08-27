@@ -44,6 +44,37 @@ class OtFormatTests(unittest.TestCase):
         self.assertEqual(loaded.content_identity, first.content_identity)
         self.assertTrue(loaded.read_text("resources/workflow.json"))
 
+    def test_evidence_history_is_independent_and_round_trips_in_workflow_settings(self) -> None:
+        draft = minimal_studio_draft()
+        self.assertEqual(draft["settings"]["evidence_policy"]["annual_history_years"], 5)
+        draft["settings"]["horizon_years"] = 12
+        draft["settings"]["evidence_policy"]["annual_history_years"] = 7
+
+        raw, _ = compile_studio_draft(draft)
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            workflow = json.loads(archive.read("resources/workflow.json"))
+
+        self.assertEqual(workflow["settings"]["horizon_years"], 12)
+        self.assertEqual(workflow["settings"]["evidence_policy"]["annual_history_years"], 7)
+
+    def test_legacy_studio_draft_without_evidence_policy_remains_valid(self) -> None:
+        draft = minimal_studio_draft()
+        draft["settings"].pop("evidence_policy")
+
+        self.assertFalse(any(item.severity == "error" for item in validate_studio_draft(draft)))
+        compile_studio_draft(draft)
+
+    def test_evidence_history_rejects_out_of_range_values(self) -> None:
+        draft = minimal_studio_draft()
+        draft["settings"]["evidence_policy"]["annual_history_years"] = 11
+
+        diagnostics = validate_studio_draft(draft)
+
+        self.assertIn(
+            "settings.evidence_policy.annual_history_years",
+            {item.path for item in diagnostics if item.code == "OT_SETTING_RANGE"},
+        )
+
     def test_studio_rejects_a_kind_the_research_runtime_cannot_import(self) -> None:
         draft = minimal_studio_draft()
         draft["package"]["kind"] = "research_workflow"

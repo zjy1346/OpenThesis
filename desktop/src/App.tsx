@@ -57,6 +57,8 @@ export default function App() {
     retryResearch,
     retrySynthesis,
     retryGrowth,
+    retryFinancials,
+    rebuildFinancials,
     openFailedDisclosure,
     stopResearch,
     decideVisionUpload,
@@ -256,7 +258,7 @@ export default function App() {
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} />
+            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} />
           ) : (
             <EmptyState title={copy.emptyTitle} body={copy.emptyBody} demoAction={copy.startDemo}
               realAction={copy.startReal} hint={copy.demoHint}

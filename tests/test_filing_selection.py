@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from openthesis.domain import FilingDocument
-from openthesis.filing_selection import select_research_filings
+from openthesis.filing_selection import FilingPlan, select_research_filings
 
 
 class FilingSelectionTests(unittest.TestCase):
@@ -73,6 +73,24 @@ class FilingSelectionTests(unittest.TestCase):
         corrected.filed_at = "2024-05-30T00:00:00+00:00"
         result = select_research_filings([original, corrected])
         self.assertEqual([item.document_id for item in result.documents], ["corrected"])
+
+    def test_filing_plan_keeps_hidden_comparison_year_and_reports_missing_years(self) -> None:
+        result = select_research_filings(
+            [_filing(f"fy-{year}", "ANNUAL_REPORT", "FY", f"{year}-12-31") for year in (2026, 2024, 2023, 2022)],
+            annual_limit=3,
+        )
+
+        self.assertIsInstance(result.plan, FilingPlan)
+        self.assertEqual(result.plan.display_years, 3)
+        self.assertEqual(result.plan.comparison_years, (2022,))
+        self.assertEqual(result.plan.missing_years, (2025,))
+        self.assertEqual(result.plan.candidate_limit, 6)
+        self.assertEqual(result.plan.candidate_surplus, 2)
+        self.assertEqual(result.annual_years, (2026, 2024, 2023))
+        self.assertEqual(
+            [item.period_end[:4] for item in result.documents if item.form_type == "ANNUAL_REPORT"],
+            ["2026", "2024", "2023", "2022"],
+        )
 
 
 def _filing(document_id: str, form_type: str, period: str, period_end: str) -> FilingDocument:

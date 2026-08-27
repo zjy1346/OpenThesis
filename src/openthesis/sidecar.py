@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import sys
 from pathlib import Path
 from typing import Any, TextIO
@@ -143,6 +144,17 @@ class JsonLineServer:
             if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
                 raise ValueError("run_id and model are required")
             return self.service.retry_research_growth(run_id, model)
+        if method == "research.retry_financials":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            return self.service.retry_financials(run_id)
+        if method == "research.rebuild_financials":
+            run_id = params.get("run_id")
+            confirmed = params.get("confirmed")
+            if not isinstance(run_id, str) or not run_id or not isinstance(confirmed, bool):
+                raise ValueError("run_id and confirmed are required")
+            return self.service.rebuild_financials(run_id, confirmed=confirmed)
         if method == "research.vision_decision":
             job_id = params.get("job_id")
             approved = params.get("approved")
@@ -172,6 +184,7 @@ def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    multiprocessing.freeze_support()
     for stream in (sys.stdin, sys.stdout):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):

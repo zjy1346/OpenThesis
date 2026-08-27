@@ -12,12 +12,25 @@ LISTING = frozenset({"PROSPECTUS", "LISTING_REPORT"})
 
 
 @dataclass(frozen=True, slots=True)
+class FilingPlan:
+    """Stable selection metadata separating display history from comparators."""
+
+    display_years: int
+    comparison_years: tuple[int, ...]
+    candidate_limit: int
+    candidate_surplus: int
+    missing_years: tuple[int, ...]
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchFilingSet:
     """A policy result describing the official documents safe to research."""
 
     documents: tuple[FilingDocument, ...]
     annual_years: tuple[int, ...]
     used_listing_fallback: bool
+    plan: FilingPlan
 
 
 def select_research_filings(
@@ -53,8 +66,32 @@ def select_research_filings(
         elif filing.form_type in LISTING:
             listing.append(filing)
 
-    kept_annual_years = tuple(sorted(annual_by_year, reverse=True)[: max(1, annual_limit)])
+    display_limit = max(1, annual_limit)
+    kept_annual_years = tuple(sorted(annual_by_year, reverse=True)[:display_limit])
     selected: list[FilingDocument] = [annual_by_year[year] for year in kept_annual_years]
+
+    # Keep one hidden annual comparator for the oldest displayed year.  This
+    # is deliberately separate from the display count so a report cannot
+    # mistake the comparison companion for another user-facing year.
+    comparison_years: tuple[int, ...] = ()
+    if kept_annual_years:
+        comparison_year = min(kept_annual_years) - 1
+        if comparison_year in annual_by_year:
+            comparison_years = (comparison_year,)
+            selected.append(annual_by_year[comparison_year])
+    missing_years = tuple(
+        year
+        for year in range(max(kept_annual_years, default=0), min(kept_annual_years, default=0), -1)
+        if year not in annual_by_year
+    )
+    plan = FilingPlan(
+        display_years=display_limit,
+        comparison_years=comparison_years,
+        candidate_limit=display_limit + 1 + 2,
+        candidate_surplus=2,
+        missing_years=missing_years,
+        diagnostics=(f"missing_fiscal_years:{','.join(map(str, missing_years))}",) if missing_years else (),
+    )
 
     # A periodic filing is normally useful only when its fiscal year has no annual
     # report. Keep every discovered period for such a year so a newly listed
@@ -88,6 +125,7 @@ def select_research_filings(
         documents=tuple(selected),
         annual_years=kept_annual_years,
         used_listing_fallback=used_listing_fallback,
+        plan=plan,
     )
 
 
@@ -140,7 +178,15 @@ def _document_authority(filing: FilingDocument) -> int:
 def _revision_rank(filing: FilingDocument) -> tuple[int, int, str]:
     """Prefer explicit corrected versions, then the latest filed timestamp."""
     title = (filing.primary_document or "").casefold()
-    revision = 1 if filing.revision.casefold() not in {"", "original", "orig"} else 0
+    revision = 1 if filing.revision.casefold() not in {
+        "",
+        "original",
+        "orig",
+        # HKEX adapters use these values to describe period-date certainty;
+        # they are provenance statuses, not corrected-document revisions.
+        "period_end_provisional",
+        "period_end_verified",
+    } else 0
     if any(token in title for token in ("更正", "修订", "revision", "restated", "corrigendum")):
         revision = max(revision, 1)
     if filing.supersedes_document_id:

@@ -412,6 +412,22 @@ def validate_studio_draft(draft: Mapping[str, Any]) -> tuple[OtDiagnostic, ...]:
             value = settings.get(key)
             if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
                 diagnostics.append(OtDiagnostic("OT_SETTING_RANGE", "error", f"settings.{key}", f"设置必须是 {minimum} 到 {maximum} 的整数"))
+        evidence_policy = settings.get("evidence_policy")
+        if evidence_policy is not None and not isinstance(evidence_policy, Mapping):
+            diagnostics.append(OtDiagnostic("OT_SETTINGS_TYPE", "error", "settings.evidence_policy", "财报证据策略必须是对象"))
+        elif isinstance(evidence_policy, Mapping):
+            annual_history = evidence_policy.get("annual_history_years")
+            if (
+                not isinstance(annual_history, int)
+                or isinstance(annual_history, bool)
+                or not 2 <= annual_history <= 10
+            ):
+                diagnostics.append(OtDiagnostic(
+                    "OT_SETTING_RANGE",
+                    "error",
+                    "settings.evidence_policy.annual_history_years",
+                    "财报证据历史必须是 2 到 10 的整数",
+                ))
         if settings.get("report_language") not in {"zh-CN", "zh-Hant", "en"}:
             diagnostics.append(OtDiagnostic("OT_REPORT_LANGUAGE", "error", "settings.report_language", "报告语言必须是 zh-CN、zh-Hant 或 en"))
 
@@ -629,6 +645,7 @@ def minimal_studio_draft() -> dict[str, Any]:
         },
         "settings": {
             "horizon_years": 5,
+            "evidence_policy": {"annual_history_years": 5},
             "depth": 3,
             "risk_emphasis": 3,
             "report_language": "en",

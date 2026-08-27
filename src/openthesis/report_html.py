@@ -306,6 +306,59 @@ def _metric_cell(label: str, value: str) -> str:
     )
 
 
+def _annual_metric_gap_note(rows: list[object], language: str) -> str:
+    messages: list[str] = []
+    for row in rows[:5]:
+        if not isinstance(row, dict) or row.get("revenue_growth") is not None:
+            continue
+        gap = str(row.get("comparison_gap") or "")
+        year = row.get("year", "—")
+        if gap.startswith("missing_"):
+            missing_year = gap.removeprefix("missing_")
+            if language == EN:
+                messages.append(
+                    f"Fiscal {year} revenue growth is missing verified fiscal {missing_year} revenue."
+                )
+            elif language == ZH_HANT:
+                messages.append(f"{year} 財年收入增長缺少 {missing_year} 財年已驗證收入")
+            else:
+                messages.append(f"{year} 财年收入增长缺少 {missing_year} 财年已验证收入")
+        elif gap:
+            messages.append(
+                f"Fiscal {year} revenue growth lacks a verified comparable revenue value."
+                if language == EN
+                else f"{year} 財年收入增長缺少已驗證的可比收入"
+                if language == ZH_HANT
+                else f"{year} 财年收入增长缺少已验证的可比收入"
+            )
+    latest = next((item for item in rows if isinstance(item, dict)), None)
+    if latest is not None and latest.get("return_on_equity") is None:
+        roe_gap = str(latest.get("return_on_equity_gap") or "")
+        if roe_gap == "missing_equity":
+            messages.append(
+                "Return on equity cannot be calculated: equity data is missing."
+                if language == EN
+                else "淨資產報酬率無法計算：缺少權益資料"
+                if language == ZH_HANT
+                else "净资产收益率无法计算：缺少权益数据"
+            )
+        elif roe_gap == "missing_net_income":
+            messages.append(
+                "Return on equity cannot be calculated: net income is missing."
+                if language == EN
+                else "淨資產報酬率無法計算：缺少淨利潤資料"
+                if language == ZH_HANT
+                else "净资产收益率无法计算：缺少净利润数据"
+            )
+    if not messages:
+        return ""
+    return (
+        '<div class="callout callout-warning"><ul class="list">'
+        + "".join(f"<li>{_escape(message)}</li>" for message in messages)
+        + "</ul></div>"
+    )
+
+
 def _interim_financial_snapshot(rows: list[object], language: str, currency: str) -> str:
     latest = next((item for item in rows if isinstance(item, dict)), None)
     if latest is None:
@@ -385,6 +438,7 @@ def _financial_section(
         )
 
     latest = rows[0] if isinstance(rows[0], dict) else {}
+    metric_gap_note = _annual_metric_gap_note(rows, language)
     has_operating_margin = any(row.get("operating_margin") is not None for row in rows if isinstance(row, dict))
     has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in rows if isinstance(row, dict))
     kpis = [("营业收入", "Revenue", format_money(latest.get("revenue"), currency))]
@@ -506,7 +560,7 @@ def _financial_section(
         )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + note,
+        snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + metric_gap_note + note,
         section_id="financials",
     )
 

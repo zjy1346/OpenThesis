@@ -88,6 +88,37 @@ class StorageTests(unittest.TestCase):
             )
             self.assertEqual(storage.get_financial_evidence(filing.document_id), [])
 
+    def test_filings_and_financial_retry_state_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("09988.HK", "Alibaba", reporting_currency="CNY")
+            storage.save_company(company)
+            older = FilingDocument(
+                "doc-2024", company.security_id, "acc-2024", "ANNUAL_REPORT", "FY",
+                "2024-03-31", "2024-06-01", "2024.pdf", "https://example.test/2024.pdf",
+            )
+            newer = FilingDocument(
+                "doc-2025", company.security_id, "acc-2025", "ANNUAL_REPORT", "FY",
+                "2025-03-31", "2025-06-01", "2025.pdf", "https://example.test/2025.pdf",
+            )
+            storage.save_filings([older, newer])
+
+            self.assertEqual(
+                [item.document_id for item in storage.get_filings(company.security_id)],
+                ["doc-2025", "doc-2024"],
+            )
+            self.assertEqual(storage.get_financial_retry_state(company.security_id)["attempt_count"], 0)
+            first = storage.record_financial_retry_attempt(
+                company.security_id, stage="filing-download", error="temporary_timeout"
+            )
+            second = storage.record_financial_retry_attempt(
+                company.security_id, stage="filing-validation", error=""
+            )
+            self.assertEqual(first["attempt_count"], 1)
+            self.assertEqual(second["attempt_count"], 2)
+            self.assertEqual(second["last_stage"], "filing-validation")
+            self.assertEqual(second["last_error"], "")
+
     def test_validation_group_id_is_scoped_by_company(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))

@@ -195,6 +195,14 @@ export function retryResearchGrowth(
   return request("research.retry_growth", { run_id: runId, model });
 }
 
+export function retryResearchFinancials(runId: string): Promise<ResearchReport> {
+  return request("research.retry_financials", { run_id: runId });
+}
+
+export function rebuildResearchFinancials(runId: string): Promise<ResearchReport> {
+  return request("research.rebuild_financials", { run_id: runId, confirmed: true });
+}
+
 export function getResearchStatus(jobId: string): Promise<ResearchJob> {
   return request("research.status", { job_id: jobId });
 }

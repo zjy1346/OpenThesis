@@ -12,7 +12,7 @@ from openthesis.ot import compile_studio_draft, minimal_studio_draft
 from openthesis.packs import builtin_pack, load_pack
 from openthesis.markets import build_company
 from openthesis.providers import ModelConfig, ProviderError
-from openthesis.research import ResearchCancelled, ResearchWorkflow
+from openthesis.research import ResearchCancelled, ResearchWorkflow, verify_agent_output
 from openthesis.storage import Storage
 
 
@@ -36,6 +36,32 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_financial_claim_period_and_value_must_match_cited_evidence(self) -> None:
+        evidence = {
+            "fact:revenue-2025": {
+                "evidence_id": "fact:revenue-2025",
+                "kind": "financial_fact",
+                "concept": "revenue",
+                "value": 100.0,
+                "unit": "CNY",
+                "fiscal_year": 2025,
+                "fiscal_period": "FY",
+                "end_date": "2025-12-31",
+            }
+        }
+        valid = verify_agent_output(
+            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 100.0, "unit": "CNY", "fiscal_year": 2025}]},
+            set(evidence), "en", evidence,
+        )
+        invalid = verify_agent_output(
+            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 120.0, "unit": "CNY", "fiscal_year": 2024}]},
+            set(evidence), "en", evidence,
+        )
+
+        self.assertTrue(valid["passed"])
+        self.assertFalse(invalid["passed"])
+        self.assertIn("period/value", invalid["issues"][0])
+
     def test_compiled_custom_ot_executes_its_own_dependency_graph(self) -> None:
         class OtProvider:
             def __init__(self) -> None:

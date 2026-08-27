@@ -22,7 +22,17 @@ from openthesis.domain import (
 from openthesis.markets import build_company
 from openthesis.market_data import MarketDataError
 from openthesis.ot import compile_studio_draft, minimal_studio_draft
-from openthesis.service import AppService, PreferenceValidationError, _latest_sec_verified_group, _market_snapshot, _request_secrets, _vision_config_from_request, _ResearchJob
+from openthesis.service import (
+    AppService,
+    PreferenceValidationError,
+    _bounded_download_filings,
+    _latest_sec_verified_group,
+    _market_snapshot,
+    _request_secrets,
+    _vision_config_from_request,
+    _research_history_years,
+    _ResearchJob,
+)
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
 from openthesis.market_financials import FinancialValidation, ValidationStatus
 
@@ -76,6 +86,115 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_job_records_per_stage_timings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            job = _ResearchJob("timed")
+            service._update_job(job, state="running", stage="filing-download")
+            time.sleep(0.01)
+            service._update_job(job, stage="filing-parse")
+            snapshot = job.snapshot()
+
+            self.assertGreaterEqual(snapshot["stage_timings"]["filing-download"], 0.009)
+            self.assertEqual(snapshot["stage"], "filing-parse")
+            self.assertIn("stage_elapsed_seconds", snapshot)
+
+    def test_download_helper_enforces_global_and_per_host_limits_with_deterministic_results(self) -> None:
+        started: list[str] = []
+        active = 0
+        active_by_host: dict[str, int] = {}
+        maximum = [0, 0]
+        lock = threading.Lock()
+
+        class Adapter:
+            def download_filing(self, filing: FilingDocument, _target: Path) -> FilingDocument:
+                nonlocal active
+                host = filing.source_url.split("//", 1)[1].split("/", 1)[0]
+                with lock:
+                    started.append(filing.document_id)
+                    active += 1
+                    active_by_host[host] = active_by_host.get(host, 0) + 1
+                    maximum[0] = max(maximum[0], active)
+                    maximum[1] = max(maximum[1], active_by_host[host])
+                time.sleep(0.01)
+                with lock:
+                    active -= 1
+                    active_by_host[host] -= 1
+                return filing
+
+        filings = [_download_filing(f"f{index}", "a.example.test" if index < 4 else "b.example.test") for index in range(6)]
+        progress: list[tuple[int, int]] = []
+        downloaded, failures = _bounded_download_filings(
+            Adapter(), filings, Path("."), progress=lambda done, total: progress.append((done, total))
+        )
+
+        self.assertEqual([item.document_id for item in downloaded], [item.document_id for item in filings])
+        self.assertEqual(failures, [])
+        self.assertLessEqual(maximum[0], 3)
+        self.assertLessEqual(maximum[1], 2)
+        self.assertEqual(progress[-1], (len(filings), len(filings)))
+
+    def test_download_helper_deduplicates_urls_retries_once_and_keeps_partial_success(self) -> None:
+        calls: dict[str, int] = {}
+
+        class Adapter:
+            def download_filing(self, filing: FilingDocument, _target: Path) -> FilingDocument:
+                calls[filing.source_url] = calls.get(filing.source_url, 0) + 1
+                if filing.document_id == "retry" and calls[filing.source_url] == 1:
+                    raise MarketDataError("temporary", code="FILING_FETCH_FAILED")
+                if filing.document_id == "bad":
+                    raise OSError("permanent")
+                return filing
+
+        duplicate = _download_filing("duplicate", "a.example.test", url="https://a.example.test/shared.pdf")
+        filings = [
+            duplicate,
+            _download_filing("retry", "a.example.test"),
+            _download_filing("bad", "b.example.test"),
+            _download_filing("other", "b.example.test"),
+        ]
+        downloaded, failures = _bounded_download_filings(Adapter(), filings, Path("."))
+
+        self.assertEqual([item.document_id for item in downloaded], ["duplicate", "retry", "other"])
+        self.assertEqual([item.document_id for item, _ in failures], ["bad"])
+        self.assertEqual(calls["https://a.example.test/shared.pdf"], 1)
+        self.assertEqual(calls["https://a.example.test/retry.pdf"], 2)
+        self.assertEqual(calls["https://b.example.test/bad.pdf"], 1)
+
+    def test_download_helper_cancel_prevents_queued_work(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        calls: list[str] = []
+
+        class Adapter:
+            def download_filing(self, filing: FilingDocument, _target: Path) -> FilingDocument:
+                calls.append(filing.document_id)
+                return filing
+
+        downloaded, failures = _bounded_download_filings(
+            Adapter(), [_download_filing("one", "a.example.test"), _download_filing("two", "b.example.test")], Path("."), cancel_event=cancel
+        )
+        self.assertEqual(downloaded, [])
+        self.assertEqual(failures, [])
+        self.assertEqual(calls, [])
+
+    def test_research_history_years_is_bounded_and_defaults_to_five(self) -> None:
+        self.assertEqual(_research_history_years({}), 5)
+        self.assertEqual(_research_history_years({"evidence_policy": {"annual_history_years": 2}}), 2)
+        self.assertEqual(_research_history_years({"evidence_policy": {"annual_history_years": 100}}), 10)
+        self.assertEqual(_research_history_years({"evidence_policy": {"annual_history_years": 1}}), 2)
+
+    def test_research_history_uses_pack_policy_and_request_override(self) -> None:
+        class Pack:
+            workflow = {"settings": {"evidence_policy": {"annual_history_years": 7}}}
+
+        self.assertEqual(_research_history_years({}, Pack()), 7)
+        self.assertEqual(
+            _research_history_years(
+                {"evidence_policy": {"annual_history_years": 3}}, Pack()
+            ),
+            3,
+        )
     def test_job_leaves_download_stage_before_financial_ingestion_blocks(self) -> None:
         company = build_company("002594.SZ", "BYD")
         filing = FilingDocument(
@@ -124,7 +243,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertTrue(download_entered.wait(timeout=2), "download did not start")
             downloading = service.get_research_status(started["job_id"])
             self.assertEqual(downloading["stage"], "filing-download")
-            self.assertEqual(downloading["stage_current"], 1)
+            self.assertEqual(downloading["stage_current"], 0)
             self.assertEqual(downloading["stage_total"], 1)
             download_release.set()
             self.assertTrue(entered.wait(timeout=2), "ingestion did not start")
@@ -561,8 +680,11 @@ class AppServiceTests(unittest.TestCase):
             source_url="https://example.invalid/jinbo.pdf",
         )
 
+        requested_limits: list[int] = []
+
         class BadFilingAdapter:
             def list_financial_filings(self, _company: Company, *, limit: int = 5):
+                requested_limits.append(limit)
                 return [filing][:limit]
 
             def download_filing(self, item: FilingDocument, _target: Path) -> FilingDocument:
@@ -622,6 +744,7 @@ class AppServiceTests(unittest.TestCase):
                     "mode": "company",
                     "company": company.to_dict(),
                     "download_filings": True,
+                    "evidence_policy": {"annual_history_years": 2},
                     "model": {"configured_model_id": "test.primary", "configuration_version": 1, "role": "primary"},
                 }
             )
@@ -634,6 +757,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(status["state"], "failed")
             self.assertEqual(status["error_code"], "FILING_DATA_QUALITY_FAILED")
             self.assertEqual(provider_calls, [])
+            self.assertEqual(requested_limits, [5])
             self.assertEqual(service.storage.get_facts(company.security_id), [])
 
     def test_unverified_official_response_is_distinct_and_skips_model(self) -> None:
@@ -799,6 +923,221 @@ class AppServiceTests(unittest.TestCase):
 
             self.assertTrue(report["retryable_growth"])
             self.assertIn("growth-opportunity model returned no usable content", report["markdown"])
+
+    def test_report_exposes_missing_financial_periods_and_zero_token_retry_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            company = build_company("09988.HK", "Alibaba", reporting_currency="CNY")
+            run = ResearchRun(
+                run_id="financial-status",
+                company=company,
+                workflow_id="test",
+                research_pack_id="test",
+                research_pack_version="1",
+                provider_id="test",
+                model_id="test",
+                data_as_of=utc_now_iso(),
+                status=RunStatus.COMPLETED,
+                research_configuration={"annual_history_years": 2},
+            )
+            service.storage.save_company(company)
+            service.storage.save_run(run)
+            service.storage.save_filings([
+                FilingDocument(
+                    "doc-2026", company.security_id, "acc-2026", "ANNUAL_REPORT", "FY",
+                    "2026-03-31", "2026-06-01", "2026.pdf", "https://example.test/2026.pdf",
+                ),
+                FilingDocument(
+                    "doc-2024", company.security_id, "acc-2024", "ANNUAL_REPORT", "FY",
+                    "2024-03-31", "2024-06-01", "2024.pdf", "https://example.test/2024.pdf",
+                ),
+            ])
+
+            status = service.get_report(run.run_id, language="en")["financial_status"]
+
+            self.assertEqual(status["state"], "incomplete")
+            self.assertEqual(status["missing_periods"], ["2025"])
+            self.assertTrue(status["retryable"])
+            self.assertEqual(status["next_action"], "retry_missing_periods")
+            self.assertEqual(status["model_calls"], 0)
+            self.assertEqual(status["token_delta"], 0)
+
+    def test_retry_financials_refreshes_only_unhealthy_nodes_without_provider(self) -> None:
+        company = build_company("300750.SZ", "CATL", reporting_currency="CNY")
+        provider_calls: list[str] = []
+        download_calls: list[str] = []
+
+        def facts_for(filing: FilingDocument, value: float) -> tuple[FinancialFact, ...]:
+            values = {"revenue": value, "net_income": value / 10, "operating_cash_flow": value / 8, "assets": value * 2, "liabilities": value, "equity": value}
+            return tuple(FinancialFact(
+                fact_id=f"{filing.accession_number}:{concept}", company_cik=company.security_id,
+                concept=concept, reported_concept=concept, value=amount, unit="CNY",
+                fiscal_year=int(filing.period_end[:4]), fiscal_period="FY", form_type=filing.form_type,
+                start_date=f"{filing.period_end[:4]}-01-01", end_date=filing.period_end,
+                filed_at=filing.filed_at, accession_number=filing.accession_number,
+                source_url=filing.source_url,
+                statement="income_statement" if concept in {"revenue", "net_income"} else "cash_flow" if concept == "operating_cash_flow" else "balance_sheet",
+                currency="CNY", validation_status="VERIFIED",
+            ) for concept, amount in values.items())
+
+        with tempfile.TemporaryDirectory() as directory:
+            good_path = Path(directory) / "good.pdf"
+            good_path.write_bytes(b"official-good")
+            good = FilingDocument("good-doc", company.security_id, "good-2024", "ANNUAL_REPORT", "FY", "2024-12-31", "2025-03-01", "2024.pdf", "https://example.test/good.pdf", local_path=str(good_path), content_hash="good-hash")
+            unhealthy = FilingDocument("bad-doc", company.security_id, "bad-2025", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-03-01", "2025.pdf", "https://example.test/bad.pdf")
+
+            class Adapter:
+                def list_financial_filings(self, _company, *, limit=5):
+                    return [unhealthy, good][:limit]
+                def download_filing(self, filing, target):
+                    download_calls.append(filing.accession_number)
+                    target.mkdir(parents=True, exist_ok=True)
+                    path = target / f"{filing.accession_number}.pdf"
+                    path.write_bytes(b"official-repaired")
+                    filing.local_path, filing.content_hash = str(path), f"hash-{filing.accession_number}"
+                    return filing
+
+            class Engine:
+                def ingest(self, _company, filings, **_kwargs):
+                    filing = filings[0]
+                    facts = facts_for(filing, 200.0)
+                    validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset(item.concept for item in facts), facts, ())
+                    group = FinancialGroupValidation((filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"), validation)
+                    manifest = FilingManifest(filing.document_id, filing.accession_number, filing.source_url, filing.primary_document, filing.form_type, filing.fiscal_period, filing.period_end, filing.revision, filing.supersedes_document_id, filing.content_hash)
+                    return FinancialDataset(facts, (), (manifest,), validation, (), (group,))
+
+            service = AppService(Path(directory), market_data=_ResearchMarketData(Adapter()), financial_ingestion_engine=Engine(), provider_factory=lambda config: provider_calls.append(config.public_id))
+            service.storage.save_company(company)
+            service.storage.save_run(ResearchRun(run_id="financial-retry", company=company, workflow_id="test", research_pack_id="test", research_pack_version="1", provider_id="unused", model_id="unused", data_as_of=utc_now_iso(), status=RunStatus.PARTIAL))
+            good_facts = facts_for(good, 100.0)
+            good_validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset(item.concept for item in good_facts), good_facts, ())
+            bad_fact = facts_for(unhealthy, 1.0)[0]
+            bad_validation = FinancialValidation(ValidationStatus.REJECTED, ("core_coverage_insufficient",), frozenset({"revenue"}), (), (bad_fact,))
+            service.storage.save_filings([good, unhealthy])
+            service.storage.replace_financial_ingestion(company.security_id, [good.accession_number, unhealthy.accession_number], list(good_facts), [bad_fact], [FinancialGroupValidation((good.accession_number, good.period_end, "FY", "consolidated", "CNY"), good_validation), FinancialGroupValidation((unhealthy.accession_number, unhealthy.period_end, "FY", "consolidated", "CNY"), bad_validation)])
+
+            result = service.retry_financials("financial-retry")
+            self.assertEqual(result["run_id"], "financial-retry")
+            self.assertEqual(download_calls, [unhealthy.accession_number])
+            self.assertEqual(provider_calls, [])
+            self.assertTrue(any(item["accession_number"] == unhealthy.accession_number for item in service.storage.get_facts(company.security_id)))
+            service.retry_financials("financial-retry")
+            self.assertEqual(download_calls, [unhealthy.accession_number])
+            with self.assertRaisesRegex(ValueError, "explicit confirmation"):
+                service.rebuild_financials("financial-retry")
+            service.rebuild_financials("financial-retry", confirmed=True)
+            self.assertEqual(
+                set(download_calls[1:]),
+                {unhealthy.accession_number, good.accession_number},
+            )
+            self.assertEqual(provider_calls, [])
+
+    def test_retry_financials_keeps_success_when_another_node_fails(self) -> None:
+        company = build_company("300750.SZ", "CATL", reporting_currency="CNY")
+        download_calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            good = FilingDocument("good", company.security_id, "good-2025", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-03-01", "good.pdf", "https://example.test/good.pdf")
+            bad = FilingDocument("bad", company.security_id, "bad-2024", "ANNUAL_REPORT", "FY", "2024-12-31", "2025-03-01", "bad.pdf", "https://example.test/bad.pdf")
+            class Adapter:
+                def list_financial_filings(self, _company, *, limit=5): return [good, bad][:limit]
+                def download_filing(self, filing, target):
+                    download_calls.append(filing.accession_number)
+                    target.mkdir(parents=True, exist_ok=True)
+                    path = target / f"{filing.accession_number}.pdf"
+                    path.write_bytes(b"official")
+                    filing.local_path, filing.content_hash = str(path), filing.accession_number
+                    return filing
+            class Engine:
+                def ingest(self, _company, filings, **_kwargs):
+                    filing = filings[0]
+                    if filing.accession_number == bad.accession_number: raise OSError("bad filing")
+                    fact = FinancialFact(f"{filing.accession_number}:revenue", company.security_id, "revenue", "Revenue", 10.0, "CNY", 2025, "FY", "ANNUAL_REPORT", "2025-01-01", filing.period_end, filing.filed_at, filing.accession_number, filing.source_url, statement="income_statement", currency="CNY", validation_status="VERIFIED")
+                    validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ())
+                    group = FinancialGroupValidation((filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"), validation)
+                    manifest = FilingManifest(filing.document_id, filing.accession_number, filing.source_url, filing.primary_document, filing.form_type, filing.fiscal_period, filing.period_end, filing.revision, filing.supersedes_document_id, filing.content_hash)
+                    return FinancialDataset((fact,), (), (manifest,), validation, (), (group,))
+            service = AppService(Path(directory), market_data=_ResearchMarketData(Adapter()), financial_ingestion_engine=Engine())
+            service.storage.save_company(company)
+            service.storage.save_run(ResearchRun(run_id="financial-retry-partial", company=company, workflow_id="test", research_pack_id="test", research_pack_version="1", provider_id="unused", model_id="unused", data_as_of=utc_now_iso(), status=RunStatus.PARTIAL))
+            service.storage.save_filings([good, bad])
+            result = service.retry_financials("financial-retry-partial")
+            self.assertEqual(result["run_id"], "financial-retry-partial")
+            self.assertEqual(set(download_calls), {good.accession_number, bad.accession_number})
+            self.assertTrue(any(item["accession_number"] == good.accession_number for item in service.storage.get_facts_audit(company.security_id)))
+            self.assertEqual(service.storage.get_financial_retry_state(company.security_id)["last_stage"], "filing-parse")
+
+    def test_us_retry_is_local_and_idempotent_when_annual_window_is_complete(self) -> None:
+        company = Company(
+            cik="0000000002", ticker="CACHE", name="Cached Corp", exchange="NASDAQ",
+            market="US", security_id="US:NASDAQ:CACHE", listing_currency="USD",
+            reporting_currency="USD", accounting_standard="US_GAAP",
+        )
+        client_calls = {"factory": 0, "list": 0, "facts": 0, "download": 0}
+
+        class Client:
+            def list_annual_filings(self, _company, *, limit=5):
+                client_calls["list"] += 1
+                return []
+            def get_company_facts(self, _company):
+                client_calls["facts"] += 1
+                return []
+
+        def client_factory(*_args):
+            client_calls["factory"] += 1
+            return Client()
+
+        core = {
+            "revenue": "income_statement",
+            "net_income": "income_statement",
+            "operating_cash_flow": "cash_flow",
+            "assets": "balance_sheet",
+            "liabilities": "balance_sheet",
+            "equity": "balance_sheet",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory), sec_client_factory=client_factory)
+            service.storage.save_company(company)
+            service.storage.save_run(ResearchRun(
+                run_id="us-cache-status", company=company, workflow_id="test",
+                research_pack_id="test", research_pack_version="1",
+                provider_id="unused", model_id="unused", data_as_of=utc_now_iso(),
+                status=RunStatus.COMPLETED,
+                research_configuration={"annual_history_years": 2},
+                data_snapshot={"financial_fact_ids_sha256": "original-snapshot"},
+            ))
+            for year in (2025, 2024, 2023):
+                path = Path(directory) / f"{year}.htm"
+                path.write_text("cached annual filing", encoding="utf-8")
+                accession = f"cached-{year}"
+                filing = FilingDocument(
+                    f"doc-{year}", company.cik, accession, "10-K", "FY",
+                    f"{year}-12-31", f"{year + 1}-02-01", f"annual-{year}.htm",
+                    f"https://www.sec.gov/Archives/{accession}/annual.htm",
+                    local_path=str(path), content_hash=f"hash-{year}",
+                )
+                service.storage.save_filings([filing])
+                facts = [FinancialFact(
+                    fact_id=f"{accession}:{concept}", company_cik=company.cik,
+                    concept=concept, reported_concept=concept, value=float(year),
+                    unit="USD", fiscal_year=year, fiscal_period="FY", form_type="10-K",
+                    start_date=f"{year}-01-01", end_date=f"{year}-12-31",
+                    filed_at=filing.filed_at, accession_number=accession,
+                    source_url=filing.source_url, scope="consolidated",
+                    statement=statement, consolidated_scope="consolidated",
+                    currency="USD", source_document=filing.primary_document,
+                    raw_text=f"{concept} {year}", parser_version="sec-companyfacts-1",
+                    validation_status="VERIFIED",
+                ) for concept, statement in core.items()]
+                service.storage.save_facts(facts)
+
+            payload = {"research_configuration": {"annual_history_years": 2}}
+            self.assertEqual(service._retry_us_financials(company, payload), [])
+            self.assertEqual(service._retry_us_financials(company, payload), [])
+            self.assertEqual(client_calls, {"factory": 0, "list": 0, "facts": 0, "download": 0})
+            status = service.get_report("us-cache-status", language="en")["financial_status"]
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["available_periods"], ["2025", "2024", "2023"])
+            self.assertTrue(status["snapshot_stale"])
 
     def test_demo_research_job_reports_progress_and_produces_a_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1087,6 +1426,20 @@ class AppServiceTests(unittest.TestCase):
             facts, FinancialIngestionEngine(), expected_period_end="2025-12-31"
         )
         self.assertIsNone(result)
+
+
+def _download_filing(document_id: str, host: str, *, url: str | None = None) -> FilingDocument:
+    return FilingDocument(
+        document_id=document_id,
+        company_cik="fixture",
+        accession_number=document_id,
+        form_type="ANNUAL_REPORT",
+        fiscal_period="FY",
+        period_end="2025-12-31",
+        filed_at="2026-03-01T00:00:00+00:00",
+        primary_document=document_id,
+        source_url=url or f"https://{host}/{document_id}.pdf",
+    )
 
 
 if __name__ == "__main__":

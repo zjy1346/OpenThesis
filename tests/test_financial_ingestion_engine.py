@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import hashlib
+import tempfile
+import threading
+import time
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -29,6 +32,9 @@ from openthesis.financial_ingestion import (
     _period_start,
     _statement_context,
     _vision_failed_pages,
+      _parse_local_pdfs_bounded,
+      _candidate_financial_pages,
+      _safe_pdf_worker_count,
 )
 from openthesis.financials import calculate_interim_metrics
 from openthesis.market_financials import FinancialValidation, ValidationStatus
@@ -123,6 +129,145 @@ def _formal_rows(title: str = "Consolidated balance sheet") -> tuple[PdfRowAST, 
 
 
 class FinancialIngestionEngineTests(unittest.TestCase):
+    def test_financial_page_prepass_selects_titles_and_bounded_continuations(self) -> None:
+        from unittest.mock import patch
+
+        class Page:
+            def __init__(self, text: str) -> None:
+                self.text = text
+            def extract_text(self) -> str:
+                return self.text
+
+        class Reader:
+            pages = [
+                Page("Narrative"),
+                Page("CONSOLIDATED INCOME STATEMENT"),
+                Page("continuation"),
+                Page("continuation"),
+                Page("continuation"),
+                Page("Consolidated statement of cash flows"),
+                Page("continuation"),
+                Page("合并资产负债表"),
+                Page("continuation"),
+                Page("净资产收益率及每股收益 加权平均净资产收益率（%）"),
+            ]
+
+        with patch("pypdf.PdfReader", return_value=Reader()):
+            selected = _candidate_financial_pages("annual.pdf")
+        self.assertEqual(selected, frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10}))
+
+    def test_pdf_process_parallelism_falls_back_for_large_compressed_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            small = []
+            for index in range(2):
+                path = Path(directory) / f"small-{index}.pdf"
+                path.write_bytes(b"x" * 1024)
+                small.append(_filing(f"small-{index}", path=str(path)))
+            large_path = Path(directory) / "large.pdf"
+            with large_path.open("wb") as handle:
+                handle.truncate(9 * 1024 * 1024)
+            large = _filing("large", path=str(large_path))
+
+            self.assertEqual(_safe_pdf_worker_count(small, requested=3), 2)
+            self.assertEqual(_safe_pdf_worker_count([small[0], large], requested=3), 1)
+
+    def test_ingest_parses_local_filings_with_bounded_parallelism_and_ordered_reuse(self) -> None:
+        active = 0
+        maximum = 0
+        calls: list[str] = []
+        lock = threading.Lock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            filings = []
+            for index in range(6):
+                path = Path(directory) / f"report-{index}.pdf"
+                path.write_bytes(f"pdf-{index}".encode())
+                filing = _filing(f"parallel-{index}", path=str(path))
+                filing.content_hash = f"hash-{index}"
+                paths.append(path)
+                filings.append(filing)
+            duplicate = _filing("parallel-duplicate", path=str(paths[0]))
+            duplicate.content_hash = filings[0].content_hash
+            filings.append(duplicate)
+
+            engine = FinancialIngestionEngine()
+
+            def parse(path, company, filing, manifest):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                    calls.append(filing.document_id)
+                time.sleep(0.01)
+                with lock:
+                    active -= 1
+                return [], []
+
+            with patch.object(engine, "_parse_pdf_ast", side_effect=parse):
+                dataset = engine.ingest(_company(), filings)
+
+            self.assertLessEqual(maximum, 3)
+            self.assertEqual(calls, [f"parallel-{index}" for index in range(6)])
+            self.assertEqual(len(dataset.manifest), 7)
+
+    def test_bounded_pdf_helper_skips_cancelled_unstarted_work(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        calls: list[str] = []
+        filings = [_filing(f"cancel-{index}", path=f"cancel-{index}.pdf") for index in range(4)]
+
+        def parse(path, company, filing, manifest):
+            calls.append(filing.document_id)
+            return [], []
+
+        result = _parse_local_pdfs_bounded(
+            FinancialIngestionEngine(), _company(), filings,
+            {filing.document_id: _manifest_for(filing) for filing in filings},
+            parse=parse, cancel_check=cancel.is_set,
+        )
+        self.assertEqual(result, {})
+        self.assertEqual(calls, [])
+
+    def test_bounded_pdf_helper_preserves_completed_result_when_cancel_cancels_queue(self) -> None:
+        cancel = threading.Event()
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for index in range(3):
+                path = Path(directory) / f"cancel-queue-{index}.pdf"
+                path.write_bytes(f"pdf-{index}".encode())
+                filings.append(_filing(f"cancel-queue-{index}", path=str(path)))
+
+            def parse(path, company, filing, manifest):
+                calls.append(filing.document_id)
+                cancel.set()
+                return [], []
+
+            result = _parse_local_pdfs_bounded(
+                FinancialIngestionEngine(), _company(), filings,
+                {filing.document_id: _manifest_for(filing) for filing in filings},
+                parse=parse, cancel_check=cancel.is_set, max_workers=1,
+            )
+        self.assertIn(filings[0].document_id, result)
+        self.assertEqual(calls, [filings[0].document_id])
+
+    def test_pdf_prescan_falls_back_to_full_parse_when_statement_index_is_incomplete(self) -> None:
+        class Page:
+            def __init__(self, text: str):
+                self.text = text
+            def extract_text(self):
+                return self.text
+
+        class Reader:
+            def __init__(self, _path):
+                self.pages = [
+                    Page("Consolidated Income Statement"),
+                    Page("Consolidated Balance Sheet"),
+                ]
+
+        with patch("pypdf.PdfReader", Reader):
+            self.assertIsNone(_candidate_financial_pages("not-a-real-pdf.pdf"))
     def test_vision_page_selection_excludes_parent_and_stops_at_next_statement(self) -> None:
         import tempfile
         from unittest.mock import patch
@@ -433,13 +578,58 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(target.currency, "CNY")
         self.assertEqual(target.unit_scale, 1_000_000.0)
 
-    def test_missing_any_core_statement_rejects_group(self) -> None:
+    def test_reporting_currency_wins_over_current_year_convenience_translation(self) -> None:
+        rows = (
+            _row(("Consolidated", 10, 90), ("Balance", 95, 145), ("Sheets", 150, 190)),
+            _row(("2024", 357, 397), ("2025", 455, 495)),
+            _row(("RMB", 357, 397), ("RMB", 423, 463), ("US$", 488, 528)),
+            _row(("(in millions)", 10, 90)),
+            _row(("Total", 10, 45), ("assets", 48, 90), ("1,764,829", 367, 407),
+                 ("1,804,227", 432, 472), ("248,629", 500, 540)),
+        )
+
+        sections = _page_sections(
+            None,
+            "Consolidated Balance Sheets\n2024 2025\nRMB RMB US$\n(in millions)",
+            rows,
+            247,
+            "CNY",
+        )
+
+        self.assertEqual(len(sections), 1)
+        context = sections[0].context
+        self.assertEqual(context.currency, "CNY")
+        current = next(column for column in context.periods if column.year == 2025)
+        self.assertEqual(current.currency, "CNY")
+        self.assertLess(current.center, 470)
+
+    def test_table_wide_currency_label_does_not_replace_period_column_center(self) -> None:
+        rows = (
+            _row(("CNY", 60, 90), ("2025", 430, 470), ("2024", 500, 540)),
+            _row(
+                ("Revenue", 60, 120),
+                ("45", 390, 405),
+                ("803,964,958", 430, 475),
+                ("777,102,455", 500, 545),
+            ),
+        )
+
+        columns = _period_columns(rows, "CNY")
+        selected = _select_period_cell(rows[1], 120, columns, 2025)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "803,964,958")
+        self.assertEqual(columns[0].center, 450)
+
+    def test_missing_one_core_statement_keeps_verified_fields_with_warning(self) -> None:
         filing = _filing("partial")
         facts = list(_core(filing))
         facts = [fact for fact in facts if fact.concept != "operating_cash_flow"]
         result = FinancialIngestionEngine()._validate_group(list(facts), ("partial", "2025-12-31", "FY", "consolidated", "CNY"))
-        self.assertEqual(result.validation.status.value, "REJECTED")
+        self.assertEqual(result.validation.status.value, "READY_WITH_WARNINGS")
         self.assertIn("cash_flow_core_missing", result.validation.issues)
+        self.assertEqual({fact.concept for fact in result.validation.accepted}, {fact.concept for fact in facts})
+        self.assertEqual(result.validation.quarantined, ())
 
     def test_missing_provenance_rejects_group(self) -> None:
         filing = _filing("noprov")

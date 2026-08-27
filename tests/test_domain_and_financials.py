@@ -23,6 +23,17 @@ class FinancialMetricTests(unittest.TestCase):
         summary = deterministic_summary("示例", [{"year": 2025, "revenue": 10.0, "revenue_growth": 0.1, "net_income": 1.0, "operating_cash_flow": 2.0}], "zh-CN", "CNY")
         self.assertIn("财年", summary)
         self.assertIn("收入增长", summary)
+
+    def test_deterministic_summary_explains_missing_roe_input(self) -> None:
+        summary = deterministic_summary(
+            "示例",
+            [{"year": 2025, "revenue": 10.0, "net_income": 1.0,
+              "operating_cash_flow": 2.0, "return_on_equity": None,
+              "return_on_equity_gap": "missing_equity"}],
+            "zh-CN",
+            "CNY",
+        )
+        self.assertIn("净资产收益率：—（缺少权益数据）", summary)
         self.assertNotIn("財年", summary)
         self.assertNotIn("镾", summary)
 
@@ -100,6 +111,66 @@ class FinancialMetricTests(unittest.TestCase):
         )
         self.assertGreater(metrics[0]["revenue_growth"], 0)
         self.assertLess(metrics[0]["cash_conversion"], metrics[1]["cash_conversion"])
+
+    def test_annual_growth_never_crosses_a_missing_fiscal_year(self) -> None:
+        facts = []
+        for year, revenue in ((2026, 160.0), (2024, 120.0), (2023, 100.0), (2022, 80.0)):
+            facts.append(
+                {
+                    "fact_id": f"fy-{year}",
+                    "concept": "revenue",
+                    "value": revenue,
+                    "fiscal_year": year,
+                    "fiscal_period": "FY",
+                    "filed_at": f"{year + 1}-03-01",
+                }
+            )
+        metrics = calculate_metrics(facts)
+        by_year = {item["year"]: item for item in metrics}
+        self.assertIsNone(by_year[2026]["revenue_growth"])
+        self.assertIsNone(by_year[2026]["comparison_year"])
+        self.assertEqual(by_year[2026]["comparison_gap"], "missing_2025")
+        self.assertEqual(by_year[2024]["comparison_year"], 2023)
+        self.assertIsNone(by_year[2024]["comparison_gap"])
+        self.assertAlmostEqual(by_year[2024]["revenue_growth"], 0.2)
+        self.assertEqual(by_year[2023]["comparison_year"], 2022)
+
+    def test_roe_accepts_total_equity_and_prefers_average_equity(self) -> None:
+        facts = []
+        for year, concept, value in (
+            (2025, "net_income", 30.0),
+            (2025, "total_equity", 220.0),
+            (2024, "total_equity", 180.0),
+        ):
+            facts.append(
+                {
+                    "fact_id": f"{year}-{concept}",
+                    "concept": concept,
+                    "value": value,
+                    "fiscal_year": year,
+                    "fiscal_period": "FY",
+                    "filed_at": f"{year + 1}-03-01",
+                }
+            )
+
+        latest = calculate_metrics(facts)[0]
+
+        self.assertAlmostEqual(latest["return_on_equity"], 0.15)
+        self.assertEqual(latest["return_on_equity_basis"], "average_equity")
+        self.assertIsNone(latest["return_on_equity_gap"])
+        self.assertEqual(
+            latest["return_on_equity_inputs"],
+            {"net_income": 30.0, "opening_equity": 180.0, "closing_equity": 220.0},
+        )
+
+    def test_roe_missing_inputs_are_explained(self) -> None:
+        latest = calculate_metrics(
+            [{"fact_id": "2025-net", "concept": "net_income", "value": 30.0,
+              "fiscal_year": 2025, "fiscal_period": "FY", "filed_at": "2026-03-01"}]
+        )[0]
+
+        self.assertIsNone(latest["return_on_equity"])
+        self.assertEqual(latest["return_on_equity_gap"], "missing_equity")
 
     def test_reverse_dcf_recovers_growth_assumption(self) -> None:
         base_fcf = 100.0
