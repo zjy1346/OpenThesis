@@ -10,13 +10,15 @@ import {
   openExternalUrl,
   retryResearchSynthesis,
   retryResearchGrowth,
-  retryResearchFinancials,
-  rebuildResearchFinancials,
+  refreshFinancialReport as refreshFinancialReportBackend,
+  startResearchFinancialRetry,
+  startResearchFinancialRebuild,
   startResearch,
   updatePreferences,
 } from "../backend";
 import type {
   BootstrapResult,
+  FinancialRetryResult,
   Preferences,
   ResearchJob,
   ResearchReport,
@@ -41,6 +43,22 @@ export function useWorkbenchSession() {
   const [job, setJob] = useState<ResearchJob | null>(null);
   const [error, setError] = useState<WorkbenchError | null>(null);
   const lastRequest = useRef<ResearchRequest | null>(null);
+  const pendingFinancialRetry = useRef<{
+    jobId: string;
+    resolve: () => void;
+    reject: (reason?: unknown) => void;
+  } | null>(null);
+
+  const finishFinancialJob = (job: ResearchJob, result?: FinancialRetryResult | null) => {
+    const pending = pendingFinancialRetry.current;
+    if (!pending || pending.jobId !== job.job_id) return;
+    pendingFinancialRetry.current = null;
+    if (job.state === "completed" && result?.status === "succeeded") {
+      pending.resolve();
+    } else {
+      pending.reject(new Error(result?.error || job.message || "Financial evidence refresh was incomplete"));
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -73,22 +91,50 @@ export function useWorkbenchSession() {
       void getResearchStatus(job.job_id)
         .then(async (next) => {
           if (!active) return;
-          setJob(next);
-          if (next.state === "completed" && next.run_id) {
+          if (next.state === "completed") {
             window.clearInterval(poll);
+            if (!next.run_id) {
+              setJob(next);
+              finishFinancialJob(next, next.operation_result);
+              return;
+            }
             try {
               const [nextBootstrap, nextReport] = await Promise.all([
                 bootstrapBackend(),
                 getResearchReport(next.run_id, bootstrap?.preferences.report_language),
               ]);
               if (!active) return;
+              const operationResult = next.operation_result ?? null;
+              const refreshedReport = operationResult
+                ? { ...nextReport, financial_retry: operationResult }
+                : nextReport;
+              setJob(next);
               setBootstrap(nextBootstrap);
-              setReport(nextReport);
+              setReport(refreshedReport);
+              finishFinancialJob(next, operationResult);
             } catch {
+              finishFinancialJob(next);
               if (active) setError({ kind: "report-unavailable" });
             }
           } else if (next.state === "failed") {
             window.clearInterval(poll);
+            setJob(next);
+            if (next.run_id && next.operation_result) {
+              try {
+                const [nextBootstrap, nextReport] = await Promise.all([
+                  bootstrapBackend(),
+                  getResearchReport(next.run_id, bootstrap?.preferences.report_language),
+                ]);
+                if (active) {
+                  setBootstrap(nextBootstrap);
+                  setReport({ ...nextReport, financial_retry: next.operation_result });
+                }
+              } catch {
+                // Keep the last report visible only as a fallback; the error
+                // below explicitly identifies the failed refresh stage.
+              }
+            }
+            finishFinancialJob(next, next.operation_result);
             setError({
               kind: "research-failed",
               detail: next.message,
@@ -97,10 +143,19 @@ export function useWorkbenchSession() {
             });
           } else if (next.state === "cancelled") {
             window.clearInterval(poll);
+            setJob(next);
+            finishFinancialJob(next, next.operation_result);
+          } else {
+            setJob(next);
           }
         })
         .catch(() => {
           if (!active) return;
+          if (pendingFinancialRetry.current?.jobId === job.job_id) {
+            const pending = pendingFinancialRetry.current;
+            pendingFinancialRetry.current = null;
+            pending.reject(new Error("Financial evidence refresh status was unavailable"));
+          }
           setError({ kind: "core-unavailable" });
           setJob((current) => current ? { ...current, state: "failed" } : current);
         });
@@ -139,7 +194,9 @@ export function useWorkbenchSession() {
   const stopResearch = async () => {
     if (!job) return;
     try {
-      setJob(await cancelResearch(job.job_id));
+      const next = await cancelResearch(job.job_id);
+      setJob(next);
+      if (next.state === "cancelled") finishFinancialJob(next, next.operation_result);
     } catch {
       setError({ kind: "core-unavailable" });
     }
@@ -219,15 +276,32 @@ export function useWorkbenchSession() {
   const retryFinancials = async () => {
     if (!report) throw new Error("report is unavailable");
     setError(null);
-    const next = await retryResearchFinancials(report.run_id);
-    setReport(next);
-    setBootstrap(await bootstrapBackend());
+    const started = await startResearchFinancialRetry(report.run_id);
+    return new Promise<void>((resolve, reject) => {
+      pendingFinancialRetry.current = { jobId: started.job_id, resolve, reject };
+      setJob(started);
+      if (TERMINAL_JOB_STATES.has(started.state)) finishFinancialJob(started, started.operation_result);
+    });
   };
 
   const rebuildFinancials = async () => {
     if (!report) throw new Error("report is unavailable");
     setError(null);
-    const next = await rebuildResearchFinancials(report.run_id);
+    const started = await startResearchFinancialRebuild(report.run_id);
+    return new Promise<void>((resolve, reject) => {
+      pendingFinancialRetry.current = { jobId: started.job_id, resolve, reject };
+      setJob(started);
+      if (TERMINAL_JOB_STATES.has(started.state)) finishFinancialJob(started, started.operation_result);
+    });
+  };
+
+  const refreshFinancialReport = async () => {
+    if (!report) throw new Error("report is unavailable");
+    setError(null);
+    const next = await refreshFinancialReportBackend(
+      report.run_id,
+      report.report_language,
+    );
     setReport(next);
     setBootstrap(await bootstrapBackend());
   };
@@ -256,6 +330,7 @@ export function useWorkbenchSession() {
     retryGrowth,
     retryFinancials,
     rebuildFinancials,
+    refreshFinancialReport,
     openFailedDisclosure,
     stopResearch,
     decideVisionUpload: decideVision,

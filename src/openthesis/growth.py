@@ -115,6 +115,25 @@ def format_probability_range(
     return f"{low * 100:.0f}%–{high * 100:.0f}%"
 
 
+def format_evidence_summary(
+    supporting_count: int,
+    contradicting_count: int,
+    language: str = "zh-CN",
+) -> str:
+    """Render a citation summary without implying evidence where none exists."""
+
+    if supporting_count == 0 and contradicting_count == 0:
+        if normalize_language(language) == ZH_HANT:
+            return "未引用已驗證證據"
+        return _pick(language, "未引用已验证证据", "No verified evidence cited")
+    locale = normalize_language(language)
+    if locale == EN:
+        return f"Evidence: {supporting_count} supporting evidence · {contradicting_count} contradicting evidence"
+    if locale == ZH_HANT:
+        return f"證據：{supporting_count} 條支持證據 · {contradicting_count} 條相反證據"
+    return f"证据：{supporting_count} 条支持证据 · {contradicting_count} 条相反证据"
+
+
 def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -259,6 +278,27 @@ def normalize_growth_output(
                         + "、".join(unknown_evidence)
                     )
                 )
+        # Counts are derived only from the verified evidence registry.  A
+        # model-provided count is untrusted metadata and must never be shown
+        # as if it were an independently checked citation count.
+        valid_supporting_count = len(
+            {
+                evidence_id
+                for evidence_id in supporting
+                if available_evidence is not None
+                and evidence_id in available_evidence
+            }
+        )
+        valid_contradicting_count = len(
+            {
+                evidence_id
+                for evidence_id in contradicting
+                if available_evidence is not None
+                and evidence_id in available_evidence
+            }
+        )
+        supporting_count = valid_supporting_count
+        contradicting_count = valid_contradicting_count
 
         scenarios = [
             item.lower()
@@ -293,6 +333,8 @@ def normalize_growth_output(
                 ),
                 "supporting_evidence_ids": supporting,
                 "contradicting_evidence_ids": contradicting,
+                "supporting_evidence_count": supporting_count,
+                "contradicting_evidence_count": contradicting_count,
                 "unknown_evidence_ids": unknown_evidence,
                 "capital_requirements": str(
                     raw.get("capital_requirements", "")

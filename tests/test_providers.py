@@ -127,6 +127,24 @@ class ProviderTests(unittest.TestCase):
             self.assertTrue(caught.exception.retryable)
             self.assertNotIn("ignored", str(caught.exception))
 
+    def test_gateway_oserror_remains_unavailable_and_does_not_echo_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            with patch(
+                "openthesis.providers.subprocess.run",
+                side_effect=OSError("api_key=sk-private-value"),
+            ):
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="model.ready"),
+                    gateway_path=gateway,
+                )
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate("system", "user")
+            self.assertEqual(caught.exception.code, "MODEL_GATEWAY_UNAVAILABLE")
+            self.assertTrue(caught.exception.retryable)
+            self.assertNotIn("sk-private-value", str(caught.exception))
+
     def test_gateway_path_must_be_absolute_existing_file(self) -> None:
         provider = RustModelGatewayProvider(
             ModelConfig(configured_model_id="model.ready"),
@@ -135,6 +153,34 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderError) as caught:
             provider.generate("system", "user")
         self.assertEqual(caught.exception.code, "MODEL_GATEWAY_UNAVAILABLE")
+
+    def test_gateway_error_diagnostics_are_bounded_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {
+                "ok": False,
+                "error": {
+                    "code": "MODEL_PROVIDER_ERROR",
+                    "message": "prompt=private prompt api_key=sk-private-value " * 100,
+                    "retryable": False,
+                },
+            }
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout=json.dumps(response).encode(), stderr=b"ignored"
+            )
+            with patch("openthesis.providers.subprocess.run", return_value=completed):
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="model.ready"),
+                    gateway_path=gateway,
+                )
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate("system", "user")
+
+            message = str(caught.exception)
+            self.assertNotIn("private prompt", message)
+            self.assertNotIn("sk-private-value", message)
+            self.assertLessEqual(len(message), 300)
 
     def test_malformed_model_json_keeps_a_safe_parse_error_class(self) -> None:
         result = _parse_model_json("not-json")

@@ -34,11 +34,13 @@ _REPORT_FIELDS = frozenset(
         "confidence", "title", "argument", "counterargument", "severity",
         "summary", "analysis", "conclusion", "strengths", "concerns",
         "risks", "unknowns", "possible_moats", "assumptions", "assumption",
+        "financial_analysis", "accounting_risk", "information_gaps",
         "mechanism", "category", "maturity_stage", "time_horizon_years",
         "condition", "indicator", "metric", "trigger", "question",
         "probability", "probability_range", "scenario_eligibility",
         "capital_requirements", "leading_indicators", "invalidation_conditions",
-        "evidence_grade",
+        "evidence_grade", "supporting_evidence_count", "contradicting_evidence_count",
+        "opportunities",
     }
 )
 
@@ -48,6 +50,9 @@ _FIELD_LABELS: dict[str, tuple[str, str]] = {
     "claims": ("主要结论", "Key Conclusions"),
     "unknowns": ("信息缺口", "Information Gaps"),
     "possible_moats": ("潜在护城河", "Potential Moats"),
+    "financial_analysis": ("财务分析", "Financial Analysis"),
+    "accounting_risk": ("会计风险", "Accounting Risk"),
+    "information_gaps": ("信息缺口", "Information Gaps"),
     "risks": ("主要风险", "Key Risks"),
     "conclusion": ("结论", "Conclusion"),
     "strengths": ("优势", "Strengths"),
@@ -92,6 +97,8 @@ _FIELD_LABELS_HANT = {
     "leading_indicators": "領先指標", "invalidation_conditions": "失效條件",
     "counterargument": "反方觀點", "severity": "嚴重程度", "title": "標題",
     "confidence": "信心程度", "text": "結論", "kind": "類型",
+    "financial_analysis": "財務分析", "accounting_risk": "會計風險",
+    "information_gaps": "資訊缺口",
 }
 
 _DISPLAY_VALUES_ZH = {
@@ -111,6 +118,17 @@ _DISPLAY_VALUES_ZH = {
 
 _DISPLAY_VALUES_ZH.update({"high": "高", "medium": "中", "low": "低"})
 
+_DISPLAY_VALUES_HANT = {
+    **_DISPLAY_VALUES_ZH,
+    "calculation": "計算",
+    "forecast": "預測",
+    "inference": "推論",
+    "opinion": "觀點",
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+}
+
 
 _INTERNAL_ID_RE = re.compile(
     r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
@@ -124,11 +142,32 @@ _PROTOCOL_VALUE_FIELDS = {
 _TYPED_SECTION_FIELDS = {
     "executive_summary": {"summary", "text", "analysis", "conclusion"},
     "claims": {"text", "conclusion", "argument", "kind", "confidence", "title"},
+    "business_model": {"summary", "analysis", "conclusion", "possible_moats", "risks", "unknowns", "strengths", "concerns"},
+    "financial_quality": {"summary", "analysis", "conclusion", "financial_analysis", "accounting_risk", "strengths", "concerns", "risks", "unknowns"},
+    "balance_sheet": {"summary", "analysis", "conclusion", "strengths", "concerns", "risks", "unknowns", "assets", "liabilities", "equity", "total_equity"},
+    "competitive_position": {"summary", "analysis", "conclusion", "possible_moats", "strengths", "concerns", "risks", "unknowns"},
     "counterarguments": {"title", "counterargument", "argument", "text", "severity", "confidence"},
     "invalidation_conditions": {"title", "condition", "text", "trigger", "confidence"},
     "leading_indicators": {"title", "indicator", "metric", "text", "confidence"},
     "unresolved_questions": {"title", "question", "text", "confidence"},
+    "scenarios": {"summary", "analysis", "conclusion", "base", "bear", "bull", "probability", "probability_range", "assumptions", "text"},
+    "thesis": {"summary", "analysis", "conclusion", "text", "claims", "assumptions", "confidence"},
 }
+_REQUIRED_QUALITATIVE_SECTIONS = (
+    "executive_summary",
+    "claims",
+    "business_model",
+    "financial_quality",
+    "balance_sheet",
+    "competitive_position",
+    "growth_opportunities",
+    "counterarguments",
+    "scenarios",
+    "thesis",
+    "invalidation_conditions",
+    "leading_indicators",
+    "unresolved_questions",
+)
 _MISSING = object()
 
 
@@ -142,12 +181,44 @@ def _project_scalar(value: Any, *, parent_key: str | None) -> Any:
     return value
 
 
-def _project_value(value: Any, *, parent_key: str | None = None) -> Any:
+def _project_value(
+    value: Any,
+    *,
+    parent_key: str | None = None,
+    available_evidence: set[str] | None = None,
+) -> Any:
     if isinstance(value, dict):
         allowed = _TYPED_SECTION_FIELDS.get(parent_key or "")
         projected: dict[str, Any] = {}
+        unknown_evidence = {
+            str(item).strip()
+            for item in value.get("unknown_evidence_ids", [])
+            if str(item).strip()
+        } if isinstance(value.get("unknown_evidence_ids"), list) else set()
+        for evidence_field, count_field in (
+            ("supporting_evidence_ids", "supporting_evidence_count"),
+            ("contradicting_evidence_ids", "contradicting_evidence_count"),
+        ):
+            evidence_ids = value.get(evidence_field)
+            if isinstance(evidence_ids, list):
+                projected[count_field] = len(
+                    {
+                        str(item).strip()
+                        for item in evidence_ids
+                        if str(item).strip()
+                        and str(item).strip() not in unknown_evidence
+                        and (
+                            available_evidence is None
+                            or str(item).strip() in available_evidence
+                        )
+                    }
+                )
         for key, child in value.items():
             name = str(key)
+            # Evidence counts are derived above from registered evidence IDs;
+            # never copy model-supplied count values back over that result.
+            if name in {"supporting_evidence_count", "contradicting_evidence_count"}:
+                continue
             if (
                 name in _INTERNAL_FIELDS
                 or name.startswith("_")
@@ -155,20 +226,34 @@ def _project_value(value: Any, *, parent_key: str | None = None) -> Any:
                 or (allowed is not None and name not in allowed)
             ):
                 continue
-            item = _project_value(child, parent_key=name)
+            item = _project_value(
+                child, parent_key=name, available_evidence=available_evidence
+            )
             if item is not _MISSING:
                 projected[name] = item
         return projected
     if isinstance(value, list):
         return [
             item
-            for item in (_project_value(item, parent_key=parent_key) for item in value)
+            for item in (
+                _project_value(
+                    item, parent_key=parent_key,
+                    available_evidence=available_evidence,
+                )
+                for item in value
+            )
             if item is not _MISSING
         ]
     if isinstance(value, tuple):
         return tuple(
             item
-            for item in (_project_value(item, parent_key=parent_key) for item in value)
+            for item in (
+                _project_value(
+                    item, parent_key=parent_key,
+                    available_evidence=available_evidence,
+                )
+                for item in value
+            )
             if item is not _MISSING
         )
     return _project_scalar(value, parent_key=parent_key)
@@ -179,12 +264,52 @@ def project_report_value(
     *,
     include_technical: bool,
     section: str | None = None,
+    available_evidence: set[str] | None = None,
 ) -> Any:
     """Return a presentation-safe view without mutating stored research artifacts."""
 
     if include_technical:
         return value
-    return _project_value(value, parent_key=section)
+    return _project_value(
+        value, parent_key=section, available_evidence=available_evidence
+    )
+
+
+def normalize_report_sections(value: Any, language: str) -> dict[str, Any]:
+    """Normalize legacy/partial synthesis into one section-aware view.
+
+    This function does not invent qualitative conclusions. Missing sections
+    receive an explicit localized capability/evidence notice so a partially
+    valid synthesis cannot silently erase whole report areas.
+    """
+
+    report = dict(value) if isinstance(value, dict) else {}
+    if value not in (None, "") and not isinstance(value, dict):
+        report["executive_summary"] = value
+    narrative = report.pop("narrative", None)
+    if narrative and not report.get("executive_summary"):
+        report["executive_summary"] = narrative
+    business = report.get("business_model")
+    if isinstance(business, dict):
+        business = dict(business)
+        embedded_claims = business.pop("claims", None)
+        if embedded_claims and not report.get("claims"):
+            report["claims"] = embedded_claims
+        report["business_model"] = business
+    if report.get("unknowns") and not report.get("unresolved_questions"):
+        report["unresolved_questions"] = report.get("unknowns")
+    locale = normalize_language(language)
+    missing = (
+        "This section was not returned with verifiable content in the current research stage."
+        if locale == EN
+        else "本研究階段未返回可驗證的此章節內容。"
+        if locale == ZH_HANT
+        else "当前研究阶段未返回可验证的此章节内容。"
+    )
+    for key in _REQUIRED_QUALITATIVE_SECTIONS:
+        if report.get(key) in (None, "", [], {}):
+            report[key] = missing
+    return report
 
 
 def report_field_label(key: object, language: str) -> str:
@@ -228,6 +353,9 @@ def project_report_diagnostics(value: Any, *, include_technical: bool = False) -
 
 
 def report_display_value(value: str, language: str) -> str:
-    if normalize_language(language) == EN:
+    locale = normalize_language(language)
+    if locale == EN:
         return value
+    if locale == ZH_HANT:
+        return _DISPLAY_VALUES_HANT.get(value.casefold().strip(), value)
     return _DISPLAY_VALUES_ZH.get(value.casefold().strip(), value)

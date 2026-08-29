@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .paths import default_data_dir
-from .service import AppService, PreferenceValidationError
+from .service import AppService, PreferenceValidationError, _FinancialReportRefreshError
 
 
 class JsonLineServer:
@@ -45,6 +45,8 @@ class JsonLineServer:
             return _error(request_id, -32004, message)
         except MethodNotFoundError:
             return _error(request_id, -32601, "method not found")
+        except _FinancialReportRefreshError as exc:
+            return _error(request_id, -32020, exc.code)
         except Exception:
             return _error(request_id, -32603, "internal error")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -149,12 +151,33 @@ class JsonLineServer:
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
             return self.service.retry_financials(run_id)
+        if method == "research.refresh_financial_report":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            language = params.get("language")
+            if language is not None and not isinstance(language, str):
+                raise ValueError("language must be a string")
+            return self.service.refresh_financial_report(run_id, language=language)
+        if method == "research.start_financial_retry":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            return self.service.start_financial_retry(run_id)
         if method == "research.rebuild_financials":
             run_id = params.get("run_id")
             confirmed = params.get("confirmed")
             if not isinstance(run_id, str) or not run_id or not isinstance(confirmed, bool):
                 raise ValueError("run_id and confirmed are required")
             return self.service.rebuild_financials(run_id, confirmed=confirmed)
+        if method == "research.start_financial_rebuild":
+            run_id = params.get("run_id")
+            confirmed = params.get("confirmed")
+            if not isinstance(run_id, str) or not run_id or not isinstance(confirmed, bool):
+                raise ValueError("run_id and confirmed are required")
+            return self.service.start_financial_retry(
+                run_id, force=True, confirmed=confirmed
+            )
         if method == "research.vision_decision":
             job_id = params.get("job_id")
             approved = params.get("approved")

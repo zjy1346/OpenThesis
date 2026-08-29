@@ -49,6 +49,34 @@ class FinancialValidation:
     def allow_ai(self) -> bool:
         return self.status in {ValidationStatus.VERIFIED, ValidationStatus.READY_WITH_WARNINGS}
 
+    @property
+    def quality_class(self) -> str:
+        """Classify the failure boundary without flattening warnings.
+
+        Coverage warnings mean that individual fields are unavailable while
+        the accepted sibling facts remain auditable.  Other issues invalidate
+        the statement/group as a whole; an empty group means the source file
+        produced no usable statement facts.
+        """
+        coverage = {
+            "income_statement_core_missing",
+            "cash_flow_core_missing",
+            "balance_sheet_core_missing",
+            "core_coverage_insufficient",
+        }
+        if not self.covered_concepts and not self.accepted:
+            return "file_unavailable"
+        if any(issue not in coverage for issue in self.issues):
+            return "statement_unavailable" if self.status is ValidationStatus.REJECTED else "warning"
+        if self.issues:
+            return "field_missing"
+        return "verified"
+
+    @property
+    def category(self) -> str:
+        """Backward-compatible alias for callers that use category wording."""
+        return self.quality_class
+
 
 @dataclass(frozen=True, slots=True)
 class ConceptPattern:

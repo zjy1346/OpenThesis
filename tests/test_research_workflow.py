@@ -36,6 +36,25 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_staged_fallback_uses_latest_annual_metric_row_for_balance_sheet(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workflow = ResearchWorkflow(
+                Storage(Path(directory)),
+                builtin_pack(),
+                None,
+                ModelConfig(configured_model_id="test.fake", role="primary"),
+                report_language="zh-Hant",
+            )
+            fallback = workflow._build_staged_fallback(
+                {}, {}, {}, {},
+                [{"year": 2024, "assets": 100, "liabilities": 40, "equity": 60}],
+            )
+            self.assertEqual(fallback["balance_sheet"]["year"], 2024)
+            self.assertEqual(fallback["balance_sheet"]["assets"], 100)
+            self.assertEqual(fallback["balance_sheet"]["liabilities"], 40)
+            self.assertEqual(fallback["balance_sheet"]["equity"], 60)
+            self.assertIn("資產負債表摘要", fallback["balance_sheet"]["summary"])
+
     def test_financial_claim_period_and_value_must_match_cited_evidence(self) -> None:
         evidence = {
             "fact:revenue-2025": {
@@ -174,6 +193,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     "executive_summary": "Synthetic verified research.",
                     "business_model": "Synthetic business model.",
                     "financial_quality": "Synthetic financial quality.",
+                    "balance_sheet": "Synthetic balance sheet.",
                     "competitive_position": "Synthetic competitive position.",
                     "growth_opportunities": [],
                     "counterarguments": ["Synthetic counterargument."],
@@ -325,6 +345,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     "executive_summary": "Synthetic verified research.",
                     "business_model": "Synthetic business model.",
                     "financial_quality": "Synthetic financial quality.",
+                    "balance_sheet": "Synthetic balance sheet.",
                     "competitive_position": "Synthetic competitive position.",
                     "growth_opportunities": ["Synthetic opportunity."],
                     "counterarguments": ["Synthetic counterargument."],
@@ -404,6 +425,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                         "executive_summary": "Recovered synthesis.",
                         "business_model": "Business model.",
                         "financial_quality": "Financial quality.",
+                        "balance_sheet": "Balance sheet.",
                         "competitive_position": "Competitive position.",
                         "growth_opportunities": ["Opportunity."],
                         "counterarguments": ["Counterargument."],
@@ -458,7 +480,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             fallback = report["content"]["report"]
             required = {
                 "executive_summary", "business_model", "financial_quality",
-                "competitive_position", "growth_opportunities", "counterarguments",
+                "balance_sheet", "competitive_position", "growth_opportunities", "counterarguments",
                 "scenarios", "thesis", "invalidation_conditions",
                 "leading_indicators", "unresolved_questions", "claims",
             }
@@ -714,6 +736,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     "executive_summary": "Summary",
                     "business_model": "Business model",
                     "financial_quality": "Financial quality",
+                    "balance_sheet": "Balance sheet",
                     "competitive_position": "Competitive position",
                     "growth_opportunities": ["Opportunity"],
                     "counterarguments": ["Counterargument"],

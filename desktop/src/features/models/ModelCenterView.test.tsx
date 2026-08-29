@@ -211,6 +211,28 @@ describe("ModelCenterView", () => {
     expect(saveConfiguredModel).not.toHaveBeenCalled();
   });
 
+  it("keeps unrelated safe controls interactive while a connection test is pending", async () => {
+    let resolveTest!: (value: { ok: boolean; message: string }) => void;
+    vi.mocked(testProviderConnection).mockImplementation(() => new Promise((resolve) => {
+      resolveTest = resolve;
+    }));
+    render(<ModelCenterView language="en" />);
+    fireEvent.click(await screen.findByRole("button", { name: /OpenAI/ }));
+
+    const testButton = screen.getByRole("button", { name: "Test connection · Uses: gpt-test" });
+    fireEvent.click(testButton);
+    await waitFor(() => expect(testButton).toBeDisabled());
+    expect(testButton).toHaveTextContent("Testing connection…");
+
+    const safeFilter = screen.getByRole("button", { name: "Cloud" });
+    expect(safeFilter).not.toBeDisabled();
+    fireEvent.click(safeFilter);
+    expect(safeFilter).toHaveAttribute("data-active", "true");
+
+    resolveTest({ ok: true, message: "Connection succeeded." });
+    await waitFor(() => expect(testProviderConnection).toHaveBeenCalledWith(connection.connection_id));
+  });
+
   it("keeps custom connection testing available when a configured model exists", async () => {
     vi.mocked(listProviderConnections).mockResolvedValue([{ ...connection, provider_id: "custom" }]);
     vi.mocked(listConfiguredModels).mockResolvedValue([{ ...model, model_id: "custom-model" }]);

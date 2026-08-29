@@ -231,10 +231,18 @@ button { color: inherit; }
 .financial-health-copy { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 12px; }
 .financial-health-copy strong { color: #25352c; font-size: 12px; }
 .financial-health-copy small { flex-basis: 100%; color: var(--ink-muted); line-height: 1.45; }
+.financial-stage-status { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 3px; color: var(--ink-muted); font-size: 10px; line-height: 1.4; }
+.financial-stage-status span { white-space: nowrap; }
 .financial-health .report-retry-button { flex: none; min-height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid #cba982; border-radius: 9px; background: #fff; color: #704821; cursor: pointer; }
 .financial-health .report-retry-button:disabled { cursor: default; opacity: .45; }
 .financial-health-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .financial-health .report-rebuild-button { border-color: var(--line-strong); color: var(--ink-soft); background: transparent; }
+.financial-rebuild-advanced { max-width: 280px; padding: 8px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; }
+.financial-rebuild-advanced[open] { border-color: #e7d5c2; background: rgba(255, 255, 255, .72); }
+.financial-rebuild-advanced summary { cursor: pointer; color: var(--ink-muted); font-size: 11px; font-weight: 650; text-align: right; }
+.financial-rebuild-advanced summary:hover { color: #704821; }
+.financial-rebuild-advanced p { margin: 8px 0; color: var(--ink-muted); font-size: 10px; line-height: 1.5; text-align: left; }
+.financial-rebuild-advanced .report-rebuild-button { width: 100%; justify-content: center; }
 .financial-snapshot-warning { color: #8a5a23; font-weight: 650; }
 .report-markdown { max-width: 980px; margin: 26px auto; color: #303733; font-family: "Source Serif 4", "Noto Serif SC", Georgia, serif; font-size: calc(16px * var(--report-scale)); line-height: 1.76; }
 .report-markdown h1, .report-markdown h2, .report-markdown h3 { color: #1f2722; font-family: Inter, "Segoe UI", sans-serif; letter-spacing: -0.03em; }

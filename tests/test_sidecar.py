@@ -8,11 +8,22 @@ import unittest
 from pathlib import Path
 
 from openthesis.ot import minimal_studio_draft
-from openthesis.service import AppService
+from openthesis.service import AppService, _FinancialReportRefreshError
 from openthesis.sidecar import JsonLineServer
 
 
 class JsonLineServerTests(unittest.TestCase):
+    def test_sidecar_spec_declares_windows_version_resource(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        spec = (root / "OpenThesisSidecar.spec").read_text(encoding="utf-8")
+        version = root / "OpenThesisSidecar.version.txt"
+        self.assertTrue(version.is_file())
+        version_text = version.read_text(encoding="utf-8")
+        self.assertIn('version=str(version_file)', spec)
+        self.assertIn('StringStruct("CompanyName"', version_text)
+        self.assertIn('StringStruct("ProductName"', version_text)
+        self.assertIn('StringStruct("FileVersion"', version_text)
+
     def test_retry_financials_method_is_registered(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             server = JsonLineServer(AppService(Path(directory)))
@@ -119,6 +130,39 @@ class JsonLineServerTests(unittest.TestCase):
             })
             self.assertEqual(result["run_id"], "run-1")
             self.assertFalse(result["model_called"])
+
+    def test_refresh_financial_report_is_exposed_as_a_separate_deterministic_method(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            class Service(AppService):
+                def refresh_financial_report(self, run_id: str, *, language: str | None = None):
+                    self.seen = (run_id, language)
+                    return {"run_id": run_id, "financial_report_refresh": {"status": "succeeded"}}
+
+            service = Service(Path(directory))
+            self.assertIn("research.refresh_financial_report", service.hello()["capabilities"])
+            result = JsonLineServer(service).dispatch({
+                "jsonrpc": "2.0", "id": 14,
+                "method": "research.refresh_financial_report",
+                "params": {"run_id": "run-1", "language": "en"},
+            })
+            self.assertEqual(service.seen, ("run-1", "en"))
+            self.assertEqual(result["financial_report_refresh"]["status"], "succeeded")
+
+    def test_refresh_financial_report_failure_keeps_stable_error_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            class Service(AppService):
+                def refresh_financial_report(self, run_id: str, *, language: str | None = None):
+                    raise _FinancialReportRefreshError({
+                        "status": "failed", "error": "FILING_REPORT_REFRESH_FAILED",
+                    })
+
+            response = JsonLineServer(Service(Path(directory)))._handle_line(json.dumps({
+                "jsonrpc": "2.0", "id": 15,
+                "method": "research.refresh_financial_report",
+                "params": {"run_id": "run-1"},
+            }))
+            self.assertEqual(response["error"]["code"], -32020)
+            self.assertEqual(response["error"]["message"], "FILING_REPORT_REFRESH_FAILED")
 
     def test_rebuild_financials_requires_explicit_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

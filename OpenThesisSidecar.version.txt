@@ -1,0 +1,37 @@
+# UTF-8
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(2, 2, 1, 0),
+        prodvers=(2, 2, 1, 0),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "040904B0",
+                    [
+                        StringStruct("CompanyName", "OpenThesis Contributors"),
+                        StringStruct(
+                            "FileDescription",
+                            "OpenThesis official financial disclosure sidecar",
+                        ),
+                        StringStruct("FileVersion", "2.2.1.0"),
+                        StringStruct("InternalName", "openthesis-sidecar"),
+                        StringStruct(
+                            "OriginalFilename", "openthesis-sidecar.exe"
+                        ),
+                        StringStruct("ProductName", "OpenThesis"),
+                        StringStruct("ProductVersion", "2.2.1"),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+    ],
+)

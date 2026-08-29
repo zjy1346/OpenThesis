@@ -5,6 +5,7 @@ from pathlib import Path
 
 project_root = Path(SPECPATH)
 resources = project_root / "src" / "openthesis" / "resources"
+version_file = project_root / "OpenThesisSidecar.version.txt"
 
 a = Analysis(
     [str(project_root / "sidecar_launcher.py")],
@@ -38,6 +39,7 @@ exe = EXE(
     upx=False,
     console=True,
     hide_console="hide-early",
+    version=str(version_file),
 )
 
 bundle = COLLECT(

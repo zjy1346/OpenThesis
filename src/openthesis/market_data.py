@@ -13,6 +13,7 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 
 from .domain import Company, FilingDocument
+from .download_safety import UnsafeDisclosurePayload, store_immutable_payload
 from .filing_selection import select_research_filings
 from .markets import (
     COMMON_MARKET_COMPANIES,
@@ -75,9 +76,15 @@ class OfficialDisclosureHttpClient:
 
     def download(self, url: str, target: Path) -> Path:
         payload = self._request(url)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(payload)
-        return target
+        try:
+            return store_immutable_payload(
+                target,
+                payload,
+                maximum_bytes=self.maximum_bytes,
+                require_pdf=target.suffix.lower() == ".pdf",
+            )
+        except UnsafeDisclosurePayload as exc:
+            raise MarketDataError("official disclosure failed safety validation", code="FILING_CONTENT_UNSAFE") from exc
 
     def _request(
         self,
@@ -289,9 +296,9 @@ class CnInfoAdapter:
     def download_filing(self, filing: FilingDocument, target_dir: Path) -> FilingDocument:
         suffix = Path(urllib.parse.urlparse(filing.source_url).path).suffix or ".pdf"
         target = target_dir / f"{filing.accession_number}{suffix.lower()}"
-        self.transport.download(filing.source_url, target)
-        filing.local_path = str(target)
-        filing.content_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        saved = self.transport.download(filing.source_url, target)
+        filing.local_path = str(saved)
+        filing.content_hash = hashlib.sha256(saved.read_bytes()).hexdigest()
         return filing
 
     def _search_rows(self, query: str, limit: int) -> list[dict[str, str]]:
@@ -486,9 +493,9 @@ class HkexNewsAdapter:
 
     def download_filing(self, filing: FilingDocument, target_dir: Path) -> FilingDocument:
         target = target_dir / f"{filing.accession_number}.pdf"
-        self.transport.download(filing.source_url, target)
-        filing.local_path = str(target)
-        filing.content_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        saved = self.transport.download(filing.source_url, target)
+        filing.local_path = str(saved)
+        filing.content_hash = hashlib.sha256(saved.read_bytes()).hexdigest()
         return filing
 
     def _stocks(self) -> list[dict[str, str]]:

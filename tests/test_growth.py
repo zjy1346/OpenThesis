@@ -4,6 +4,7 @@ import unittest
 
 from openthesis.growth import (
     evidence_grade_label,
+    format_evidence_summary,
     format_probability_range,
     normalize_growth_output,
     scenario_label,
@@ -11,6 +12,20 @@ from openthesis.growth import (
 
 
 class GrowthNormalizationTests(unittest.TestCase):
+    def test_zero_verified_evidence_is_localized_without_a_numeric_zero(self) -> None:
+        self.assertEqual(
+            format_evidence_summary(0, 0, "zh-Hant"),
+            "未引用已驗證證據",
+        )
+        self.assertEqual(
+            format_evidence_summary(0, 0, "zh-CN"),
+            "未引用已验证证据",
+        )
+        self.assertEqual(
+            format_evidence_summary(0, 0, "en"),
+            "No verified evidence cited",
+        )
+
     def test_normalizes_valid_growth_opportunity(self) -> None:
         result = normalize_growth_output(
             {

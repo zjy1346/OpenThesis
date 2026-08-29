@@ -209,6 +209,7 @@ _REQUIRED_SYNTHESIS_SECTIONS = frozenset(
         "executive_summary",
         "business_model",
         "financial_quality",
+        "balance_sheet",
         "competitive_position",
         "growth_opportunities",
         "counterarguments",
@@ -395,12 +396,18 @@ class ResearchWorkflow:
         self.parallel_agents = parallel_agents
         self.agent_progress = agent_progress or (lambda _agent_id, _state: None)
 
-    def _report_text(self, chinese: str, english: str) -> str:
+    def _report_text(
+        self, chinese: str, english: str, traditional: str | None = None
+    ) -> str:
         if self.report_language == EN:
             return english
         if self.report_language == ZH_HANT:
             prefix = chinese[: len(chinese) - len(chinese.lstrip("# >-"))]
-            return prefix + UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+            return prefix + (
+                traditional
+                if traditional is not None
+                else UI_HANT.get(chinese[len(prefix):], chinese[len(prefix):])
+            )
         return chinese
 
     def _progress_text(self, chinese: str, **params: object) -> str:
@@ -412,6 +419,7 @@ class ResearchWorkflow:
         growth: dict[str, Any],
         skeptic: dict[str, Any],
         forecast: dict[str, Any],
+        financial_metrics: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         business_raw = stage_results.get("business-analyst", {})
         financial_raw = stage_results.get("financial-analyst", {})
@@ -430,6 +438,38 @@ class ResearchWorkflow:
             skeptic, "unsupported_assumptions", "strongest_counterarguments"
         )
         leading_indicators = _collect_strings(growth, "leading_indicators")
+        metric_rows = [
+            metric
+            for metric in (financial_metrics or [])
+            if isinstance(metric, dict) and metric.get("year") is not None
+        ]
+        latest_metric = max(
+            metric_rows,
+            key=lambda metric: int(metric.get("year", 0)),
+            default=None,
+        )
+        metric_values: dict[str, Any] = {}
+        if latest_metric is not None:
+            metric_values["year"] = latest_metric.get("year")
+            for key in ("assets", "liabilities", "equity", "total_equity"):
+                value = latest_metric.get(key)
+                if value is not None:
+                    metric_values[key] = value
+        if len(metric_values) > 1:
+            balance_sheet: Any = {
+                "summary": self._report_text(
+                    "以下资产负债表摘要仅使用通过校验的确定性财务数据。",
+                    "This balance-sheet summary uses only deterministic financial data that passed validation.",
+                    "以下資產負債表摘要僅使用通過驗證的確定性財務數據。",
+                ),
+                **metric_values,
+            }
+        else:
+            balance_sheet = self._report_text(
+                "缺少已验证的资产负债表数据，暂不能判断资产、负债与权益结构。",
+                "Verified balance-sheet data is unavailable, so the asset, liability, and equity structure cannot be assessed.",
+                "缺少已驗證的資產負債表數據，暫不能判斷資產、負債與權益結構。",
+            )
         return {
             "executive_summary": self._report_text(
                 "最终综合未完整生成。以下内容由已完成的研究阶段确定性整理。",
@@ -440,6 +480,7 @@ class ResearchWorkflow:
                 "financial_analysis": _presentation_stage_value(financial_raw),
                 "accounting_risk": _presentation_stage_value(accounting_raw),
             },
+            "balance_sheet": balance_sheet,
             "competitive_position": possible_moats
             or self._report_text(
                 "竞争地位尚待最终综合；请结合商业模式与信息缺口复核。",
@@ -1187,7 +1228,7 @@ class ResearchWorkflow:
                 report_mode = "staged-fallback"
                 if not verification["passed"]:
                     report_payload = self._build_staged_fallback(
-                        stage_results, growth, skeptic, forecast
+                        stage_results, growth, skeptic, forecast, context.metrics
                     )
                 else:
                     report_mode = "synthesized"

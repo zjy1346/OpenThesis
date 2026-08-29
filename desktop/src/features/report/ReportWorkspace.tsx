@@ -50,6 +50,20 @@ type ReportCopy = {
   retryingFinancials: string;
   retryFinancialsSucceeded: string;
   retryFinancialsFailed: string;
+  financialRetryPartial: string;
+  financialReportRefreshFailed: string;
+  refreshFinancialReport: string;
+  refreshingFinancialReport: string;
+  refreshFinancialReportSucceeded: string;
+  refreshFinancialReportFailed: string;
+  financialStageStatus: string;
+  financialStageDownload: string;
+  financialStageValidation: string;
+  financialStageProjection: string;
+  financialStageRefresh: string;
+  financialStageDone: string;
+  financialStageFailed: string;
+  financialStagePending: string;
   rebuildFinancials: string;
   rebuildFinancialsConfirm: string;
   financialSnapshotStale: string;
@@ -62,7 +76,7 @@ type ReportCopy = {
 type FocusState = "normal" | "focused" | "closing";
 type ExportState = "idle" | "exporting" | "exported" | "failed";
 type RetryState = "idle" | "retrying" | "succeeded" | "failed";
-type RetryTarget = "synthesis" | "growth" | "financials" | "rebuild-financials";
+type RetryTarget = "synthesis" | "growth" | "financials" | "rebuild-financials" | "financial-report";
 
 const MIN_ZOOM = 0.9;
 const MAX_ZOOM = 1.3;
@@ -87,7 +101,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void> }) {
+export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void> }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -100,7 +114,13 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
   const reportBody = stripReportPreamble(displayedReport.markdown);
-  const retryCopy = retryTarget === "financials" || retryTarget === "rebuild-financials"
+  const retryCopy = retryTarget === "financial-report"
+    ? {
+        retrying: copy.refreshingFinancialReport,
+        succeeded: copy.refreshFinancialReportSucceeded,
+        failed: copy.refreshFinancialReportFailed,
+      }
+    : retryTarget === "financials" || retryTarget === "rebuild-financials"
     ? {
         retrying: copy.retryingFinancials,
         succeeded: copy.retryFinancialsSucceeded,
@@ -113,16 +133,41 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
         failed: copy.retryGrowthFailed,
       }
     : {
-        retrying: copy.retryingSynthesis,
+      retrying: copy.retryingSynthesis,
         succeeded: copy.retrySynthesisSucceeded,
-        failed: copy.retrySynthesisFailed,
-      };
+      failed: copy.retrySynthesisFailed,
+    };
+  const financialOperation = displayedReport.financial_retry;
+  const financialRefreshFailed = Boolean(
+    financialOperation?.error?.includes("FILING_REPORT_REFRESH_FAILED"),
+  );
+  const financialRetryPartial = financialOperation?.status === "partial";
+  const financialStage = displayedReport.financial_status?.last_stage ?? "";
+  const stageRank = (stage: string): number => ({
+    "filing-download": 1,
+    "filing-parse": 2,
+    "filing-validation": 2,
+    "artifact-rebuild": 3,
+    "report-refresh": 4,
+    completed: 4,
+  }[stage] ?? 0);
+  const stageText = (rank: number): string => {
+    if (financialRefreshFailed && rank === 4) return copy.financialStageFailed;
+    if (financialOperation?.status === "succeeded" || stageRank(financialStage) >= rank) return copy.financialStageDone;
+    if (retryState === "retrying" && stageRank(financialStage) === rank) return copy.financialStagePending;
+    return copy.financialStagePending;
+  };
+  const financialFailureText = financialRefreshFailed
+    ? copy.financialReportRefreshFailed
+    : financialRetryPartial
+      ? copy.financialRetryPartial
+      : retryCopy.failed;
   const reportStatus = retryState === "retrying"
     ? { text: retryCopy.retrying, tone: "normal", role: "status" as const }
     : retryState === "succeeded"
       ? { text: retryCopy.succeeded, tone: "normal", role: "status" as const }
       : retryState === "failed"
-        ? { text: retryCopy.failed, tone: "error", role: "alert" as const }
+        ? { text: financialFailureText, tone: "error", role: "alert" as const }
         : technicalError
           ? { text: technicalError, tone: "error", role: "alert" as const }
           : technicalLoading
@@ -230,6 +275,8 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   const retryStage = async (target: RetryTarget) => {
     const action = target === "rebuild-financials"
       ? onRebuildFinancials
+      : target === "financial-report"
+      ? onRefreshFinancialReport
       : target === "financials"
       ? onRetryFinancials
       : target === "growth" ? onRetryGrowth : onRetrySynthesis;
@@ -294,20 +341,37 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
             {displayedReport.financial_status.snapshot_stale && (
               <small className="financial-snapshot-warning">{copy.financialSnapshotStale}</small>
             )}
+            {(financialOperation || displayedReport.financial_status.attempt_count > 0) && (
+              <div className="financial-stage-status" aria-label={copy.financialStageStatus}>
+                <span>{copy.financialStageDownload}: {stageText(1)}</span>
+                <span>{copy.financialStageValidation}: {stageText(2)}</span>
+                <span>{copy.financialStageProjection}: {stageText(3)}</span>
+                <span>{copy.financialStageRefresh}: {stageText(4)}</span>
+              </div>
+            )}
           </div>
           {displayedReport.financial_status.retryable && (
             <div className="financial-health-actions">
-              {onRetryFinancials && (
+              {financialRefreshFailed && onRefreshFinancialReport && (
+                <button type="button" className="report-retry-button" aria-label={copy.refreshFinancialReport} disabled={retryState === "retrying"} onClick={() => void retryStage("financial-report")}>
+                  <RefreshCw size={16} /><span>{copy.refreshFinancialReport}</span>
+                </button>
+              )}
+              {onRetryFinancials && !financialRefreshFailed && (
                 <button type="button" className="report-retry-button" aria-label={copy.retryFinancials} disabled={retryState === "retrying"} onClick={() => void retryStage("financials")}>
                   <RefreshCw size={16} /><span>{copy.retryFinancials}</span>
                 </button>
               )}
               {onRebuildFinancials && (
-                <button type="button" className="report-retry-button report-rebuild-button" aria-label={copy.rebuildFinancials} disabled={retryState === "retrying"} onClick={() => {
-                  if (window.confirm(copy.rebuildFinancialsConfirm)) void retryStage("rebuild-financials");
-                }}>
-                  <RefreshCw size={16} /><span>{copy.rebuildFinancials}</span>
-                </button>
+                <details className="financial-rebuild-advanced">
+                  <summary>{copy.rebuildFinancials}</summary>
+                  <p>{copy.rebuildFinancialsConfirm}</p>
+                  <button type="button" className="report-retry-button report-rebuild-button" aria-label={copy.rebuildFinancials} disabled={retryState === "retrying"} onClick={() => {
+                    if (window.confirm(copy.rebuildFinancialsConfirm)) void retryStage("rebuild-financials");
+                  }}>
+                    <RefreshCw size={16} /><span>{copy.rebuildFinancials}</span>
+                  </button>
+                </details>
               )}
             </div>
           )}

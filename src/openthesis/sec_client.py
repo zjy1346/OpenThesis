@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .download_safety import UnsafeDisclosurePayload, store_immutable_payload
 
 
 SEC_DATA_BASE = "https://data.sec.gov"
@@ -241,11 +242,21 @@ class SecClient:
         target_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(filing.primary_document).suffix or ".html"
         target_path = target_dir / f"{filing.accession_number}{suffix}"
-        if not target_path.exists():
-            target_path.write_bytes(self._request_bytes(filing.source_url))
-        payload = target_path.read_bytes()
-        filing.local_path = str(target_path)
-        filing.content_hash = hashlib.sha256(payload).hexdigest()
+        # An accession URL can be revised in place. Never let a legacy
+        # accession-only cache suppress an authoritative refresh. Publish the
+        # fetched bytes by content address and leave the legacy object intact.
+        payload = self._request_bytes(filing.source_url)
+        try:
+            saved = store_immutable_payload(
+                target_path,
+                payload,
+                maximum_bytes=100_000_000,
+                require_pdf=suffix.lower() == ".pdf",
+            )
+        except UnsafeDisclosurePayload as exc:
+            raise SecClientError("SEC filing failed safety validation") from exc
+        filing.local_path = str(saved)
+        filing.content_hash = hashlib.sha256(saved.read_bytes()).hexdigest()
         return filing
 
     @staticmethod

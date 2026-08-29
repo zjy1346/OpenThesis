@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -496,7 +497,15 @@ class Storage:
                     "DELETE FROM financial_validation_groups WHERE company_cik = ? AND accession_number = ?",
                     (company_cik, accession),
                 )
-            self._insert_facts(db, list(accepted_facts) + list(quarantined_facts or ()))
+            # Quarantine is a storage-boundary invariant. Parsers may hand us
+            # the original fact instance whose status is still ``unvalidated``;
+            # never allow that metadata omission to expose a rejected fact via
+            # the normal ``get_facts`` query.
+            rejected_facts = [
+                replace(fact, validation_status="REJECTED")
+                for fact in (quarantined_facts or ())
+            ]
+            self._insert_facts(db, list(accepted_facts) + rejected_facts)
             for item in evidence:
                 bbox = getattr(item, "bbox", None)
                 db.execute(
@@ -688,6 +697,47 @@ class Storage:
                     run.completed_at,
                 ),
             )
+
+    def save_run_with_artifacts(
+        self, run: ResearchRun, artifacts: list[ResearchArtifact]
+    ) -> None:
+        """Persist a run snapshot and its replacement artifacts atomically."""
+        payload = run.to_dict()
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO research_runs(
+                    run_id, company_cik, payload_json, status, started_at, completed_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.run_id,
+                    run.company.cik,
+                    json.dumps(payload, ensure_ascii=False),
+                    run.status.value,
+                    run.started_at,
+                    run.completed_at,
+                ),
+            )
+            for artifact in artifacts:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO artifacts(
+                        artifact_id, run_id, artifact_type, title, payload_json,
+                        model_id, agent_id, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.artifact_id,
+                        artifact.run_id,
+                        artifact.artifact_type,
+                        artifact.title,
+                        json.dumps(artifact.content, ensure_ascii=False),
+                        artifact.model_id,
+                        artifact.agent_id,
+                        artifact.created_at,
+                    ),
+                )
 
     def interrupt_running_runs(
         self, reason: str = "应用在研究完成前退出，任务已标记为中断"

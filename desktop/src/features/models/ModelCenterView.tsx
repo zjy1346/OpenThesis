@@ -255,6 +255,10 @@ export function ModelCenterView({ language }: { language: Language }) {
   const providerConnections = connections.filter((item) => item.provider_id === providerId);
   const activeConnection = providerConnections.find((item) => item.connection_id === connectionId);
   const connectionModels = models.filter((item) => item.connection_id === connectionId);
+  const busyForConnection = (id: string) =>
+    busy === "test-connection:" + id || busy === "connection:" + id || busy.startsWith("dialog:");
+  const busyForModel = (id: string) =>
+    busy === "test:" + id || busy.startsWith("dialog:");
   const visibleProviders = useMemo(() => {
     const search = query.trim().toLowerCase();
     return providers.filter((item) => {
@@ -462,9 +466,9 @@ export function ModelCenterView({ language }: { language: Language }) {
             </button>
             <div className="connection-actions">
               <button type="button" title={`${text.testUsing}: ${provider.default_test_model_id || connectionTestModelId(connection) || text.manualModel}`} aria-label={`${text.testConnection} · ${text.testUsing}: ${provider.default_test_model_id || connectionTestModelId(connection) || text.manualModel}`} disabled={Boolean(busy) || !connection.enabled || (!provider.default_test_model_id && provider.provider_id !== "ollama" && !connectionTestModelId(connection))} onClick={() => void testConnection(connection)}>{busy === "test-connection:" + connection.connection_id ? text.testingConnection : text.testConnection}</button>
-              {provider.requires_api_key && <button type="button" disabled={Boolean(busy)} onClick={(event) => replaceKey(connection, event.currentTarget)}>{text.replaceKey}</button>}
-              <button type="button" disabled={Boolean(busy)} onClick={() => void toggleConnection(connection)}>{connection.enabled ? text.disable : text.enable}</button>
-              <button type="button" disabled={Boolean(busy)} aria-label={text.delete} onClick={(event) => removeConnection(connection, event.currentTarget)}><Trash2 size={14} /></button>
+              {provider.requires_api_key && <button type="button" disabled={busyForConnection(connection.connection_id)} onClick={(event) => replaceKey(connection, event.currentTarget)}>{text.replaceKey}</button>}
+              <button type="button" disabled={busyForConnection(connection.connection_id)} onClick={() => void toggleConnection(connection)}>{connection.enabled ? text.disable : text.enable}</button>
+              <button type="button" disabled={busyForConnection(connection.connection_id)} aria-label={text.delete} onClick={(event) => removeConnection(connection, event.currentTarget)}><Trash2 size={14} /></button>
             </div>
           </article>)}
         </div>
@@ -481,7 +485,7 @@ export function ModelCenterView({ language }: { language: Language }) {
         </fieldset>}
 
         {activeConnection && <section className="connection-models">
-          <div className="panel-section-title"><h3>{text.models}</h3>{provider.supports_discovery && <button type="button" disabled={Boolean(busy)} onClick={() => void discover()}><RefreshCw size={14} />{busy === "discover" ? text.discovering : text.discover}</button>}</div>
+          <div className="panel-section-title"><h3>{text.models}</h3>{provider.supports_discovery && <button type="button" disabled={busy === "discover" || busy === "save-models"} onClick={() => void discover()}><RefreshCw size={14} />{busy === "discover" ? text.discovering : text.discover}</button>}</div>
           <p className="connection-test-model">{text.testUsing}: {provider.default_test_model_id || text.manualModel}</p>
           <details className="advanced-model-entry"><summary>{text.advancedModels}</summary>
             <div className="manual-model-row"><label>{text.manualModel}<input value={manualModel} onChange={(event) => setManualModel(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addManual(); } }} /></label><button type="button" onClick={addManual}>{text.addManual}</button></div>
@@ -493,10 +497,10 @@ export function ModelCenterView({ language }: { language: Language }) {
               <label className="discovered-model-select"><input aria-label={`${text.selectModel}: ${model.alias}`} type="checkbox" checked={selectedModels.has(model.model_id)} onChange={(event) => setSelectedModels((current) => { const next = new Set(current); if (event.target.checked) next.add(model.model_id); else next.delete(model.model_id); return next; })} /><span><strong>{model.alias}</strong><small>{model.model_id} · {costLabel(model, text)}</small></span></label>
               <label className="model-capability-check"><input aria-label={`${text.visionCapability}: ${model.alias}`} type="checkbox" checked={visionModelIds.has(model.model_id)} onChange={(event) => setVisionModelIds((current) => { const next = new Set(current); if (event.target.checked) next.add(model.model_id); else next.delete(model.model_id); return next; })} /><span>{text.visionCapability}</span></label>
             </div>)}
-            <button className="primary-action" type="button" disabled={!selectedModels.size || Boolean(busy)} onClick={() => void addModels()}>{text.addModels}</button>
+            <button className="primary-action" type="button" disabled={!selectedModels.size || busy === "discover" || busy === "save-models"} onClick={() => void addModels()}>{text.addModels}</button>
           </fieldset>}
           <div className="configured-model-list">
-            {connectionModels.map((model) => <article key={model.configured_model_id}><div><strong>{model.alias}</strong><span>{model.model_id}</span><small>{costLabel(model, text)} · {text.status}: {model.health_status || text.untested}{model.capabilities.includes("vision") ? ` · ${text.visionBadge}` : ""}</small></div><div><button type="button" disabled={Boolean(busy)} onClick={() => void testModel(model)}>{busy === "test:" + model.configured_model_id ? text.testing : text.test}</button><button type="button" aria-label={text.delete} disabled={Boolean(busy)} onClick={(event) => removeModel(model, event.currentTarget)}><Trash2 size={14} /></button></div></article>)}
+            {connectionModels.map((model) => <article key={model.configured_model_id}><div><strong>{model.alias}</strong><span>{model.model_id}</span><small>{costLabel(model, text)} · {text.status}: {model.health_status || text.untested}{model.capabilities.includes("vision") ? ` · ${text.visionBadge}` : ""}</small></div><div><button type="button" disabled={busyForModel(model.configured_model_id)} onClick={() => void testModel(model)}>{busy === "test:" + model.configured_model_id ? text.testing : text.test}</button><button type="button" aria-label={text.delete} disabled={busyForModel(model.configured_model_id)} onClick={(event) => removeModel(model, event.currentTarget)}><Trash2 size={14} /></button></div></article>)}
             {!connectionModels.length && <p className="model-empty">{text.noModels}</p>}
           </div>
         </section>}

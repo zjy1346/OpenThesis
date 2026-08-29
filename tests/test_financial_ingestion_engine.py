@@ -24,10 +24,12 @@ from openthesis.financial_ingestion import (
     _fact_rank,
     _select_period_cell,
     _unit_scale,
+    _explicit_unit_info,
     _page_sections,
     _known_label,
     _revenue_group_total_rows,
     _net_income_candidate_allowed,
+    _attribution_context,
     _manifest_for,
     _period_start,
     _statement_context,
@@ -110,7 +112,7 @@ def _fact(filing: FilingDocument, concept: str, value: float, *, scale: float = 
 
 
 def _core(filing: FilingDocument, scale: float = 1.0) -> tuple[FinancialFact, ...]:
-    values = {"revenue": 1000, "net_income": 100, "operating_cash_flow": 150, "assets": 1000, "liabilities": 600, "equity": 300, "total_equity": 400}
+    values = {"revenue": 1000, "net_income": 100, "operating_cash_flow": 150, "assets": 1000, "liabilities": 600, "equity": 400, "total_equity": 400}
     return tuple(_fact(filing, key, value * scale, scale=scale) for key, value in values.items())
 
 
@@ -329,7 +331,13 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             dataset = StubEngine().ingest(
                 _company(), [filing.__class__(**{**filing.to_dict(), "local_path": handle.name})],
                 vision_fallback=Adapter(),
-                vision_config=VisionFallbackConfig(enabled=True, consent=True),
+                vision_config=VisionFallbackConfig(
+                    enabled=True,
+                    consent=True,
+                    configured_model_id="fixture-model",
+                    require_page_approval=True,
+                    approve_upload=lambda _summary: True,
+                ),
             )
         self.assertEqual(dataset.status, ValidationStatus.VERIFIED)
         self.assertEqual(calls, [])
@@ -360,7 +368,13 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                 dataset = StubEngine().ingest(
                     _company(), [filing.__class__(**{**filing.to_dict(), "local_path": handle.name})],
                     vision_fallback=Adapter(),
-                    vision_config=VisionFallbackConfig(enabled=True, consent=True),
+                    vision_config=VisionFallbackConfig(
+                        enabled=True,
+                        consent=True,
+                        configured_model_id="fixture-model",
+                        require_page_approval=True,
+                        approve_upload=lambda _summary: True,
+                    ),
                 )
         self.assertEqual(len(calls), 1)
         self.assertEqual(dataset.status, ValidationStatus.VERIFIED)
@@ -384,11 +398,20 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             with patch("openthesis.financial_ingestion._vision_failed_pages", return_value=(VisionPageRequest(1, b"opaque"),)):
                 dataset = StubEngine().ingest(
                     _company(), [filing.__class__(**{**filing.to_dict(), "local_path": handle.name})],
-                    vision_fallback=Adapter(), vision_config=VisionFallbackConfig(enabled=True, consent=True),
+                    vision_fallback=Adapter(),
+                    vision_config=VisionFallbackConfig(
+                        enabled=True,
+                        consent=True,
+                        configured_model_id="fixture-model",
+                        require_page_approval=True,
+                        approve_upload=lambda _summary: True,
+                    ),
                 )
-        self.assertNotEqual(dataset.status, ValidationStatus.VERIFIED)
+        # Vision is restricted to concepts missing from the local batch;
+        # its unrelated duplicate revenue candidate cannot overwrite the
+        # accepted local fact.
+        self.assertEqual(dataset.status, ValidationStatus.VERIFIED)
         self.assertFalse(any(fact.value == 9999 for fact in dataset.accepted_facts))
-        self.assertTrue(any(fact.value == 9999 and fact.validation_status == ValidationStatus.REJECTED.value for fact in dataset.validation.quarantined))
     def test_profile_tracks_selected_manifest_without_facts(self) -> None:
         filing = _filing("cninfo:no-facts", end="2023-12-31")
         profile = build_financial_profile(
@@ -459,6 +482,114 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(second[0].context.multiplier, 1000.0)
         self.assertTrue(second[0].context.unit_explicit)
 
+    def test_eps_bare_yuan_does_not_reset_untitled_continuation_unit(self) -> None:
+        bare_scale, bare_currency, bare_explicit = _explicit_unit_info(
+            "基本每股收益(元/股)；本期0 元"
+        )
+        self.assertEqual((bare_scale, bare_currency, bare_explicit), (1.0, "CNY", False))
+        header_scale, header_currency, header_explicit = _explicit_unit_info(
+            "单位：元 币种：人民币"
+        )
+        self.assertEqual((header_scale, header_currency, header_explicit), (1.0, "CNY", True))
+
+        first = _page_sections(
+            None,
+            "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表"),
+            1,
+            "CNY",
+        )
+        continuation = _page_sections(
+            first[-1].context,
+            "基本每股收益(元/股)；本期0 元",
+            (
+                _row(("净利润", 10, 80), ("100", 100, 140), ("90", 220, 260)),
+                _row(("基本每股收益(元/股)", 10, 150), ("0", 100, 140), ("0", 220, 260)),
+            ),
+            2,
+            "CNY",
+        )
+        self.assertTrue(continuation)
+        self.assertEqual(continuation[0].context.multiplier, 1000.0)
+        self.assertEqual(continuation[0].context.currency, "CNY")
+        self.assertTrue(continuation[0].context.unit_explicit)
+
+    def test_titled_income_continuation_inherits_unit_and_period_context(self) -> None:
+        first_rows = (
+            _row(("合并利润表", 10, 180)),
+            _row(("2021", 100, 140), ("2020", 220, 260)),
+            _row(("净利润", 10, 80), ("100", 100, 140), ("90", 220, 260)),
+        )
+        first = _page_sections(None, "合并利润表 单位：人民币千元", first_rows, 1, "CNY")
+        self.assertTrue(first)
+        continuation = _page_sections(
+            first[0].context,
+            "合并利润表（续）",
+            (_row(("合并利润表（续）", 10, 180)), _row(("净利润", 10, 80), ("80", 100, 140), ("70", 220, 260))),
+            2,
+            "CNY",
+        )
+        self.assertTrue(continuation)
+        context = continuation[0].context
+        self.assertEqual(context.statement, "income_statement")
+        self.assertEqual(context.scope, "consolidated")
+        self.assertEqual(context.multiplier, 1000.0)
+        self.assertEqual(context.currency, "CNY")
+        self.assertTrue(context.unit_explicit)
+        self.assertEqual([column.year for column in context.periods], [2021, 2020])
+        self.assertTrue(continuation[0].inherited)
+
+    def test_same_statement_without_continuation_title_does_not_inherit_unit(self) -> None:
+        first = _page_sections(None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY")
+        second = _page_sections(
+            first[0].context, "合并利润表", _formal_rows("合并利润表"), 2, "CNY"
+        )
+        self.assertTrue(second)
+        self.assertEqual(second[0].context.multiplier, 1.0)
+        self.assertFalse(second[0].context.unit_explicit)
+
+    def test_changed_scope_does_not_inherit_continuation_unit(self) -> None:
+        first = _page_sections(None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY")
+        second = _page_sections(
+            first[0].context, "母公司利润表（续）", _formal_rows("母公司利润表"), 2, "CNY"
+        )
+        self.assertTrue(second)
+        self.assertEqual(second[0].context.scope, "parent")
+        self.assertEqual(second[0].context.multiplier, 1.0)
+        self.assertFalse(second[0].context.unit_explicit)
+
+    def test_same_statement_unit_scale_mismatch_is_fatal(self) -> None:
+        filing = _filing("scale-mismatch")
+        facts = list(_core(filing))
+        revenue = _fact(
+            filing, "revenue", 1_000_000, scale=1000
+        )
+        net_income = _fact(
+            filing, "net_income", 100, scale=1
+        )
+        revenue.parser_version = net_income.parser_version = "financial-ingestion-ast-v2"
+        facts[facts.index(next(item for item in facts if item.concept == "revenue"))] = revenue
+        facts[facts.index(next(item for item in facts if item.concept == "net_income"))] = net_income
+        identity = (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY")
+        result = FinancialIngestionEngine().validate_group(facts, identity)
+        self.assertEqual(result.validation.status, ValidationStatus.REJECTED)
+        self.assertIn("statement_unit_scale_inconsistent", result.validation.issues)
+
+    def test_mixed_normalized_sources_do_not_trigger_unit_scale_issue(self) -> None:
+        filing = _filing("mixed-source")
+        facts = list(_core(filing))
+        revenue = _fact(filing, "revenue", 1_000_000, scale=1000)
+        net_income = _fact(filing, "net_income", 100, scale=1)
+        revenue.parser_version = "financial-ingestion-ast-v2"
+        revenue.source_document = "report.pdf"
+        net_income.parser_version = "sec-companyfacts-v1"
+        net_income.source_document = "companyfacts.json"
+        facts[facts.index(next(item for item in facts if item.concept == "revenue"))] = revenue
+        facts[facts.index(next(item for item in facts if item.concept == "net_income"))] = net_income
+        identity = (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY")
+        result = FinancialIngestionEngine().validate_group(facts, identity)
+        self.assertNotIn("statement_unit_scale_inconsistent", result.validation.issues)
+
     def test_coordinate_ast_merges_wrapped_label_around_period_values(self) -> None:
         rows = (
             PdfRowAST((PdfCellAST("加权平均净资产收益", 62.304, 521.899, 143.304, 530.899),), 521.899, (62.304, 521.899, 143.304, 530.899)),
@@ -488,6 +619,90 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         selected = _select_period_cell(row, 80, columns, 2025)
         self.assertIsNotNone(selected)
         self.assertEqual(selected.text, "1000")
+
+    def test_balance_date_headers_preserve_fiscal_current_and_opening_years(self) -> None:
+        header = PdfRowAST(
+            (
+                PdfCellAST("2022年12月31日", 100, 0, 180, 10),
+                PdfCellAST("2022年1月1日", 220, 0, 300, 10),
+            ),
+            0,
+            (100, 0, 300, 10),
+        )
+        data = PdfRowAST(
+            (
+                PdfCellAST("资产总计", 10, 20, 80, 30),
+                PdfCellAST("600", 100, 20, 180, 30),
+                PdfCellAST("300", 220, 20, 300, 30),
+            ),
+            20,
+            (10, 20, 300, 30),
+        )
+        columns = _period_columns((header, data), "CNY")
+        self.assertEqual([column.year for column in columns], [2022, 2021])
+        selected = _select_period_cell(data, 80, columns, 2022)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "600")
+
+    def test_balance_english_date_headers_preserve_fiscal_current_and_opening_years(self) -> None:
+        header = PdfRowAST(
+            (
+                PdfCellAST("31 December 2022", 100, 0, 180, 10),
+                PdfCellAST("1 January 2022", 220, 0, 300, 10),
+            ),
+            0,
+            (100, 0, 300, 10),
+        )
+        data = PdfRowAST(
+            (
+                PdfCellAST("Total assets", 10, 20, 80, 30),
+                PdfCellAST("600", 100, 20, 180, 30),
+                PdfCellAST("300", 220, 20, 300, 30),
+            ),
+            20,
+            (10, 20, 300, 30),
+        )
+        columns = _period_columns((header, data), "CNY")
+        self.assertEqual([column.year for column in columns], [2022, 2021])
+        selected = _select_period_cell(data, 80, columns, 2022)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "600")
+
+    def test_balance_american_date_headers_preserve_fiscal_current_and_opening_years(self) -> None:
+        header = PdfRowAST(
+            (
+                PdfCellAST("December 31, 2022", 100, 0, 180, 10),
+                PdfCellAST("January 1, 2022", 220, 0, 300, 10),
+            ),
+            0,
+            (100, 0, 300, 10),
+        )
+        data = PdfRowAST(
+            (
+                PdfCellAST("Total assets", 10, 20, 80, 30),
+                PdfCellAST("600", 100, 20, 180, 30),
+                PdfCellAST("300", 220, 20, 300, 30),
+            ),
+            20,
+            (10, 20, 300, 30),
+        )
+        columns = _period_columns((header, data), "CNY")
+        self.assertEqual([column.year for column in columns], [2022, 2021])
+        selected = _select_period_cell(data, 80, columns, 2022)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "600")
+
+    def test_balance_date_range_uses_period_end_year(self) -> None:
+        header = PdfRowAST(
+            (
+                PdfCellAST("January 1, 2022 - December 31, 2022", 100, 0, 210, 10),
+                PdfCellAST("January 1, 2021 - December 31, 2021", 230, 0, 340, 10),
+            ),
+            0,
+            (100, 0, 340, 10),
+        )
+        columns = _period_columns((header,))
+        self.assertEqual([column.year for column in columns], [2022, 2021])
 
     def test_current_assets_label_is_not_mistaken_for_period_header(self) -> None:
         rows = (
@@ -545,6 +760,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertTrue(_net_income_candidate_allowed("Attributable to: Equity holders of the Company 224,842"))
         self.assertFalse(_net_income_candidate_allowed("Earnings per share for profit attributable to equity holders of the Company"))
         self.assertFalse(_net_income_candidate_allowed("Basic and diluted EPS attributable to equity holders of the Company"))
+
+    def test_split_attribution_context_is_bounded_and_eps_is_excluded(self) -> None:
+        rows = (
+            _row(("Attributable to:", 10, 80)),
+            _row(("Equity holders of the Company", 10, 180), ("188,243", 220, 270), ("224,822", 300, 350)),
+            _row(("Earnings per share for profit attributable to equity holders", 10, 240)),
+        )
+        context = _attribution_context(rows, 1)
+        self.assertEqual(context, "Attributableto:")
+        self.assertTrue(_net_income_candidate_allowed(context + " Equity holders of the Company"))
+        self.assertFalse(_net_income_candidate_allowed("Earnings per share for profit attributable to equity holders of the Company"))
 
     def test_hkd_million_is_not_treated_as_usd(self) -> None:
         self.assertEqual(_unit_scale("HK$ million"), (1_000_000.0, "HKD"))
@@ -699,9 +925,12 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         pdf_facts = list(_core(filing))
         with patch.object(engine, "_parse_pdf_ast", return_value=(pdf_facts, [])):
             dataset = engine.ingest(_company(), [filing], structured_sources=(Adapter(),))
-        self.assertEqual(dataset.status.value, "VERIFIED")
-        self.assertEqual({fact.value for fact in dataset.accepted_facts}, {1000, 100, 150, 1000, 600, 300, 400})
-        self.assertTrue(any("structured_source_quality:balance_sheet_imbalance" in item for item in dataset.diagnostics))
+        # A conflicting source value is quarantined by the canonical
+        # compiler; it must not silently fall back or overwrite the PDF
+        # candidate with a last-write-wins result.
+        self.assertEqual(dataset.status.value, "REJECTED")
+        self.assertFalse(dataset.accepted_facts)
+        self.assertTrue(any("compiler_quality_gate_failed" in item for item in dataset.diagnostics))
 
     def test_public_engine_parses_real_catl_pdf_with_statement_provenance(self) -> None:
         path = _official_pdf("OPENTHESIS_CATL_2025_PDF", "CN_A_SZSE_300750.SZ/1225002214.pdf")

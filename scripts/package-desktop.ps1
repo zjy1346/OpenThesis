@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("unsigned-test", "authenticode-required")]
+    [string]$SignatureMode = "unsigned-test"
+)
+
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -11,7 +16,7 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "2.1.0"
+$version = "2.2.1"
 
 $pythonPaths = @((Join-Path $projectRoot "src"))
 if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
@@ -52,6 +57,14 @@ try {
     if (-not (Test-Path -LiteralPath $desktopExecutable -PathType Leaf)) {
         throw "The desktop executable was not created: $desktopExecutable"
     }
+    if ($SignatureMode -eq "authenticode-required") {
+        foreach ($executable in @($desktopExecutable, $sidecarExecutable)) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $executable
+            if ($signature.Status -ne "Valid") {
+                throw "Authenticode validation failed for ${executable}: $($signature.Status)"
+            }
+        }
+    }
     Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $portableRoot "OpenThesis.exe")
     Copy-Item -Path (Join-Path $sidecarBundle "*") -Destination $portableSidecar -Recurse
     # PyInstaller hooks may copy third-party package SBOM directories containing
@@ -72,7 +85,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Release privacy verification failed with exit code $LASTEXITCODE"
     }
-    & (Join-Path $PSScriptRoot "verify-desktop-portable.ps1") -Version $version -CargoTarget $cargoTarget
+    & (Join-Path $PSScriptRoot "verify-desktop-portable.ps1") `
+        -Version $version -CargoTarget $cargoTarget -SignatureMode $SignatureMode
     if ($LASTEXITCODE -ne 0) {
         throw "Portable package verification failed with exit code $LASTEXITCODE"
     }

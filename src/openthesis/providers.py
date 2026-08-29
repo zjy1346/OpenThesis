@@ -28,6 +28,34 @@ class ProviderHTTPError(ProviderError):
         )
 
 
+_SENSITIVE_GATEWAY_MESSAGE_MARKERS = (
+    "api_key",
+    "apikey",
+    "access_token",
+    "authorization",
+    "bearer ",
+    "credential",
+    "password",
+    "prompt",
+    "secret",
+    "system_message",
+    "user_message",
+    "token",
+)
+
+
+def _safe_gateway_error_message(value: Any) -> str:
+    """Keep provider diagnostics useful without echoing request data or secrets."""
+
+    message = str(value).strip()
+    if not message:
+        return "模型网关调用失败。"
+    lowered = message.casefold()
+    if any(marker in lowered for marker in _SENSITIVE_GATEWAY_MESSAGE_MARKERS):
+        return "模型网关调用失败（错误详情已隐藏）。"
+    return message[:160]
+
+
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     """A non-secret reference to a model configured in the Rust Model Center."""
@@ -223,7 +251,7 @@ class RustModelGatewayProvider:
             error = response.get("error") if isinstance(response, dict) else None
             error = error if isinstance(error, dict) else {}
             code = str(error.get("code", "MODEL_GATEWAY_ERROR"))[:80]
-            message = str(error.get("message", "模型网关调用失败。"))[:1200]
+            message = _safe_gateway_error_message(error.get("message", "模型网关调用失败。"))
             raise ProviderError(
                 f"{code}: {message}",
                 retryable=bool(error.get("retryable", False)),

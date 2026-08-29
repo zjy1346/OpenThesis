@@ -40,6 +40,9 @@ export const BACKEND_METHODS = [
   "research.start",
   "research.retry_growth",
   "research.retry_financials",
+  "research.refresh_financial_report",
+  "research.start_financial_retry",
+  "research.start_financial_rebuild",
   "research.rebuild_financials",
   "research.retry_synthesis",
   "research.status",
@@ -74,6 +77,9 @@ export type BackendParams = {
   "research.start": ResearchRequest;
   "research.retry_growth": { run_id: string; model: ModelSelection };
   "research.retry_financials": { run_id: string };
+  "research.refresh_financial_report": { run_id: string; language?: Language };
+  "research.start_financial_retry": { run_id: string };
+  "research.start_financial_rebuild": { run_id: string; confirmed: boolean };
   "research.rebuild_financials": { run_id: string; confirmed: boolean };
   "research.retry_synthesis": { run_id: string; model: ModelSelection };
   "research.status": { job_id: string };
@@ -98,6 +104,9 @@ export type BackendResult = {
   "research.start": ResearchJob;
   "research.retry_growth": ResearchReport;
   "research.retry_financials": ResearchReport;
+  "research.refresh_financial_report": ResearchReport;
+  "research.start_financial_retry": ResearchJob;
+  "research.start_financial_rebuild": ResearchJob;
   "research.rebuild_financials": ResearchReport;
   "research.retry_synthesis": ResearchReport;
   "research.status": ResearchJob;

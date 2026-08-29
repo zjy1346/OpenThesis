@@ -248,6 +248,17 @@ export type BootstrapResult = {
   interrupted_runs: number;
 };
 
+export type FinancialRetryResult = {
+  mode: "retry" | "rebuild" | string;
+  targets: string[];
+  downloaded: string[];
+  accepted: string[];
+  rejected: string[];
+  status: "succeeded" | "partial" | "failed" | string;
+  error: string;
+  updated_artifacts: string[];
+};
+
 export type ResearchReport = {
   run_id: string;
   ticker: string;
@@ -262,6 +273,11 @@ export type ResearchReport = {
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
   retryable_growth?: boolean;
+  financial_retry?: FinancialRetryResult;
+  financial_report_refresh?: {
+    status: "succeeded" | "failed" | string;
+    updated_artifacts?: string[];
+  };
   financial_status?: {
     state: "complete" | "incomplete" | "warning" | "unavailable";
     retryable: boolean;
@@ -318,6 +334,7 @@ export type ResearchJob = {
   } | null;
   vision_approval_pending?: boolean;
   vision_approval?: boolean | null;
+  operation_result?: FinancialRetryResult | null;
 };
 
 export type ThesisVersion = {

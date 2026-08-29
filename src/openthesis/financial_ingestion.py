@@ -8,7 +8,7 @@ page-wide regular-expression match.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from concurrent.futures import CancelledError, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from io import BytesIO
@@ -524,51 +524,45 @@ class _PeriodColumn:
     unit_scale: float = 1.0
 
 
-def _period_columns_legacy(rows: Sequence[PdfRowAST]) -> tuple[_PeriodColumn, ...]:
-    """Build x-coordinate intervals from a real table header row."""
-    for row in rows:
-        candidates: list[tuple[int, float]] = []
-        for cell in row.cells:
-            match = re.search(r"20\d{2}", cell.text)
-            if match:
-                candidates.append((int(match.group()), (cell.x0 + cell.x1) / 2))
-        if not candidates:
-            # Balance/cash tables often use semantic headers rather than
-            # years.  ``期末``/``本期`` is the current-period column and is
-            # intentionally represented by year 0; the selector maps it to
-            # any requested manifest year.
-            semantic = [
-                (0, (cell.x0 + cell.x1) / 2)
-                for cell in row.cells
-                if any(marker in cell.text for marker in ("期末", "本期", "本年", "current"))
-            ]
-            if semantic:
-                candidates = semantic
-            else:
-                continue
-        if len(candidates) < 2 and re.search(r"20\d{2}年(?:\d{1,2}[月—-]|\d{1,2}月\d{1,2}日)", row.text):
-            # Do not treat a statement title such as ``2025年1—12月`` as the
-            # period header; it has no value-column geometry.
-            continue
-        if len(candidates) < 2:
-            normalized = row.text.casefold()
-            title_markers = ("for the year ended", "year ended", "as at", "年度", "年末")
-            current_markers = ("current", "期末", "本期", "本年")
-            if len(candidates) == 1 and (
-                any(marker in normalized for marker in title_markers)
-                or (row_index == 0 and not any(marker in normalized for marker in current_markers))
-            ):
-                continue
-        # A title line with one year is not a table header. A one-column table
-        # is still supported by giving the column a generous bounded interval.
-        centers = [center for _, center in candidates]
-        result: list[_PeriodColumn] = []
-        for index, (year, center) in enumerate(candidates):
-            left = (centers[index - 1] + center) / 2 if index else center - 90
-            right = (center + centers[index + 1]) / 2 if index + 1 < len(centers) else center + 90
-            result.append(_PeriodColumn(year, center, left, right))
-        return tuple(result)
-    return ()
+_ENGLISH_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def _effective_period_year(text: str) -> int | None:
+    """Map a balance-sheet date header to its fiscal column year.
+
+    Opening-date headers (January 1) belong to the preceding fiscal year,
+    while a year-end date belongs to the named year.  When a cell contains a
+    range, the chronologically latest date is the period end.  This helper is
+    intentionally limited to complete dates so plain ``2025``/``2024`` and
+    one-year statement titles retain the existing header rules.
+    """
+    normalized = re.sub(r"\s+", " ", text.casefold())
+    dates: list[tuple[int, int, int]] = []
+    chinese = re.compile(r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?")
+    for match in chinese.finditer(normalized):
+        dates.append((int(match.group("year")), int(match.group("month")), int(match.group("day"))))
+    day_month = re.compile(
+        r"(?P<day>\d{1,2})\s+(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s*,?\s*(?P<year>20\d{2})",
+        re.IGNORECASE,
+    )
+    for match in day_month.finditer(normalized):
+        dates.append((int(match.group("year")), _ENGLISH_MONTHS[match.group("month").casefold()], int(match.group("day"))))
+    month_day = re.compile(
+        r"(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s+(?P<day>\d{1,2}),?\s*(?P<year>20\d{2})",
+        re.IGNORECASE,
+    )
+    for match in month_day.finditer(normalized):
+        dates.append((int(match.group("year")), _ENGLISH_MONTHS[match.group("month").casefold()], int(match.group("day"))))
+    if not dates:
+        return None
+    year, month, day = max(dates)
+    return year - 1 if len(dates) == 1 and month == 1 and day == 1 else year
 
 
 def _period_columns(
@@ -589,6 +583,10 @@ def _period_columns(
                     unit_cells.append(((cell.x0 + cell.x1) / 2, currency))
         by_year: dict[int, float] = {}
         for cell in row.cells:
+            effective_year = _effective_period_year(cell.text)
+            if effective_year is not None:
+                by_year.setdefault(effective_year, (cell.x0 + cell.x1) / 2)
+                continue
             match = re.search(r"20\d{2}", cell.text)
             if match:
                 by_year.setdefault(int(match.group()), (cell.x0 + cell.x1) / 2)
@@ -735,11 +733,20 @@ def _explicit_unit_info(text: str) -> tuple[float, str, bool]:
     compact = re.sub(r"\s+", "", text.casefold())
     markers = (
         "hk$", "hkd", "hk拢", "港元", "港幣", "usd", "us$", "美元",
-        "cny", "rmb", "人民币", "元", "千元", "千人民币", "万元",
+        "cny", "rmb", "人民币", "千元", "千人民币", "万元",
         "万人民币", "百万元", "rmb'000", "rmbmillion", "inthousands",
         "inmillions", "thousand", "million",
     )
-    return scale, currency, any(marker.casefold() in compact for marker in markers)
+    # A bare ``元`` is common in EPS labels and explanatory prose.  It is not
+    # a table-wide unit declaration.  Accept it only when attached to an
+    # explicit unit header; other currency/scale markers remain compatible
+    # with existing statement headings.
+    explicit_unit_header = bool(re.search(
+        r"(?:单位|unit)[:：]?(?:人民币|rmb|cny|美元|usd|港元|hkd)?"
+        r"(?:元|yuan|千元|万元|百万元|million|thousand)",
+        compact,
+    ))
+    return scale, currency, any(marker.casefold() in compact for marker in markers) or explicit_unit_header
 
 
 def _row_title_context(row: PdfRowAST) -> tuple[str, str] | None:
@@ -915,12 +922,29 @@ def _page_sections(
             section_scale = scale if explicit else 1.0
             section_currency = currency or default_currency
             periods = _period_columns(section_rows, default_currency)
+            title_text = section_rows[0].text.casefold() if section_rows else ""
+            continuation_title = bool(re.search(
+                r"续|continued|continuation|cont[\s.'’_-]*d", title_text
+            ))
+            can_inherit_unit = bool(
+                previous
+                and previous.statement == statement
+                and previous.scope == scope
+                and previous.last_page + 1 == page_number
+                and not explicit
+                and previous.unit_explicit
+                and continuation_title
+            )
+            if can_inherit_unit:
+                section_scale = previous.multiplier
+                section_currency = previous.currency or default_currency
             if not periods and previous and previous.statement == statement and previous.scope == scope:
                 periods = previous.periods
             sections.append(PdfPageSection(
                 PdfTableContext(statement, scope, section_scale, section_currency,
-                                explicit, periods, page_number, 0),
-                section_rows, False, False,
+                                explicit or can_inherit_unit, periods, page_number,
+                                previous.inherited_pages + 1 if can_inherit_unit else 0),
+                section_rows, False, can_inherit_unit,
             ))
         return tuple(sections)
 
@@ -980,6 +1004,32 @@ def _net_income_candidate_allowed(compact: str) -> bool:
     if any(token in normalized for token in ("earningspershare", "basic", "diluted")):
         return False
     return "attributableto" in normalized
+
+
+def _attribution_context(rows: Sequence[PdfRowAST], start: int) -> str:
+    """Join a bounded attribution heading with its following visual row.
+
+    IFRS income tables commonly render ``Attributable to:`` and the equity
+    holder label on separate rows.  Only the preceding two rows in the same
+    AST table and aligned label column are eligible; this cannot pull context
+    from an EPS note or another statement.
+    """
+    if start <= 0:
+        return ""
+    current_labels = [cell for cell in rows[start].cells if _parse_number(cell.text) is None]
+    anchor = min((cell.x0 for cell in current_labels), default=None)
+    for row in rows[max(0, start - 2):start]:
+        label = _row_label_text(row)
+        compact = _label_compact(label)
+        if "attributableto" not in compact and "归属于" not in label:
+            continue
+        if any(_parse_number(cell.text) is not None for cell in row.cells):
+            continue
+        row_labels = [cell for cell in row.cells if _parse_number(cell.text) is None]
+        if anchor is not None and row_labels and min(abs(cell.x0 - anchor) for cell in row_labels) > 24:
+            continue
+        return label
+    return ""
 
 
 def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
@@ -1472,8 +1522,118 @@ def _candidate_financial_pages(path: str, *, continuation_pages: int = 3) -> fro
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class FinancialCandidateCollection:
+    """Untrusted candidate batches collected before canonical resolution."""
+
+    manifests: tuple[FilingManifest, ...]
+    batches_by_document: dict[str, tuple[Any, ...]]
+    evidence: tuple[EvidenceRef, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+
 class FinancialIngestionEngine:
     """Structured-first engine; PDF is a coordinate-aware deterministic fallback."""
+
+    def collect_candidate_batches(
+        self,
+        company: Company,
+        filings: Sequence[FilingDocument],
+        *,
+        structured_sources: Sequence[FinancialSourceAdapter] = (),
+        cancel_check: Callable[[], bool] | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> FinancialCandidateCollection:
+        """Collect every source candidate without selecting or validating facts.
+
+        Structured adapters are deliberately all invoked for a filing.  A
+        partial feed therefore remains available for reconciliation with the
+        already-parsed PDF batch instead of suppressing complementary rows.
+        The PDF prepass is shared with the legacy path, so orchestration never
+        opens a document a second time merely to repair a partial source.
+        """
+
+        from .financial_compiler import CandidateBatch, FactCandidate, GapStageKind
+
+        manifests: list[FilingManifest] = []
+        manifest_by_document: dict[str, FilingManifest] = {}
+        diagnostics: list[str] = []
+        for filing in filings:
+            if cancel_check is not None and cancel_check():
+                break
+            manifest = _manifest_for(filing)
+            if manifest is None:
+                diagnostics.append(f"{filing.document_id}:ambiguous_period_identity")
+                continue
+            manifests.append(manifest)
+            manifest_by_document[filing.document_id] = manifest
+            filing.form_type = manifest.form_type
+            filing.fiscal_period = manifest.fiscal_period
+            filing.period_end = manifest.period_end
+            filing.revision = manifest.revision
+            filing.supersedes_document_id = manifest.supersedes_document_id
+
+        parsed_pdfs = _parse_local_pdfs_bounded(
+            self,
+            company,
+            filings,
+            manifest_by_document,
+            cancel_check=cancel_check,
+            progress=progress,
+        )
+        batches: dict[str, tuple[Any, ...]] = {}
+        all_evidence: list[EvidenceRef] = []
+        for index, filing in enumerate(filings, start=1):
+            if cancel_check is not None and cancel_check():
+                break
+            if filing.document_id not in manifest_by_document:
+                continue
+            structured_candidates: list[FactCandidate] = []
+            structured_refs: list[EvidenceRef] = []
+            for adapter in structured_sources:
+                try:
+                    sfacts, srefs, failure = adapter.fetch(company, filing)
+                except Exception as exc:
+                    diagnostics.append(f"{filing.document_id}:structured:{type(exc).__name__}")
+                    continue
+                if failure:
+                    diagnostics.append(f"{filing.document_id}:{failure}")
+                ref_by_fact = {
+                    fact.fact_id: ref for fact, ref in zip(sfacts, srefs)
+                }
+                for fact in sfacts:
+                    refs = (ref_by_fact[fact.fact_id],) if fact.fact_id in ref_by_fact else ()
+                    structured_candidates.append(
+                        FactCandidate(fact, refs, f"structured:{type(adapter).__name__}")
+                    )
+                    structured_refs.extend(refs)
+            structured_batch = CandidateBatch(
+                filing,
+                tuple(structured_candidates),
+                tuple(structured_refs),
+            )
+            pdf_facts, pdf_refs, pdf_error = parsed_pdfs.get(
+                filing.document_id, ([], [], None)
+            )
+            if pdf_error:
+                diagnostics.append(f"{filing.document_id}:{pdf_error}")
+            pdf_candidates = tuple(
+                FactCandidate(
+                    fact,
+                    ((ref,) if ref is not None else ()),
+                    "financial-ingestion-ast",
+                )
+                for fact, ref in zip(pdf_facts, pdf_refs)
+            )
+            pdf_batch = CandidateBatch(filing, pdf_candidates, tuple(pdf_refs))
+            batches[filing.document_id] = (structured_batch, pdf_batch)
+            all_evidence.extend(structured_refs)
+            all_evidence.extend(pdf_refs)
+            if progress is not None:
+                progress("filing-candidates", index, len(filings))
+        return FinancialCandidateCollection(
+            tuple(manifests), batches, tuple(all_evidence), tuple(dict.fromkeys(diagnostics))
+        )
 
     def ingest(
         self, company: Company, filings: Sequence[FilingDocument], *,
@@ -1483,173 +1643,52 @@ class FinancialIngestionEngine:
         cancel_check: Callable[[], bool] | None = None,
         progress: Callable[[str, int, int], None] | None = None,
     ) -> FinancialDataset:
-        manifests: list[FilingManifest] = []
-        diagnostics: list[str] = []
-        facts: list[FinancialFact] = []
-        evidence: list[EvidenceRef] = []
-        groups: list[FinancialGroupValidation] = []
-        reconciliation_quarantine: list[FinancialFact] = []
-        total_filings = len(filings)
-        manifest_by_document: dict[str, FilingManifest] = {}
-        for filing in filings:
-            manifest = _manifest_for(filing)
-            if manifest is None:
-                diagnostics.append(f"{filing.document_id}:ambiguous_period_identity")
-                continue
-            manifests.append(manifest)
-            manifest_by_document[filing.document_id] = manifest
-        parsed_pdfs = _parse_local_pdfs_bounded(
-            self,
+        """Compatibility projection over the canonical candidate pipeline."""
+
+        from .financial_compiler import FinancialFactCompiler
+
+        compiled = FinancialFactCompiler().compile_from_ingestion(
             company,
             filings,
-            manifest_by_document,
+            self,
+            structured_sources=structured_sources,
+            vision_fallback=vision_fallback,
+            vision_config=vision_config,
             cancel_check=cancel_check,
             progress=progress,
+            reporting_currency=company.reporting_currency,
         )
-        for filing_index, filing in enumerate(filings, start=1):
-            if cancel_check is not None and cancel_check():
-                break
-            manifest = manifest_by_document.get(filing.document_id)
-            if manifest is None:
-                continue
-            parsed: list[FinancialFact] = []
-            refs: list[EvidenceRef] = []
-            for adapter in structured_sources:
-                sfacts, srefs, failure = adapter.fetch(company, filing)
-                if failure:
-                    diagnostics.append(f"{filing.document_id}:{failure}")
-                    continue
-                if sfacts:
-                    structured_identity = (
-                        sfacts[0].accession_number,
-                        sfacts[0].end_date,
-                        (sfacts[0].fiscal_period or "FY").upper(),
-                        sfacts[0].consolidated_scope or sfacts[0].scope or "unknown",
-                        sfacts[0].currency or company.reporting_currency,
-                    )
-                    structured_refs = {ref.evidence_id.removeprefix("fact:"): ref for ref in srefs}
-                    structured_refs.update({fact.fact_id: ref for fact, ref in zip(sfacts, srefs)})
-                    structured_validation = self._validate_group(
-                        list(sfacts), structured_identity, structured_refs
-                    )
-                    if structured_validation.validation.status in {
-                        ValidationStatus.VERIFIED,
-                        ValidationStatus.READY_WITH_WARNINGS,
-                    } and structured_validation.validation.accepted and (
-                        "core_coverage_insufficient"
-                        not in structured_validation.validation.issues
-                    ):
-                        parsed, refs = sfacts, srefs
-                        break
-                    # A partial structured feed is useful diagnostics but is
-                    # not allowed to suppress a complete official PDF table.
-                    diagnostics.extend(
-                        f"{filing.document_id}:structured_source_quality:{issue}"
-                        for issue in structured_validation.validation.issues
-                    )
-                    diagnostics.append(f"{filing.document_id}:structured_source_incomplete")
-                    if not (filing.local_path and Path(filing.local_path).is_file()):
-                        # Preserve a rejected structured group for quarantine
-                        # and audit when no document fallback is available.
-                        parsed, refs = sfacts, srefs
-                        break
-            if not parsed and filing.local_path and Path(filing.local_path).is_file():
-                cached_parse = parsed_pdfs.get(filing.document_id)
-                if cached_parse is not None:
-                    parsed, refs, parse_error = cached_parse
-                    if parse_error:
-                        diagnostics.append(f"{filing.document_id}:{parse_error}")
-            if not parsed and vision_fallback is not None and vision_config is not None and vision_config.enabled:
-                if progress:
-                    progress("vision-processing", filing_index, total_filings)
-                pages = _vision_failed_pages(filing, vision_config)
-                if pages:
-                    if progress:
-                        progress("vision-processing", filing_index, total_filings)
-                    result = vision_fallback.extract(
-                        company, filing, pages, vision_config, cancel_check=cancel_check
-                    )
-                    diagnostics.extend(f"{filing.document_id}:{item}" for item in result.diagnostics)
-                    if result.facts:
-                        parsed, refs = list(result.facts), list(result.evidence)
-            if not parsed:
-                diagnostics.append(f"{filing.document_id}:no_financial_facts")
-                if progress:
-                    progress("filing-validation", filing_index, total_filings)
-                continue
-            if not refs:
-                refs = [self._evidence_for_fact(fact, filing) for fact in parsed]
-            group_map: dict[tuple[str, str, str, str, str], list[FinancialFact]] = {}
-            for fact in parsed:
-                identity = (fact.accession_number, fact.end_date, (fact.fiscal_period or "FY").upper(), fact.consolidated_scope or fact.scope or "unknown", fact.currency or company.reporting_currency)
-                group_map.setdefault(identity, []).append(fact)
-            evidence_map = {ref.evidence_id.removeprefix("fact:"): ref for ref in refs}
-            evidence_map.update({fact.fact_id: ref for fact, ref in zip(parsed, refs)})
-            validated = [self._validate_group(group, identity, evidence_map) for identity, group in group_map.items()]
-            if (
-                vision_fallback is not None
-                and vision_config is not None
-                and vision_config.enabled
-                and any(
-                    item.validation.status is ValidationStatus.REJECTED
-                    or "core_coverage_insufficient" in item.validation.issues
-                    for item in validated
-                )
-            ):
-                pages = _vision_failed_pages(filing, vision_config, tuple(issue for item in validated for issue in item.validation.issues), parsed)
-                if pages:
-                    if progress:
-                        progress("vision-processing", filing_index, total_filings)
-                    result = vision_fallback.extract(
-                        company, filing, pages, vision_config, cancel_check=cancel_check
-                    )
-                    diagnostics.extend(f"{filing.document_id}:{item}" for item in result.diagnostics)
-                    if result.facts:
-                        seed = parsed[0] if parsed else result.facts[0]
-                        identity = (seed.accession_number, seed.end_date, (seed.fiscal_period or "FY").upper(), seed.consolidated_scope or seed.scope or "unknown", seed.currency or company.reporting_currency)
-                        parsed, refs, audit_facts = _reconcile_candidates(
-                            parsed, refs, result.facts, result.evidence, prefer_vision=True,
-                            validate=lambda selected, selected_map: self._validate_group(selected, identity, selected_map),
-                        )
-                        reconciliation_quarantine.extend(audit_facts)
-                        group_map = {}
-                        for fact in parsed:
-                            identity = (fact.accession_number, fact.end_date, (fact.fiscal_period or "FY").upper(), fact.consolidated_scope or fact.scope or "unknown", fact.currency or company.reporting_currency)
-                            group_map.setdefault(identity, []).append(fact)
-                        evidence_map = {ref.evidence_id.removeprefix("fact:"): ref for ref in refs}
-                        evidence_map.update({fact.fact_id: ref for fact, ref in zip(parsed, refs)})
-                        validated = [self._validate_group(group, identity, evidence_map) for identity, group in group_map.items()]
-                        if progress:
-                            progress("filing-validation", filing_index, total_filings)
-            for result in validated:
-                groups.append(result)
-                diagnostics.extend(f"{filing.document_id}:{issue}" for issue in result.validation.issues)
-            facts.extend(parsed)
-            evidence.extend(refs)
-            if progress:
-                progress("filing-validation", filing_index, total_filings)
-        accepted = tuple(f for result in groups for f in result.validation.accepted)
-        quarantined = tuple(f for result in groups for f in result.validation.quarantined) + tuple(reconciliation_quarantine)
-        for fact in reconciliation_quarantine:
-            fact.validation_status = ValidationStatus.REJECTED.value
-        issues = tuple(issue for result in groups for issue in result.validation.issues)
-        if not accepted:
-            status = ValidationStatus.REJECTED
-        elif any(result.validation.status is ValidationStatus.REJECTED for result in groups):
-            status = ValidationStatus.READY_WITH_WARNINGS
-        elif any(result.validation.status is ValidationStatus.READY_WITH_WARNINGS for result in groups):
-            status = ValidationStatus.READY_WITH_WARNINGS
-        else:
-            status = ValidationStatus.VERIFIED
-        validation = FinancialValidation(status, issues, frozenset(f.concept for f in accepted), accepted, quarantined)
-        # Preserve each fact's own group status.  The dataset aggregate may be
-        # READY_WITH_WARNINGS because another filing was quarantined.
-        for result in groups:
-            for fact in result.validation.accepted:
-                fact.validation_status = result.validation.status.value
-            for fact in result.validation.quarantined:
+        issues = list(compiled.diagnostics)
+        for item in compiled.validations:
+            issues.extend(item.issues)
+        status = (
+            ValidationStatus.VERIFIED
+            if compiled.allow_ai
+            else ValidationStatus.READY_WITH_WARNINGS
+            if compiled.resolved_facts
+            else ValidationStatus.REJECTED
+        )
+        validation = FinancialValidation(
+            status,
+            tuple(dict.fromkeys(issues)),
+            frozenset(fact.concept for fact in compiled.resolved_facts),
+            tuple(compiled.resolved_facts),
+            tuple(compiled.quarantined_facts),
+        )
+        groups = list(compiled.group_validations)
+        for group in groups:
+            for fact in group.validation.accepted:
+                fact.validation_status = group.validation.status.value
+            for fact in group.validation.quarantined:
                 fact.validation_status = ValidationStatus.REJECTED.value
-        return FinancialDataset(accepted, tuple(evidence), tuple(manifests), validation, tuple(dict.fromkeys(diagnostics)), tuple(groups))
+        return FinancialDataset(
+            tuple(compiled.resolved_facts),
+            tuple(compiled.evidence),
+            tuple(compiled.manifest),
+            validation,
+            tuple(dict.fromkeys(issues)),
+            tuple(groups),
+        )
 
     @staticmethod
     def _evidence_for_fact(fact: FinancialFact, filing: FilingDocument) -> EvidenceRef:
@@ -1661,27 +1700,81 @@ class FinancialIngestionEngine:
             fact.source_bbox,
         )
 
+    def extract_pdf_candidates(
+        self,
+        path: str,
+        company: Company,
+        filing: FilingDocument,
+        manifest: FilingManifest | None = None,
+        *,
+        candidate_pages: frozenset[int] | None = None,
+    ) -> tuple[list[FinancialFact], list[EvidenceRef]]:
+        """Public AST extraction seam for compiler adapters.
+
+        The method intentionally returns unvalidated facts plus evidence.  It
+        performs no source-specific acceptance decision; callers must pass
+        candidates through :meth:`validate_group` or the canonical compiler.
+        """
+        resolved_manifest = manifest or _manifest_for(filing)
+        if resolved_manifest is None:
+            return [], []
+        return self._parse_pdf_ast(
+            path, company, filing, resolved_manifest,
+            candidate_pages=candidate_pages,
+            index_precomputed=candidate_pages is not None,
+        )
+
+    def validate_group(
+        self,
+        facts: list[FinancialFact],
+        identity: tuple[str, str, str, str, str],
+        evidence_map: dict[str, EvidenceRef] | None = None,
+        required_concepts: set[str] | frozenset[str] | None = None,
+    ) -> FinancialGroupValidation:
+        """Public quality-gate seam used by canonical adapters/compiler."""
+        return self._validate_group(facts, identity, evidence_map, required_concepts)
+
     def _validate_group(
         self,
         facts: list[FinancialFact],
         identity: tuple[str, str, str, str, str],
         evidence_map: dict[str, EvidenceRef] | None = None,
+        required_concepts: set[str] | frozenset[str] | None = None,
     ) -> FinancialGroupValidation:
         values = {fact.concept: fact.value for fact in facts}
         issues: list[str] = []
         covered = set(values) & _CORE
-        required = (
-            {"revenue", "net_income"}
-            | {"operating_cash_flow"}
-            | {"assets", "liabilities"}
-        )
-        if not {"revenue", "net_income"}.issubset(values):
+        required = set(required_concepts or {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"})
+        # A normalized structured fact may legitimately use scale=1 while a
+        # PDF fact from the same filing retains the table's displayed unit.
+        # Only compare scales when the facts come from the same physical
+        # document and parser; otherwise cross-source complementing would be
+        # rejected merely because their provenance encodes units differently.
+        statement_scales: dict[tuple[str, str, str], set[float]] = {}
+        for fact in facts:
+            if (
+                fact.currency
+                and fact.concept not in {"reported_roe"}
+                and fact.statement in {"income_statement", "balance_sheet", "cash_flow"}
+                and fact.source_document
+                and fact.parser_version
+            ):
+                scale_key = (fact.source_document, fact.parser_version, fact.statement)
+                statement_scales.setdefault(scale_key, set()).add(float(fact.unit_scale))
+        if any(len(scales) > 1 for scales in statement_scales.values()):
+            issues.append("statement_unit_scale_inconsistent")
+        if {"revenue", "net_income"}.issubset(required) and not {"revenue", "net_income"}.issubset(values):
             issues.append("income_statement_core_missing")
-        if "operating_cash_flow" not in values:
+        if "operating_cash_flow" in required and "operating_cash_flow" not in values:
             issues.append("cash_flow_core_missing")
-        if not {"assets", "liabilities"}.issubset(values) or not ({"equity", "total_equity"} & values.keys()):
+        balance_required = {"assets", "liabilities"} & required
+        equity_required = bool({"equity", "total_equity"} & required)
+        if (balance_required - values.keys()) or (equity_required and not ({"equity", "total_equity"} & values.keys())):
             issues.append("balance_sheet_core_missing")
-        if not required.issubset(values) or not ({"equity", "total_equity"} & values.keys()):
+        missing_required = required - values.keys()
+        if "equity" in missing_required and "total_equity" in values:
+            missing_required.remove("equity")
+        if missing_required or (equity_required and not ({"equity", "total_equity"} & values.keys())):
             issues.append("core_coverage_insufficient")
         expected_identity = identity[1:]
         for fact in facts:
@@ -1789,6 +1882,10 @@ class FinancialIngestionEngine:
                     for row_index, row in enumerate(table.rows):
                         merged_row = _merge_visual_rows(table.rows, row_index)
                         compact = _row_label_text(merged_row)
+                        # Attribution headings are often a separate visual
+                        # row; keep the context bounded to this table/column.
+                        attribution = _attribution_context(table.rows, row_index)
+                        candidate_context = " ".join(part for part in (attribution, compact) if part)
                         if "经营活动产生的现金流" in compact and "净额" not in compact:
                             # Some CNINFO tables split the final two Chinese
                             # characters of the OCF label onto a following
@@ -1870,7 +1967,7 @@ class FinancialIngestionEngine:
                                 for token in ("totalliabilitiesandequity", "totalliabilitiesandshareholdersequity")
                             ):
                                 continue
-                            if concept == "net_income" and not _net_income_candidate_allowed(compact):
+                            if concept == "net_income" and not _net_income_candidate_allowed(candidate_context):
                                 continue
                             if concept == "operating_income" and "non-operating" in merged_row.text.casefold():
                                 continue
@@ -2114,9 +2211,23 @@ def validate_financial_facts(facts: list[FinancialFact]) -> FinancialValidation:
     for fact in facts:
         key = (fact.accession_number, fact.end_date, (fact.fiscal_period or "FY").upper(), fact.consolidated_scope or fact.scope or "unknown", fact.currency or fact.unit)
         groups.setdefault(key, []).append(fact)
-    validations = [engine._validate_group(group, identity).validation for identity, group in groups.items()]
-    accepted = tuple(item for validation in validations for item in validation.accepted)
-    quarantined = tuple(item for validation in validations for item in validation.quarantined)
+    validations = [engine.validate_group(group, identity).validation for identity, group in groups.items()]
+    # The ingestion engine keeps warning groups available for audit and repair,
+    # but public metrics and model input must cross a stricter trust boundary:
+    # only fully VERIFIED groups are accepted. Every other fact is retained as
+    # rejected quarantine evidence so it cannot silently leak into analysis.
+    accepted = tuple(
+        item
+        for validation in validations
+        if validation.status is ValidationStatus.VERIFIED
+        for item in validation.accepted
+    )
+    quarantined = tuple(
+        replace(item, validation_status=ValidationStatus.REJECTED.value)
+        for validation in validations
+        if validation.status is not ValidationStatus.VERIFIED
+        for item in (*validation.accepted, *validation.quarantined)
+    )
     issues = tuple(issue for validation in validations for issue in validation.issues)
     if not accepted:
         status = ValidationStatus.REJECTED
