@@ -5,12 +5,15 @@ import unittest
 import json
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
+from openthesis.download_safety import store_immutable_payload
 from openthesis.market_data import (
     CnInfoAdapter,
     HkexNewsAdapter,
     MarketDataError,
     MarketDataModule,
+    OfficialDisclosureHttpClient,
     _classify_report,
     _hkex_filings_from_json,
     _hkex_filings_from_text,
@@ -518,6 +521,42 @@ class MarketDataAdapterTests(unittest.TestCase):
             saved = adapter.download_filing(filing, Path(directory))
             self.assertTrue(Path(saved.local_path).exists())
             self.assertTrue(saved.content_hash)
+
+    def test_official_download_never_overwrites_and_reuses_content_address(self) -> None:
+        client = OfficialDisclosureHttpClient()
+        payload = b"%PDF-1.7\nnew official filing\n%%EOF\n"
+        client._request = lambda _url, **_kwargs: payload  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "2026.pdf"
+            target.write_bytes(b"%PDF-1.7\nold filing\n%%EOF\n")
+            saved = client.download("https://static.cninfo.com.cn/2026.pdf", target)
+            self.assertNotEqual(saved, target)
+            self.assertEqual(target.read_bytes(), b"%PDF-1.7\nold filing\n%%EOF\n")
+            self.assertTrue(saved.name.startswith("2026-"))
+            self.assertEqual(saved.read_bytes(), payload)
+            repeated = client.download("https://static.cninfo.com.cn/2026.pdf", target)
+            self.assertEqual(repeated, saved)
+
+    def test_official_download_rejects_non_pdf_payload_for_pdf_target(self) -> None:
+        client = OfficialDisclosureHttpClient()
+        client._request = lambda _url, **_kwargs: b"not a pdf"  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "unsafe.pdf"
+            with self.assertRaises(MarketDataError) as raised:
+                client.download("https://static.cninfo.com.cn/unsafe.pdf", target)
+            self.assertEqual(raised.exception.code, "FILING_CONTENT_UNSAFE")
+            self.assertFalse(target.exists())
+
+    def test_failed_atomic_publish_cleans_temp_and_preserves_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "annual.pdf"
+            history = Path(directory) / "annual-previous.pdf"
+            history.write_bytes(b"previous successful disclosure")
+            with patch("openthesis.download_safety.os.rename", side_effect=OSError("blocked")):
+                with self.assertRaises(OSError):
+                    store_immutable_payload(target, b"new disclosure")
+            self.assertEqual(history.read_bytes(), b"previous successful disclosure")
+            self.assertEqual(list(Path(directory).glob("*.tmp")), [])
 
     def test_module_exposes_one_interface_for_cn_and_hk_adapters(self) -> None:
         module = MarketDataModule(

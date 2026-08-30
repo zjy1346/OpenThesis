@@ -7,12 +7,14 @@ approval; neither path exposes long-term credentials to Python.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import date, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
 import re
+import threading
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
@@ -24,6 +26,7 @@ from .providers import ProviderError
 
 VISION_MAX_PAGES = 20
 VISION_MAX_BYTES = 10 * 1024 * 1024
+VISION_TASK_SCHEMA_VERSION = "vision-task-v1"
 
 
 def _vision_period_start(fiscal_period: str, period_end: str, statement: str) -> str | None:
@@ -117,6 +120,64 @@ class VisionExtractionResult:
 
 
 VisionResult = VisionExtractionResult
+
+
+def vision_task_key(
+    provider: str,
+    filing_hash: str,
+    pages: Sequence[VisionPageRequest],
+    *,
+    schema_version: str = VISION_TASK_SCHEMA_VERSION,
+    namespace: str = "batch",
+) -> str:
+    """Return a deterministic key without retaining page/PDF content."""
+
+    material = "|".join(
+        [schema_version, str(namespace), str(provider), str(filing_hash or "")]
+        + [f"{page.original_page}:{page.content_hash}" for page in pages]
+    )
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+class VisionTaskJournal(Protocol):
+    def save_vision_task(self, task_key: str, **kwargs: Any) -> Mapping[str, Any]: ...
+
+    def get_vision_task(self, task_key: str) -> Mapping[str, Any] | None: ...
+
+    def save_vision_result(self, task_key: str, result: dict[str, Any]) -> None: ...
+
+    def get_vision_result(self, task_key: str) -> Mapping[str, Any] | None: ...
+
+
+def _provider_identity(config: VisionFallbackConfig) -> str:
+    if config.provider == "configured_model":
+        return (
+            f"configured_model:{config.configured_model_id}:"
+            f"configuration-{config.configuration_version}"
+        )
+    return config.provider
+
+
+def _serialize_vision_result(result: VisionExtractionResult) -> dict[str, Any]:
+    return {
+        "facts": [fact.to_dict() for fact in result.facts],
+        "evidence": [item.to_dict() for item in result.evidence],
+        "diagnostics": list(result.diagnostics),
+        "error_code": result.error_code,
+    }
+
+
+def _deserialize_vision_result(payload: Mapping[str, Any]) -> VisionExtractionResult | None:
+    try:
+        facts = tuple(FinancialFact(**dict(item)) for item in payload.get("facts", ()))
+        evidence = tuple(EvidenceRef(**dict(item)) for item in payload.get("evidence", ()))
+        diagnostics = tuple(str(item) for item in payload.get("diagnostics", ()))
+        error_code = payload.get("error_code")
+        if error_code is not None or not facts:
+            return None
+        return VisionExtractionResult(facts, evidence, diagnostics, None)
+    except (TypeError, ValueError):
+        return None
 
 @dataclass(frozen=True, slots=True)
 class VisionHttpResponse:
@@ -264,19 +325,81 @@ class MineruFlashAdapter:
         *,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        journal: VisionTaskJournal | None = None,
     ):
         self.transport = transport or UrllibVisionTransport()
         self.sleep = sleep
         self.clock = clock
+        self.journal = journal
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        config: VisionFallbackConfig,
+        *,
+        headers: Mapping[str, str] | None = None,
+        body: bytes | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> VisionHttpResponse:
+        """Retry only bounded network/server failures, never auth or payload errors."""
+
+        deadline = self.clock() + max(0.01, config.timeout_seconds)
+        attempts = 0
+        while True:
+            if cancel_check and cancel_check():
+                raise VisionAdapterError("VISION_CANCELLED")
+            try:
+                response = self.transport.request(
+                    method, _https_url(url), headers=headers, body=body,
+                    timeout=max(0.01, deadline - self.clock()),
+                )
+            except (VisionAdapterError, OSError, TimeoutError) as exc:
+                error_code = exc.code if isinstance(exc, VisionAdapterError) else "VISION_NETWORK_ERROR"
+                if error_code != "VISION_NETWORK_ERROR" or attempts >= 1:
+                    if isinstance(exc, VisionAdapterError):
+                        raise
+                    raise VisionAdapterError("VISION_NETWORK_ERROR") from exc
+                delay = 0.1
+                attempts += 1
+                if self.clock() + delay >= deadline:
+                    raise VisionAdapterError("VISION_TIMEOUT") from exc
+                self.sleep(delay)
+                continue
+            if response.status in {401, 403}:
+                raise VisionAdapterError(_safe_error(response))
+            retryable = response.status == 429 or 500 <= response.status < 600
+            if not retryable:
+                if response.status >= 400:
+                    raise VisionAdapterError(_safe_error(response))
+                return response
+            if attempts >= 1:
+                raise VisionAdapterError(_safe_error(response))
+            retry_after = next(
+                (value for key, value in response.headers.items() if str(key).lower() == "retry-after"),
+                "",
+            )
+            try:
+                delay = max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                # A 429 without a valid server budget is not retried; 5xx gets
+                # one short bounded retry.
+                if response.status == 429:
+                    raise VisionAdapterError("VISION_RATE_LIMITED")
+                delay = 0.1
+            attempts += 1
+            if self.clock() + delay >= deadline:
+                raise VisionAdapterError("VISION_TIMEOUT")
+            if cancel_check and cancel_check():
+                raise VisionAdapterError("VISION_CANCELLED")
+            self.sleep(delay)
 
     def _poll(self, url: str, config: VisionFallbackConfig, cancel_check):
         deadline = self.clock() + max(0.01, config.timeout_seconds)
         while self.clock() < deadline:
             if cancel_check and cancel_check():
                 raise VisionAdapterError("VISION_CANCELLED")
-            response = self.transport.request("GET", _https_url(url), timeout=config.timeout_seconds)
-            if response.status >= 400:
-                raise VisionAdapterError(_safe_error(response))
+            response = self._request("GET", url, config, cancel_check=cancel_check)
             payload = response.json()
             state = str(_json_value(payload, "state", "status", "data.state") or "").lower()
             if state in {"success", "succeeded", "done", "completed"}:
@@ -286,6 +409,21 @@ class MineruFlashAdapter:
             self.sleep(min(2.0, max(0.01, deadline - self.clock())))
         raise VisionAdapterError("VISION_TIMEOUT")
 
+    def _save_journal(self, task_key: str, filing: FilingDocument, page: VisionPageRequest, *, status: str, remote_task_id: str = "", error_code: str = "") -> None:
+        if self.journal is None:
+            return
+        self.journal.save_vision_task(
+            task_key,
+            company_cik=filing.company_cik,
+            document_id=filing.document_id,
+            provider="mineru_flash",
+            page_hashes=(page.content_hash,),
+            page_numbers=(page.original_page,),
+            status=status,
+            remote_task_id=remote_task_id,
+            error_code=error_code,
+        )
+
     def extract(self, company, filing, pages, config, *, cancel_check=None):
         try:
             _check_request(config, pages, filing)
@@ -293,9 +431,31 @@ class MineruFlashAdapter:
                 raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
             facts: list[FinancialFact] = []
             refs: list[EvidenceRef] = []
+            diagnostics: list[str] = []
+            page_errors: list[str] = []
+            page_task_key = ""
+            current_page: VisionPageRequest | None = None
+            task_id = ""
+            remote_state = ""
             for page in pages:
+                current_page = page
+                task_id = ""
+                remote_state = ""
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
+                page_task_key = vision_task_key(
+                    "mineru_flash", filing.content_hash, (page,), namespace="page"
+                )
+                prior = self.journal.get_vision_task(page_task_key) if self.journal is not None else None
+                prior_status = str(prior.get("status") or "") if prior else ""
+                if prior_status == "created":
+                    # The service cannot prove that the prior upload completed.
+                    # Polling could incorrectly treat an empty remote task as a
+                    # valid parse, while re-uploading could duplicate disclosure.
+                    raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+                if prior and prior.get("remote_task_id") and prior_status in {"uploaded", "running", "completed"}:
+                    task_id = str(prior["remote_task_id"])
+                    remote_state = prior_status
                 payload = {
                     "file_name": f"failed-page-{page.original_page}.pdf",
                     "language": config.language if config.language in {"ch", "en"} else ("ch" if company.market == "CN_A" else "en"),
@@ -303,42 +463,72 @@ class MineruFlashAdapter:
                     "is_ocr": False,
                     "enable_formula": False,
                 }
-                response = self.transport.request(
-                    "POST",
-                    self.endpoint + "/parse/file",
-                    headers={"Content-Type": "application/json"},
-                    body=json.dumps(payload).encode("utf-8"),
-                    timeout=config.timeout_seconds,
-                )
-                if response.status >= 400:
-                    raise VisionAdapterError(_safe_error(response))
-                data = response.json()
-                _ensure_business_success(data)
-                task_id = _json_value(data, "data.task_id")
-                file_url = _https_url(_json_value(data, "data.file_url"))
                 if not task_id:
-                    raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
-                uploaded = self.transport.request("PUT", file_url, body=page.pdf_bytes, timeout=config.timeout_seconds)
-                if uploaded.status >= 400:
-                    raise VisionAdapterError(_safe_error(uploaded))
+                    response = self._request(
+                        "POST",
+                        self.endpoint + "/parse/file",
+                        config,
+                        headers={"Content-Type": "application/json"},
+                        body=json.dumps(payload).encode("utf-8"),
+                        cancel_check=cancel_check,
+                    )
+                    data = response.json()
+                    _ensure_business_success(data)
+                    task_id = str(_json_value(data, "data.task_id") or "")
+                    file_url = _https_url(_json_value(data, "data.file_url"))
+                    if not task_id:
+                        raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
+                    # ``created`` means the upload is not known to have
+                    # completed. A restart blocks instead of guessing whether
+                    # the signed upload was consumed.
+                    self._save_journal(page_task_key, filing, page, status="created", remote_task_id=task_id)
+                    remote_state = "created"
+                    if cancel_check and cancel_check():
+                        raise VisionAdapterError("VISION_CANCELLED")
+                    self._request("PUT", file_url, config, body=page.pdf_bytes, cancel_check=cancel_check)
+                    self._save_journal(page_task_key, filing, page, status="uploaded", remote_task_id=task_id)
+                    remote_state = "uploaded"
+                self._save_journal(page_task_key, filing, page, status="running", remote_task_id=task_id)
+                remote_state = "running"
                 result = self._poll(self.endpoint + "/parse/" + str(task_id), config, cancel_check)
                 markdown_url = _https_url(_json_value(result, "data.markdown_url", "data.result.markdown_url"))
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
-                markdown = self.transport.request("GET", markdown_url, timeout=config.timeout_seconds)
-                if markdown.status >= 400:
-                    raise VisionAdapterError(_safe_error(markdown))
+                markdown = self._request("GET", markdown_url, config, cancel_check=cancel_check)
                 candidate = parse_vision_markdown(markdown.body.decode("utf-8", errors="strict"), company, filing, (page,))
                 facts.extend(candidate.facts)
                 refs.extend(candidate.evidence)
+                diagnostics.extend(candidate.diagnostics)
+                if candidate.error_code:
+                    page_errors.append(candidate.error_code)
+                self._save_journal(page_task_key, filing, page, status="completed", remote_task_id=task_id)
             if not facts:
-                return VisionExtractionResult((), (), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES")
-            return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_MINERU_FLASH_COMPLETED",))
+                error_code = page_errors[0] if page_errors else "VISION_NO_CANDIDATES"
+                return VisionExtractionResult((), (), tuple(diagnostics) + (error_code,), error_code)
+            return VisionExtractionResult(
+                tuple(facts), tuple(refs), tuple(diagnostics) + ("VISION_MINERU_FLASH_COMPLETED",),
+                page_errors[0] if page_errors else None,
+            )
         except UnicodeDecodeError:
             return VisionExtractionResult(diagnostics=("VISION_MALFORMED_RESPONSE",), error_code="VISION_MALFORMED_RESPONSE")
         except VisionAdapterError as exc:
+            if (
+                exc.code != "VISION_RECOVERY_BLOCKED"
+                and self.journal is not None
+                and current_page is not None
+                and page_task_key
+            ):
+                self._save_journal(
+                    page_task_key,
+                    filing,
+                    current_page,
+                    # A failed/aborted PUT has an unknowable remote outcome.
+                    # Keep ``created`` so restart blocks instead of creating a
+                    # second chargeable task or polling an unproven upload.
+                    status="created" if remote_state == "created" else "failed",
+                    remote_task_id=task_id,
+                    error_code=exc.code,
+                )
             return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
 class GatewayVisionAdapter:
     """Render failed pages locally, then call only the Rust credential gateway."""
@@ -360,6 +550,7 @@ class GatewayVisionAdapter:
             facts: list[FinancialFact] = []
             refs: list[EvidenceRef] = []
             diagnostics: list[str] = []
+            page_errors: list[str] = []
             for page in pages:
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
@@ -393,18 +584,200 @@ class GatewayVisionAdapter:
                 facts.extend(candidate.facts)
                 refs.extend(candidate.evidence)
                 diagnostics.extend(candidate.diagnostics)
+                if candidate.error_code:
+                    page_errors.append(candidate.error_code)
             if not facts:
                 return VisionExtractionResult(
                     (),
                     (),
                     tuple(diagnostics) or ("VISION_NO_CANDIDATES",),
-                    "VISION_NO_CANDIDATES",
+                    page_errors[0] if page_errors else "VISION_NO_CANDIDATES",
                 )
             return VisionExtractionResult(
                 tuple(facts),
                 tuple(refs),
                 tuple(diagnostics) + ("VISION_MODEL_GATEWAY_COMPLETED",),
+                page_errors[0] if page_errors else None,
             )
+        except VisionAdapterError as exc:
+            return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
+
+
+class VisionTaskCoordinator:
+    """Bounded, deterministic orchestration for approved failed pages."""
+
+    def __init__(
+        self,
+        adapter: VisionFinancialSourceAdapter,
+        *,
+        journal: VisionTaskJournal | None = None,
+        max_workers: int = 2,
+        progress: Callable[[int, int], None] | None = None,
+    ):
+        self.adapter = adapter
+        self.journal = journal
+        self.max_workers = max(1, min(2, int(max_workers)))
+        self.progress = progress
+        self._completed_results: dict[str, VisionExtractionResult] = {}
+
+    def extract(
+        self,
+        company: Company,
+        filing: FilingDocument,
+        pages: Sequence[VisionPageRequest],
+        config: VisionFallbackConfig,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> VisionExtractionResult:
+        try:
+            unique: dict[tuple[int, str], VisionPageRequest] = {}
+            for page in sorted(pages, key=lambda item: (item.original_page, item.content_hash)):
+                unique.setdefault((page.original_page, page.content_hash), page)
+            ordered_pages = tuple(unique.values())
+            config.validate()
+            if not config.enabled:
+                raise VisionAdapterError("VISION_DISABLED")
+            if not ordered_pages:
+                raise VisionAdapterError("VISION_NO_FAILED_PAGES")
+            if len(ordered_pages) > config.max_pages:
+                raise VisionAdapterError("VISION_PAGE_LIMIT")
+            if sum(len(page.pdf_bytes) for page in ordered_pages) > config.max_bytes:
+                raise VisionAdapterError("VISION_SIZE_LIMIT")
+            provider_identity = _provider_identity(config)
+            task_key = vision_task_key(
+                provider_identity,
+                filing.content_hash,
+                ordered_pages,
+                namespace="batch",
+            )
+            prior = self.journal.get_vision_task(task_key) if self.journal is not None else None
+            cached = self._completed_results.get(task_key)
+            if cached is not None:
+                return cached
+            load_result = getattr(self.journal, "get_vision_result", None)
+            if callable(load_result):
+                persisted = load_result(task_key)
+                restored = _deserialize_vision_result(persisted) if persisted else None
+                if restored is not None:
+                    cached = VisionExtractionResult(
+                        restored.facts,
+                        restored.evidence,
+                        restored.diagnostics + ("VISION_RESULT_CACHE_HIT",),
+                        None,
+                    )
+                    self._completed_results[task_key] = cached
+                    return cached
+            _check_request(config, ordered_pages, filing)
+            if prior and prior.get("status") in {"created", "uploaded", "running"} and config.provider != "mineru_flash":
+                return VisionExtractionResult(
+                    diagnostics=("VISION_RECOVERY_BLOCKED",),
+                    error_code="VISION_RECOVERY_BLOCKED",
+                )
+            if self.journal is not None:
+                self.journal.save_vision_task(
+                    task_key,
+                    company_cik=filing.company_cik,
+                    document_id=filing.document_id,
+                    provider=provider_identity,
+                    page_hashes=tuple(page.content_hash for page in ordered_pages),
+                    page_numbers=tuple(page.original_page for page in ordered_pages),
+                    status="running",
+                )
+            # The coordinator performs one approval for the complete manifest;
+            # worker calls use an internal no-op callback and cannot re-prompt.
+            worker_config = replace(config, approve_upload=lambda _summary: True)
+            results: dict[int, VisionExtractionResult] = {}
+            errors: list[str] = []
+            internal_cancel = threading.Event()
+
+            def combined_cancel() -> bool:
+                return internal_cancel.is_set() or bool(cancel_check and cancel_check())
+
+            executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="vision-page")
+            futures = {
+                executor.submit(
+                    self.adapter.extract,
+                    company,
+                    filing,
+                    (page,),
+                    worker_config,
+                    cancel_check=combined_cancel,
+                ): index
+                for index, page in enumerate(ordered_pages)
+            }
+            try:
+                timeout = max(0.01, float(config.timeout_seconds))
+                for future in as_completed(futures, timeout=timeout):
+                    index = futures[future]
+                    if cancel_check and cancel_check():
+                        raise VisionAdapterError("VISION_CANCELLED")
+                    try:
+                        results[index] = future.result()
+                    except VisionAdapterError as exc:
+                        results[index] = VisionExtractionResult(
+                            diagnostics=(exc.code,), error_code=exc.code
+                        )
+                    except Exception:
+                        results[index] = VisionExtractionResult(
+                            diagnostics=("VISION_PROVIDER_ERROR",),
+                            error_code="VISION_PROVIDER_ERROR",
+                        )
+                    if self.progress is not None:
+                        self.progress(len(results), len(ordered_pages))
+            except FuturesTimeoutError:
+                errors.append("VISION_TIMEOUT")
+                internal_cancel.set()
+            except VisionAdapterError as exc:
+                errors.append(exc.code)
+                internal_cancel.set()
+            finally:
+                if errors:
+                    internal_cancel.set()
+                    for future in futures:
+                        future.cancel()
+                # Transport calls are themselves deadline-bounded. Waiting
+                # here guarantees no worker can mutate the journal after this
+                # method has returned a timeout/cancellation result.
+                executor.shutdown(wait=True, cancel_futures=True)
+            facts: list[FinancialFact] = []
+            evidence: list[EvidenceRef] = []
+            diagnostics: list[str] = []
+            for index in range(len(ordered_pages)):
+                result = results.get(index)
+                if result is None:
+                    errors.append("VISION_CANCELLED")
+                    continue
+                facts.extend(result.facts)
+                evidence.extend(result.evidence)
+                diagnostics.extend(result.diagnostics)
+                if result.error_code:
+                    errors.append(result.error_code)
+            error_code = errors[0] if errors else None
+            if not facts and error_code is None:
+                error_code = "VISION_NO_CANDIDATES"
+            if self.journal is not None:
+                self.journal.save_vision_task(
+                    task_key,
+                    company_cik=filing.company_cik,
+                    document_id=filing.document_id,
+                    provider=provider_identity,
+                    page_hashes=tuple(page.content_hash for page in ordered_pages),
+                    page_numbers=tuple(page.original_page for page in ordered_pages),
+                    status="failed" if error_code and not facts else "partial" if error_code else "completed",
+                    error_code=error_code or "",
+                )
+            if error_code is None and facts:
+                completed = VisionExtractionResult(
+                    tuple(facts), tuple(evidence), tuple(diagnostics), None
+                )
+                self._completed_results[task_key] = completed
+                save_result = getattr(self.journal, "save_vision_result", None)
+                if callable(save_result):
+                    save_result(task_key, _serialize_vision_result(completed))
+                return completed
+            if error_code and not facts:
+                diagnostics.append(error_code)
+            return VisionExtractionResult(tuple(facts), tuple(evidence), tuple(diagnostics), error_code)
         except VisionAdapterError as exc:
             return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
 

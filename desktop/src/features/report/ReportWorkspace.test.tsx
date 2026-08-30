@@ -91,4 +91,26 @@ describe("report presentation", () => {
     expect(rebuild).toHaveBeenCalledTimes(1);
     confirm.mockRestore();
   });
+
+  it("separates a completed financial rebuild from a failed report refresh", async () => {
+    const refresh = vi.fn(async () => { throw new Error("FILING_REPORT_REFRESH_FAILED"); });
+    render(<ReportWorkspace report={{
+      run_id: "run", ticker: "700", company_name: "Tencent", status: "completed",
+      report_language: "en", financial_retry: {
+        mode: "retry", targets: ["2025"], downloaded: ["2025"], accepted: ["2025:revenue"],
+        rejected: [], status: "partial", error: "FILING_REPORT_REFRESH_FAILED", updated_artifacts: [],
+      }, financial_status: {
+        state: "warning", retryable: true, history_years: 2, expected_periods: ["2025", "2024"],
+        available_periods: ["2025"], missing_periods: [], nodes: [], issues: [], attempt_count: 1,
+        last_stage: "report-refresh", last_error: "FILING_REPORT_REFRESH_FAILED", updated_at: "",
+        next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0,
+      }, markdown: "# Report", html: "",
+    }} copy={COPY.en} onRetryFinancials={vi.fn(async () => undefined)} onRefreshFinancialReport={refresh} />);
+
+    expect(screen.getByLabelText(COPY.en.financialStageStatus)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.refreshFinancialReport }));
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(COPY.en.financialReportRefreshFailed)).toBeInTheDocument();
+    expect(screen.getByText(/Report refresh: Failed/)).toBeInTheDocument();
+  });
 });

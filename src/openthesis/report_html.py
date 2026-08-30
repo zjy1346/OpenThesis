@@ -6,12 +6,13 @@ from typing import Any
 from .financials import format_money, format_percent
 from .growth import (
     evidence_grade_label,
+    format_evidence_summary,
     format_probability_range,
     growth_opportunities_from_value,
     scenario_label,
 )
 from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
-from .report_projection import project_report_value, report_display_value, report_field_label
+from .report_projection import normalize_report_sections, project_report_value, report_display_value, report_field_label
 from .reporting import (
     ARTIFACT_LABELS,
     SECTION_LABELS_EN,
@@ -640,8 +641,14 @@ def _growth_section(
     value: object,
     language: str,
     include_technical: bool,
+    available_evidence: set[str] | None = None,
 ) -> str:
-    opportunities = growth_opportunities_from_value(value, language)
+    if isinstance(value, dict) and isinstance(value.get("opportunities"), list):
+        opportunities = list(value["opportunities"])
+    elif isinstance(value, list):
+        opportunities = list(value)
+    else:
+        opportunities = growth_opportunities_from_value(value, language)
     if not opportunities:
         response_error = value.get("_response_error") if isinstance(value, dict) else None
         validation = value.get("_validation") if isinstance(value, dict) else None
@@ -691,6 +698,21 @@ def _growth_section(
         ]
         supporting = opportunity.get("supporting_evidence_ids", [])
         contradicting = opportunity.get("contradicting_evidence_ids", [])
+        if available_evidence is not None and (
+            "supporting_evidence_ids" in opportunity
+            or "contradicting_evidence_ids" in opportunity
+        ):
+            supporting_count = len(
+                {str(item).strip() for item in supporting if str(item).strip() in available_evidence}
+            )
+            contradicting_count = len(
+                {str(item).strip() for item in contradicting if str(item).strip() in available_evidence}
+            )
+        else:
+            supporting_count = opportunity.get("supporting_evidence_count", 0)
+            contradicting_count = opportunity.get("contradicting_evidence_count", 0)
+            supporting_count = supporting_count if isinstance(supporting_count, int) else 0
+            contradicting_count = contradicting_count if isinstance(contradicting_count, int) else 0
         title = opportunity.get("title") or _pick(
             language, "未命名机会", "Unnamed opportunity"
         )
@@ -715,10 +737,8 @@ def _growth_section(
                 f" · Time horizon: {horizon_text}"
             ),
         )
-        evidence_summary = _pick(
-            language,
-            f"{len(supporting)} 条支持证据 · {len(contradicting)} 条相反证据",
-            f"{len(supporting)} supporting · {len(contradicting)} contradicting evidence items",
+        evidence_summary = format_evidence_summary(
+            supporting_count, contradicting_count, language
         )
         scenario_text = ", ".join(scenarios) if language == EN else "、".join(scenarios)
         if not scenario_text:
@@ -920,6 +940,7 @@ def _report_sections(
     report: object,
     language: str,
     include_technical: bool,
+    available_evidence: set[str] | None = None,
 ) -> str:
     labels = SECTION_LABELS_EN if language == EN else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
     if not isinstance(report, dict):
@@ -928,14 +949,7 @@ def _report_sections(
             _paragraphs(report),
             section_id="research",
         )
-    display_report = dict(report)
-    business = display_report.get("business_model")
-    if isinstance(business, dict):
-        business = dict(business)
-        legacy_claims = business.pop("claims", None)
-        if legacy_claims and not display_report.get("claims"):
-            display_report["claims"] = legacy_claims
-        display_report["business_model"] = business
+    display_report = normalize_report_sections(report, language)
     parts: list[str] = []
     for key, title in labels.items():
         if key not in display_report:
@@ -947,6 +961,7 @@ def _report_sections(
                         display_report[key],
                         include_technical=include_technical,
                         section=key,
+                        available_evidence=available_evidence,
                     ),
                     language,
                 )
@@ -959,6 +974,7 @@ def _report_sections(
                         display_report[key],
                         include_technical=include_technical,
                         section=key,
+                        available_evidence=available_evidence,
                     ),
                     language,
                 )
@@ -969,14 +985,23 @@ def _report_sections(
                 display_report[key],
                 include_technical=include_technical,
                 section=key,
+                available_evidence=available_evidence,
             )
             if not growth_opportunities_from_value(projected, language):
+                parts.append(
+                    _section(
+                        title,
+                        _render_generic(projected, language),
+                        section_id="growth",
+                    )
+                )
                 continue
             parts.append(
                 _growth_section(
                     projected,
                     language,
                     include_technical,
+                    available_evidence,
                 )
             )
             continue
@@ -988,6 +1013,7 @@ def _report_sections(
                         display_report[key],
                         include_technical=include_technical,
                         section=key,
+                        available_evidence=available_evidence,
                     ),
                     language,
                 ),
@@ -1151,6 +1177,14 @@ def render_research_html(
     growth_artifact = _artifact(artifacts, "growth-opportunities", reverse=True)
     final = _artifact(artifacts, "research-report", reverse=True)
     growth_rendered = False
+    available_evidence = {
+        str(item.get("evidence_id"))
+        for item in (
+            deterministic.get("content", {}).get("evidence", [])
+            if deterministic else []
+        )
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
 
     body = [hero]
     if deterministic:
@@ -1177,6 +1211,20 @@ def render_research_html(
                 )
             )
         else:
+            if content.get("mode") == "financial-refresh":
+                body.append(
+                    _section(
+                        _pick(language, "财务刷新状态", "Financial Refresh Status"),
+                        '<div class="callout callout-warning">'
+                        + _escape(_pick(
+                            language,
+                            "财务表格与确定性指标已在不调用模型的情况下更新；下方定性研究保留自原综合结果，若关键数字发生变化，请重新生成综合报告。",
+                            "Financial tables and deterministic metrics were refreshed without a model call. Qualitative research below is retained from the prior synthesis; regenerate synthesis if material figures changed.",
+                        ))
+                        + "</div>",
+                        section_id="financial-refresh-status",
+                    )
+                )
             if content.get("mode") == "staged-fallback":
                 body.append(
                     _section(
@@ -1194,46 +1242,53 @@ def render_research_html(
                     )
                 )
             report = content.get("report", content)
-            if isinstance(report, dict) and report.get("narrative"):
-                body.append(
-                    _section(
-                        _pick(language, "模型研究", "Model Research"),
-                        _paragraphs(report["narrative"]),
-                        section_id="research",
-                    )
+            projected_growth = (
+                project_report_value(
+                    report.get("growth_opportunities"),
+                    include_technical=include_technical,
+                    section="growth_opportunities",
+                    available_evidence=available_evidence,
                 )
-            else:
-                projected_growth = (
-                    project_report_value(
-                        report.get("growth_opportunities"),
-                        include_technical=include_technical,
-                        section="growth_opportunities",
-                    )
-                    if isinstance(report, dict)
-                    and "growth_opportunities" in report
-                    else None
+                if isinstance(report, dict)
+                and "growth_opportunities" in report
+                else None
+            )
+            growth_rendered = bool(
+                growth_opportunities_from_value(projected_growth, language)
+            )
+            body.append(
+                _report_sections(
+                    report,
+                    language,
+                    include_technical,
+                    available_evidence,
                 )
-                growth_rendered = bool(
-                    growth_opportunities_from_value(projected_growth, language)
-                )
-                body.append(
-                    _report_sections(
-                        report,
-                        language,
-                        include_technical,
-                    )
-                )
+            )
             body.append(
                 _verification_section(
                     content.get("verification"), language, include_technical
                 )
             )
     if growth_artifact and not growth_rendered:
+        growth_content = growth_artifact.get("content")
+        growth_value = project_report_value(
+            growth_content,
+            include_technical=include_technical,
+            section="growth_opportunities",
+            available_evidence=available_evidence,
+        )
+        # Preserve failure metadata for the typed renderer only; private
+        # protocol fields are never rendered by the non-technical view.
+        if isinstance(growth_content, dict) and isinstance(growth_value, dict):
+            for metadata_key in ("_response_error", "_validation"):
+                if metadata_key in growth_content:
+                    growth_value[metadata_key] = growth_content[metadata_key]
         body.append(
             _growth_section(
-                growth_artifact.get("content"),
+                growth_value,
                 language,
                 include_technical,
+                available_evidence,
             )
         )
 

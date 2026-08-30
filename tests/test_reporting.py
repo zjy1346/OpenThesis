@@ -8,6 +8,44 @@ from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_financial_refresh_marks_retained_qualitative_synthesis_as_stale(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "title": "refresh",
+            "agent_id": "financial-refresh",
+            "model_id": "",
+            "content": {
+                "mode": "financial-refresh",
+                "report": {"business_model": "Existing qualitative analysis"},
+            },
+        }]
+
+        report = render_research_run("refresh-run", artifacts, "en-US")
+
+        self.assertIn("Financial Refresh Status", report)
+        self.assertIn("refreshed without a model call", report)
+        self.assertIn("Existing qualitative analysis", report)
+
+    def test_financial_refresh_notice_is_traditional_chinese_in_both_formats(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "title": "refresh",
+            "agent_id": "financial-refresh",
+            "model_id": "",
+            "content": {
+                "mode": "financial-refresh",
+                "report": {"business_model": "既有定性研究"},
+            },
+        }]
+
+        markdown = render_research_run("refresh-hant", artifacts, "zh-Hant")
+        html = render_research_html("refresh-hant", artifacts, "zh-Hant")
+
+        self.assertIn("財務刷新狀態", markdown)
+        self.assertIn("不呼叫模型", markdown)
+        self.assertIn("財務刷新狀態", html)
+        self.assertIn("不呼叫模型", html)
+
     def test_traditional_chinese_markdown_uses_traditional_section_labels(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",

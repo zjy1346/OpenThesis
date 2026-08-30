@@ -1,6 +1,8 @@
 param(
-    [string]$Version = "2.1.0",
-    [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis"
+    [string]$Version = "2.2.1",
+    [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis",
+    [ValidateSet("unsigned-test", "authenticode-required")]
+    [string]$SignatureMode = "unsigned-test"
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +38,10 @@ if (-not (Test-Path -LiteralPath $releaseExe -PathType Leaf)) {
 if ((Get-PeSubsystem $releaseExe) -ne 2) {
     throw "OpenThesis release executable is not a Windows GUI application."
 }
+$releaseSignature = Get-AuthenticodeSignature -LiteralPath $releaseExe
+if ($SignatureMode -eq "authenticode-required" -and $releaseSignature.Status -ne "Valid") {
+    throw "Authenticode validation failed for OpenThesis release executable: $($releaseSignature.Status)"
+}
 
 $expectedHash = ((Get-Content -LiteralPath $checksum -Raw) -split "\s+")[0]
 $actualHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
@@ -69,5 +75,7 @@ try {
     Sha256 = $actualHash
     MainSubsystem = "Windows GUI"
     RequiredEntries = "present"
+    SignatureMode = $SignatureMode
+    SignatureStatus = $releaseSignature.Status.ToString()
 } | ConvertTo-Json -Compress
 

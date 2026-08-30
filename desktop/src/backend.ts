@@ -199,8 +199,23 @@ export function retryResearchFinancials(runId: string): Promise<ResearchReport> 
   return request("research.retry_financials", { run_id: runId });
 }
 
+export function refreshFinancialReport(
+  runId: string,
+  language?: ResearchReport["report_language"],
+): Promise<ResearchReport> {
+  return request("research.refresh_financial_report", { run_id: runId, language });
+}
+
+export function startResearchFinancialRetry(runId: string): Promise<ResearchJob> {
+  return request("research.start_financial_retry", { run_id: runId });
+}
+
 export function rebuildResearchFinancials(runId: string): Promise<ResearchReport> {
   return request("research.rebuild_financials", { run_id: runId, confirmed: true });
+}
+
+export function startResearchFinancialRebuild(runId: string): Promise<ResearchJob> {
+  return request("research.start_financial_rebuild", { run_id: runId, confirmed: true });
 }
 
 export function getResearchStatus(jobId: string): Promise<ResearchJob> {

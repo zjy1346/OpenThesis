@@ -6,13 +6,14 @@ from .financials import deterministic_summary, format_money, format_percent
 from .growth import (
     GROWTH_FIELD_LABELS,
     evidence_grade_label,
+    format_evidence_summary,
     format_probability_range,
     growth_field_label,
     growth_opportunities_from_value,
     scenario_label,
 )
 from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
-from .report_projection import project_report_value, report_display_value, report_field_label
+from .report_projection import normalize_report_sections, project_report_value, report_display_value, report_field_label
 
 
 SECTION_LABELS_ZH = {
@@ -183,9 +184,15 @@ def _render_growth_opportunities(
     language: str,
     *,
     include_technical: bool = False,
+    available_evidence: set[str] | None = None,
 ) -> list[str]:
     english = normalize_language(language) == EN
-    opportunities = growth_opportunities_from_value(value, language)
+    if isinstance(value, dict) and isinstance(value.get("opportunities"), list):
+        opportunities = list(value["opportunities"])
+    elif isinstance(value, list):
+        opportunities = list(value)
+    else:
+        opportunities = growth_opportunities_from_value(value, language)
     if not opportunities:
         response_error = value.get("_response_error") if isinstance(value, dict) else None
         validation = value.get("_validation") if isinstance(value, dict) else None
@@ -276,11 +283,26 @@ def _render_growth_opportunities(
         )
         supporting = opportunity.get("supporting_evidence_ids", [])
         contradicting = opportunity.get("contradicting_evidence_ids", [])
+        if available_evidence is not None and (
+            "supporting_evidence_ids" in opportunity
+            or "contradicting_evidence_ids" in opportunity
+        ):
+            supporting_count = len(
+                {str(item).strip() for item in supporting if str(item).strip() in available_evidence}
+            )
+            contradicting_count = len(
+                {str(item).strip() for item in contradicting if str(item).strip() in available_evidence}
+            )
+        else:
+            supporting_count = opportunity.get("supporting_evidence_count", 0)
+            contradicting_count = opportunity.get("contradicting_evidence_count", 0)
+            supporting_count = supporting_count if isinstance(supporting_count, int) else 0
+            contradicting_count = contradicting_count if isinstance(contradicting_count, int) else 0
         lines.append(
             (
-                f"Evidence: {len(supporting)} supporting · {len(contradicting)} contradicting"
-                if english
-                else f"证据：{len(supporting)} 条支持 · {len(contradicting)} 条相反"
+                format_evidence_summary(
+                    supporting_count, contradicting_count, language
+                )
             )
         )
         if opportunity.get("leading_indicators"):
@@ -399,6 +421,14 @@ def render_research_run(
         None,
     )
     growth_rendered = False
+    available_evidence = {
+        str(item.get("evidence_id"))
+        for item in (
+            deterministic.get("content", {}).get("evidence", [])
+            if deterministic else []
+        )
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
     if deterministic:
         metrics = deterministic["content"].get("metrics")
         if company_name and isinstance(metrics, list):
@@ -625,26 +655,20 @@ def render_research_run(
                 ]
             )
         else:
+            if content.get("mode") == "financial-refresh":
+                lines.extend([
+                    _pick(language, "## 财务刷新状态", "## Financial Refresh Status"),
+                    "",
+                    _pick(
+                        language,
+                        "> 财务表格与确定性指标已在不调用模型的情况下更新；下方定性研究保留自原综合结果，若关键数字发生变化，请重新生成综合报告。",
+                        "> Financial tables and deterministic metrics were refreshed without a model call. Qualitative research below is retained from the prior synthesis; regenerate synthesis if material figures changed.",
+                    ),
+                    "",
+                ])
             report = content.get("report", content)
-            narrative = report.get("narrative") if isinstance(report, dict) else None
-            if narrative:
-                lines.extend(
-                    [
-                        _pick(language, "## 模型原始研究", "## Original Model Research"),
-                        "",
-                        str(narrative),
-                        "",
-                    ]
-                )
-            elif isinstance(report, dict):
-                display_report = dict(report)
-                business = display_report.get("business_model")
-                if isinstance(business, dict):
-                    business = dict(business)
-                    legacy_claims = business.pop("claims", None)
-                    if legacy_claims and not display_report.get("claims"):
-                        display_report["claims"] = legacy_claims
-                    display_report["business_model"] = business
+            if isinstance(report, dict):
+                display_report = normalize_report_sections(report, language)
                 for key in section_labels:
                     if key not in display_report:
                         continue
@@ -652,12 +676,14 @@ def render_research_run(
                         display_report[key],
                         include_technical=include_technical,
                         section=key,
+                        available_evidence=available_evidence,
                     )
                     rendered = (
                         _render_growth_opportunities(
                             projected,
                             language,
                             include_technical=include_technical,
+                            available_evidence=available_evidence,
                         )
                         if key == "growth_opportunities"
                         else _render_claims(
@@ -672,8 +698,9 @@ def render_research_run(
                     )
                     if key == "growth_opportunities":
                         if not growth_opportunities_from_value(projected, language):
-                            continue
-                        growth_rendered = True
+                            rendered = _render_value(projected, language)
+                        else:
+                            growth_rendered = True
                     lines.extend(
                         [
                             f"## {section_labels[key]}",
@@ -719,14 +746,28 @@ def render_research_run(
                 lines.append("")
 
     if growth_artifact and not growth_rendered:
+        growth_content = growth_artifact.get("content")
+        growth_value = project_report_value(
+            growth_content,
+            include_technical=include_technical,
+            section="growth_opportunities",
+            available_evidence=available_evidence,
+        )
+        # Keep machine-readable failure metadata available to the typed
+        # renderer without projecting private protocol keys into the report.
+        if isinstance(growth_content, dict) and isinstance(growth_value, dict):
+            for metadata_key in ("_response_error", "_validation"):
+                if metadata_key in growth_content:
+                    growth_value[metadata_key] = growth_content[metadata_key]
         lines.extend(
             [
                 _pick(language, "## 增长机会", "## Growth Opportunities"),
                 "",
                 *_render_growth_opportunities(
-                    growth_artifact.get("content"),
+                    growth_value,
                     language,
                     include_technical=include_technical,
+                    available_evidence=available_evidence,
                 ),
                 "",
             ]
@@ -864,7 +905,7 @@ def render_research_run(
                 "假设和未知项区分；最终投资判断由用户自行作出。",
                 "Financial values come from structured facts and deterministic "
                 "calculations. Model-generated content must distinguish evidence, "
-                "assumptions, and unknowns. The user makes the final investment judgment.",
+                "assumptions, and information gaps. The user makes the final investment judgment.",
             ),
         ]
     )

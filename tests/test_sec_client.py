@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from openthesis.domain import Company, FilingDocument, FinancialFact
+from openthesis.download_safety import UnsafeDisclosurePayload, store_immutable_payload
 from openthesis.sec_client import SecClient, SecFinancialSourceAdapter
 
 
@@ -24,6 +25,36 @@ class SecClientTests(unittest.TestCase):
     def test_requires_contact_email(self) -> None:
         with self.assertRaises(ValueError):
             SecClient("missing-contact", Path(self.temp.name))
+
+    def test_download_does_not_trust_legacy_accession_cache_for_revision(self) -> None:
+        filing = FilingDocument(
+            "sec:revision", "0000001234", "0001-25-001", "10-K", "FY",
+            "2025-12-31", "2026-02-01", "annual25.htm",
+            "https://www.sec.gov/Archives/test/annual25.htm",
+        )
+        legacy = Path(self.temp.name) / "0001-25-001.htm"
+        legacy.write_text("<html>original filing</html>", encoding="utf-8")
+        revised = b"<html>corrected filing with a new official revision</html>"
+        with patch.object(self.client, "_request_bytes", side_effect=[revised, revised]) as fetch:
+            first = self.client.download_filing(filing, Path(self.temp.name))
+            second = self.client.download_filing(filing, Path(self.temp.name))
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(legacy.read_text(encoding="utf-8"), "<html>original filing</html>")
+        self.assertNotEqual(Path(first.local_path), legacy)
+        self.assertEqual(Path(first.local_path).read_bytes(), revised)
+        self.assertEqual(first.local_path, second.local_path)
+        self.assertEqual(first.content_hash, second.content_hash)
+
+    def test_content_addressed_reuse_rejects_same_size_different_content(self) -> None:
+        payload = b"official-content"
+        target = Path(self.temp.name) / "accession.pdf"
+        digest = __import__("hashlib").sha256(payload).hexdigest()
+        destination = target.with_name(f"{target.stem}-{digest[:16]}{target.suffix}")
+        destination.write_bytes(b"corrupt-content!")
+        self.assertEqual(destination.stat().st_size, len(payload))
+        with self.assertRaises(UnsafeDisclosurePayload):
+            store_immutable_payload(target, payload)
+        self.assertEqual(destination.read_bytes(), b"corrupt-content!")
 
     def test_company_search_and_annual_filing_mapping(self) -> None:
         tickers = {

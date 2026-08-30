@@ -144,6 +144,41 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(storage.get_facts(company.security_id), [])
             self.assertEqual(len(storage.get_facts_audit(company.security_id)), 1)
 
+    def test_run_and_rebuilt_artifacts_are_committed_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            run = ResearchRun(
+                run_id="atomic-refresh",
+                company=DEMO_COMPANY,
+                workflow_id="test",
+                research_pack_id="test",
+                research_pack_version="1",
+                provider_id="none",
+                model_id="",
+                data_as_of=utc_now_iso(),
+            )
+            valid = ResearchArtifact(
+                artifact_id="atomic-valid",
+                run_id=run.run_id,
+                artifact_type="deterministic-financial-summary",
+                title="Valid",
+                content={"metrics": []},
+            )
+            invalid = ResearchArtifact(
+                artifact_id="atomic-invalid",
+                run_id=run.run_id,
+                artifact_type="research-report",
+                title="Invalid",
+                content={"not_json": {1}},
+            )
+
+            with self.assertRaises(TypeError):
+                storage.save_run_with_artifacts(run, [valid, invalid])
+
+            self.assertIsNone(storage.get_run(run.run_id))
+            self.assertEqual(storage.get_artifacts(run.run_id), [])
+
     def test_existing_schema_is_migrated_additively(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
