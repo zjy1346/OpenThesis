@@ -9,13 +9,39 @@ page-wide regular-expression match.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from concurrent.futures import CancelledError, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 import hashlib
+import inspect
+import json
+import multiprocessing as mp
+import os
+import queue
 import re
+import tempfile
+import threading
+import time
+import types
+
+
+_PDF_PARSER_VERSION = "financial-ingestion-ast-v3"
+_PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
+_PDF_CACHE_POLICY_VERSION = "parse-cache-v1"
+
+
+@dataclass
+class _PdfParseFlight:
+    """In-process single-flight state for one content-addressed parse."""
+
+    event: threading.Event
+    result: tuple[list[FinancialFact], list[EvidenceRef], str | None] | None = None
+
+
+_PDF_FLIGHT_LOCK = threading.Lock()
+_PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .market_financials import FinancialValidation, ValidationStatus
@@ -1299,6 +1325,43 @@ def _vision_failed_pages(
         return ()
 
 
+def _emit_ingestion_progress(
+    progress: Callable[..., None] | None,
+    stage: str,
+    current: int,
+    total: int,
+    filing: FilingDocument | None = None,
+    *,
+    status: str = "",
+    error_code: str = "",
+    elapsed_seconds: float = 0.0,
+) -> None:
+    """Emit optional per-filing detail without breaking legacy callbacks."""
+
+    if progress is None:
+        return
+    detail = None
+    if filing is not None:
+        detail = {
+            "filing_id": filing.document_id,
+            "label": filing.primary_document or filing.accession_number or filing.document_id,
+            "status": status or stage,
+            "error_code": error_code,
+            "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+        }
+    try:
+        signature = inspect.signature(progress)
+        accepts_detail = len(signature.parameters) >= 4
+    except (TypeError, ValueError):
+        accepts_detail = False
+    if stage == "filing-status" and not accepts_detail:
+        return
+    if accepts_detail:
+        progress(stage, current, total, detail)
+    else:
+        progress(stage, current, total)
+
+
 def _parse_local_pdfs_bounded(
     engine: "FinancialIngestionEngine",
     company: Company,
@@ -1307,35 +1370,60 @@ def _parse_local_pdfs_bounded(
     *,
     parse: Callable[[str, Company, FilingDocument, FilingManifest], tuple[list[FinancialFact], list[EvidenceRef]]] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    progress: Callable[[str, int, int], None] | None = None,
+    progress: Callable[..., None] | None = None,
     max_workers: int = 3,
+    parse_timeout_seconds: float = 120.0,
+    batch_timeout_seconds: float = 280.0,
+    worker_entry: Callable[..., None] | None = None,
 ) -> dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]]:
-    """Pre-parse local PDFs with bounded, deterministic worker coordination.
+    """Parse local PDFs as bounded per-document pipelines.
 
-    The parser itself is the only work performed in worker threads. Results,
-    diagnostics, and progress are collected by the caller thread in completion
-    order and then mapped back to the original filing order. Structured sources
-    and vision adapters remain in the sequential ingest loop.
+    Indexing and AST parsing for a document are submitted as one streaming
+    pipeline: when one index completes, only that document's AST task is
+    queued. This avoids a global pre-index barrier while keeping all progress
+    callbacks in the collecting thread. Results are always remapped to filing
+    order before returning.
     """
     parse_fn = parse or engine._parse_pdf_ast
+    # Subclass/instance parser injection remains a synchronous test seam;
+    # only the unmodified base engine is eligible for process isolation.
     default_parser = (
         parse is None
-        and getattr(parse_fn, "__func__", None) is FinancialIngestionEngine._parse_pdf_ast
+        and type(engine) is FinancialIngestionEngine
+        and isinstance(parse_fn, types.MethodType)
     )
+    process_isolated = (
+        default_parser
+        and isinstance(parse_fn, types.MethodType)
+        and getattr(parse_fn, "__func__", None) is globals().get("_ORIGINAL_PARSE_PDF_AST")
+    )
+    cache_enabled = engine._parse_cache_dir is not None
     unique: list[tuple[str, FilingDocument, FilingManifest]] = []
     duplicate_ids: dict[str, list[str]] = {}
     seen: dict[str, str] = {}
+    actual_hashes: dict[str, str] = {}
+    hash_mismatches: dict[str, str] = {}
     for filing in filings:
         manifest = manifests.get(filing.document_id)
         if manifest is None or not filing.local_path or not Path(filing.local_path).is_file():
             continue
-        if filing.content_hash:
-            key = f"hash:{filing.content_hash.casefold()}"
-        else:
+        if default_parser or cache_enabled:
             try:
-                key = f"path:{str(Path(filing.local_path).resolve(strict=False)).casefold()}"
+                actual_hash = engine._file_sha256(filing.local_path)
             except OSError:
-                key = f"path:{str(Path(filing.local_path)).casefold()}"
+                continue
+            key = f"hash:{actual_hash.casefold()}"
+            actual_hashes[key] = actual_hash
+            if filing.content_hash and filing.content_hash.casefold() != actual_hash.casefold():
+                hash_mismatches[key] = "CACHE_HASH_MISMATCH"
+        else:
+            if filing.content_hash:
+                key = f"hash:{filing.content_hash.casefold()}"
+            else:
+                try:
+                    key = f"path:{str(Path(filing.local_path).resolve(strict=False)).casefold()}"
+                except OSError:
+                    key = f"path:{str(Path(filing.local_path)).casefold()}"
         duplicate_ids.setdefault(key, []).append(filing.document_id)
         if key not in seen:
             seen[key] = filing.document_id
@@ -1343,72 +1431,217 @@ def _parse_local_pdfs_bounded(
     if not unique or (cancel_check is not None and cancel_check()):
         return {}
 
-    page_indexes: dict[str, frozenset[int] | None] = {}
-    if default_parser:
-        # Whole-document text indexing has a materially higher memory peak
-        # than parsing the selected statement pages. Build indexes in a
-        # deterministic sequence, then parallelize only bounded page parsing.
-        for key, filing, _manifest in unique:
-            if cancel_check is not None and cancel_check():
-                return {}
-            page_indexes[key] = _candidate_financial_pages(filing.local_path)
-
-    def parse_one(item: tuple[str, FilingDocument, FilingManifest]) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
+    def parse_one(
+        item: tuple[str, FilingDocument, FilingManifest],
+        candidate_pages: frozenset[int] | None = None,
+    ) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
         key, filing, manifest = item
         if cancel_check is not None and cancel_check():
             return key, [], [], None
         try:
-            facts, refs = parse_fn(filing.local_path, company, filing, manifest)
+            if default_parser:
+                facts, refs = parse_fn(
+                    filing.local_path,
+                    company,
+                    filing,
+                    manifest,
+                    candidate_pages=candidate_pages,
+                    index_precomputed=True,
+                )
+            else:
+                facts, refs = parse_fn(filing.local_path, company, filing, manifest)
             return key, list(facts), list(refs), None
         except Exception as exc:
             return key, [], [], f"pdf_table_parse_failed:{type(exc).__name__}"
 
-    results: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]] = {}
     workers = (
-        _safe_pdf_worker_count(
-            [item[1] for item in unique], requested=max_workers
-        )
+        _safe_pdf_worker_count([item[1] for item in unique], requested=max_workers)
         if default_parser
         else max(1, min(3, int(max_workers), len(unique)))
     )
     completed = 0
-    executor_type = ProcessPoolExecutor if default_parser and workers > 1 else ThreadPoolExecutor
-    executor_kwargs = {"max_workers": workers}
-    if executor_type is ThreadPoolExecutor:
-        executor_kwargs["thread_name_prefix"] = "financial-pdf"
-    executor = executor_type(**executor_kwargs)
-    futures = []
-    cancelled = False
-    try:
-        futures = [
-            executor.submit(
-                _parse_pdf_process_worker,
-                item[0], company, item[1], item[2], page_indexes.get(item[0]),
+    total = len(unique)
+    results: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]] = {}
+    uncached: list[tuple[str, FilingDocument, FilingManifest]] = []
+    cache_keys: dict[str, str] = {}
+    pre_errors: dict[str, str] = {}
+    flight_waiters: dict[str, _PdfParseFlight] = {}
+    flight_owners: dict[str, _PdfParseFlight] = {}
+    cache_checked = 0
+    # Hash verification happens before cache lookup. A stale database hash can
+    # never make an unrelated object look like a valid parse-cache hit.
+    for item in unique:
+        key, filing, manifest = item
+        cache_checked += 1
+        _emit_ingestion_progress(
+            progress,
+            "cache-check",
+            cache_checked,
+            total,
+            filing,
+            status="cache-check",
+        )
+        if not cache_enabled and not default_parser:
+            uncached.append(item)
+            continue
+        try:
+            actual_hash = actual_hashes.get(key) or engine._file_sha256(filing.local_path)
+            # A stored hash mismatch is an auditable cache failure. Preserve
+            # the filing metadata so callers cannot mistake a stale reference
+            # for a newly verified object; only hash-less filings are filled.
+            if not filing.content_hash:
+                filing.content_hash = actual_hash
+            cache_key = engine._parse_cache_key(filing.local_path, company, filing, actual_hash)
+            cache_keys[key] = cache_key
+            cached = None if key in hash_mismatches else engine._load_parse_cache(cache_key)
+            if key in hash_mismatches:
+                pre_errors[key] = hash_mismatches[key]
+        except (OSError, ValueError):
+            cached = None
+            cache_key = ""
+        if cached is None:
+            if default_parser and cache_key and key not in hash_mismatches:
+                with _PDF_FLIGHT_LOCK:
+                    flight = _PDF_FLIGHTS.get(cache_key)
+                    if flight is None:
+                        flight = _PdfParseFlight(threading.Event())
+                        _PDF_FLIGHTS[cache_key] = flight
+                        flight_owners[key] = flight
+                    else:
+                        flight_waiters[key] = flight
+                        continue
+            uncached.append(item)
+            continue
+        facts, refs = cached
+        results[key] = (facts, refs, None)
+        completed += 1
+        _emit_ingestion_progress(
+            progress,
+            "filing-parse",
+            completed,
+            total,
+            filing,
+            status="cache-hit",
+        )
+    if not uncached:
+        _resolve_pdf_parse_flights(
+            flight_owners, flight_waiters, cache_keys, results, parse_timeout_seconds
+        )
+        return {
+            document_id: results[key]
+            for key, document_ids in duplicate_ids.items()
+            if key in results
+            for document_id in document_ids
+        }
+
+    if process_isolated:
+        try:
+            _parse_local_pdfs_isolated(
+                engine,
+                company,
+                uncached,
+                results=results,
+                cache_keys=cache_keys,
+                pre_errors=pre_errors,
+                progress=progress,
+                cancel_check=cancel_check,
+                max_workers=workers,
+                parse_timeout_seconds=parse_timeout_seconds,
+                batch_timeout_seconds=batch_timeout_seconds,
+                worker_entry=worker_entry,
             )
-            if default_parser and workers > 1
-            else executor.submit(parse_one, item)
-            for item in unique
-        ]
-        for future in as_completed(futures):
+        finally:
+            # Every owner wakes waiters, including cancellation and process
+            # startup failures. Never leave an in-flight entry behind.
+            _resolve_pdf_parse_flights(
+                flight_owners, flight_waiters, cache_keys, results, parse_timeout_seconds
+            )
+        return {
+            document_id: results[key]
+            for key, document_ids in duplicate_ids.items()
+            if key in results
+            for document_id in document_ids
+        }
+
+    workers = min(workers, len(uncached))
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="financial-pdf")
+    futures: dict[Any, tuple[str, tuple[str, FilingDocument, FilingManifest]]] = {}
+    cancelled = False
+    next_item = 0
+    indexed = 0
+    parsed = completed
+
+    def _index_one(
+        item: tuple[str, FilingDocument, FilingManifest],
+    ) -> tuple[str, frozenset[int] | None, str | None]:
+        key, filing, _manifest = item
+        if cancel_check is not None and cancel_check():
+            return key, None, None
+        try:
+            return key, _candidate_financial_pages(filing.local_path), None
+        except Exception as exc:
+            return key, None, f"pdf_index_failed:{type(exc).__name__}"
+
+    def submit_index() -> None:
+        nonlocal next_item
+        if next_item >= len(uncached):
+            return
+        item = uncached[next_item]
+        next_item += 1
+        futures[executor.submit(_index_one, item)] = ("index", item)
+
+    try:
+        if default_parser:
+            for _ in range(min(workers, len(uncached))):
+                submit_index()
+        else:
+            for item in uncached:
+                futures[executor.submit(parse_one, item)] = ("parse", item)
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
             if cancel_check is not None and cancel_check():
                 cancelled = True
                 # Do not disturb results that have already completed; cancel
                 # only work that has not started and let running workers drain.
-                for pending in futures:
+                for pending in tuple(futures):
                     if not pending.done():
                         pending.cancel()
-            try:
-                key, facts, refs, error = future.result()
-            except CancelledError:
-                continue
-            results[key] = (facts, refs, error)
-            completed += 1
-            if progress is not None:
-                progress("filing-parse", completed, len(unique))
+            for future in done:
+                kind, item = futures.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    if kind == "index":
+                        key, candidate_pages, index_error = future.result()
+                        indexed += 1
+                        if progress is not None:
+                            progress("filing-index", indexed, total)
+                        if index_error is not None:
+                            results[key] = ([], [], index_error)
+                            parsed += 1
+                            if progress is not None:
+                                progress("filing-parse", parsed, total)
+                        elif cancel_check is None or not cancel_check():
+                            futures[executor.submit(parse_one, item, candidate_pages)] = ("parse", item)
+                        if not cancelled:
+                            submit_index()
+                    else:
+                        key, facts, refs, error = future.result()
+                        results[key] = (facts, refs, error)
+                        parsed += 1
+                        completed += 1
+                        if error is None and facts and refs and cache_enabled:
+                            cache_key = cache_keys.get(key)
+                            if cache_key:
+                                engine._store_parse_cache(cache_key, facts, refs)
+                        if progress is not None:
+                            progress("filing-parse", parsed, total)
+                except CancelledError:
+                    continue
     finally:
         if cancel_check is not None and cancel_check():
             cancelled = True
-            for pending in futures:
+            for pending in tuple(futures):
                 if not pending.done():
                     pending.cancel()
         # Waiting allows already-running native parsers to release resources;
@@ -1416,6 +1649,9 @@ def _parse_local_pdfs_bounded(
         executor.shutdown(wait=True, cancel_futures=cancelled)
 
     by_document: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]] = {}
+    _resolve_pdf_parse_flights(
+        flight_owners, flight_waiters, cache_keys, results, parse_timeout_seconds
+    )
     for key, document_ids in duplicate_ids.items():
         result = results.get(key)
         if result is None:
@@ -1448,76 +1684,458 @@ def _parse_pdf_process_worker(
         return key, [], [], f"pdf_table_parse_failed:{type(exc).__name__}"
 
 
+def _parse_pdf_process_worker_entry(
+    key: str,
+    company: Company,
+    filing: FilingDocument,
+    manifest: FilingManifest,
+    candidate_pages: frozenset[int] | None,
+    result_queue: Any,
+) -> None:
+    """Process entrypoint which returns one bounded, pickle-safe result."""
+
+    try:
+        index_error = None
+        try:
+            indexed_pages = _candidate_financial_pages(filing.local_path)
+        except Exception as exc:
+            indexed_pages = None
+            index_error = f"pdf_index_failed:{type(exc).__name__}"
+        result_queue.put(("filing-index", key, indexed_pages, index_error))
+        # A partial index is deliberately represented by None; the AST parser
+        # then fails open to its full-document path for correctness.
+        result_queue.put(("filing-result", _parse_pdf_process_worker(
+            key, company, filing, manifest, indexed_pages
+        )))
+    except BaseException as exc:  # pragma: no cover - process boundary safety
+        try:
+            result_queue.put(("filing-result", (key, [], [], f"pdf_worker_failed:{type(exc).__name__}")))
+        except BaseException:
+            pass
+
+
+def _terminate_pdf_process(process: Any) -> None:
+    """Terminate one parser process and wait briefly for OS resource cleanup."""
+
+    try:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=1.0)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(timeout=1.0)
+    except (OSError, ValueError):
+        pass
+
+
+def _close_pdf_result_queue(result_queue: Any) -> None:
+    try:
+        result_queue.close()
+        result_queue.join_thread()
+    except (OSError, ValueError, AssertionError):
+        pass
+
+
+def _resolve_pdf_parse_flights(
+    owners: dict[str, _PdfParseFlight],
+    waiters: dict[str, _PdfParseFlight],
+    cache_keys: dict[str, str],
+    results: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]],
+    timeout_seconds: float,
+) -> None:
+    """Publish owner outcomes and release all waiters on every exit path."""
+
+    for key, flight in owners.items():
+        result = results.get(key, ([], [], "pdf_parse_cancelled"))
+        with _PDF_FLIGHT_LOCK:
+            flight.result = result
+            flight.event.set()
+            flight_key = cache_keys.get(key, "")
+            if _PDF_FLIGHTS.get(flight_key) is flight:
+                _PDF_FLIGHTS.pop(flight_key, None)
+    for key, flight in waiters.items():
+        flight.event.wait(timeout=max(0.1, float(timeout_seconds)) + 1.0)
+        if flight.result is not None:
+            results[key] = flight.result
+
+
+def _parse_local_pdfs_isolated(
+    engine: "FinancialIngestionEngine",
+    company: Company,
+    uncached: Sequence[tuple[str, FilingDocument, FilingManifest]],
+    *,
+    results: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]],
+    cache_keys: dict[str, str],
+    pre_errors: dict[str, str],
+    progress: Callable[..., None] | None,
+    cancel_check: Callable[[], bool] | None,
+    max_workers: int,
+    parse_timeout_seconds: float,
+    batch_timeout_seconds: float,
+    worker_entry: Callable[..., None] | None = None,
+) -> None:
+    """Run the default AST stage in killable per-document processes.
+
+    Each worker owns the bounded text index prepass and AST parse in one
+    ``multiprocessing.Process``. Cancellation and timeout can therefore
+    terminate a native PDF parse rather than waiting for a thread to return.
+    """
+
+    worker_count = max(1, min(3, int(max_workers), len(uncached)))
+    total = len(uncached) + sum(1 for value in results.values() if value[2] is None)
+    parsed = sum(1 for value in results.values() if value[2] is None)
+    indexed = 0
+    next_item = 0
+    cancelled = False
+    processes: dict[str, dict[str, Any]] = {}
+    context = mp.get_context("spawn")
+    timeout = max(0.1, float(parse_timeout_seconds))
+    batch_deadline = time.monotonic() + max(0.1, float(batch_timeout_seconds))
+    entrypoint = worker_entry or _parse_pdf_process_worker_entry
+    exit_drain_seconds = 0.2
+
+    def start_next() -> None:
+        nonlocal next_item
+        while (
+            next_item < len(uncached)
+            and len(processes) < worker_count
+            and not cancelled
+            and time.monotonic() < batch_deadline
+        ):
+            item = uncached[next_item]
+            next_item += 1
+            key, filing, manifest = item
+            if cancel_check is not None and cancel_check():
+                return
+            result_queue = context.Queue(maxsize=2)
+            process = context.Process(
+                target=entrypoint,
+                args=(key, company, filing, manifest, None, result_queue),
+                name=f"financial-pdf-{key[-12:]}",
+            )
+            process.daemon = True
+            try:
+                process.start()
+            except (OSError, RuntimeError) as exc:
+                _close_pdf_result_queue(result_queue)
+                results[key] = ([], [], f"pdf_worker_start_failed:{type(exc).__name__}")
+                continue
+            processes[key] = {
+                "process": process,
+                "queue": result_queue,
+                "deadline": time.monotonic() + timeout,
+                "item": item,
+                "indexed": False,
+                "started_at": time.monotonic(),
+            }
+            _emit_ingestion_progress(
+                progress, "filing-status", indexed, total, filing, status="indexing"
+            )
+
+    def finish_process(key: str, result: tuple[str, list[FinancialFact], list[EvidenceRef], str | None]) -> None:
+        nonlocal parsed
+        state = processes.pop(key)
+        process = state["process"]
+        result_queue = state["queue"]
+        try:
+            process.join(timeout=0.2)
+        finally:
+            _close_pdf_result_queue(result_queue)
+        _result_key, facts, refs, error = result
+        error = pre_errors.get(key) or error
+        results[key] = (list(facts), list(refs), error)
+        parsed += 1
+        if error is None and facts and refs:
+            cache_key = cache_keys.get(key)
+            if cache_key:
+                engine._store_parse_cache(cache_key, facts, refs)
+        filing = state["item"][1]
+        _emit_ingestion_progress(
+            progress,
+            "filing-parse",
+            parsed,
+            total,
+            filing,
+            status="failed" if error else "parsed",
+            error_code=error or "",
+            elapsed_seconds=time.monotonic() - state["started_at"],
+        )
+
+    try:
+        start_next()
+        while processes:
+            if cancel_check is not None and cancel_check():
+                cancelled = True
+                for key, state in tuple(processes.items()):
+                    _terminate_pdf_process(state["process"])
+                    _close_pdf_result_queue(state["queue"])
+                    processes.pop(key, None)
+                    results[key] = ([], [], "pdf_parse_cancelled")
+                    filing = state["item"][1]
+                    _emit_ingestion_progress(
+                        progress,
+                        "filing-parse",
+                        parsed,
+                        total,
+                        filing,
+                        status="cancelled",
+                        error_code="pdf_parse_cancelled",
+                        elapsed_seconds=time.monotonic() - state["started_at"],
+                    )
+                break
+            progressed = False
+            now = time.monotonic()
+            if now >= batch_deadline:
+                for key, state in tuple(processes.items()):
+                    _terminate_pdf_process(state["process"])
+                    _close_pdf_result_queue(state["queue"])
+                    processes.pop(key, None)
+                    results[key] = ([], [], "pdf_batch_timeout")
+                    parsed += 1
+                    filing = state["item"][1]
+                    _emit_ingestion_progress(
+                        progress,
+                        "filing-parse",
+                        parsed,
+                        total,
+                        filing,
+                        status="blocked",
+                        error_code="pdf_batch_timeout",
+                        elapsed_seconds=time.monotonic() - state["started_at"],
+                    )
+                break
+            for key, state in tuple(processes.items()):
+                try:
+                    message = state["queue"].get_nowait()
+                except queue.Empty:
+                    message = None
+                if message is not None:
+                    progressed = True
+                    kind = message[0]
+                    if kind == "filing-index":
+                        if not state["indexed"]:
+                            state["indexed"] = True
+                            indexed += 1
+                            filing = state["item"][1]
+                            _emit_ingestion_progress(
+                                progress,
+                                "filing-index",
+                                indexed,
+                                total,
+                                filing,
+                                status="local-parsing",
+                                elapsed_seconds=time.monotonic() - state["started_at"],
+                            )
+                    elif kind == "filing-result":
+                        finish_process(key, message[1])
+                        start_next()
+                elif not state["process"].is_alive():
+                    # ``multiprocessing.Queue`` uses a feeder thread. A child
+                    # can therefore report not-alive before its final put is
+                    # visible to the parent. Give that bounded handoff a short
+                    # drain window before converting a normal result into an
+                    # exit failure.
+                    final_result = None
+                    drain_deadline = time.monotonic() + exit_drain_seconds
+                    while time.monotonic() < drain_deadline:
+                        try:
+                            pending_message = state["queue"].get(
+                                timeout=max(0.001, drain_deadline - time.monotonic())
+                            )
+                        except queue.Empty:
+                            continue
+                        if pending_message and pending_message[0] == "filing-index":
+                            if not state["indexed"]:
+                                state["indexed"] = True
+                                indexed += 1
+                                filing = state["item"][1]
+                                _emit_ingestion_progress(
+                                    progress,
+                                    "filing-index",
+                                    indexed,
+                                    total,
+                                    filing,
+                                    status="local-parsing",
+                                    elapsed_seconds=time.monotonic() - state["started_at"],
+                                )
+                        elif pending_message and pending_message[0] == "filing-result":
+                            final_result = pending_message[1]
+                            break
+                    finish_process(
+                        key,
+                        final_result or (key, [], [], "pdf_worker_exit_failed"),
+                    )
+                    start_next()
+                elif now >= state["deadline"]:
+                    _terminate_pdf_process(state["process"])
+                    _close_pdf_result_queue(state["queue"])
+                    processes.pop(key, None)
+                    results[key] = ([], [], "pdf_parse_timeout")
+                    parsed += 1
+                    filing = state["item"][1]
+                    _emit_ingestion_progress(
+                        progress,
+                        "filing-parse",
+                        parsed,
+                        total,
+                        filing,
+                        status="blocked",
+                        error_code="pdf_parse_timeout",
+                        elapsed_seconds=time.monotonic() - state["started_at"],
+                    )
+                    start_next()
+            if not progressed:
+                time.sleep(0.01)
+        if not cancelled and time.monotonic() >= batch_deadline:
+            for key, filing, _manifest in uncached[next_item:]:
+                results[key] = ([], [], "pdf_batch_timeout")
+                parsed += 1
+                _emit_ingestion_progress(
+                    progress,
+                    "filing-parse",
+                    parsed,
+                    total,
+                    filing,
+                    status="blocked",
+                    error_code="pdf_batch_timeout",
+                )
+    finally:
+        for key, state in tuple(processes.items()):
+            _terminate_pdf_process(state["process"])
+            _close_pdf_result_queue(state["queue"])
+            results.setdefault(key, ([], [], "pdf_parse_cancelled" if cancelled else "pdf_worker_exit_failed"))
+
+
 def _safe_pdf_worker_count(
     filings: Sequence[FilingDocument], *, requested: int
 ) -> int:
-    """Keep process isolation inside a conservative aggregate file budget.
+    """Choose a bounded worker count from per-file, not batch, size.
 
-    Compressed annual reports expand substantially during text and coordinate
-    extraction. Small independent documents may use two workers; larger
-    batches remain sequential after concurrent download and page indexing.
+    A single unusually large report can lower its own scheduling pressure, but
+    it must not serialize unrelated reports in the same research request.
     """
 
     count = len(filings)
     if count <= 1:
         return count
-    total_bytes = 0
+    largest_bytes = 0
     for filing in filings:
         try:
-            total_bytes += Path(filing.local_path).stat().st_size
+            largest_bytes = max(largest_bytes, Path(filing.local_path).stat().st_size)
         except OSError:
             return 1
-    if total_bytes > 8 * 1024 * 1024:
-        return 1
-    return max(1, min(2, int(requested), count))
+    bounded = max(1, min(3, int(requested), count))
+    # Keep two lanes for a very large individual PDF; the memory budget is
+    # intentionally per-file so small reports can still make progress.
+    if largest_bytes > 64 * 1024 * 1024:
+        return min(2, bounded)
+    return bounded
+
+
+def _candidate_pages_from_text(
+    page_texts: Sequence[str], *, continuation_pages: int
+) -> frozenset[int] | None:
+    """Convert one page-index text stream into the bounded candidate set."""
+
+    starts: list[int] = []
+    summary_pages: set[int] = set()
+    statement_kinds: set[str] = set()
+    for page_number, text in enumerate(page_texts, 1):
+        compact = re.sub(r"\s+", "", text).casefold()
+        if any(label.casefold() in compact for label in _LABELS["reported_roe"]):
+            # ROE is commonly disclosed in a standalone performance table
+            # outside the three formal statements. Keep the exact page in
+            # the bounded coordinate pass without widening its continuation
+            # window to unrelated narrative pages.
+            summary_pages.add(page_number)
+        statement_context = _statement_context(text)
+        if statement_context is not None:
+            starts.append(page_number)
+            statement_kinds.add(statement_context[0])
+    # A partial index is unsafe: missing one statement can make the coordinate
+    # parser report an apparently valid but incomplete filing. Returning None
+    # deliberately fails open to the full-document parser.
+    if not starts or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
+        return None
+    selected: set[int] = set()
+    page_count = len(page_texts)
+    for start in starts:
+        selected.update(
+            range(start, min(page_count, start + max(0, continuation_pages)) + 1)
+        )
+    selected.update(summary_pages)
+    return frozenset(selected)
+
+
+def _close_pdf_resource(resource: Any) -> None:
+    """Close a PDFium resource without masking the original parse failure."""
+
+    try:
+        close = getattr(resource, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def _candidate_financial_pages_pypdfium(
+    path: str, *, continuation_pages: int
+) -> frozenset[int] | None:
+    """Index page text through PDFium, closing page/text/document resources."""
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(path)
+    page_texts: list[str] = []
+    try:
+        for page_number in range(len(document)):
+            page = document[page_number]
+            try:
+                text_page = page.get_textpage()
+                try:
+                    page_texts.append(str(text_page.get_text_range() or ""))
+                finally:
+                    _close_pdf_resource(text_page)
+            finally:
+                _close_pdf_resource(page)
+    finally:
+        _close_pdf_resource(document)
+    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages)
+
+
+def _candidate_financial_pages_pypdf(
+    path: str, *, continuation_pages: int
+) -> frozenset[int] | None:
+    """Compatibility indexer used when PDFium is unavailable or incomplete."""
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    page_texts = [(page.extract_text() or "") for page in reader.pages]
+    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages)
 
 
 def _candidate_financial_pages(path: str, *, continuation_pages: int = 3) -> frozenset[int] | None:
     """Find formal statement pages with a low-memory text prepass.
 
-    Annual reports can contain hundreds of narrative pages. Extracting
-    coordinate words from every page is both slow and memory-heavy, so pypdf
-    first locates title-like financial statements. The coordinate parser then
-    reads only each title page and a bounded continuation window. If the index
-    cannot be built, callers fail open to the established full-document path.
+    PDFium supplies the fast text layer for the normal path. If PDFium cannot
+    be imported/read safely, or produces an incomplete three-statement index,
+    pypdf remains the compatibility fallback. Both paths retain the bounded
+    continuation window and standalone ROE summary-page semantics.
     """
 
     try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(path)
-        starts: list[int] = []
-        summary_pages: set[int] = set()
-        statement_kinds: set[str] = set()
-        for page_number, page in enumerate(reader.pages, 1):
-            text = page.extract_text() or ""
-            compact = re.sub(r"\s+", "", text).casefold()
-            if any(
-                label.casefold() in compact
-                for label in _LABELS["reported_roe"]
-            ):
-                # ROE is commonly disclosed in a standalone performance table
-                # outside the three formal statements. Keep the exact page in
-                # the bounded coordinate pass without widening its continuation
-                # window to unrelated narrative pages.
-                summary_pages.add(page_number)
-            statement_context = _statement_context(text)
-            if statement_context is not None:
-                starts.append(page_number)
-                statement_kinds.add(statement_context[0])
-        # A partial index is unsafe: missing one statement can make the
-        # coordinate parser report an apparently valid but incomplete filing.
-        # Returning None deliberately fails open to the full-document parser.
-        if not starts or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
-            return None
-        selected: set[int] = set()
-        page_count = len(reader.pages)
-        for start in starts:
-            selected.update(
-                range(start, min(page_count, start + max(0, continuation_pages)) + 1)
-            )
-        selected.update(summary_pages)
-        return frozenset(selected)
+        indexed = _candidate_financial_pages_pypdfium(
+            path, continuation_pages=continuation_pages
+        )
+        if indexed is not None:
+            return indexed
+    except Exception:
+        pass
+    try:
+        return _candidate_financial_pages_pypdf(
+            path, continuation_pages=continuation_pages
+        )
     except Exception:
         return None
 
@@ -1534,6 +2152,107 @@ class FinancialCandidateCollection:
 
 class FinancialIngestionEngine:
     """Structured-first engine; PDF is a coordinate-aware deterministic fallback."""
+
+    def __init__(
+        self,
+        cache_dir: str | Path | None = None,
+        *,
+        max_workers: int = 3,
+        parse_timeout_seconds: float = 120.0,
+        batch_timeout_seconds: float = 280.0,
+    ) -> None:
+        # The cache is deliberately optional so fixture/injected engines keep
+        # their historical behavior. Production supplies a workspace-owned
+        # directory; successful entries are content addressed and atomic.
+        self._parse_cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self._parse_cache_memory: dict[str, tuple[list[FinancialFact], list[EvidenceRef]]] = {}
+        self._max_workers = max(1, min(3, int(max_workers)))
+        self._parse_timeout_seconds = max(0.1, float(parse_timeout_seconds))
+        self._batch_timeout_seconds = max(0.1, min(280.0, float(batch_timeout_seconds)))
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _parse_cache_key(
+        self, path: str, company: Company, filing: FilingDocument, actual_hash: str
+    ) -> str:
+        profile = "|".join(
+            str(getattr(company, name, ""))
+            for name in ("market", "accounting_standard", "industry", "industry_support", "company_type")
+        )
+        policy = "|".join((filing.fiscal_period or "FY", filing.period_end or "", "consolidated", company.reporting_currency or ""))
+        material = "|".join(
+            (
+                actual_hash,
+                _PDF_PARSER_VERSION,
+                _PDF_TAXONOMY_VERSION,
+                _PDF_CACHE_POLICY_VERSION,
+                profile,
+                policy,
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _load_parse_cache(
+        self, key: str
+    ) -> tuple[list[FinancialFact], list[EvidenceRef]] | None:
+        cached = self._parse_cache_memory.get(key)
+        if cached is not None:
+            return ([replace(item) for item in cached[0]], [replace(item) for item in cached[1]])
+        if self._parse_cache_dir is None:
+            return None
+        cache_path = self._parse_cache_dir / f"{key}.json"
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            facts = [FinancialFact(**item) for item in payload["facts"]]
+            refs = [EvidenceRef(**item) for item in payload["evidence"]]
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+        self._parse_cache_memory[key] = (facts, refs)
+        return ([replace(item) for item in facts], [replace(item) for item in refs])
+
+    def _store_parse_cache(
+        self,
+        key: str,
+        facts: Sequence[FinancialFact],
+        refs: Sequence[EvidenceRef],
+    ) -> None:
+        safe_facts = [replace(item) for item in facts]
+        safe_refs = [replace(item) for item in refs]
+        self._parse_cache_memory[key] = (safe_facts, safe_refs)
+        if self._parse_cache_dir is None:
+            return
+        payload = json.dumps(
+            {"facts": [item.to_dict() for item in safe_facts], "evidence": [item.to_dict() for item in safe_refs]},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self._parse_cache_dir.mkdir(parents=True, exist_ok=True)
+        destination = self._parse_cache_dir / f"{key}.json"
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{key}-", suffix=".tmp",
+                dir=self._parse_cache_dir, delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def collect_candidate_batches(
         self,
@@ -1580,6 +2299,9 @@ class FinancialIngestionEngine:
             manifest_by_document,
             cancel_check=cancel_check,
             progress=progress,
+            max_workers=self._max_workers,
+            parse_timeout_seconds=self._parse_timeout_seconds,
+            batch_timeout_seconds=self._batch_timeout_seconds,
         )
         batches: dict[str, tuple[Any, ...]] = {}
         all_evidence: list[EvidenceRef] = []
@@ -2252,3 +2974,8 @@ def ingest_official_pdf(filing: FilingDocument, company: Company):
         raise FinancialExtractionError("; ".join(dataset.diagnostics) or "no_financial_facts")
     warnings = tuple(dataset.diagnostics)
     return list(dataset.accepted_facts), list(dataset.evidence), warnings
+
+
+# Captured after class construction so tests that monkeypatch the parser do
+# not accidentally masquerade as the production, process-isolated path.
+_ORIGINAL_PARSE_PDF_AST = FinancialIngestionEngine._parse_pdf_ast

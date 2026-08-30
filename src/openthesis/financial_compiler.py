@@ -8,10 +8,13 @@ here so a service or retry path cannot accidentally create a second policy.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, Iterable, Protocol, Sequence
+import inspect
+import time
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_ingestion import FinancialIngestionEngine
@@ -21,6 +24,41 @@ from .market_financials import ValidationStatus
 CORE_CONCEPTS = frozenset(
     {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"}
 )
+
+
+def _emit_filing_progress(
+    progress: Any,
+    stage: str,
+    current: int,
+    total: int,
+    filing: FilingDocument,
+    *,
+    status: str,
+) -> None:
+    """Emit stable filing states while retaining three-argument callbacks."""
+
+    if progress is None:
+        return
+    detail = {
+        "filing_id": filing.document_id,
+        "label": filing.primary_document or filing.accession_number or filing.document_id,
+        "status": status,
+        "error_code": "",
+        "elapsed_seconds": 0.0,
+    }
+    try:
+        signature = inspect.signature(progress)
+        accepts_detail = any(
+            parameter.kind is inspect.Parameter.VAR_POSITIONAL
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ) or len(signature.parameters) >= 4
+    except (TypeError, ValueError):
+        accepts_detail = True
+    if accepts_detail:
+        progress(stage, current, total, detail)
+    else:
+        progress(stage, current, total)
 
 
 def concepts_cover_profile(
@@ -416,6 +454,8 @@ class VisionCandidateExtractor:
     adapter: Any
     config: Any
     cancel_check: Any = None
+    validation_issues_by_document: Mapping[str, Sequence[str]] | None = None
+    existing_facts_by_document: Mapping[str, Sequence[FinancialFact]] | None = None
     stage_kind: GapStageKind = GapStageKind.MINERU
     name: str = "vision-fallback"
 
@@ -424,7 +464,11 @@ class VisionCandidateExtractor:
 
         if self.cancel_check is not None and self.cancel_check():
             return CandidateBatch(filing, diagnostics=("vision_cancelled",))
-        pages = _vision_failed_pages(filing, self.config)
+        issues = (self.validation_issues_by_document or {}).get(filing.document_id, ())
+        existing_facts = (self.existing_facts_by_document or {}).get(
+            filing.document_id, ()
+        )
+        pages = _vision_failed_pages(filing, self.config, issues, existing_facts)
         if not pages:
             return CandidateBatch(filing, diagnostics=("vision_no_failed_pages",))
         result = self.adapter.extract(
@@ -444,6 +488,56 @@ class VisionCandidateExtractor:
         return CandidateBatch(
             filing, candidates, tuple(result.evidence), tuple(result.diagnostics)
         )
+
+
+def _prefetch_vision_batches(
+    subject: Company,
+    filings: Sequence[FilingDocument],
+    extractor: VisionCandidateExtractor,
+    *,
+    timeout_seconds: float,
+) -> dict[str, CandidateBatch]:
+    """Run authorized visual gap extraction with deterministic bounded fan-out.
+
+    The first canonical pass determines the missing filing contexts before
+    this function is called. Results are collected in filing order and then
+    passed to one compiler quality gate; a timeout, cancellation, or adapter
+    failure produces diagnostics only and is never cached as a candidate.
+    """
+
+    ordered = tuple(filings)
+    if not ordered:
+        return {}
+    worker_count = max(1, min(2, len(ordered)))
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix="financial-vision"
+    )
+    futures = {
+        filing.document_id: executor.submit(extractor.extract, subject, filing)
+        for filing in ordered
+    }
+    results: dict[str, CandidateBatch] = {}
+    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
+    try:
+        for filing in ordered:
+            future = futures[filing.document_id]
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                batch = future.result(timeout=remaining)
+            except FuturesTimeoutError:
+                batch = CandidateBatch(filing, diagnostics=("vision_timeout",))
+            except Exception as exc:
+                batch = CandidateBatch(
+                    filing, diagnostics=(f"vision_failed:{type(exc).__name__}",)
+                )
+            results[filing.document_id] = batch
+    finally:
+        # Adapters receive the coordinator cancellation callback and own their
+        # remote timeout. Waiting here guarantees no executor thread survives
+        # the compiler call, while cancel_futures prevents queued work from
+        # starting after a timeout/cancellation.
+        executor.shutdown(wait=True, cancel_futures=True)
+    return results
 
 
 def _period_range_bounds(value: object) -> tuple[str | None, str | None]:
@@ -619,10 +713,29 @@ class FinancialFactCompiler:
             period_range=actual_range,
             fiscal_period=target_fiscal_period,
         )
+        total_filings = len(filings)
+        for index, filing in enumerate(filings, start=1):
+            _emit_filing_progress(
+                progress,
+                "filing-validation",
+                index,
+                total_filings,
+                filing,
+                status="local-validating",
+            )
         # Resolve structured/PDF/same-year candidates first.  A local
         # success must never trigger a network vision call, while an
         # incomplete target group must validate the session-only vision
         # configuration before its extractor is even constructed.
+        for index, filing in enumerate(filings, start=1):
+            _emit_filing_progress(
+                progress,
+                "filing-validation",
+                index,
+                total_filings,
+                filing,
+                status="canonical-compiling",
+            )
         dataset = self.compile(
             subject,
             actual_range,
@@ -638,9 +751,59 @@ class FinancialFactCompiler:
             if not callable(validate):
                 raise ValueError("vision_config_validation_required")
             validate()
+            validation_issues_by_document: dict[str, tuple[str, ...]] = {}
+            existing_facts_by_document: dict[str, tuple[FinancialFact, ...]] = {}
+            visual_filings: list[FilingDocument] = []
+            for filing in filings:
+                accession = filing.accession_number
+                groups = tuple(
+                    item for item in dataset.validations
+                    if tuple(getattr(item, "identity", ()))
+                    and item.identity[0] == accession
+                )
+                validation_issues_by_document[filing.document_id] = tuple(
+                    issue for item in groups for issue in getattr(item, "issues", ())
+                )
+                existing_facts_by_document[filing.document_id] = tuple(
+                    fact for fact in dataset.resolved_facts
+                    if fact.accession_number == accession
+                )
+                if not groups or any(
+                    getattr(item.status, "value", item.status)
+                    != ValidationStatus.VERIFIED.value
+                    for item in groups
+                ):
+                    visual_filings.append(filing)
+            vision_extractor = VisionCandidateExtractor(
+                engine,
+                vision_fallback,
+                vision_config,
+                cancel_check,
+                validation_issues_by_document,
+                existing_facts_by_document,
+            )
+            for index, filing in enumerate(visual_filings, start=1):
+                _emit_filing_progress(
+                    progress,
+                    "vision-processing",
+                    index,
+                    len(visual_filings),
+                    filing,
+                    status="cloud-processing",
+                )
+            # Determine all filing gaps from the first canonical pass, then
+            # perform authorized page extraction with two bounded workers. The
+            # resulting candidate map is deterministic before the second,
+            # shared compiler quality gate runs.
+            vision_batches = _prefetch_vision_batches(
+                subject,
+                visual_filings,
+                vision_extractor,
+                timeout_seconds=float(getattr(vision_config, "timeout_seconds", 60.0)),
+            )
             extractors.append(
-                VisionCandidateExtractor(
-                    engine, vision_fallback, vision_config, cancel_check
+                MappedCandidateExtractor(
+                    vision_batches, GapStageKind.MINERU, "vision-fallback"
                 )
             )
             dataset = self.compile(
@@ -653,6 +816,30 @@ class FinancialFactCompiler:
                         and getattr(vision_config, "consent", False)
                     ),
                 ),
+            )
+        for index, filing in enumerate(filings, start=1):
+            groups = tuple(
+                item for item in dataset.validations
+                if tuple(getattr(item, "identity", ()))
+                and item.identity[0] == filing.accession_number
+            )
+            final_status = (
+                "validated"
+                if groups
+                and all(
+                    getattr(item.status, "value", item.status)
+                    == ValidationStatus.VERIFIED.value
+                    for item in groups
+                )
+                else "blocked"
+            )
+            _emit_filing_progress(
+                progress,
+                "filing-validation",
+                index,
+                total_filings,
+                filing,
+                status=final_status,
             )
         return replace(dataset, manifests=collection.manifests)
 

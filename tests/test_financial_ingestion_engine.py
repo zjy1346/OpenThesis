@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import sys
 import tempfile
 import threading
 import time
@@ -38,6 +39,7 @@ from openthesis.financial_ingestion import (
       _candidate_financial_pages,
       _safe_pdf_worker_count,
 )
+from openthesis.financial_compiler import _prefetch_vision_batches
 from openthesis.financials import calculate_interim_metrics
 from openthesis.market_financials import FinancialValidation, ValidationStatus
 from openthesis.vision_financials import VisionExtractionResult, VisionFallbackConfig, VisionPageRequest
@@ -64,6 +66,22 @@ def _official_pdf(env_name: str, relative_path: str) -> str:
     if not local_app_data:
         return ""
     return str(Path(local_app_data) / "OpenThesis" / "filings" / relative_path)
+
+
+def _spawn_scheduler_test_entry(key, _company, filing, _manifest, _candidate_pages, result_queue):
+    """Picklable worker seam used only to exercise scheduler lifecycle."""
+
+    marker = Path(filing.local_path + ".started")
+    active = Path(filing.local_path + ".active")
+    marker.write_text("started", encoding="utf-8")
+    active.write_text("active", encoding="utf-8")
+    if "slow" in filing.document_id or "block" in filing.document_id:
+        time.sleep(10)
+    result_queue.put(("filing-index", key, frozenset({1}), None))
+    error = "fixture-failure" if "fail" in filing.document_id else None
+    result_queue.put(("filing-result", (key, [], [], error)))
+    active.unlink(missing_ok=True)
+    Path(filing.local_path + ".done").write_text("done", encoding="utf-8")
 
 
 def _acceptance_pdf(env_name: str, relative_path: str, acceptance_name: str) -> str:
@@ -158,6 +176,80 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             selected = _candidate_financial_pages("annual.pdf")
         self.assertEqual(selected, frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10}))
 
+    def test_financial_page_prepass_uses_pdfium_and_closes_resources(self) -> None:
+        class TextPage:
+            def __init__(self, text: str) -> None:
+                self.text = text
+                self.closed = False
+            def get_text_range(self) -> str:
+                return self.text
+            def close(self) -> None:
+                self.closed = True
+
+        class Page:
+            def __init__(self, text: str) -> None:
+                self.text_page = TextPage(text)
+                self.closed = False
+            def get_textpage(self) -> TextPage:
+                return self.text_page
+            def close(self) -> None:
+                self.closed = True
+
+        class Document:
+            def __init__(self) -> None:
+                self.pages = [Page(text) for text in (
+                    "CONSOLIDATED INCOME STATEMENT", "continuation",
+                    "CONSOLIDATED BALANCE SHEET", "CONSOLIDATED STATEMENT OF CASH FLOWS",
+                    "continuation", "continuation", "narrative",
+                )]
+                self.closed = False
+            def __len__(self) -> int:
+                return len(self.pages)
+            def __getitem__(self, index: int) -> Page:
+                return self.pages[index]
+            def close(self) -> None:
+                self.closed = True
+
+        document = Document()
+        fake_pdfium = type("Pdfium", (), {"PdfDocument": lambda _path: document})
+        with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
+                patch("pypdf.PdfReader") as reader:
+            selected = _candidate_financial_pages("annual.pdf")
+        self.assertEqual(selected, frozenset({1, 2, 3, 4, 5, 6, 7}))
+        self.assertTrue(document.closed)
+        self.assertTrue(all(page.closed for page in document.pages))
+        self.assertTrue(all(page.text_page.closed for page in document.pages))
+        reader.assert_not_called()
+
+    def test_financial_page_prepass_falls_back_when_pdfium_index_is_incomplete(self) -> None:
+        class IncompleteDocument:
+            def __len__(self) -> int:
+                return 2
+            def __getitem__(self, index: int):
+                class Page:
+                    def get_textpage(self):
+                        return type("Text", (), {"get_text_range": lambda self: "CONSOLIDATED INCOME STATEMENT" if index == 0 else "CONSOLIDATED BALANCE SHEET", "close": lambda self: None})()
+                    def close(self):
+                        pass
+                return Page()
+            def close(self):
+                pass
+
+        class PdfPage:
+            def __init__(self, text: str) -> None:
+                self.text = text
+            def extract_text(self) -> str:
+                return self.text
+
+        class PdfReader:
+            pages = [PdfPage("CONSOLIDATED INCOME STATEMENT"), PdfPage("CONSOLIDATED BALANCE SHEET"), PdfPage("CONSOLIDATED STATEMENT OF CASH FLOWS")]
+
+        fake_pdfium = type("Pdfium", (), {"PdfDocument": lambda _path: IncompleteDocument()})
+        with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
+                patch("pypdf.PdfReader", return_value=PdfReader()):
+            selected = _candidate_financial_pages("annual.pdf")
+        self.assertEqual(selected, frozenset({1, 2, 3}))
+
     def test_pdf_process_parallelism_falls_back_for_large_compressed_batches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             small = []
@@ -171,7 +263,241 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             large = _filing("large", path=str(large_path))
 
             self.assertEqual(_safe_pdf_worker_count(small, requested=3), 2)
-            self.assertEqual(_safe_pdf_worker_count([small[0], large], requested=3), 1)
+            # A large batch must not force every document into one global
+            # worker.  Scheduling remains bounded, but the per-file budget
+            # may still reduce the requested count.
+            self.assertEqual(_safe_pdf_worker_count([small[0], large], requested=3), 2)
+
+    def test_pdf_helper_streams_fast_document_before_slow_document(self) -> None:
+        progress: list[tuple[str, int, int]] = []
+        started: list[str] = []
+        release_slow = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for name in ("fast", "slow"):
+                path = Path(directory) / f"{name}.pdf"
+                path.write_bytes(name.encode())
+                filing = _filing(name, path=str(path))
+                filing.content_hash = name
+                filings.append(filing)
+
+            def parse(_path, _company, filing, _manifest):
+                started.append(filing.document_id)
+                if filing.document_id == "slow":
+                    release_slow.wait(timeout=1)
+                return [], []
+
+            result_holder: list[dict] = []
+            worker = threading.Thread(
+                target=lambda: result_holder.append(_parse_local_pdfs_bounded(
+                    FinancialIngestionEngine(), _company(), filings,
+                    {item.document_id: _manifest_for(item) for item in filings},
+                    parse=parse, progress=lambda *event: progress.append(event),
+                    max_workers=2,
+                )),
+                daemon=True,
+            )
+            worker.start()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and ("filing-parse", 1, 2) not in progress:
+                time.sleep(0.005)
+            self.assertEqual(progress[0], ("cache-check", 1, 2))
+            self.assertIn(("filing-parse", 1, 2), progress)
+            release_slow.set()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([item.document_id for item in filings], list(result_holder[0]))
+
+    def test_isolated_scheduler_limits_processes_and_orders_index_before_result(self) -> None:
+        events: list[tuple[str, int, int]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for index in range(4):
+                path = Path(directory) / f"spawn-{index}.pdf"
+                path.write_bytes(f"fixture-{index}".encode())
+                item = _filing(f"spawn-{index}", path=str(path))
+                item.content_hash = ""
+                filings.append(item)
+            holder: list[dict] = []
+            thread = threading.Thread(target=lambda: holder.append(_parse_local_pdfs_bounded(
+                FinancialIngestionEngine(), _company(), filings,
+                {item.document_id: _manifest_for(item) for item in filings},
+                worker_entry=_spawn_scheduler_test_entry,
+                progress=lambda *event: events.append(event), max_workers=2,
+                parse_timeout_seconds=2,
+            )))
+            thread.start()
+            peak = 0
+            while thread.is_alive():
+                peak = max(peak, len(list(Path(directory).glob("*.active"))))
+                time.sleep(0.01)
+            thread.join(timeout=1)
+            result = holder[0]
+            self.assertEqual(len(result), 4)
+            self.assertLessEqual(peak, 2)
+            stages = [event[0] for event in events]
+            self.assertEqual(stages.count("cache-check"), 4)
+            self.assertEqual(stages.count("filing-index"), 4)
+            self.assertEqual(stages.count("filing-parse"), 4)
+            self.assertEqual(stages[4], "filing-index")
+            for item in filings:
+                self.assertTrue(Path(item.local_path + ".done").is_file())
+
+    def test_isolated_scheduler_timeout_and_cancel_terminate_report_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            slow_path = Path(directory) / "slow.pdf"
+            slow_path.write_bytes(b"fixture")
+            slow = _filing("slow", path=str(slow_path))
+            slow.content_hash = ""
+            started = time.monotonic()
+            result = _parse_local_pdfs_bounded(
+                FinancialIngestionEngine(), _company(), [slow],
+                {slow.document_id: _manifest_for(slow)},
+                worker_entry=_spawn_scheduler_test_entry, max_workers=1,
+                parse_timeout_seconds=0.2,
+            )
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(result[slow.document_id][2], "pdf_parse_timeout")
+            self.assertFalse(Path(slow.local_path + ".done").exists())
+
+            cancel = threading.Event()
+            blocked_path = Path(directory) / "block.pdf"
+            blocked_path.write_bytes(b"fixture")
+            blocked = _filing("block", path=str(blocked_path))
+            blocked.content_hash = ""
+            holder: list[dict] = []
+            thread = threading.Thread(target=lambda: holder.append(_parse_local_pdfs_bounded(
+                FinancialIngestionEngine(), _company(), [blocked],
+                {blocked.document_id: _manifest_for(blocked)},
+                worker_entry=_spawn_scheduler_test_entry, cancel_check=cancel.is_set,
+                max_workers=1, parse_timeout_seconds=10,
+            )))
+            thread.start()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not Path(blocked.local_path + ".started").exists():
+                time.sleep(0.01)
+            cancel.set()
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(Path(blocked.local_path + ".done").exists())
+
+    def test_batch_watchdog_blocks_running_and_queued_reports_without_reducing_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for document_id in ("slow-batch", "queued-batch"):
+                path = Path(directory) / f"{document_id}.pdf"
+                path.write_bytes(b"fixture")
+                filing = _filing(document_id, path=str(path))
+                filing.content_hash = ""
+                filings.append(filing)
+            started = time.monotonic()
+            result = _parse_local_pdfs_bounded(
+                FinancialIngestionEngine(),
+                _company(),
+                filings,
+                {item.document_id: _manifest_for(item) for item in filings},
+                worker_entry=_spawn_scheduler_test_entry,
+                max_workers=1,
+                parse_timeout_seconds=10,
+                batch_timeout_seconds=0.2,
+            )
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(set(result), {item.document_id for item in filings})
+            self.assertTrue(
+                all(value[2] == "pdf_batch_timeout" for value in result.values())
+            )
+            self.assertFalse(any(Path(item.local_path + ".done").exists() for item in filings))
+
+    def test_parse_single_flight_failure_wakes_concurrent_waiter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "same.pdf"
+            path.write_bytes(b"same-content")
+            first = _filing("fail-one", path=str(path))
+            second = _filing("fail-two", path=str(path))
+            first.content_hash = second.content_hash = ""
+            manifests = {
+                first.document_id: _manifest_for(first),
+                second.document_id: _manifest_for(second),
+            }
+            results: list[dict] = []
+            threads = [
+                threading.Thread(target=lambda item=item: results.append(_parse_local_pdfs_bounded(
+                    FinancialIngestionEngine(), _company(), [item],
+                    {item.document_id: manifests[item.document_id]},
+                    worker_entry=_spawn_scheduler_test_entry, max_workers=1,
+                    parse_timeout_seconds=2,
+                )))
+                for item in (first, second)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=4)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(next(iter(item.values()))[2] == "fixture-failure" for item in results))
+
+    def test_pdf_parse_cache_reuses_success_and_invalidates_parser_version(self) -> None:
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cached.pdf"
+            path.write_bytes(b"stable-pdf")
+            filing = _filing("cached", path=str(path))
+            filing.content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            cache_dir = Path(directory) / "cache"
+            engine = FinancialIngestionEngine(cache_dir=cache_dir)
+            second_engine = FinancialIngestionEngine(cache_dir=cache_dir)
+
+            def parse(self, _path, _company, item, _manifest, **_kwargs):
+                calls.append(item.document_id)
+                fact = _fact(item, "revenue", 100)
+                return [fact], [self._evidence_for_fact(fact, item)]
+
+            manifests = {filing.document_id: _manifest_for(filing)}
+            with patch.object(FinancialIngestionEngine, "_parse_pdf_ast", parse), \
+                    patch("openthesis.financial_ingestion._candidate_financial_pages", return_value=frozenset({1})):
+                first = _parse_local_pdfs_bounded(engine, _company(), [filing], manifests)
+                second = _parse_local_pdfs_bounded(second_engine, _company(), [filing], manifests)
+                self.assertEqual(len(calls), 1)
+                self.assertIn(filing.document_id, second)
+                cached_facts, cached_refs, cached_error = second[filing.document_id]
+                self.assertIsNone(cached_error)
+                self.assertIsInstance(cached_facts[0], FinancialFact)
+                self.assertIsInstance(cached_refs[0], EvidenceRef)
+                with patch("openthesis.financial_ingestion._PDF_PARSER_VERSION", "new-parser"):
+                    third = _parse_local_pdfs_bounded(second_engine, _company(), [filing], manifests)
+            self.assertIn(filing.document_id, first)
+            self.assertIn(filing.document_id, third)
+            self.assertEqual(len(calls), 2)
+
+    def test_default_pdf_pipeline_reports_cache_and_index_stages_before_all_files(self) -> None:
+        events: list[tuple[str, int, int]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for name in ("fast-index", "slow-index"):
+                path = Path(directory) / f"{name}.pdf"
+                path.write_bytes(name.encode())
+                filing = _filing(name, path=str(path))
+                filing.content_hash = name
+                filings.append(filing)
+
+            def parse(self, _path, _company, _filing, _manifest, **_kwargs):
+                return [], []
+
+            def index(path: str):
+                if "slow-index" in path:
+                    time.sleep(0.1)
+                return frozenset({1})
+
+            with patch.object(FinancialIngestionEngine, "_parse_pdf_ast", parse), \
+                    patch("openthesis.financial_ingestion._candidate_financial_pages", side_effect=index):
+                _parse_local_pdfs_bounded(
+                    FinancialIngestionEngine(), _company(), filings,
+                    {item.document_id: _manifest_for(item) for item in filings},
+                    progress=lambda *event: events.append(event), max_workers=2,
+                )
+        self.assertEqual(events[0], ("cache-check", 1, 2))
+        self.assertIn(("filing-index", 1, 2), events)
 
     def test_ingest_parses_local_filings_with_bounded_parallelism_and_ordered_reuse(self) -> None:
         active = 0
@@ -310,6 +636,81 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                     actual, config, ("balance_sheet_core_missing",), ()
                 )
         self.assertEqual([page.original_page for page in selected], [3, 4])
+
+    def test_vision_page_selection_only_uploads_missing_statement_after_local_facts(self) -> None:
+        class Page:
+            def __init__(self, text: str):
+                self.text = text
+            def extract_text(self):
+                return self.text
+
+        pages = [
+            Page("Consolidated income statement"),
+            Page("Revenue continued"),
+            Page("Consolidated balance sheet"),
+            Page("Assets continued"),
+            Page("Consolidated statement of cash flows"),
+            Page("Cash flows continued"),
+        ]
+
+        class Reader:
+            def __init__(self, _path):
+                self.pages = pages
+
+        class Writer:
+            def add_page(self, _page):
+                pass
+            def write(self, buffer):
+                buffer.write(b"page")
+
+        filing = _filing("cninfo:vision-missing-cash", path="placeholder.pdf")
+        existing = [fact for fact in _core(filing) if fact.statement != "cash_flow"]
+        config = VisionFallbackConfig(enabled=True, consent=True, max_pages=20)
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
+            actual = filing.__class__(**{**filing.to_dict(), "local_path": handle.name})
+            with patch("pypdf.PdfReader", Reader), patch("pypdf.PdfWriter", Writer):
+                selected = _vision_failed_pages(
+                    actual, config, ("cash_flow_core_missing",), existing
+                )
+        self.assertEqual([page.original_page for page in selected], [5, 6])
+
+    def test_vision_prefetch_runs_two_filings_concurrently_and_preserves_order(self) -> None:
+        filings = [_filing("vision-prefetch-1"), _filing("vision-prefetch-2")]
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Extractor:
+            def extract(self, _subject, filing):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    entered.set()
+                release.wait(timeout=1)
+                with lock:
+                    active -= 1
+                return type("Batch", (), {
+                    "filing": filing, "candidates": (), "evidence": (), "diagnostics": ()
+                })()
+
+        result_holder: list[dict] = []
+        worker = threading.Thread(target=lambda: result_holder.append(
+            _prefetch_vision_batches(_company(), filings, Extractor(), timeout_seconds=1.0)
+        ))
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1))
+        time.sleep(0.05)
+        self.assertEqual(peak, 2)
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            tuple(result_holder[0]),
+            tuple(item.document_id for item in filings),
+        )
 
     def test_local_verified_group_never_calls_vision_adapter(self) -> None:
         import tempfile

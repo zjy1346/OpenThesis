@@ -97,4 +97,57 @@ describe("ResearchProgress", () => {
     view.unmount();
     vi.useRealTimers();
   });
+
+  it("localizes filing statuses and shows a bounded remaining range", () => {
+    render(
+      <ResearchProgress
+        language="en"
+        job={{
+          job_id: "eta",
+          state: "running",
+          message: "",
+          percent: 42,
+          run_id: null,
+          stage: "filing-validation",
+          stage_current: 2,
+          stage_total: 5,
+          elapsed_seconds: 30,
+          filing_states: {
+            first: { filing_id: "first", label: "2025", status: "validated", elapsed_seconds: 10 },
+            second: { filing_id: "second", label: "2024", status: "cloud-processing", elapsed_seconds: 8 },
+            third: { filing_id: "third", label: "2023", status: "queued", elapsed_seconds: 0 },
+          },
+        }}
+        labels={{ cancel: "Cancel", cancelling: "Stopping", agents: "Agents", running: "Running", retrying: "Retrying", queued: "Queued", completed: "Done", cancelled: "Cancelled", failed: "Failed", unknown: "Waiting" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Validated")).toBeInTheDocument();
+    expect(screen.getByText("Cloud processing")).toBeInTheDocument();
+    expect(screen.getByText("Queued")).toBeInTheDocument();
+    expect(screen.getByLabelText("Estimated remaining")).toBeInTheDocument();
+  });
+
+  it("does not estimate remaining while cloud approval is waiting", () => {
+    render(
+      <ResearchProgress
+        language="en"
+        job={{
+          job_id: "approval-eta",
+          state: "running",
+          message: "",
+          percent: 42,
+          run_id: null,
+          stage: "vision-approval",
+          stage_current: 2,
+          stage_total: 5,
+          elapsed_seconds: 30,
+          vision_approval_pending: true,
+        }}
+        labels={{ cancel: "Cancel", cancelling: "Stopping", agents: "Agents", running: "Running", retrying: "Retrying", queued: "Queued", completed: "Done", cancelled: "Cancelled", failed: "Failed", unknown: "Waiting" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText("Estimated remaining")).not.toBeInTheDocument();
+  });
 });

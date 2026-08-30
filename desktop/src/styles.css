@@ -149,7 +149,7 @@ button { color: inherit; }
 .research-stage-copy strong { font-size: 14px; line-height: 1.45; }
 .research-stage-copy span { color: #65726b; font-size: 12px; line-height: 1.55; }
 .research-stage-copy small { color: #466555; font-size: 11px; font-weight: 650; }
-.research-progress-metrics { flex: none; display: flex; align-items: center; gap: 12px; color: var(--ink-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.research-progress-metrics { flex: none; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; color: var(--ink-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .research-progress-metrics time { min-width: 68px; display: inline-flex; align-items: center; justify-content: flex-end; gap: 5px; }
 .research-progress button { grid-row: 1 / 4; grid-column: 2; align-self: center; padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; background: white; color: #536059; cursor: pointer; transition: transform 140ms var(--ease-out), background-color 140ms ease; }
 .research-progress button:active { transform: scale(.97); }
@@ -157,11 +157,20 @@ button { color: inherit; }
 .research-progress[data-state="cancelling"] { border-color: #e6d5b3; background: #fffaf0; }
 .research-waiting-copy { grid-column: 1; min-height: 38px; margin: 1px 0 0; padding: 9px 12px; border-left: 2px solid #a9cdb9; background: rgba(238, 247, 242, .72); color: #5d6c64; font-size: 11px; line-height: 1.65; opacity: 1; transition: opacity 160ms var(--ease-out); }
 @starting-style { .research-waiting-copy { opacity: 0; } }
+.research-remaining { grid-column: 1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; border: 1px solid #dfe9e2; border-radius: 8px; background: rgba(255,255,255,.7); color: #65726b; font-size: 11px; }
+.research-remaining strong { color: #38644e; font-variant-numeric: tabular-nums; }
 .vision-approval-card { grid-column: 1 / -1; display: grid; gap: 7px; padding: 14px; border: 1px solid #c8d9ef; border-radius: 12px; background: #f4f8ff; color: #29415d; }
 .vision-approval-card code { width: fit-content; padding: 3px 6px; border-radius: 5px; background: #e7eef8; font-size: 11px; }
 .vision-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
 .vision-approval-actions button { grid-row: auto; grid-column: auto; }
 .vision-approval-actions button:first-child { border-color: #2f6f50; background: #2f6f50; color: #fff; }
+.filing-progress-list { grid-column: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; max-height: 132px; overflow: auto; }
+.filing-progress-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; min-width: 0; padding: 7px 9px; border: 1px solid #dfe9e2; border-radius: 8px; background: rgba(255, 255, 255, .76); color: #506158; font-size: 10px; }
+.filing-progress-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filing-progress-row strong { color: #32634c; font-size: 10px; font-weight: 700; }
+.filing-progress-row time { color: var(--ink-muted); font-variant-numeric: tabular-nums; }
+.filing-progress-row code { grid-column: 1 / -1; overflow: hidden; color: #9a4d43; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.filing-progress-row[data-status="failed"], .filing-progress-row[data-status="blocked"] { border-color: #ecd2cb; background: #fff7f5; }
 .agent-progress { grid-column: 1; display: grid; gap: 7px; padding-top: 4px; }
 .agent-progress-heading { display: flex; justify-content: space-between; color: #536059; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 .agent-progress-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
@@ -464,6 +473,7 @@ button { color: inherit; }
   .research-progress-metrics { justify-content: space-between; }
   .research-progress button { grid-row: auto; grid-column: 1; justify-self: start; }
   .vision-approval-actions { flex-direction: column; align-items: stretch; }
+  .filing-progress-list { grid-template-columns: 1fr; }
   .agent-progress-list { grid-template-columns: 1fr; }
 }
 

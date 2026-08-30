@@ -5,7 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from .domain import (
     Company,
@@ -18,7 +18,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 class Storage:
@@ -178,6 +178,29 @@ class Storage:
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
+                CREATE TABLE IF NOT EXISTS vision_task_journal (
+                    task_key TEXT PRIMARY KEY,
+                    company_cik TEXT NOT NULL,
+                    document_id TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    remote_task_id TEXT NOT NULL DEFAULT '',
+                    page_hashes_json TEXT NOT NULL,
+                    page_numbers_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(company_cik) REFERENCES companies(cik)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_vision_task_company
+                ON vision_task_journal(company_cik, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS vision_result_cache (
+                    task_key TEXT PRIMARY KEY,
+                    result_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS research_runs (
                     run_id TEXT PRIMARY KEY,
                     company_cik TEXT NOT NULL,
@@ -251,6 +274,11 @@ class Storage:
                     "parser_version": "TEXT NOT NULL DEFAULT ''",
                     "validation_status": "TEXT NOT NULL DEFAULT 'unvalidated'",
                 },
+            )
+            self._ensure_columns(
+                db,
+                "vision_task_journal",
+                {"page_numbers_json": "TEXT NOT NULL DEFAULT '[]'"},
             )
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
@@ -425,6 +453,124 @@ class Storage:
                 (company_cik,),
             ).fetchone()
         return dict(row)
+
+    def save_vision_task(
+        self,
+        task_key: str,
+        *,
+        company_cik: str,
+        document_id: str,
+        provider: str,
+        page_hashes: Sequence[str],
+        page_numbers: Sequence[int] = (),
+        status: str,
+        remote_task_id: str = "",
+        error_code: str = "",
+    ) -> dict[str, Any]:
+        """Persist only safe cloud-task metadata, never document bytes or secrets."""
+
+        updated_at = utc_now_iso()
+        safe_hashes = [str(value) for value in page_hashes]
+        safe_page_numbers = [int(value) for value in page_numbers]
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO vision_task_journal(
+                    task_key, company_cik, document_id, provider, remote_task_id,
+                    page_hashes_json, page_numbers_json, status, error_code, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_key) DO UPDATE SET
+                    company_cik=excluded.company_cik,
+                    document_id=excluded.document_id,
+                    provider=excluded.provider,
+                    remote_task_id=CASE
+                        WHEN excluded.remote_task_id <> '' THEN excluded.remote_task_id
+                        ELSE vision_task_journal.remote_task_id
+                    END,
+                    page_hashes_json=excluded.page_hashes_json,
+                    page_numbers_json=excluded.page_numbers_json,
+                    status=excluded.status,
+                    error_code=excluded.error_code,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    task_key,
+                    company_cik,
+                    document_id,
+                    provider,
+                    remote_task_id,
+                    json.dumps(safe_hashes, separators=(",", ":")),
+                    json.dumps(safe_page_numbers, separators=(",", ":")),
+                    status,
+                    error_code,
+                    updated_at,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM vision_task_journal WHERE task_key = ?", (task_key,)
+            ).fetchone()
+        payload = dict(row)
+        payload["page_hashes"] = json.loads(payload.pop("page_hashes_json"))
+        payload["page_numbers"] = json.loads(payload.pop("page_numbers_json"))
+        return payload
+
+    def get_vision_task(self, task_key: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM vision_task_journal WHERE task_key = ?", (task_key,)
+            ).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["page_hashes"] = json.loads(payload.pop("page_hashes_json"))
+        payload["page_numbers"] = json.loads(payload.pop("page_numbers_json"))
+        return payload
+
+    def list_vision_tasks(self, company_cik: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM vision_task_journal
+                WHERE company_cik = ? ORDER BY updated_at DESC, task_key
+                """,
+                (company_cik,),
+            ).fetchall()
+        payloads: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["page_hashes"] = json.loads(item.pop("page_hashes_json"))
+            item["page_numbers"] = json.loads(item.pop("page_numbers_json"))
+            payloads.append(item)
+        return payloads
+
+    def save_vision_result(self, task_key: str, result: dict[str, Any]) -> None:
+        """Cache a complete candidate result; callers must not store credentials."""
+
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO vision_result_cache(task_key, result_json, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(task_key) DO UPDATE SET
+                    result_json=excluded.result_json,
+                    updated_at=excluded.updated_at
+                """,
+                (task_key, json.dumps(result, ensure_ascii=False), utc_now_iso()),
+            )
+
+    def get_vision_result(self, task_key: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT result_json FROM vision_result_cache WHERE task_key = ?",
+                (task_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["result_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def save_facts(self, facts: list[FinancialFact]) -> None:
         with self.connect() as db:

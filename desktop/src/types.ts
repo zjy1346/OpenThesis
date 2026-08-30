@@ -305,6 +305,23 @@ export type ResearchReport = {
   html: string;
 };
 
+export type FilingProgressStatus =
+  | "queued"
+  | "cache-check"
+  | "cache-hit"
+  | "indexing"
+  | "local-parsing"
+  | "local-validating"
+  | "cloud-awaiting-approval"
+  | "cloud-processing"
+  | "canonical-compiling"
+  | "validated"
+  | "blocked"
+  | "failed"
+  | "cancelled"
+  | "parsed"
+  | (string & {});
+
 export type ResearchJob = {
   job_id: string;
   state: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
@@ -317,10 +334,19 @@ export type ResearchJob = {
   total_agents?: number;
   cancel_requested?: boolean;
   elapsed_seconds?: number;
+  engine_active_seconds?: number;
+  external_wait_seconds?: number;
   stage_elapsed_seconds?: number;
   stage_timings?: Record<string, number>;
   stage_current?: number | null;
   stage_total?: number | null;
+  filing_states?: Record<string, {
+    filing_id: string;
+    label: string;
+    status: FilingProgressStatus;
+    error_code?: string;
+    elapsed_seconds?: number;
+  }>;
   error_code?: string | null;
   market?: Market | null;
   disclosure_url?: string | null;

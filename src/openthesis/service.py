@@ -37,6 +37,7 @@ from .financial_compiler import (
     FinancialFactCompiler,
     concepts_cover_profile,
 )
+from .financial_recognition import FinancialRecognitionCoordinator
 from .financials import deterministic_summary
 from .market_financials import FinancialValidation, ValidationStatus
 from .markets import COMMON_MARKET_COMPANIES, MARKET_PROFILES, Market, normalize_market
@@ -61,6 +62,7 @@ from .vision_financials import (
     VisionAdapterError,
     VisionFallbackConfig,
     VisionFinancialSourceAdapter,
+    VisionTaskCoordinator,
 )
 
 
@@ -160,11 +162,32 @@ class _ResearchJob:
     stage_started_at: float = field(default_factory=time.perf_counter, repr=False)
     finished_at: float | None = field(default=None, repr=False)
     stage_timings: dict[str, float] = field(default_factory=dict)
+    engine_active_seconds: float = 0.0
+    external_wait_seconds: float = 0.0
+    timing_started_at: float = field(default_factory=time.perf_counter, repr=False)
+    filing_states: dict[str, dict[str, Any]] = field(default_factory=dict)
     vision_upload_preview: dict[str, Any] | None = None
     vision_approval: bool | None = None
     vision_approval_pending: bool = False
     vision_approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
     operation_result: dict[str, Any] | None = None
+
+    @staticmethod
+    def _is_external_stage(stage: str) -> bool:
+        return stage in {
+            "filing-download",
+            "vision-approval",
+            "vision-processing",
+            "comparison",
+        }
+
+    def roll_timing(self, next_stage: str, now: float) -> None:
+        elapsed = max(0.0, now - self.timing_started_at)
+        if self._is_external_stage(self.stage):
+            self.external_wait_seconds += elapsed
+        else:
+            self.engine_active_seconds += elapsed
+        self.timing_started_at = now
 
     def snapshot(self) -> dict[str, Any]:
         now = self.finished_at or time.perf_counter()
@@ -172,6 +195,13 @@ class _ResearchJob:
         timings[self.stage] = timings.get(self.stage, 0.0) + max(
             0.0, now - self.stage_started_at
         )
+        current_bucket = max(0.0, now - self.timing_started_at)
+        active_seconds = self.engine_active_seconds
+        external_seconds = self.external_wait_seconds
+        if self._is_external_stage(self.stage):
+            external_seconds += current_bucket
+        else:
+            active_seconds += current_bucket
         return {
             "job_id": self.job_id,
             "state": self.state,
@@ -189,6 +219,11 @@ class _ResearchJob:
             "stage_elapsed_seconds": round(max(0.0, now - self.stage_started_at), 3),
             "stage_timings": {
                 key: round(value, 3) for key, value in timings.items()
+            },
+            "engine_active_seconds": round(active_seconds, 3),
+            "external_wait_seconds": round(external_seconds, 3),
+            "filing_states": {
+                key: dict(value) for key, value in self.filing_states.items()
             },
             "error_code": self.error_code,
             "market": self.market,
@@ -220,7 +255,12 @@ class AppService:
         self._sec_client_factory = sec_client_factory
         self._provider_factory = provider_factory
         self._market_data = market_data or MarketDataModule()
-        self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine()
+        self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine(
+            cache_dir=self.storage.data_dir / "financial-parse-cache"
+        )
+        self._financial_recognition = FinancialRecognitionCoordinator(
+            self._financial_ingestion
+        )
         self._vision_adapter_factory = vision_adapter_factory or _default_vision_adapter_factory
         self._jobs: dict[str, _ResearchJob] = {}
         self._jobs_lock = threading.Lock()
@@ -1111,7 +1151,7 @@ class AppService:
         for item in plan.documents:
             # Fresh discovery metadata wins, including a corrected revision.
             previous = stored_by_accession.get(item.accession_number)
-            if previous is not None:
+            if previous is not None and _filing_identity_matches(item, previous):
                 if not item.local_path:
                     item.local_path = previous.local_path
                 if not item.content_hash:
@@ -1126,7 +1166,7 @@ class AppService:
         unhealthy = {"REJECTED", "READY_WITH_WARNINGS", "UNVALIDATED", ""}
 
         def needs_refresh(filing: FilingDocument) -> bool:
-            path_ok = bool(filing.local_path) and Path(filing.local_path).is_file()
+            path_ok = _filing_cache_valid(filing)
             current = statuses.get(filing.accession_number)
             return (
                 not path_ok
@@ -1144,7 +1184,7 @@ class AppService:
         target_dir = self.storage.filings_dir / company.security_id.replace(":", "_")
         cached = [] if force else [
             item for item in targets
-            if item.local_path and Path(item.local_path).is_file()
+            if _filing_cache_valid(item)
         ]
         needs_download = [item for item in targets if item not in cached]
         progress("filing-download", 0, len(needs_download))
@@ -1170,28 +1210,16 @@ class AppService:
             for item in targets
         ]
         parse_targets = [item for item in reparsed if item is not None]
-        for index, filing in enumerate(parse_targets, start=1):
-            if cancel_check():
-                raise ResearchCancelled()
-            progress("filing-parse", index - 1, len(parse_targets))
-            try:
-                if hasattr(self._financial_ingestion, "collect_candidate_batches"):
-                    dataset = FinancialFactCompiler().compile_from_ingestion(
-                        company,
-                        [filing],
-                        self._financial_ingestion,
-                        cancel_check=cancel_check,
-                        progress=progress,
-                        reporting_currency=company.reporting_currency,
-                    )
-                else:
-                    # Compatibility-only seam for injected pre-canonical
-                    # engines in legacy tests.  Production always supplies
-                    # FinancialIngestionEngine.collect_candidate_batches.
-                    dataset = self._financial_ingestion.ingest(company, [filing])
-            except Exception as exc:
-                errors.append(f"{filing.accession_number}:parse:{type(exc).__name__}")
-                continue
+        if not parse_targets:
+            return errors
+
+        def persist_dataset_slice(
+            filing: FilingDocument,
+            dataset: Any,
+            index: int,
+        ) -> list[str]:
+            """Persist one filing's slice of a possibly multi-filing dataset."""
+
             manifest_by_id = {item.document_id: item for item in dataset.manifest}
             manifest = manifest_by_id.get(filing.document_id)
             if manifest is not None:
@@ -1202,23 +1230,59 @@ class AppService:
                 filing.supersedes_document_id = manifest.supersedes_document_id
                 filing.content_hash = manifest.content_hash
             self.storage.save_filings([filing])
-            # Recompile retry output through the canonical compiler.  The
-            # ingestion dataset remains the audit source, but only compiler
-            # resolved facts can be persisted as research facts.
-            canonical = (
-                dataset
-                if hasattr(dataset, "research_facts")
-                else FinancialFactCompiler().compile_facts(
+
+            production_dataset = hasattr(dataset, "research_facts")
+            accession = filing.accession_number
+            if production_dataset:
+                # The coordinator already ran one canonical compilation over
+                # all targets. Scope every persisted object back to this
+                # filing so one incomplete sibling cannot be promoted or
+                # overwrite another filing's evidence.
+                source_groups = tuple(
+                    item for item in dataset.validations
+                    if tuple(getattr(item, "identity", ()))
+                    and item.identity[0] == accession
+                )
+                canonical = dataset
+                accepted_facts = [
+                    fact for fact in canonical.resolved_facts
+                    if fact.accession_number == accession
+                ]
+                quarantined: list[FinancialFact] = [
+                    fact for fact in canonical.quarantined_facts
+                    if fact.accession_number == accession
+                ]
+                canonical_groups = _compiler_validation_groups(source_groups)
+                evidence = [
+                    item for item in dataset.evidence
+                    if item.document_id == filing.document_id
+                ]
+                source_has_facts = bool(
+                    accepted_facts or quarantined
+                    or any(
+                        fact.accession_number == accession
+                        for fact in dataset.resolved_facts
+                    )
+                )
+            else:
+                # Compatibility-only seam for injected pre-canonical engines
+                # in legacy tests. Production always supplies the canonical
+                # collection API above.
+                canonical = FinancialFactCompiler().compile_facts(
                     company,
                     [filing],
                     dataset.accepted_facts,
                     reporting_currency=company.reporting_currency,
                 )
-            )
-            quarantined: list[FinancialFact] = list(dataset.validation.quarantined)
-            for group in dataset.group_validations:
-                quarantined.extend(group.validation.quarantined)
-            quarantined.extend(canonical.quarantined_facts)
+                quarantined = list(dataset.validation.quarantined)
+                for group in dataset.group_validations:
+                    quarantined.extend(group.validation.quarantined)
+                quarantined.extend(canonical.quarantined_facts)
+                accepted_facts = list(canonical.resolved_facts)
+                canonical_groups = _compiler_validation_groups(canonical.validations)
+                evidence = list(dataset.evidence)
+                source_groups = ()
+                source_has_facts = bool(dataset.accepted_facts)
             seen_quarantine: set[str] = set()
             unique_quarantine: list[FinancialFact] = []
             for fact in quarantined:
@@ -1231,24 +1295,25 @@ class AppService:
             # audit/reporting, but only ``canonical.research_facts`` is ever a
             # research/model input.  INCOMPLETE groups therefore remain
             # visible without being promoted to AI-eligible data.
-            accepted_facts = list({fact.fact_id: fact for fact in canonical.resolved_facts}.values())
-            canonical_groups = _compiler_validation_groups(canonical.validations)
+            accepted_facts = list({fact.fact_id: fact for fact in accepted_facts}.values())
             self.storage.replace_financial_ingestion(
                 company.security_id,
                 [filing.accession_number],
                 accepted_facts,
                 quarantined,
                 canonical_groups,
-                list(dataset.evidence) + list(build_filing_evidence([filing])),
+                evidence + list(build_filing_evidence([filing])),
             )
-            if accepted_facts and canonical.allow_ai is False and any(
-                item.validation.status is ValidationStatus.READY_WITH_WARNINGS
-                and item.validation.quality_class == "field_missing"
-                for item in dataset.group_validations
-            ):
+            incomplete = production_dataset and (
+                not source_groups
+                or any(item.status != ValidationStatus.VERIFIED.value for item in source_groups)
+            )
+            if accepted_facts and incomplete:
                 # A partial, auditable repair is useful for deterministic
                 # reporting, but must never be presented as a full success.
-                errors.append(f"{filing.accession_number}:quality:field_missing")
+                slice_errors = [f"{filing.accession_number}:quality:field_missing"]
+            else:
+                slice_errors = []
             if trace is not None and filing.accession_number:
                 trace["processed"].add(filing.accession_number)
             progress("filing-validation", index, len(parse_targets))
@@ -1256,10 +1321,48 @@ class AppService:
                 # A parser can produce auditable but incomplete fields.  Keep
                 # that node visibly partial while reserving the hard quality
                 # failure for files with no accepted facts at all.
-                errors.append(
+                slice_errors.append(
                     f"{filing.accession_number}:quality:"
-                    f"{'incomplete_profile' if dataset.accepted_facts else 'FILING_DATA_QUALITY_FAILED'}"
+                    f"{'incomplete_profile' if source_has_facts else 'FILING_DATA_QUALITY_FAILED'}"
                 )
+            return slice_errors
+
+        if hasattr(self._financial_ingestion, "collect_candidate_batches"):
+            if cancel_check():
+                raise ResearchCancelled()
+            progress("filing-parse", 0, len(parse_targets))
+            try:
+                outcome = self._financial_recognition.recognize(
+                    company,
+                    parse_targets,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                )
+            except Exception as exc:
+                errors.extend(
+                    f"{filing.accession_number}:parse:{type(exc).__name__}"
+                    for filing in parse_targets
+                )
+            else:
+                dataset = outcome.dataset
+                for index, filing in enumerate(parse_targets, start=1):
+                    if cancel_check():
+                        raise ResearchCancelled()
+                    errors.extend(persist_dataset_slice(filing, dataset, index))
+            return errors
+
+        # Legacy injected engines retain their historical one-filing adapter
+        # contract; production engines use the single batch coordinator call.
+        for index, filing in enumerate(parse_targets, start=1):
+            if cancel_check():
+                raise ResearchCancelled()
+            progress("filing-parse", index - 1, len(parse_targets))
+            try:
+                dataset = self._financial_ingestion.ingest(company, [filing])
+            except Exception as exc:
+                errors.append(f"{filing.accession_number}:parse:{type(exc).__name__}")
+                continue
+            errors.extend(persist_dataset_slice(filing, dataset, index))
         return errors
 
     def _retry_us_financials(
@@ -1307,12 +1410,12 @@ class AppService:
         }
         for item in filings:
             previous = stored_by_accession.get(item.accession_number)
-            if previous is not None:
+            if previous is not None and _filing_identity_matches(item, previous):
                 item.local_path = item.local_path or previous.local_path
                 item.content_hash = item.content_hash or previous.content_hash
         targets = list(filings) if force else [
             item for item in filings
-            if not item.local_path or not Path(item.local_path).is_file()
+            if not _filing_cache_valid(item)
             or item.accession_number not in known_fact_accessions
         ]
         if trace is not None:
@@ -1542,6 +1645,7 @@ class AppService:
                 updates["stage_current"] = min(current, int(total)) if total is not None else current
             if "stage" in updates and updates["stage"] != job.stage:
                 now = time.perf_counter()
+                job.roll_timing(str(updates["stage"]), now)
                 job.stage_timings[job.stage] = job.stage_timings.get(job.stage, 0.0) + max(
                     0.0, now - job.stage_started_at
                 )
@@ -1559,22 +1663,39 @@ class AppService:
         stage: str,
         current: int,
         total: int,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         safe_total = max(1, int(total))
         safe_current = min(safe_total, max(0, int(current)))
-        if stage == "filing-parse":
+        if stage == "cache-check":
+            percent = 16 + round(safe_current * 2 / safe_total)
+        elif stage == "filing-index":
+            percent = 16 + round(safe_current * 2 / safe_total)
+        elif stage == "filing-parse":
             percent = 18 + round(safe_current * 6 / safe_total)
         elif stage == "filing-validation":
             percent = 24 + round(safe_current * 5 / safe_total)
         else:
             percent = max(job.percent, 24)
-        self._update_job(
-            job,
-            stage=stage,
-            stage_current=safe_current,
-            stage_total=safe_total,
-            percent=max(job.percent, percent),
-        )
+        display_stage = job.stage if stage == "filing-status" else stage
+        updates: dict[str, Any] = {
+            "stage": display_stage,
+            "stage_current": safe_current,
+            "stage_total": safe_total,
+            "percent": max(job.percent, percent),
+        }
+        if detail and detail.get("filing_id"):
+            filing_states = {key: dict(value) for key, value in job.filing_states.items()}
+            filing_id = str(detail["filing_id"])
+            filing_states[filing_id] = {
+                "filing_id": filing_id,
+                "label": str(detail.get("label") or filing_id),
+                "status": str(detail.get("status") or stage),
+                "error_code": str(detail.get("error_code") or ""),
+                "elapsed_seconds": round(float(detail.get("elapsed_seconds") or 0.0), 3),
+            }
+            updates["filing_states"] = filing_states
+        self._update_job(job, **updates)
 
     def _auto_retry_financial_evidence(
         self,
@@ -1602,8 +1723,8 @@ class AppService:
         trace: dict[str, set[str]] = {
             "targets": set(), "downloaded": set(), "processed": set()
         }
-        progress = lambda stage, current, total: self._ingestion_progress(
-            job, stage, current, total
+        progress = lambda stage, current, total, detail=None: self._ingestion_progress(
+            job, stage, current, total, detail
         )
         errors = (
             self._retry_us_financials(
@@ -1702,6 +1823,12 @@ class AppService:
                             job.vision_approval = None
                             job.vision_approval_pending = True
                             job.vision_upload_preview = safe_summary
+                            now = time.perf_counter()
+                            job.roll_timing("vision-approval", now)
+                            job.stage_timings[job.stage] = job.stage_timings.get(job.stage, 0.0) + max(
+                                0.0, now - job.stage_started_at
+                            )
+                            job.stage_started_at = now
                             job.stage = "vision-approval"
                             job.message = "Review failed financial pages before upload"
                         while not job.vision_approval_event.wait(0.1):
@@ -1714,11 +1841,50 @@ class AppService:
                             cancelled = job.cancel_event.is_set()
                             job.vision_approval_pending = False
                             job.vision_upload_preview = None
+                        if approved and not cancelled:
+                            self._update_job(
+                                job,
+                                stage="vision-processing",
+                                stage_current=0,
+                                stage_total=len(tuple(summary.get("pages") or ())),
+                                message=_ui_message(
+                                    ui_language,
+                                    "Cloud recognition approved; processing failed financial pages",
+                                    "已批准云端识别，正在处理本地失败的财务表页",
+                                    "已批准雲端辨識，正在處理本地失敗的財務表頁",
+                                ),
+                            )
                         return approved and not cancelled
                     vision_config = replace(vision_config, approve_upload=approve_upload)
                 try:
                     vision_config.validate()
-                    vision_adapter = self._vision_adapter_factory(vision_config)
+                    base_vision_adapter = self._vision_adapter_factory(vision_config)
+                    # Journal remote identifiers on the same Storage used by
+                    # research.  The coordinator owns one approval and
+                    # bounded page-level concurrency for every adapter.
+                    if isinstance(base_vision_adapter, MineruFlashAdapter):
+                        base_vision_adapter.journal = self.storage
+
+                    def vision_progress(current: int, total: int) -> None:
+                        self._update_job(
+                            job,
+                            stage="vision-processing",
+                            stage_current=current,
+                            stage_total=total,
+                            message=_ui_message(
+                                ui_language,
+                                f"Cloud recognition processed {current}/{total} failed financial pages",
+                                f"云端识别已处理 {current}/{total} 个失败财务表页",
+                                f"雲端辨識已處理 {current}/{total} 個失敗財務表頁",
+                            ),
+                        )
+
+                    vision_adapter = VisionTaskCoordinator(
+                        base_vision_adapter,
+                        journal=self.storage,
+                        max_workers=2,
+                        progress=vision_progress,
+                    )
                 except VisionAdapterError as exc:
                     raise _ResearchDataUnavailable(exc.code) from exc
                 self._update_job(
@@ -1875,10 +2041,25 @@ class AppService:
                 downloaded = []
                 if bool(request.get("download_filings", True)):
                     target = self.storage.filings_dir / company.security_id.replace(":", "_")
+                    stored_by_accession = {
+                        item.accession_number: item
+                        for item in self.storage.get_filings(company.security_id)
+                        if item.accession_number
+                    }
+                    cached_by_accession: dict[str, FilingDocument] = {}
+                    pending_download: list[FilingDocument] = []
+                    for item in filings:
+                        previous = stored_by_accession.get(item.accession_number)
+                        if previous is not None and _filing_identity_matches(item, previous) and _filing_cache_valid(previous):
+                            item.local_path = previous.local_path
+                            item.content_hash = previous.content_hash
+                            cached_by_accession[item.accession_number] = item
+                        else:
+                            pending_download.append(item)
                     self._update_job(
                         job,
                         stage="filing-download",
-                        stage_current=0,
+                        stage_current=len(cached_by_accession),
                         stage_total=len(filings),
                         message=_ui_message(
                             ui_language,
@@ -1890,32 +2071,41 @@ class AppService:
                     )
                     downloaded, download_errors = _bounded_download_filings(
                         adapter,
-                        filings,
+                        pending_download,
                         target,
                         cancel_event=job.cancel_event,
                         progress=lambda completed, total: self._update_job(
                             job,
                             stage="filing-download",
-                            stage_current=completed,
-                            stage_total=total,
+                            stage_current=len(cached_by_accession) + completed,
+                            stage_total=len(filings),
                             message=_ui_message(
                                 ui_language,
-                                f"Downloading official reports ({completed}/{total})",
-                                f"正在下载官方财报（{completed}/{total}）",
-                                f"正在下載官方財報（{completed}/{total}）",
+                                f"Downloading official reports ({len(cached_by_accession) + completed}/{len(filings)})",
+                                f"正在下载官方财报（{len(cached_by_accession) + completed}/{len(filings)}）",
+                                f"正在下載官方財報（{len(cached_by_accession) + completed}/{len(filings)}）",
                             ),
-                            percent=6 + round(completed * 10 / max(1, total)),
+                            percent=6 + round((len(cached_by_accession) + completed) * 10 / max(1, len(filings))),
                         ),
                     )
                     if job.cancel_event.is_set():
                         raise ResearchCancelled()
                     if not downloaded and download_errors:
-                        raise _ResearchDataUnavailable("FILING_DOWNLOAD_FAILED")
-                    filings = downloaded
+                        if not cached_by_accession:
+                            raise _ResearchDataUnavailable("FILING_DOWNLOAD_FAILED")
+                    downloaded_by_accession = {
+                        item.accession_number: item for item in downloaded
+                    }
+                    filings = [
+                        downloaded_by_accession.get(item.accession_number)
+                        or cached_by_accession.get(item.accession_number)
+                        for item in filings
+                    ]
+                    filings = [item for item in filings if item is not None]
                 else:
                     raise _ResearchDataUnavailable("FILING_DOWNLOAD_REQUIRED")
                 self.storage.save_filings(filings)
-                research_reports = list(downloaded)
+                research_reports = list(filings)
                 self._update_job(
                     job,
                     stage="filing-parse",
@@ -1944,19 +2134,18 @@ class AppService:
                         structured_sources = ()
                 if hasattr(self._financial_ingestion, "collect_candidate_batches"):
                     try:
-                        dataset = FinancialFactCompiler().compile_from_ingestion(
+                        outcome = self._financial_recognition.recognize(
                             company,
                             research_reports,
-                            self._financial_ingestion,
                             structured_sources=structured_sources,
                             vision_fallback=vision_adapter,
                             vision_config=vision_config,
                             cancel_check=job.cancel_event.is_set,
-                            progress=lambda stage, current, total: self._ingestion_progress(
-                                job, stage, current, total
+                            progress=lambda stage, current, total, detail=None: self._ingestion_progress(
+                                job, stage, current, total, detail
                             ),
-                            reporting_currency=company.reporting_currency,
                         )
+                        dataset = outcome.dataset
                     except VisionAdapterError as exc:
                         if job.cancel_event.is_set() or exc.code == "VISION_CANCELLED":
                             raise ResearchCancelled() from exc
@@ -1973,8 +2162,8 @@ class AppService:
                                 vision_fallback=vision_adapter,
                                 vision_config=vision_config,
                                 cancel_check=job.cancel_event.is_set,
-                                progress=lambda stage, current, total: self._ingestion_progress(
-                                    job, stage, current, total
+                                progress=lambda stage, current, total, detail=None: self._ingestion_progress(
+                                    job, stage, current, total, detail
                                 ),
                             )
                         except TypeError as exc:
@@ -1997,8 +2186,8 @@ class AppService:
                         dataset = self._financial_ingestion.ingest(
                             company,
                             research_reports,
-                            progress=lambda stage, current, total: self._ingestion_progress(
-                                job, stage, current, total
+                            progress=lambda stage, current, total, detail=None: self._ingestion_progress(
+                                job, stage, current, total, detail
                             ),
                         )
                     except TypeError as exc:
@@ -2445,6 +2634,51 @@ def _bounded_download_filings(
     return (
         [successes[index] for index in range(len(unique)) if index in successes],
         [failures[index] for index in range(len(unique)) if index in failures],
+    )
+
+
+def _filing_cache_valid(filing: FilingDocument) -> bool:
+    """Verify a local filing object before allowing cache reuse."""
+
+    if not filing.local_path or not filing.content_hash:
+        return False
+    path = Path(filing.local_path)
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest().casefold() == filing.content_hash.casefold()
+    except OSError:
+        return False
+
+
+def _filing_identity_matches(discovered: FilingDocument, stored: FilingDocument) -> bool:
+    """Allow cache reuse only for the same discovered filing revision.
+
+    Accession numbers are not sufficient because issuers can republish a
+    document at the same accession. Empty historical revisions are treated as
+    ``original`` for backwards compatibility, while a missing source URL is
+    never silently considered equivalent.
+    """
+
+    source_discovered = str(discovered.source_url or "").strip().rstrip("/").casefold()
+    source_stored = str(stored.source_url or "").strip().rstrip("/").casefold()
+    if not source_discovered or source_discovered != source_stored:
+        return False
+    revision_discovered = str(discovered.revision or "original").strip().casefold() or "original"
+    revision_stored = str(stored.revision or "original").strip().casefold() or "original"
+    if revision_discovered != revision_stored:
+        return False
+    return (
+        str(discovered.form_type or "").strip().casefold()
+        == str(stored.form_type or "").strip().casefold()
+        and str(discovered.fiscal_period or "").strip().casefold()
+        == str(stored.fiscal_period or "").strip().casefold()
+        and str(discovered.period_end or "").strip()
+        == str(stored.period_end or "").strip()
     )
 
 

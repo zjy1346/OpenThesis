@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import io
 import json
+import hashlib
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +42,7 @@ from openthesis.service import (
     _financial_status,
     _canonical_retry_snapshot,
     _canonical_snapshot_digest,
+    _filing_identity_matches,
 )
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
 from openthesis.market_financials import FinancialValidation, ValidationStatus
@@ -94,6 +97,20 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_filing_cache_reuse_requires_source_revision_and_period_identity(self) -> None:
+        base = FilingDocument(
+            "doc", "cik", "acc", "10-K", "FY", "2025-12-31", "2026-02-01",
+            "annual.htm", "https://www.sec.gov/Archives/acc/annual.htm",
+            revision="original",
+        )
+        self.assertTrue(_filing_identity_matches(base, FilingDocument(**base.to_dict())))
+        for field, value in (
+            ("source_url", "https://www.sec.gov/Archives/acc/revised.htm"),
+            ("revision", "amended"),
+            ("period_end", "2024-12-31"),
+        ):
+            changed = FilingDocument(**{**base.to_dict(), field: value})
+            self.assertFalse(_filing_identity_matches(changed, base), field)
     def test_unsafe_financial_write_has_localized_fail_closed_guidance(self) -> None:
         for language, marker in (("zh-CN", "安全软件"), ("zh-Hant", "安全軟體"), ("en", "Security software")):
             message = _research_data_message("FILING_CONTENT_UNSAFE", language)
@@ -340,6 +357,25 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(job.percent, 40)
             self.assertEqual(job.stage_current, 6)
             self.assertEqual(job.stage_total, 6)
+            service._ingestion_progress(
+                job,
+                "filing-status",
+                1,
+                6,
+                {
+                    "filing_id": "annual-2025",
+                    "label": "2025 Annual Report",
+                    "status": "indexing",
+                    "elapsed_seconds": 1.25,
+                },
+            )
+            detailed = job.snapshot()
+            self.assertEqual(detailed["stage"], "filing-parse")
+            self.assertEqual(
+                detailed["filing_states"]["annual-2025"]["status"], "indexing"
+            )
+            self.assertIn("engine_active_seconds", detailed)
+            self.assertIn("external_wait_seconds", detailed)
             service._update_job(job, percent=100)
             self.assertEqual(job.percent, 100)
 
@@ -397,6 +433,37 @@ class AppServiceTests(unittest.TestCase):
                         "require_page_approval": True,
                         secret_name: "must-not-enter-python",
                     })
+
+    def test_vision_journal_persists_only_safe_task_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            company = build_company("688981.SH", "SMIC")
+            service.storage.save_company(company)
+            row = service.storage.save_vision_task(
+                "task-key", company_cik=company.cik, document_id="filing-1",
+                provider="mineru_flash", page_hashes=["page-hash"], page_numbers=[7],
+                status="uploaded", remote_task_id="remote-task",
+            )
+            self.assertEqual(row["page_hashes"], ["page-hash"])
+            self.assertEqual(row["page_numbers"], [7])
+            self.assertEqual(service.storage.get_vision_task("task-key")["status"], "uploaded")
+            service.storage.save_vision_task(
+                "task-key", company_cik=company.cik, document_id="filing-1",
+                provider="mineru_flash", page_hashes=["page-hash"], page_numbers=[7],
+                status="running",
+            )
+            self.assertEqual(
+                service.storage.get_vision_task("task-key")["remote_task_id"],
+                "remote-task",
+            )
+            service.storage.save_vision_result("result-key", {"facts": [{"value": 1}]})
+            self.assertEqual(
+                service.storage.get_vision_result("result-key"),
+                {"facts": [{"value": 1}]},
+            )
+            self.assertNotIn("pdf_bytes", row)
+            self.assertNotIn("authorization", row)
+            self.assertNotIn("signed_url", row)
         with self.assertRaises(ValueError):
             _vision_config_from_request({"enabled": True, "consent": True, "provider": "mineru_flash", "require_page_approval": False})
 
@@ -1078,7 +1145,7 @@ class AppServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             good_path = Path(directory) / "good.pdf"
             good_path.write_bytes(b"official-good")
-            good = FilingDocument("good-doc", company.security_id, "good-2024", "ANNUAL_REPORT", "FY", "2024-12-31", "2025-03-01", "2024.pdf", "https://example.test/good.pdf", local_path=str(good_path), content_hash="good-hash")
+            good = FilingDocument("good-doc", company.security_id, "good-2024", "ANNUAL_REPORT", "FY", "2024-12-31", "2025-03-01", "2024.pdf", "https://example.test/good.pdf", local_path=str(good_path), content_hash=hashlib.sha256(b"official-good").hexdigest())
             unhealthy = FilingDocument("bad-doc", company.security_id, "bad-2025", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-03-01", "2025.pdf", "https://example.test/bad.pdf")
 
             class Adapter:
@@ -1089,7 +1156,7 @@ class AppServiceTests(unittest.TestCase):
                     target.mkdir(parents=True, exist_ok=True)
                     path = target / f"{filing.accession_number}.pdf"
                     path.write_bytes(b"official-repaired")
-                    filing.local_path, filing.content_hash = str(path), f"hash-{filing.accession_number}"
+                    filing.local_path, filing.content_hash = str(path), hashlib.sha256(b"official-repaired").hexdigest()
                     return filing
 
             class Engine:
@@ -1167,6 +1234,158 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(set(download_calls), {good.accession_number, bad.accession_number})
             self.assertTrue(any(item["accession_number"] == good.accession_number for item in service.storage.get_facts_audit(company.security_id)))
             self.assertEqual(service.storage.get_financial_retry_state(company.security_id)["last_stage"], "filing-parse")
+
+    def test_market_retry_batches_production_targets_and_persists_each_slice(self) -> None:
+        company = build_company("300750.SZ", "CATL", reporting_currency="CNY")
+        with tempfile.TemporaryDirectory() as directory:
+            filings: list[FilingDocument] = []
+            facts: list[FinancialFact] = []
+            groups = []
+            manifests = []
+            for year in (2025, 2024):
+                path = Path(directory) / f"{year}.pdf"
+                path.write_bytes(f"official-{year}".encode())
+                filing = FilingDocument(
+                    f"doc-{year}", company.security_id, f"acc-{year}",
+                    "ANNUAL_REPORT", "FY", f"{year}-12-31", f"{year + 1}-03-01",
+                    f"{year}.pdf", f"https://example.test/{year}.pdf",
+                    local_path=str(path), content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                fact = FinancialFact(
+                    f"{filing.accession_number}:revenue", company.security_id,
+                    "revenue", "Revenue", float(year), "CNY", year, "FY",
+                    "ANNUAL_REPORT", f"{year}-01-01", filing.period_end,
+                    filing.filed_at, filing.accession_number, filing.source_url,
+                    statement="income_statement", currency="CNY", raw_text=f"Revenue {year}",
+                    validation_status="VERIFIED",
+                )
+                filings.append(filing)
+                facts.append(fact)
+                groups.append(SimpleNamespace(
+                    identity=(filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"),
+                    status="VERIFIED", issues=(), covered=frozenset({"revenue"}),
+                    accepted=(fact,), quarantined=(),
+                ))
+                manifests.append(FilingManifest(
+                    filing.document_id, filing.accession_number, filing.source_url,
+                    filing.primary_document, filing.form_type, filing.fiscal_period,
+                    filing.period_end, filing.revision, filing.supersedes_document_id,
+                    filing.content_hash,
+                ))
+
+            class Adapter:
+                def list_financial_filings(self, _company, *, limit=5):
+                    return filings[:limit]
+
+            class ProductionEngine:
+                def collect_candidate_batches(self, *_args, **_kwargs):
+                    raise AssertionError("coordinator should own production collection")
+
+            dataset = SimpleNamespace(
+                manifest=tuple(manifests), validations=tuple(groups),
+                resolved_facts=tuple(facts), quarantined_facts=(), evidence=(),
+                allow_ai=True, research_facts=tuple(facts),
+            )
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=ProductionEngine(),
+            )
+            service.storage.save_company(company)
+            calls: list[tuple[str, ...]] = []
+            service._financial_recognition.recognize = lambda _company, items, **_kwargs: (
+                calls.append(tuple(item.accession_number for item in items))
+                or SimpleNamespace(dataset=dataset)
+            )
+            trace = {"targets": set(), "downloaded": set(), "processed": set(), "warnings": set()}
+
+            errors = service._retry_market_financials(
+                company, {}, trace=trace,
+            )
+
+            self.assertEqual(errors, [])
+            self.assertEqual(calls, [("acc-2025", "acc-2024")])
+            self.assertEqual(trace["processed"], {"acc-2025", "acc-2024"})
+            persisted = service.storage.get_facts_audit(company.security_id)
+            self.assertEqual(
+                {item["accession_number"] for item in persisted},
+                {"acc-2025", "acc-2024"},
+            )
+            self.assertEqual(
+                {item["accession_number"] for item in service.storage.get_validation_groups(company.security_id)},
+                {"acc-2025", "acc-2024"},
+            )
+
+    def test_market_retry_batch_keeps_incomplete_group_partial(self) -> None:
+        company = build_company("300750.SZ", "CATL", reporting_currency="CNY")
+        with tempfile.TemporaryDirectory() as directory:
+            filings: list[FilingDocument] = []
+            facts: list[FinancialFact] = []
+            groups = []
+            manifests = []
+            for index, (accession, status) in enumerate((("good", "VERIFIED"), ("partial", "INCOMPLETE")), start=1):
+                path = Path(directory) / f"{accession}.pdf"
+                path.write_bytes(accession.encode())
+                filing = FilingDocument(
+                    f"doc-{accession}", company.security_id, accession,
+                    "ANNUAL_REPORT", "FY", f"{2025 - index + 1}-12-31", f"2026-03-01",
+                    f"{accession}.pdf", f"https://example.test/{accession}.pdf",
+                    local_path=str(path), content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+                fact = FinancialFact(
+                    f"{accession}:revenue", company.security_id, "revenue", "Revenue",
+                    float(index), "CNY", 2025 - index + 1, "FY", "ANNUAL_REPORT",
+                    f"{2025 - index + 1}-01-01", filing.period_end, filing.filed_at,
+                    accession, filing.source_url, statement="income_statement",
+                    currency="CNY", raw_text=f"Revenue {index}", validation_status="VERIFIED",
+                )
+                filings.append(filing)
+                facts.append(fact)
+                groups.append(SimpleNamespace(
+                    identity=(accession, filing.period_end, "FY", "consolidated", "CNY"),
+                    status=status, issues=("missing_core",) if status != "VERIFIED" else (),
+                    covered=frozenset({"revenue"}), accepted=(fact,), quarantined=(),
+                ))
+                manifests.append(FilingManifest(
+                    filing.document_id, accession, filing.source_url, filing.primary_document,
+                    filing.form_type, filing.fiscal_period, filing.period_end, filing.revision,
+                    filing.supersedes_document_id, filing.content_hash,
+                ))
+
+            class Adapter:
+                def list_financial_filings(self, _company, *, limit=5):
+                    return filings[:limit]
+
+            class ProductionEngine:
+                def collect_candidate_batches(self, *_args, **_kwargs):
+                    raise AssertionError("coordinator should own production collection")
+
+            dataset = SimpleNamespace(
+                manifest=tuple(manifests), validations=tuple(groups),
+                resolved_facts=tuple(facts), quarantined_facts=(), evidence=(),
+                allow_ai=False, research_facts=(),
+            )
+            service = AppService(
+                Path(directory), market_data=_ResearchMarketData(Adapter()),
+                financial_ingestion_engine=ProductionEngine(),
+            )
+            service.storage.save_company(company)
+            calls: list[tuple[str, ...]] = []
+            service._financial_recognition.recognize = lambda _company, items, **_kwargs: (
+                calls.append(tuple(item.accession_number for item in items))
+                or SimpleNamespace(dataset=dataset)
+            )
+            trace = {"targets": set(), "downloaded": set(), "processed": set(), "warnings": set()}
+
+            errors = service._retry_market_financials(company, {}, trace=trace)
+
+            self.assertEqual(calls, [("good", "partial")])
+            self.assertTrue(any(item.startswith("partial:quality:") for item in errors))
+            self.assertNotIn("good:quality:field_missing", errors)
+            self.assertEqual(trace["processed"], {"good", "partial"})
+            self.assertEqual(
+                {item["accession_number"] for item in service.storage.get_facts_audit(company.security_id)},
+                {"good", "partial"},
+            )
 
     def test_us_retry_is_local_and_idempotent_when_annual_window_is_complete(self) -> None:
         company = Company(
