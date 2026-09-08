@@ -177,6 +177,176 @@ class SecClientTests(unittest.TestCase):
         )
         self.assertEqual(revenue[2024], (900, "Revenues"))
 
+    def test_companyfacts_maps_operating_income_and_capex_statements(self) -> None:
+        def row(value: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "10-K",
+                "start": "2025-01-01", "end": "2025-12-31",
+                "filed": "2026-02-01", "accn": "0001-25-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "OperatingIncomeLoss": {"units": {"USD": [row(300)]}},
+            "PaymentsToAcquirePropertyPlantAndEquipment": {"units": {"USD": [row(40)]}},
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="TEST", name="Test Systems", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        by_concept = {fact.concept: fact for fact in facts}
+        self.assertEqual(by_concept["operating_income"].statement, "income_statement")
+        self.assertEqual(by_concept["capital_expenditure"].statement, "cash_flow")
+
+    def test_companyfacts_derives_liabilities_with_explicit_nci_formula(self) -> None:
+        def row(value: int, accession: str = "0001-25-001") -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "10-K",
+                "start": None, "end": "2025-12-31", "filed": "2026-02-01",
+                "accn": accession,
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [row(100)]}},
+            "StockholdersEquity": {"units": {"USD": [row(40)]}},
+            "MinorityInterestInConsolidatedEntity": {"units": {"USD": [row(5)]}},
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": {
+                "units": {"USD": [row(45)]}
+            },
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Example", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = [fact for fact in facts if fact.concept == "liabilities"]
+        self.assertEqual(len(liabilities), 1)
+        self.assertEqual(liabilities[0].value, 55)
+        self.assertIn("LiabilitiesAndStockholdersEquity - StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", liabilities[0].reported_concept)
+        self.assertIn("inputs: LiabilitiesAndStockholdersEquity=100, StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest=45", liabilities[0].raw_text)
+        self.assertEqual(liabilities[0].statement, "balance_sheet")
+
+    def test_companyfacts_does_not_guess_liabilities_from_parent_equity(self) -> None:
+        def row(value: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "10-K",
+                "start": None, "end": "2025-12-31", "filed": "2026-02-01",
+                "accn": "0001-25-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [row(100)]}},
+            "StockholdersEquity": {"units": {"USD": [row(40)]}},
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Example", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        self.assertFalse([fact for fact in facts if fact.concept == "liabilities"])
+
+    def test_companyfacts_derives_ko_style_nine_years_with_cross_validation(self) -> None:
+        def row(value: int, year: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": year, "fp": "FY", "form": "10-K",
+                "start": None, "end": f"{year}-12-31", "filed": f"{year + 1}-02-01",
+                "accn": f"0001-{year}-001",
+            }
+
+        tags: dict[str, dict[str, dict[str, list[dict[str, object]]]]] = {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": []}},
+            "StockholdersEquity": {"units": {"USD": []}},
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": {"units": {"USD": []}},
+            "MinorityInterestInConsolidatedEntity": {"units": {"USD": []}},
+            "LiabilitiesCurrent": {"units": {"USD": []}},
+            "LiabilitiesNoncurrent": {"units": {"USD": []}},
+        }
+        for year in range(2017, 2026):
+            total_equity = 625 + year
+            liabilities = 375 + year
+            tags["LiabilitiesAndStockholdersEquity"]["units"]["USD"].append(row(total_equity + liabilities, year))
+            tags["StockholdersEquity"]["units"]["USD"].append(row(total_equity - 25, year))
+            tags["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]["units"]["USD"].append(row(total_equity, year))
+            tags["MinorityInterestInConsolidatedEntity"]["units"]["USD"].append(row(25, year))
+            tags["LiabilitiesCurrent"]["units"]["USD"].append(row(200 + year, year))
+            tags["LiabilitiesNoncurrent"]["units"]["USD"].append(row(175, year))
+        payload = {"facts": {"us-gaap": tags, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Coca-Cola", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = {fact.fiscal_year: fact for fact in facts if fact.concept == "liabilities"}
+        self.assertEqual(set(liabilities), set(range(2017, 2026)))
+        self.assertTrue(all(fact.value == 375 + year for year, fact in liabilities.items()))
+
+    def test_companyfacts_uses_parent_and_explicit_nci_as_reverse_path(self) -> None:
+        def row(value: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "10-K",
+                "start": None, "end": "2025-12-31", "filed": "2026-02-01",
+                "accn": "0001-25-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [row(100)]}},
+            "StockholdersEquity": {"units": {"USD": [row(40)]}},
+            "MinorityInterestInConsolidatedEntity": {"units": {"USD": [row(5)]}},
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Example", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = [fact for fact in facts if fact.concept == "liabilities"]
+        self.assertEqual(len(liabilities), 1)
+        self.assertEqual(liabilities[0].value, 55)
+        self.assertIn("- MinorityInterestInConsolidatedEntity", liabilities[0].reported_concept)
+
+    def test_companyfacts_official_liabilities_wins_over_derived_paths(self) -> None:
+        def row(value: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "10-K",
+                "start": None, "end": "2025-12-31", "filed": "2026-02-01",
+                "accn": "0001-25-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "Liabilities": {"units": {"USD": [row(55)]}},
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [row(100)]}},
+            "StockholdersEquity": {"units": {"USD": [row(40)]}},
+            "LiabilitiesCurrent": {"units": {"USD": [row(30)]}},
+            "LiabilitiesNoncurrent": {"units": {"USD": [row(20)]}},
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Example", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = [fact for fact in facts if fact.concept == "liabilities"]
+        self.assertEqual(len(liabilities), 1)
+        self.assertEqual(liabilities[0].value, 55)
+        self.assertEqual(liabilities[0].reported_concept, "Liabilities")
+
+    def test_companyfacts_rejects_cross_period_or_inconsistent_liability_derivation(self) -> None:
+        def row(value: int, end: str, accession: str = "0001-25-001") -> dict[str, object]:
+            return {
+                "val": value, "fy": int(end[:4]), "fp": "FY", "form": "10-K",
+                "start": None, "end": end, "filed": "2026-02-01", "accn": accession,
+            }
+
+        cross_period = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [row(100, "2025-12-31")]}},
+            "StockholdersEquity": {"units": {"USD": [row(40, "2024-12-31", "0001-24-001")]}},
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="KO", name="Example", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=cross_period):
+            facts = self.client.get_company_facts(company)
+        self.assertFalse([fact for fact in facts if fact.concept == "liabilities"])
+
+        def same(value: int, tag: str) -> dict[str, object]:
+            return {"val": value, "fy": 2025, "fp": "FY", "form": "10-K", "start": None,
+                    "end": "2025-12-31", "filed": "2026-02-01", "accn": "0001-25-001"}
+        inconsistent = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {"units": {"USD": [same(100, "a")]}},
+            "StockholdersEquity": {"units": {"USD": [same(40, "b")]}},
+            "MinorityInterestInConsolidatedEntity": {"units": {"USD": [same(5, "e")]}},
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": {"units": {"USD": [same(45, "f")]}},
+            "LiabilitiesCurrent": {"units": {"USD": [same(35, "c")] }},
+            "LiabilitiesNoncurrent": {"units": {"USD": [same(30, "d")]}},
+        }, "dei": {}}}
+        with patch.object(self.client, "_get_json", return_value=inconsistent):
+            facts = self.client.get_company_facts(company)
+        self.assertFalse([fact for fact in facts if fact.concept == "liabilities"])
+
     def test_foreign_private_issuer_20f_is_listed(self) -> None:
         submissions = {
             "filings": {"recent": {
