@@ -75,6 +75,45 @@ IFRS_CONCEPT_MAP: dict[str, tuple[str, ...]] = {
     "total_equity": ("Equity",),
 }
 
+# Keep the SEC adapter's statement metadata in lockstep with the canonical
+# ingestion validator.  An empty statement is not an innocuous omission: the
+# validator treats it as a fatal mismatch for known financial concepts.
+SEC_STATEMENT_BY_CONCEPT: dict[str, str] = {
+    "revenue": "income_statement",
+    "net_income": "income_statement",
+    "operating_income": "income_statement",
+    "profit_before_tax": "income_statement",
+    "profit_after_tax": "income_statement",
+    "gross_profit": "income_statement",
+    "operating_cash_flow": "cash_flow",
+    "capital_expenditure": "cash_flow",
+    "assets": "balance_sheet",
+    "liabilities": "balance_sheet",
+    "equity": "balance_sheet",
+    "total_equity": "balance_sheet",
+    "reported_roe": "summary",
+}
+
+_LIABILITY_DERIVATION_TAGS: tuple[tuple[str, ...], ...] = (
+    (
+        "LiabilitiesAndStockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ),
+    ("LiabilitiesCurrent", "LiabilitiesNoncurrent"),
+)
+
+# ``StockholdersEquity`` is the parent shareholders' equity and therefore
+# does not, by itself, balance the consolidated statement. These tags are
+# explicit non-controlling-interest facts that may be used to turn
+# ``LiabilitiesAndStockholdersEquity - StockholdersEquity`` into a real
+# liabilities value. Never infer NCI from another equity fact.
+_NONCONTROLLING_INTEREST_TAGS: tuple[str, ...] = (
+    "MinorityInterest",
+    "MinorityInterestInConsolidatedEntity",
+    "NoncontrollingInterestInConsolidatedEntity",
+    "EquityAttributableToNoncontrollingInterest",
+)
+
 SEC_HK_ISSUERS: dict[str, tuple[str, str, str, str]] = {
     "00005.HK": ("0001089113", "HSBC", "USD", "IFRS"),
     "09988.HK": ("0001577552", "BABA", "CNY", "US_GAAP"),
@@ -324,12 +363,7 @@ class SecClient:
                     continue
                 seen.add(key)
                 namespace_name = "ifrs-full" if namespace is ifrs_full else "us-gaap" if namespace is us_gaap else "dei"
-                statement = {
-                    "revenue": "income_statement", "net_income": "income_statement",
-                    "operating_cash_flow": "cash_flow", "assets": "balance_sheet",
-                    "liabilities": "balance_sheet", "equity": "balance_sheet",
-                    "total_equity": "balance_sheet",
-                }.get(normalized, "")
+                statement = SEC_STATEMENT_BY_CONCEPT.get(normalized, "")
                 currency = preferred_unit.upper() if preferred_unit else ""
                 facts.append(
                     FinancialFact(
@@ -362,7 +396,169 @@ class SecClient:
                         validation_status="ready_with_warnings",
                     )
                 )
+        # Some US-GAAP issuers do not publish a scalar ``Liabilities`` fact.
+        # Derive it only from rows sharing every period/provenance dimension;
+        # this prevents silently combining different filings or currencies.
+        #
+        # Accounting semantics matter here. ``L+E - parent equity`` is not
+        # liabilities when a consolidated filer has NCI: it is liabilities
+        # plus NCI. It is a valid path only with an explicitly reported NCI
+        # fact for the same accession/period/currency/scope.
+        official_liability_keys = {
+            (
+                fact.accession_number,
+                fact.end_date,
+                fact.fiscal_year,
+                (fact.fiscal_period or "FY").upper(),
+                fact.form_type,
+                fact.currency.upper(),
+                "consolidated",
+            )
+            for fact in facts
+            if fact.concept == "liabilities"
+        }
+
+        def annual_rows(tags: tuple[str, ...]) -> dict[tuple[str, str, int, str, str, str, str], tuple[str, dict[str, Any], str]]:
+            selected: dict[tuple[str, str, int, str, str, str, str], tuple[str, dict[str, Any], str]] = {}
+            for tag in tags:
+                definition = us_gaap.get(tag)
+                if not isinstance(definition, dict):
+                    continue
+                units = definition.get("units", {})
+                preferred_unit = self._preferred_unit("liabilities", units, getattr(company, "reporting_currency", ""))
+                if not preferred_unit:
+                    continue
+                for row in self._select_annual_facts(units.get(preferred_unit, []), allow_foreign=True):
+                    try:
+                        year = int(row["fy"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    key = (
+                        str(row.get("accn", "")), str(row.get("end", "")), year,
+                        str(row.get("fp", "FY")).upper(), str(row.get("form", "10-K")),
+                        preferred_unit.upper(), "consolidated",
+                    )
+                    current = selected.get(key)
+                    if current is None or str(row.get("filed", "")) >= str(current[1].get("filed", "")):
+                        selected[key] = (tag, row, preferred_unit)
+            return selected
+
+        formula_candidates: dict[tuple[str, str, int, str, str, str, str], list[tuple[float, str, tuple[tuple[str, float], ...], dict[str, Any], str]]] = {}
+        for formula_tags in _LIABILITY_DERIVATION_TAGS:
+            rows_by_tag = [annual_rows((tag,)) for tag in formula_tags]
+            common_keys = set(rows_by_tag[0]).intersection(*rows_by_tag[1:])
+            for key in common_keys:
+                inputs = tuple((rows_by_tag[index][key][0], float(rows_by_tag[index][key][1]["val"])) for index in range(len(rows_by_tag)))
+                value = inputs[0][1] - inputs[1][1] if len(inputs) == 2 and formula_tags[0].startswith("LiabilitiesAnd") else sum(item[1] for item in inputs)
+                formula = (
+                    f"{inputs[0][0]} - {inputs[1][0]}"
+                    if len(inputs) == 2 and formula_tags[0].startswith("LiabilitiesAnd")
+                    else " + ".join(item[0] for item in inputs)
+                )
+                formula_candidates.setdefault(key, []).append(
+                    (value, formula, inputs, rows_by_tag[0][key][1], rows_by_tag[0][key][2])
+                )
+
+        # Parent equity plus an explicitly reported NCI is a separate,
+        # semantically complete path. A missing NCI must not be guessed from
+        # total equity minus parent equity.
+        parent_rows = annual_rows(("StockholdersEquity",))
+        nci_rows = annual_rows(_NONCONTROLLING_INTEREST_TAGS)
+        total_equity_rows = annual_rows(
+            ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",)
+        )
+        balance_rows = annual_rows(("LiabilitiesAndStockholdersEquity",))
+        for key, parent_item in parent_rows.items():
+            nci_item = nci_rows.get(key)
+            balance_item = balance_rows.get(key)
+            if nci_item is None or balance_item is None:
+                continue
+            total_item = total_equity_rows.get(key)
+            if total_item is not None:
+                parent_value = float(parent_item[1]["val"])
+                nci_value = float(nci_item[1]["val"])
+                total_value = float(total_item[1]["val"])
+                if not self._values_reconcile(parent_value + nci_value, total_value):
+                    continue
+            balance_value = float(balance_item[1]["val"])
+            parent_value = float(parent_item[1]["val"])
+            nci_value = float(nci_item[1]["val"])
+            inputs = (
+                (balance_item[0], balance_value),
+                (parent_item[0], parent_value),
+                (nci_item[0], nci_value),
+            )
+            formula = f"{balance_item[0]} - {parent_item[0]} - {nci_item[0]}"
+            formula_candidates.setdefault(key, []).append(
+                (
+                    balance_value - parent_value - nci_value,
+                    formula,
+                    inputs,
+                    balance_item[1],
+                    balance_item[2],
+                )
+            )
+
+        for key, candidates in formula_candidates.items():
+            if key in official_liability_keys:
+                continue
+            values = [candidate[0] for candidate in candidates]
+            if not values:
+                continue
+            # Compare only semantically equivalent true-liability paths.
+            if not all(self._values_reconcile(values[0], value) for value in values[1:]):
+                continue
+            def formula_priority(candidate: tuple[float, str, tuple[tuple[str, float], ...], dict[str, Any], str]) -> tuple[int, str]:
+                formula = candidate[1]
+                if "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest" in formula:
+                    return (0, formula)
+                if formula.startswith("LiabilitiesCurrent"):
+                    return (1, formula)
+                return (2, formula)
+
+            value, formula, inputs, row, preferred_unit = sorted(candidates, key=formula_priority)[0]
+            accession = str(row.get("accn", ""))
+            accession_plain = accession.replace("-", "")
+            source_url = f"{SEC_ARCHIVES_BASE}/{str(int(company.cik))}/{accession_plain}/"
+            input_text = ", ".join(f"{tag}={input_value:g}" for tag, input_value in inputs)
+            fact_key = f"{company.cik}|liabilities|derived|{key}|{formula}|{value}"
+            facts.append(
+                FinancialFact(
+                    fact_id=hashlib.sha256(fact_key.encode()).hexdigest()[:24],
+                    company_cik=company.cik,
+                    concept="liabilities",
+                    reported_concept=f"derived liabilities ({formula})",
+                    value=float(value),
+                    unit=preferred_unit,
+                    fiscal_year=int(row["fy"]),
+                    fiscal_period=str(row.get("fp", "FY")),
+                    form_type=str(row.get("form", "10-K")),
+                    start_date=None,
+                    end_date=str(row.get("end", "")),
+                    filed_at=str(row.get("filed", "")),
+                    accession_number=accession,
+                    source_url=source_url,
+                    scope="consolidated",
+                    entity=company.name,
+                    market=company.market,
+                    statement="balance_sheet",
+                    period_start=None,
+                    consolidated_scope="consolidated",
+                    currency=preferred_unit.upper(),
+                    unit_scale=1.0,
+                    revision="original",
+                    source_document="SEC CompanyFacts us-gaap:derived-liabilities",
+                    raw_text=f"derived liabilities = {formula} = {value:g}; inputs: {input_text}",
+                    parser_version="sec-companyfacts-v2",
+                    validation_status="ready_with_warnings",
+                )
+            )
         return facts
+
+    @staticmethod
+    def _values_reconcile(left: float, right: float) -> bool:
+        """Return whether two same-semantic XBRL values agree after rounding."""
+        return abs(left - right) <= max(1.0, max(abs(left), abs(right)) * 0.01)
 
     @staticmethod
     def _preferred_unit(
