@@ -222,6 +222,11 @@ _REQUIRED_SYNTHESIS_SECTIONS = frozenset(
     }
 )
 
+_SYNTHESIS_MAX_BYTES = 32_000
+_SYNTHESIS_REPAIR_MAX_BYTES = 24_000
+_SYNTHESIS_STRING_LIMIT = 1_600
+_SYNTHESIS_ARRAY_LIMIT = 24
+
 
 def validate_research_synthesis(
     output: dict[str, Any],
@@ -334,18 +339,182 @@ def _synthesis_prior_artifacts(
     skeptic: Any,
     forecast: Any,
 ) -> dict[str, Any]:
-    """Keep synthesis input complete without repeating company metrics and evidence."""
+    """Build a deterministic, bounded projection for the final model call.
 
+    Full stage artifacts remain persisted separately.  This projection keeps
+    section names, claims, numeric values and evidence identifiers while
+    removing repeated prose and provider metadata from the synthesis context.
+    """
     base_analyses = dossier.get("analyses", dossier) if isinstance(dossier, dict) else dossier
-    return _presentation_stage_value(
-        {
-            "base_analyses": base_analyses,
-            "growth_opportunities": growth,
-            "counter_analysis": skeptic,
-            "forecast": forecast,
-        },
-        remove_claims=False,
-    )
+    values = {
+        "base_analyses": base_analyses,
+        "growth_opportunities": growth,
+        "counter_analysis": skeptic,
+        "forecast": forecast,
+    }
+    evidence_ids = _collect_evidence_ids(values)
+    values["source_evidence_ids"] = evidence_ids
+    limit = _SYNTHESIS_STRING_LIMIT
+    array_limit = _SYNTHESIS_ARRAY_LIMIT
+    projected = _bounded_synthesis_value(values, string_limit=limit, array_limit=array_limit)
+    while len(json.dumps(projected, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > _SYNTHESIS_MAX_BYTES and limit > 120:
+        limit //= 2
+        array_limit = max(8, array_limit - 4)
+        projected = _bounded_synthesis_value(values, string_limit=limit, array_limit=array_limit)
+    if len(json.dumps(projected, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > _SYNTHESIS_MAX_BYTES:
+        projected = _hard_clip_synthesis(projected, _SYNTHESIS_MAX_BYTES)
+    return projected
+
+
+def _collect_evidence_ids(value: Any) -> list[str]:
+    found: list[str] = []
+    seen_nodes: set[int] = set()
+    pattern = re.compile(r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+")
+    def visit(item: Any) -> None:
+        if isinstance(item, str):
+            for match in pattern.findall(item):
+                if match not in found:
+                    found.append(match)
+        elif isinstance(item, (dict, list)):
+            marker = id(item)
+            if marker in seen_nodes:
+                return
+            seen_nodes.add(marker)
+        if isinstance(item, dict):
+            for child in item.values(): visit(child)
+        elif isinstance(item, list):
+            for child in item: visit(child)
+    visit(value)
+    return found
+
+
+def _hard_clip_synthesis(value: Any, budget: int) -> Any:
+    """Deterministic byte-budget clip, retaining priority keys and IDs."""
+    if budget <= 32:
+        return None
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, str):
+        text = value
+        while len(json.dumps(text, ensure_ascii=False).encode("utf-8")) > budget and text:
+            text = text[: max(1, len(text) // 2)]
+        return text
+    if isinstance(value, list):
+        result: list[Any] = []
+        for item in value:
+            candidate = _hard_clip_synthesis(item, max(32, budget // max(1, len(value))))
+            trial = [*result, candidate]
+            if len(json.dumps(trial, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > budget:
+                break
+            result.append(candidate)
+        return result
+    if isinstance(value, dict):
+        priority = {"source_evidence_ids", "evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids", "claims", "strongest_counterarguments", "unsupported_assumptions", "missing_evidence"}
+        items = [*[(k, v) for k, v in value.items() if str(k) in priority], *[(k, v) for k, v in value.items() if str(k) not in priority]]
+        result: dict[str, Any] = {}
+        for key, item in items:
+            key_text = str(key)
+            remaining = max(32, budget - len(json.dumps(result, ensure_ascii=False).encode("utf-8")))
+            candidate = _hard_clip_synthesis(item, max(32, remaining - len(key_text) - 8))
+            trial = {**result, key_text: candidate}
+            if len(json.dumps(trial, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > budget:
+                continue
+            result[key_text] = candidate
+        return result
+    return str(value)
+
+
+def _bounded_synthesis_value(value: Any, *, string_limit: int, array_limit: int, _seen: set[int] | None = None) -> Any:
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value
+        # Preserve internal evidence IDs even when narrative prose is cut.
+        ids = re.findall(r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+", value)
+        suffix = " " + " ".join(dict.fromkeys(ids)) if ids else ""
+        return value[: max(0, string_limit - len(suffix))].rstrip() + suffix
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, list):
+        if id(value) in seen: return []
+        seen.add(id(value))
+        return [_bounded_synthesis_value(item, string_limit=string_limit, array_limit=array_limit, _seen=seen) for item in value[:array_limit]]
+    if isinstance(value, dict):
+        if id(value) in seen: return {}
+        seen.add(id(value))
+        items = list(value.items())
+        priority = {
+            "executive_summary", "business_model", "financial_quality", "balance_sheet",
+            "competitive_position", "growth_opportunities", "counterarguments", "scenarios",
+            "thesis", "invalidation_conditions", "leading_indicators", "unresolved_questions",
+            "claims", "evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
+        }
+        items = [*[(key, item) for key, item in items if str(key) in priority],
+                 *[(key, item) for key, item in items if str(key) not in priority]][:80]
+        return {
+            str(key): _bounded_synthesis_value(item, string_limit=string_limit, array_limit=array_limit, _seen=seen)
+            for key, item in items
+            if not str(key).startswith("_") and key not in {"raw_response", "prompt"}
+        }
+    return str(value)[:string_limit]
+
+
+def _synthesis_repair_input(
+    synthesis: Any,
+    verification: dict[str, Any],
+    dossier: Any,
+    growth: Any,
+    skeptic: Any,
+    forecast: Any,
+) -> dict[str, Any]:
+    missing = [
+        key for key in sorted(_REQUIRED_SYNTHESIS_SECTIONS)
+        if not isinstance(synthesis, dict) or key not in synthesis or synthesis.get(key) in (None, "", [])
+    ]
+    issues = " ".join(str(item) for item in verification.get("issues", []))
+    if "claim" in issues.casefold() or verification.get("unsupported_fact_count", 0):
+        missing.append("claims")
+    fields = list(dict.fromkeys(missing or ["report_sections"]))
+    stage_by_field = {
+        "growth_opportunities": growth,
+        "counterarguments": skeptic,
+        "scenarios": forecast,
+        "claims": {"dossier": dossier, "growth": growth, "counter_analysis": skeptic, "forecast": forecast},
+    }
+    context = {field: _bounded_synthesis_value(stage_by_field[field], string_limit=900, array_limit=12)
+               for field in fields if field in stage_by_field}
+    if not context:
+        context = {"base_analyses": _bounded_synthesis_value(dossier, string_limit=900, array_limit=12)}
+    result = {
+        "repair_sections": fields,
+        "section_context": context,
+        "repair_schema": {"type": "object", "required": ["section_patches"], "properties": {"section_patches": {"type": "object", "only": fields}}},
+        "repair_instruction": "Return only {section_patches: {...}} for the listed sections. Preserve evidence IDs and do not invent evidence.",
+    }
+    repair_string_limit, repair_array_limit = 400, 6
+    while len(json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > _SYNTHESIS_REPAIR_MAX_BYTES:
+        context = {key: _bounded_synthesis_value(value, string_limit=repair_string_limit, array_limit=repair_array_limit) for key, value in context.items()}
+        result["section_context"] = context
+        if repair_string_limit <= 120:
+            break
+        repair_string_limit //= 2
+        repair_array_limit = max(2, repair_array_limit - 1)
+    return result
+
+
+def _section_patch_from_output(output: Any, fields: list[str]) -> dict[str, Any]:
+    """Accept only requested patch fields from a repair response."""
+    if not isinstance(output, dict):
+        return {}
+    source = output.get("section_patches") if isinstance(output.get("section_patches"), dict) else output
+    patches = {
+        key: source[key]
+        for key in fields
+        if isinstance(source, dict) and key in source and not str(key).startswith("_")
+    }
+    patches = _bounded_synthesis_value(patches, string_limit=900, array_limit=12)
+    encoded = json.dumps(patches, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return _hard_clip_synthesis(patches, _SYNTHESIS_REPAIR_MAX_BYTES) if len(encoded) > _SYNTHESIS_REPAIR_MAX_BYTES else patches
 
 
 def _response_diagnostics(payload: Any) -> dict[str, Any]:
@@ -804,7 +973,8 @@ class ResearchWorkflow:
             evidence = build_fact_evidence(facts)
             evidence.extend(filing_evidence or [])
             valuation = None
-            snapshot_currency = str((market_snapshot or {}).get("currency", ""))
+            snapshot_currency = str((market_snapshot or {}).get("valuation_currency") or (market_snapshot or {}).get("currency", ""))
+            snapshot_status = str((market_snapshot or {}).get("status", "VERIFIED")).upper()
             if company.industry_support == "financial_beta" and valuation_inputs:
                 valuation = {
                     "status": "not_applicable",
@@ -813,6 +983,16 @@ class ResearchWorkflow:
                         "Financials Beta does not apply the standard free-cash-flow reverse DCF.",
                     ),
                     "currency": company.reporting_currency,
+                }
+            elif valuation_inputs and snapshot_status in {"CONFLICT", "STALE", "UNAVAILABLE"}:
+                valuation = {
+                    "status": "market_snapshot_unavailable",
+                    "reason": self._report_text(
+                        "行情快照存在冲突、陈旧或不可用状态；未执行权益反向 DCF。",
+                        "Reverse DCF was skipped because the market snapshot is conflicted, stale, or unavailable.",
+                    ),
+                    "error_code": str((market_snapshot or {}).get("error_code") or "MARKET_SNAPSHOT_UNAVAILABLE"),
+                    "currency": snapshot_currency or company.reporting_currency,
                 }
             elif (
                 valuation_inputs
@@ -834,8 +1014,12 @@ class ResearchWorkflow:
                     valuation_inputs["market_cap"],
                     valuation_inputs.get("discount_rate", 0.10),
                     valuation_inputs.get("terminal_growth", 0.03),
+                    int(valuation_inputs.get("horizon_years", 5)),
+                    market_as_of=str((market_snapshot or {}).get("as_of", "")),
+                    currency=company.reporting_currency,
                 )
                 valuation["currency"] = company.reporting_currency
+                valuation["market_snapshot"] = dict(market_snapshot or {})
             context = ResearchContext(
                 company,
                 facts,
@@ -1186,16 +1370,13 @@ class ResearchWorkflow:
                 # call.  The prior agents are already persisted and are never
                 # rerun; authentication, rate-limit and provider exceptions
                 # remain terminal rather than becoming hidden retries.
-                repair_input = _synthesis_prior_artifacts(dossier, growth, skeptic, forecast)
-                repair_input["invalid_synthesis"] = _presentation_stage_value(synthesis, remove_claims=False)
-                repair_input["repair_instruction"] = (
-                    "Return one complete JSON object matching the required report schema. "
-                    "Repair only the final synthesis; do not invent evidence."
+                repair_input = _synthesis_repair_input(
+                    synthesis, verification, dossier, growth, skeptic, forecast
                 )
                 try:
                     repaired = self._run_agent(
                         "research-synthesizer-repair",
-                        "prompts/research-synthesizer.md",
+                        "prompts/research-synthesizer-section-repair.md",
                         context.compact_json(),
                         repair_input,
                     )
@@ -1210,16 +1391,20 @@ class ResearchWorkflow:
                         "Final synthesis repair was unavailable; completed stages were preserved."
                     )
                 else:
+                    repair_fields = list(repair_input.get("repair_sections", []))
+                    patches = _section_patch_from_output(repaired, repair_fields)
+                    merged = dict(synthesis) if isinstance(synthesis, dict) else {}
+                    merged.update(patches)
                     repaired_verification = validate_research_synthesis(
-                        repaired, available, self.report_language, evidence_records
+                        merged, available, self.report_language, evidence_records
                     )
                     repair_diagnostics = _response_diagnostics(repaired)
                     if not repaired_verification["passed"] and not repair_diagnostics.get("parse_error_class"):
                         repair_diagnostics["parse_error_class"] = "invalid_schema"
                     if repaired_verification["passed"]:
-                        synthesis = repaired
+                        synthesis = merged
                         verification = repaired_verification
-                        report_payload = repaired
+                        report_payload = merged
                     else:
                         verification["issues"].extend(
                             issue for issue in repaired_verification["issues"]
@@ -1558,8 +1743,15 @@ class ResearchWorkflow:
             ensure_ascii=False,
         )
         try:
+            system_prompt = CORE_SYSTEM_PROMPT + "\n" + language_instruction
+            if agent_id == "research-synthesizer-repair":
+                # Keep the repair contract in the provider's highest-priority
+                # instructions as well as the task payload. This prevents a
+                # provider from following the normal synthesizer contract and
+                # regenerating untouched sections.
+                system_prompt += "\n\n" + role_prompt
             result = self._generate_with_cancellation(
-                CORE_SYSTEM_PROMPT + "\n" + language_instruction,
+                system_prompt,
                 user_prompt,
                 json_mode=True,
             )

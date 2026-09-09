@@ -13,6 +13,17 @@ from openthesis.sidecar import JsonLineServer
 
 
 class JsonLineServerTests(unittest.TestCase):
+    def test_financial_diagnostics_requires_run_id_and_calls_service(self) -> None:
+        class Service:
+            def financial_diagnostics(self, run_id: str):
+                return {"run_id": run_id, "schema": "openthesis.financial-diagnostics.v1"}
+
+        server = JsonLineServer(Service())
+        with self.assertRaises(ValueError):
+            server.dispatch({"jsonrpc": "2.0", "method": "research.financial_diagnostics", "params": {}})
+        result = server.dispatch({"jsonrpc": "2.0", "method": "research.financial_diagnostics", "params": {"run_id": "run-1"}})
+        self.assertEqual(result["run_id"], "run-1")
+
     def test_sidecar_spec_declares_windows_version_resource(self) -> None:
         root = Path(__file__).resolve().parents[1]
         spec = (root / "OpenThesisSidecar.spec").read_text(encoding="utf-8")

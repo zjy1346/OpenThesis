@@ -81,6 +81,12 @@ def convert() -> tuple[str, str]:
             "languages": metadata["languages"],
         },
         "workflow": {"steps": steps},
+        "additional_resources": {
+            "resources/prompts/research-synthesizer-section-repair.md": (
+                source.joinpath("prompts", "research-synthesizer-section-repair.md")
+                .read_text(encoding="utf-8")
+            ),
+        },
         "outputs": {
             "formats": ["json", "markdown", "html"],
             "include_evidence": True,

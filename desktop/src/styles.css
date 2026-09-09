@@ -244,6 +244,8 @@ button { color: inherit; }
 .financial-stage-status span { white-space: nowrap; }
 .financial-health .report-retry-button { flex: none; min-height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid #cba982; border-radius: 9px; background: #fff; color: #704821; cursor: pointer; }
 .financial-health .report-retry-button:disabled { cursor: default; opacity: .45; }
+.financial-recovery-diagnostics { display: block; color: #704821; }
+.financial-recovery-diagnostics code { margin-left: 4px; padding: 2px 5px; border-radius: 4px; background: #fff4e8; font-size: 11px; overflow-wrap: anywhere; }
 .financial-health-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .financial-health .report-rebuild-button { border-color: var(--line-strong); color: var(--ink-soft); background: transparent; }
 .financial-rebuild-advanced { max-width: 280px; padding: 8px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; }
@@ -374,6 +376,12 @@ button { color: inherit; }
 .vision-source-panel .vision-consent { margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line); }
 .vision-source-panel select option[value="mineru_flash"] { font-weight: 700; }
 .vision-source-panel .secondary-button { white-space: nowrap; }
+.vision-approval-mode { display: grid; gap: 8px; margin: 2px 0 0; padding: 0; border: 0; }
+.vision-approval-mode legend { margin-bottom: 1px; color: #536059; font-size: 12px; font-weight: 700; }
+.vision-approval-option { display: flex; align-items: center; gap: 9px; min-height: 40px; padding: 0 11px; border: 1px solid var(--line); border-radius: 10px; background: #fff; color: #3f4b44; font-size: 12px; font-weight: 600; cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease; }
+.vision-approval-option.active { border-color: #86b59a; background: var(--accent-soft); color: #245f43; }
+.vision-approval-option input { flex: none; accent-color: var(--accent); }
+.vision-approval-mode .field-caption { margin: 1px 0 0; }
 
 .field-grid label, .model-fields label { display: grid; gap: 7px; color: #536059; font-size: 12px; font-weight: 620; }
 .field-grid input, .field-grid select, .model-fields input, .model-fields select, .search-row input {

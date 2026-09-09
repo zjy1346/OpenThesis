@@ -196,6 +196,7 @@ export type VisionFallbackSelection = {
   model?: ModelReference;
   language?: "auto" | "ch" | "en";
   require_page_approval: true;
+  approval_mode: "review_each_plan" | "approve_current_research";
 };
 
 export type ResearchRequest = {
@@ -211,7 +212,9 @@ export type ResearchRequest = {
     market_cap_billions: number;
     discount_rate_percent: number;
     terminal_growth_percent: number;
+    horizon_years?: number;
   };
+  auto_market_snapshot?: boolean;
   market_snapshot?: {
     price: number;
     market_cap_billions: number;
@@ -219,6 +222,19 @@ export type ResearchRequest = {
     as_of: string;
   };
   vision_fallback?: VisionFallbackSelection;
+};
+
+export type MarketSnapshotPreview = {
+  status: "VERIFIED" | "STALE" | "MANUAL" | "UNAVAILABLE" | "CONFLICT";
+  price?: number | null;
+  market_cap?: number | null;
+  quote_currency?: string;
+  valuation_currency?: string;
+  currency?: string;
+  as_of?: string;
+  provider?: string;
+  cache?: string;
+  error_code?: string;
 };
 
 export type ResearchRunSummary = {
@@ -257,6 +273,44 @@ export type FinancialRetryResult = {
   status: "succeeded" | "partial" | "failed" | string;
   error: string;
   updated_artifacts: string[];
+  terminal_state?: string;
+  diagnostics?: string[];
+  freshness?: string;
+  next_action?: string;
+};
+
+export type FinancialDiagnostics = {
+  schema: string;
+  app: { version: string; contract_version: string };
+  run: { run_id: string; status: string };
+  company: Record<string, string> & { ticker?: string };
+  financial_status: {
+    state: string;
+    expected_periods: string[];
+    available_periods: string[];
+    missing_periods: string[];
+    unverified_periods: string[];
+    attempt_count: number;
+    last_stage: string;
+    updated_at: string;
+    next_action: string;
+    snapshot_stale: boolean;
+    quality_summary?: Record<string, number>;
+  };
+  recovery_cases: Array<{
+    accession_number: string;
+    period: string;
+    pages: number[];
+    fields: string[];
+    stage: string;
+    error_code: string;
+    attempts: number;
+    status: string;
+    next_action: string;
+    freshness: string;
+  }>;
+  issues: Array<Record<string, string>>;
+  active_compatibility_pack: Record<string, string> | null;
 };
 
 export type ResearchReport = {
@@ -296,6 +350,18 @@ export type ResearchReport = {
     model_calls: number;
     token_delta: number;
     snapshot_stale?: boolean;
+    recovery_cases?: Array<{
+      accession_number: string;
+      period?: string;
+      pages?: number[];
+      fields?: string[];
+      stage: string;
+      error_code: string;
+      attempts: number;
+      status: string;
+      next_action: string;
+      diagnostics?: Record<string, string>;
+    }>;
   };
   reproducibility?: {
     model_configuration: Record<string, unknown>;
@@ -351,9 +417,12 @@ export type ResearchJob = {
   market?: Market | null;
   disclosure_url?: string | null;
   vision_upload_preview?: {
+    plan_id?: string;
     provider: string;
     pages: number[];
     total_bytes: number;
+    max_pages?: number;
+    max_bytes?: number;
     source_document?: string;
     filing_hash?: string;
     document_hashes?: string[];

@@ -18,7 +18,7 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class Storage:
@@ -178,6 +178,30 @@ class Storage:
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
+                CREATE TABLE IF NOT EXISTS financial_recovery_cases (
+                    case_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    company_cik TEXT NOT NULL,
+                    accession_number TEXT NOT NULL,
+                    document_hash TEXT NOT NULL DEFAULT '',
+                    pages_json TEXT NOT NULL DEFAULT '[]',
+                    fields_json TEXT NOT NULL DEFAULT '[]',
+                    stage TEXT NOT NULL DEFAULT '',
+                    error_code TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    next_action TEXT NOT NULL DEFAULT '',
+                    diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(company_cik) REFERENCES companies(cik)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_financial_recovery_run
+                ON financial_recovery_cases(run_id, updated_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_financial_recovery_company
+                ON financial_recovery_cases(company_cik, updated_at DESC);
+
                 CREATE TABLE IF NOT EXISTS vision_task_journal (
                     task_key TEXT PRIMARY KEY,
                     company_cik TEXT NOT NULL,
@@ -242,6 +266,12 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS market_snapshot_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    snapshot_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -453,6 +483,128 @@ class Storage:
                 (company_cik,),
             ).fetchone()
         return dict(row)
+
+    def save_financial_recovery_case(
+        self,
+        *,
+        run_id: str,
+        company_cik: str,
+        accession_number: str,
+        document_hash: str = "",
+        pages: Sequence[int] = (),
+        fields: Sequence[str] = (),
+        stage: str = "",
+        error_code: str = "",
+        next_action: str = "",
+        status: str = "open",
+        diagnostics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist a bounded recovery target without secrets or model output."""
+
+        safe_accession = str(accession_number).strip()
+        if not str(run_id).strip() or not safe_accession:
+            raise ValueError("run_id and accession_number are required")
+        case_id = "|".join((str(run_id), str(company_cik), safe_accession))
+        updated_at = utc_now_iso()
+        safe_pages = [int(item) for item in pages]
+        safe_fields = [str(item)[:160] for item in fields]
+        safe_diagnostics = {
+            str(key)[:80]: str(value)[:800]
+            for key, value in (diagnostics or {}).items()
+            if str(key) not in {"api_key", "token", "secret", "response"}
+        }
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO financial_recovery_cases(
+                    case_id, run_id, company_cik, accession_number, document_hash,
+                    pages_json, fields_json, stage, error_code, attempts, status,
+                    next_action, diagnostics_json, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(case_id) DO UPDATE SET
+                    document_hash=excluded.document_hash,
+                    pages_json=excluded.pages_json,
+                    fields_json=excluded.fields_json,
+                    stage=excluded.stage,
+                    error_code=excluded.error_code,
+                    attempts=financial_recovery_cases.attempts + 1,
+                    status=excluded.status,
+                    next_action=excluded.next_action,
+                    diagnostics_json=excluded.diagnostics_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    case_id, str(run_id), str(company_cik), safe_accession,
+                    str(document_hash)[:256], json.dumps(safe_pages),
+                    json.dumps(safe_fields, ensure_ascii=False), str(stage)[:120],
+                    str(error_code)[:120], str(status)[:80], str(next_action)[:160],
+                    json.dumps(safe_diagnostics, ensure_ascii=False), updated_at,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM financial_recovery_cases WHERE case_id = ?",
+                (case_id,),
+            ).fetchone()
+        return self._recovery_case_row(row)
+
+    def get_financial_recovery_cases(
+        self, run_id: str | None = None, *, company_cik: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM financial_recovery_cases"
+        params: list[str] = []
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            params.append(str(run_id))
+        elif company_cik is not None:
+            query += " WHERE company_cik = ?"
+            params.append(str(company_cik))
+        query += " ORDER BY updated_at DESC, case_id"
+        with self.connect() as db:
+            rows = db.execute(query, tuple(params)).fetchall()
+        return [self._recovery_case_row(row) for row in rows]
+
+    def reassign_financial_recovery_cases(self, source_run_id: str, target_run_id: str) -> int:
+        """Attach pre-report session cases to the durable research run."""
+        if not str(source_run_id).strip() or not str(target_run_id).strip():
+            raise ValueError("recovery case ids are required")
+        with self.connect() as db:
+            result = db.execute(
+                "UPDATE financial_recovery_cases SET run_id = ?, updated_at = ? WHERE run_id = ?",
+                (str(target_run_id), utc_now_iso(), str(source_run_id)),
+            )
+        return int(result.rowcount)
+
+    def resolve_financial_recovery_cases(
+        self, run_id: str, accessions: Sequence[str] = ()
+    ) -> int:
+        """Close only the accessions that completed deterministic recovery."""
+        values = [str(item) for item in accessions if str(item)]
+        with self.connect() as db:
+            if values:
+                marks = ", ".join("?" for _ in values)
+                result = db.execute(
+                    f"UPDATE financial_recovery_cases SET status = 'resolved', error_code = '', next_action = 'none', updated_at = ? WHERE run_id = ? AND accession_number IN ({marks})",
+                    (utc_now_iso(), str(run_id), *values),
+                )
+            else:
+                result = db.execute(
+                    "UPDATE financial_recovery_cases SET status = 'resolved', error_code = '', next_action = 'none', updated_at = ? WHERE run_id = ?",
+                    (utc_now_iso(), str(run_id)),
+                )
+        return int(result.rowcount)
+
+    @staticmethod
+    def _recovery_case_row(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            return {}
+        item = dict(row)
+        for key, default in (("pages_json", []), ("fields_json", []), ("diagnostics_json", {})):
+            encoded = item.pop(key, None)
+            try:
+                item[key.removesuffix("_json")] = json.loads(encoded) if encoded else default
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item[key.removesuffix("_json")] = default
+        return item
 
     def save_vision_task(
         self,
@@ -992,6 +1144,7 @@ class Storage:
                 (run_id,),
             )
             db.execute("DELETE FROM artifacts WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM financial_recovery_cases WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM research_runs WHERE run_id = ?", (run_id,))
         return True
 
@@ -1108,3 +1261,22 @@ class Storage:
         with self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else default
+
+    def save_market_snapshot(self, cache_key: str, snapshot: dict[str, Any], updated_at: str) -> None:
+        """Atomically persist normalized market data, never raw provider data."""
+        with self.connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO market_snapshot_cache(cache_key, snapshot_json, updated_at) VALUES(?, ?, ?)",
+                (cache_key, json.dumps(snapshot, ensure_ascii=False), updated_at),
+            )
+
+    def get_market_snapshot(self, cache_key: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT snapshot_json FROM market_snapshot_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+        if not row:
+            return None
+        try:
+            value = json.loads(str(row["snapshot_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None

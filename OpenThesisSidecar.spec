@@ -1,18 +1,28 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 
 project_root = Path(SPECPATH)
 resources = project_root / "src" / "openthesis" / "resources"
 version_file = project_root / "OpenThesisSidecar.version.txt"
 
+# ``cryptography`` is imported lazily by the financial-compatibility trust
+# path.  PyInstaller's static analysis cannot reliably see that import, so
+# collect its package data, native backends, and hidden imports explicitly.
+cryptography_datas, cryptography_binaries, cryptography_hiddenimports = collect_all("cryptography")
+# HTTPS market/FX adapters rely on the Windows system trust store. Collect the
+# dependency explicitly so a local build cannot silently fall back to a Python
+# bundle that lacks the operating-system certificate bridge.
+truststore_datas, truststore_binaries, truststore_hiddenimports = collect_all("truststore")
+
 a = Analysis(
     [str(project_root / "sidecar_launcher.py")],
     pathex=[str(project_root / "src")],
-    binaries=[],
-    datas=[(str(resources), "openthesis/resources")],
-    hiddenimports=[],
+    binaries=cryptography_binaries + truststore_binaries,
+    datas=cryptography_datas + truststore_datas + [(str(resources), "openthesis/resources")],
+    hiddenimports=cryptography_hiddenimports + truststore_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

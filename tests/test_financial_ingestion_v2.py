@@ -148,7 +148,7 @@ class FinancialIngestionV2Tests(unittest.TestCase):
         self.assertEqual(values["revenue"].unit_scale, 10_000)
         self.assertEqual(values["revenue"].statement, "income_statement")
         self.assertEqual(values["revenue"].source_page, 100)
-        self.assertEqual(values["revenue"].parser_version, "financial-ingestion-v2")
+        self.assertEqual(values["revenue"].parser_version, "financial-ingestion-ast-v5")
         self.assertTrue(any(item.locator == "page:100" for item in evidence))
         # Page 140 is not an adjacent continuation and cannot inherit 万元.
         self.assertEqual(values["operating_cash_flow"].value, 2_345 * 10_000)

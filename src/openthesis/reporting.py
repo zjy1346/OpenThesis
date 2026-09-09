@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from .financials import deterministic_summary, format_money, format_percent
+from .financials import (
+    deterministic_summary,
+    format_money,
+    format_percent,
+    reverse_dcf_disclaimer,
+    reverse_dcf_status_text,
+)
 from .growth import (
     GROWTH_FIELD_LABELS,
     evidence_grade_label,
@@ -383,6 +389,7 @@ def render_research_run(
 ) -> str:
     language = normalize_language(language)
     english = language == EN
+    traditional = language == ZH_HANT
     section_labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
     lines = [
         _pick(language, "# OpenThesis 长期公司研究", "# OpenThesis Long-term Company Research"),
@@ -399,7 +406,7 @@ def render_research_run(
     deterministic = next(
         (
             artifact
-            for artifact in artifacts
+            for artifact in reversed(artifacts)
             if artifact["artifact_type"] == "deterministic-financial-summary"
         ),
         None,
@@ -519,27 +526,33 @@ def render_research_run(
             snapshot = content.get("market_snapshot")
             if isinstance(snapshot, dict):
                 values: list[str] = []
+                quote_currency = str(snapshot.get("quote_currency") or snapshot.get("currency", ""))
+                valuation_currency = str(snapshot.get("valuation_currency") or snapshot.get("reporting_currency") or quote_currency)
+                manual_snapshot = str(snapshot.get("source", "")).casefold() == "manual" or str(snapshot.get("status", "")).upper() == "MANUAL"
+                price_label = ("Manual price" if manual_snapshot else "Price") if english else ("手動價格" if traditional and manual_snapshot else "價格" if traditional else "手动价格" if manual_snapshot else "价格")
+                cap_label = ("Manual market cap" if manual_snapshot else "Market cap") if english else ("手動市值" if traditional and manual_snapshot else "市值" if traditional else "手动市值" if manual_snapshot else "市值")
                 if isinstance(snapshot.get("price"), (int, float)):
                     values.append(
-                        ("Manual price" if language == EN else "手動價格" if language == ZH_HANT else "手动价格")
-                        + f": {snapshot.get('currency', '')} {snapshot['price']:,.2f}"
+                        price_label
+                        + f": {quote_currency} {snapshot['price']:,.2f}"
                     )
                 if isinstance(snapshot.get("market_cap"), (int, float)):
                     values.append(
-                        ("Manual market cap" if language == EN else "手動市值" if language == ZH_HANT else "手动市值")
-                        + f": {snapshot.get('currency', '')} {snapshot['market_cap']:,.0f}"
+                        cap_label
+                        + f": {quote_currency} {snapshot['market_cap']:,.0f}"
                     )
                 if values:
+                    source = str(snapshot.get("source") or snapshot.get("provider") or "—")
                     lines.extend(
                         [
                             "> "
                             + "；".join(values)
                             + (
-                                f"。來源：使用者手動輸入；日期：{snapshot.get('as_of', '—')}。"
+                                f"。來源：{source}；日期：{snapshot.get('as_of', '—')}。"
                                 if language == ZH_HANT
-                                else f". Source: user-supplied; as of {snapshot.get('as_of', '—')}."
+                                else f". Source: {source}; as of {snapshot.get('as_of', '—')}."
                                 if language == EN
-                                else f"。来源：用户手动输入；日期：{snapshot.get('as_of', '—')}。"
+                                else f"。来源：{source}；日期：{snapshot.get('as_of', '—')}；估值币种：{valuation_currency}。"
                             ),
                             "",
                         ]
@@ -583,54 +596,54 @@ def render_research_run(
             ]
         )
         if value.get("status") == "ok":
+            currency = str(value.get("currency", "USD"))
+            snapshot = value.get("market_snapshot") if isinstance(value.get("market_snapshot"), dict) else {}
+            source = str(snapshot.get("source") or value.get("source") or "—")
+            as_of = str(snapshot.get("as_of") or value.get("market_as_of") or "—")
+            period = str(value.get("base_fcf_period") or "—")
+            horizon = int(value.get("horizon_years", 5))
             lines.extend(
                 (
                     [
-                        f"- Current market-cap input: ${value['market_cap'] / 1_000_000_000:,.2f} billion",
-                        f"- Latest free cash flow: ${value['base_free_cash_flow'] / 1_000_000_000:,.2f} billion",
-                        f"- Implied free-cash-flow growth for the first five years: {value['implied_fcf_growth'] * 100:.1f}%",
+                        f"- Equity market value ({currency}): {format_money(value['equity_market_value'], currency)}",
+                        f"- FCFE proxy ({period}): {format_money(value['base_free_cash_flow'], currency)}",
+                        f"- Implied FCFE growth for the first {horizon} years: {value['implied_fcf_growth'] * 100:.1f}%",
                         f"- Discount rate: {value['discount_rate'] * 100:.1f}%",
                         f"- Terminal growth rate: {value['terminal_growth'] * 100:.1f}%",
+                        f"- Market snapshot: {source}; as of {as_of}",
                     ]
                     if english
                     else [
-                        f"- 当前市值输入：{value['market_cap'] / 1_000_000_000:,.2f} 十亿美元",
-                        f"- 最新自由现金流：{value['base_free_cash_flow'] / 1_000_000_000:,.2f} 十亿美元",
-                        f"- 前五年隐含自由现金流增速：{value['implied_fcf_growth'] * 100:.1f}%",
-                        f"- 折现率：{value['discount_rate'] * 100:.1f}%",
-                        f"- 永续增长率：{value['terminal_growth'] * 100:.1f}%",
+                        f"- {'權益市值' if traditional else '权益市值'}（{currency}）：{format_money(value['equity_market_value'], currency)}",
+                        f"- {'FCFE 近似' if traditional else 'FCFE 近似'}（{period}）：{format_money(value['base_free_cash_flow'], currency)}",
+                        f"- {'前' if traditional else '前'} {horizon} {'年隱含 FCFE 增速' if traditional else '年隐含 FCFE 增速'}：{value['implied_fcf_growth'] * 100:.1f}%",
+                        f"- {'折現率' if traditional else '折现率'}：{value['discount_rate'] * 100:.1f}%",
+                        f"- {'永續增長率' if traditional else '永续增长率'}：{value['terminal_growth'] * 100:.1f}%",
+                        f"- {'行情快照' if traditional else '行情快照'}：{source}；{'截至' if traditional else '截至'} {as_of}",
                     ]
                 )
             )
         else:
-            reason = {
-                "insufficient_data": (
-                    "没有足够的正自由现金流数据。",
-                    "There is not enough positive free-cash-flow data.",
-                ),
-                "outside_search_range": (
-                    "隐含增速超出当前搜索范围。",
-                    "The implied growth rate is outside the current search range.",
-                ),
-            }.get(str(value.get("status")), ("无法计算。", "Unable to calculate."))
-            lines.append(
-                _pick(
-                    language,
-                    f"- 无法给出隐含增速：{reason[0]}",
-                    f"- Implied growth could not be calculated: {reason[1]}",
-                )
+            status_reason = reverse_dcf_status_text(value.get("status"), language)
+            prefix = (
+                "- Implied growth could not be calculated: "
+                if english
+                else "- 無法給出隱含增速："
+                if traditional
+                else "- 无法给出隐含增速："
             )
+            lines.append(prefix + status_reason)
         limitations = (
             [
-                "Market capitalization approximates enterprise value without a separate net-cash or net-debt adjustment.",
-                "The model assumes free cash flow grows at a constant rate for the first five years.",
+                "Equity market value is matched to an FCFE proxy; this is not an enterprise-value model.",
+                "The model assumes the FCFE proxy grows at a constant rate during the explicit forecast period.",
                 "This result explains market-implied expectations; it is not a price target.",
             ]
             if english
             else [
-                "使用市值近似企业价值，未单独调整净现金或净债务。",
-                "模型假设前五年自由现金流按固定速度增长。",
-                "该结果用于解释市场隐含预期，不是目标价。",
+                "權益市值與 FCFE 近似口徑一致；這不是企業價值模型。" if traditional else "权益市值与 FCFE 近似口径一致；这不是企业价值模型。",
+                "模型假設顯性預測期內 FCFE 近似按固定速度增長。" if traditional else "模型假设显性预测期内 FCFE 近似按固定速度增长。",
+                reverse_dcf_disclaimer(language),
             ]
         )
         prefix = "- Limitation: " if english else "- 限制："

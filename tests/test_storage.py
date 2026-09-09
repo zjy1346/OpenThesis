@@ -119,6 +119,45 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(second["last_stage"], "filing-validation")
             self.assertEqual(second["last_error"], "")
 
+    def test_financial_recovery_case_round_trip_keeps_safe_retry_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("recovery-co", "RECOVERY")
+            storage.save_company(company)
+            saved = storage.save_financial_recovery_case(
+                run_id="run-recovery",
+                company_cik=company.security_id,
+                accession_number="acc-failed",
+                document_hash="sha256:abc",
+                pages=[3, 4],
+                fields=["revenue", "net_income"],
+                stage="filing-validation",
+                error_code="FIELD_MISSING",
+                next_action="retry_local_parse",
+                diagnostics={"reason": "candidate_conflict"},
+            )
+            self.assertEqual(saved["accession_number"], "acc-failed")
+            self.assertEqual(saved["attempts"], 1)
+            cases = storage.get_financial_recovery_cases("run-recovery")
+            self.assertEqual(len(cases), 1)
+            self.assertEqual(cases[0]["pages"], [3, 4])
+            self.assertEqual(cases[0]["fields"], ["revenue", "net_income"])
+            self.assertEqual(cases[0]["diagnostics"]["reason"], "candidate_conflict")
+            updated = storage.save_financial_recovery_case(
+                run_id="run-recovery",
+                company_cik=company.security_id,
+                accession_number="acc-failed",
+                document_hash="sha256:abc",
+                pages=[3, 4],
+                fields=["revenue"],
+                stage="cloud-processing",
+                error_code="",
+                next_action="await_result",
+                status="resolved",
+            )
+            self.assertEqual(updated["attempts"], 2)
+            self.assertEqual(storage.get_financial_recovery_cases("run-recovery")[0]["status"], "resolved")
+
     def test_validation_group_id_is_scoped_by_company(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))

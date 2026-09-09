@@ -8,6 +8,55 @@ from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_markdown_uses_latest_deterministic_financial_artifact(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{"year": 2024, "revenue": 10.0}],
+                    "evidence": [{
+                        "evidence_id": "old-evidence",
+                        "concept": "old source",
+                        "source_url": "https://example.test/old",
+                    }],
+                    "financial_quality": {
+                        "rejected_periods": [{"period_end": "2024-12-31"}],
+                    },
+                },
+            },
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{"year": 2025, "revenue": 20.0}],
+                    "evidence": [{
+                        "evidence_id": "new-evidence",
+                        "concept": "new source",
+                        "source_url": "https://example.test/new",
+                    }],
+                    "financial_quality": {"rejected_periods": []},
+                },
+            },
+        ]
+
+        report = render_research_run(
+            "run-latest-financial", artifacts, "en-US", company_name="Example"
+        )
+
+        self.assertIn("2025", report)
+        self.assertIn("20", report)
+        self.assertIn("new source", report)
+        self.assertIn("https://example.test/new", report)
+        self.assertNotIn("2024", report)
+        self.assertNotIn("old source", report)
+        self.assertNotIn("https://example.test/old", report)
+        self.assertNotIn("Some annual data failed validation", report)
+
     def test_financial_refresh_marks_retained_qualitative_synthesis_as_stale(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",
