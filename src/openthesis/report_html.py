@@ -3,7 +3,12 @@ from __future__ import annotations
 import html
 from typing import Any
 
-from .financials import format_money, format_percent
+from .financials import (
+    format_money,
+    format_percent,
+    reverse_dcf_disclaimer,
+    reverse_dcf_status_text,
+)
 from .growth import (
     evidence_grade_label,
     format_evidence_summary,
@@ -510,19 +515,21 @@ def _financial_section(
         )
     snapshot_note = ""
     if isinstance(market_snapshot, dict):
-        snapshot_currency = str(market_snapshot.get("currency", currency))
+        quote_currency = str(market_snapshot.get("quote_currency") or market_snapshot.get("currency", currency))
+        snapshot_currency = str(market_snapshot.get("valuation_currency") or market_snapshot.get("reporting_currency") or currency)
+        manual_snapshot = str(market_snapshot.get("source", "")).casefold() == "manual" or str(market_snapshot.get("status", "")).upper() == "MANUAL"
         values = []
         if isinstance(market_snapshot.get("price"), (int, float)):
             values.append(
-                _pick(language, "手动价格", "Manual price")
+                _pick(language, "手动价格" if manual_snapshot else "价格", "Manual price" if manual_snapshot else "Price")
                 + ": "
-                + format_money(float(market_snapshot["price"]), snapshot_currency)
+                + format_money(float(market_snapshot["price"]), quote_currency)
             )
         if isinstance(market_snapshot.get("market_cap"), (int, float)):
             values.append(
-                _pick(language, "手动市值", "Manual market cap")
+                _pick(language, "手动市值" if manual_snapshot else "市值", "Manual market cap" if manual_snapshot else "Market cap")
                 + ": "
-                + format_money(float(market_snapshot["market_cap"]), snapshot_currency)
+                + format_money(float(market_snapshot["market_cap"]), quote_currency)
             )
         if values:
             snapshot_note = (
@@ -530,8 +537,8 @@ def _financial_section(
                 + _escape(" · ".join(values))
                 + "<br>"
                 + _escape(
-                    _pick(language, "来源：用户手动输入", "Source: user-supplied")
-                    + f" · {market_snapshot.get('as_of', '—')}"
+                    _pick(language, "来源：" + str(market_snapshot.get("source") or market_snapshot.get("provider") or "—"), "Source: " + str(market_snapshot.get("source") or market_snapshot.get("provider") or "—"))
+                    + f" · {market_snapshot.get('as_of', '—')} · {snapshot_currency}"
                 )
                 + "</div>"
             )
@@ -572,27 +579,34 @@ def _valuation_section(value: object, language: str) -> str:
     english = language == EN
     if value.get("status") == "ok":
         currency = str(value.get("currency", "USD"))
+        snapshot = value.get("market_snapshot") if isinstance(value.get("market_snapshot"), dict) else {}
+        source = str(snapshot.get("source") or value.get("source") or "—")
+        as_of = str(snapshot.get("as_of") or value.get("market_as_of") or "—")
+        period = str(value.get("base_fcf_period") or "—")
+        horizon = int(value.get("horizon_years", 5))
         items = (
             (
-                "Current market-cap input",
-                format_money(value["market_cap"], currency),
+                "Equity market value",
+                format_money(value.get("equity_market_value", value["market_cap"]), currency),
             ),
             (
-                "Latest free cash flow",
+                f"FCFE proxy ({period})",
                 format_money(value["base_free_cash_flow"], currency),
             ),
             (
-                "Five-year implied FCF growth",
+                f"{horizon}-year implied FCFE growth",
                 f"{value['implied_fcf_growth'] * 100:.1f}%",
             ),
             ("Discount rate", f"{value['discount_rate'] * 100:.1f}%"),
             ("Terminal growth", f"{value['terminal_growth'] * 100:.1f}%"),
+            ("Market snapshot", f"{source} · {as_of}"),
         ) if english else (
-            ("当前市值输入", format_money(value["market_cap"], currency)),
-            ("最新自由现金流", format_money(value["base_free_cash_flow"], currency)),
-            ("前五年隐含 FCF 增速", f"{value['implied_fcf_growth'] * 100:.1f}%"),
+            ("权益市值", format_money(value.get("equity_market_value", value["market_cap"]), currency)),
+            (f"FCFE 近似（{period}）", format_money(value["base_free_cash_flow"], currency)),
+            (f"前 {horizon} 年隐含 FCFE 增速", f"{value['implied_fcf_growth'] * 100:.1f}%"),
             ("折现率", f"{value['discount_rate'] * 100:.1f}%"),
             ("永续增长率", f"{value['terminal_growth'] * 100:.1f}%"),
+            ("行情快照", f"{source} · {as_of}"),
         )
         rows = "".join(
             f"<tr><td>{_escape(label)}</td><td>{_escape(result)}</td></tr>"
@@ -603,22 +617,14 @@ def _valuation_section(value: object, language: str) -> str:
         content = (
             "<div class=\"callout callout-warning\">"
             + _escape(
-                _pick(
-                    language,
-                    str(value.get("reason", "当前数据不足，无法可靠计算市场隐含增速。")),
-                    str(value.get("reason", "Current data is insufficient to calculate market-implied growth reliably.")),
-                )
+                reverse_dcf_status_text(value.get("status"), language)
             )
             + "</div>"
         )
     content += (
         "<div class=\"callout\">"
         + _escape(
-            _pick(
-                language,
-                "该结果用于解释市场隐含预期，不是目标价或交易建议。",
-                "This result explains market-implied expectations; it is not a price target or trading recommendation.",
-            )
+            reverse_dcf_disclaimer(language)
         )
         + "</div>"
     )
@@ -1172,7 +1178,9 @@ def render_research_html(
         + "</div></div>"
     )
 
-    deterministic = _artifact(artifacts, "deterministic-financial-summary")
+    deterministic = _artifact(
+        artifacts, "deterministic-financial-summary", reverse=True
+    )
     valuation = _artifact(artifacts, "deterministic-valuation")
     growth_artifact = _artifact(artifacts, "growth-opportunities", reverse=True)
     final = _artifact(artifacts, "research-report", reverse=True)

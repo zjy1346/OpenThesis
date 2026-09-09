@@ -528,6 +528,26 @@ def compile_studio_draft(draft: Mapping[str, Any]) -> tuple[bytes, OtPackage]:
         step["prompt"] = prompt_path
         compiled_steps.append(step)
 
+    # Research workflows occasionally need a small auxiliary prompt (for
+    # example, a section-only repair prompt) that is not itself an executable
+    # workflow step. Keep these resources explicit and public, and subject
+    # them to the same safe member-name rules as step prompts.
+    additional_resources = draft.get("additional_resources", {})
+    if isinstance(additional_resources, Mapping):
+        for raw_path, raw_payload in additional_resources.items():
+            path = _safe_member_name(str(raw_path))
+            if path in resources or path in {OT_MANIFEST, OT_LOCKFILE}:
+                raise OtValidationError([])
+            if not isinstance(raw_payload, str):
+                raise OtValidationError([])
+            resource_id = "extra." + re.sub(r"[^a-zA-Z0-9_.-]", "_", path)
+            resources[path] = (
+                resource_id,
+                "openthesis.prompt",
+                "text/markdown",
+                (raw_payload.strip() + "\n").encode("utf-8"),
+            )
+
     workflow_payload = {
         "schema": "ot://openthesis/workflow/1",
         "steps": compiled_steps,

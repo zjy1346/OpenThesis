@@ -41,6 +41,7 @@ _REPORT_FIELDS = frozenset(
         "capital_requirements", "leading_indicators", "invalidation_conditions",
         "evidence_grade", "supporting_evidence_count", "contradicting_evidence_count",
         "opportunities",
+        "strongest_counterarguments", "unsupported_assumptions", "missing_evidence",
     }
 )
 
@@ -146,7 +147,7 @@ _TYPED_SECTION_FIELDS = {
     "financial_quality": {"summary", "analysis", "conclusion", "financial_analysis", "accounting_risk", "strengths", "concerns", "risks", "unknowns"},
     "balance_sheet": {"summary", "analysis", "conclusion", "strengths", "concerns", "risks", "unknowns", "assets", "liabilities", "equity", "total_equity"},
     "competitive_position": {"summary", "analysis", "conclusion", "possible_moats", "strengths", "concerns", "risks", "unknowns"},
-    "counterarguments": {"title", "counterargument", "argument", "text", "severity", "confidence"},
+    "counterarguments": {"title", "counterargument", "argument", "text", "severity", "confidence", "strongest_counterarguments", "unsupported_assumptions", "missing_evidence", "claims"},
     "invalidation_conditions": {"title", "condition", "text", "trigger", "confidence"},
     "leading_indicators": {"title", "indicator", "metric", "text", "confidence"},
     "unresolved_questions": {"title", "question", "text", "confidence"},
@@ -298,6 +299,22 @@ def normalize_report_sections(value: Any, language: str) -> dict[str, Any]:
         report["business_model"] = business
     if report.get("unknowns") and not report.get("unresolved_questions"):
         report["unresolved_questions"] = report.get("unknowns")
+    # Agent versions have used both a direct list and a typed object for the
+    # opposing-views section. Canonicalise aliases once at the projection seam
+    # so Markdown, HTML and the desktop renderer cannot silently disagree.
+    counter = report.get("counterarguments")
+    if isinstance(counter, dict):
+        counter = dict(counter)
+        aliases = {
+            "counterarguments": "strongest_counterarguments",
+            "strongest_arguments_against": "strongest_counterarguments",
+            "unsupported": "unsupported_assumptions",
+            "evidence_gaps": "missing_evidence",
+        }
+        for alias, canonical in aliases.items():
+            if counter.get(canonical) in (None, "", [], {}) and counter.get(alias) not in (None, "", [], {}):
+                counter[canonical] = counter[alias]
+        report["counterarguments"] = counter
     locale = normalize_language(language)
     missing = (
         "This section was not returned with verifiable content in the current research stage."

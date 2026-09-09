@@ -68,6 +68,7 @@ class VisionFallbackConfig:
     approve_upload: Callable[[Mapping[str, Any]], bool] | None = None
     language: str = "auto"
     require_page_approval: bool = False
+    approval_mode: str = "review_each_plan"
 
     def validate(self) -> None:
         if not self.enabled:
@@ -82,6 +83,8 @@ class VisionFallbackConfig:
             raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
         if self.provider == "configured_model" and not self.configured_model_id:
             raise VisionAdapterError("VISION_MODEL_REQUIRED")
+        if self.approval_mode not in {"review_each_plan", "approve_current_research"}:
+            raise VisionAdapterError("VISION_APPROVAL_MODE_UNSUPPORTED")
         if not self.require_page_approval or self.approve_upload is None:
             raise VisionAdapterError("VISION_UPLOAD_APPROVAL_REQUIRED")
 
@@ -105,6 +108,142 @@ class VisionPageRequest:
 
 
 FinancialPageRequest = VisionPageRequest
+
+
+@dataclass(frozen=True, slots=True)
+class VisionUploadPlan:
+    """Immutable, in-memory manifest for one approved failed-page upload.
+
+    The plan is the authorization boundary: its identity includes the provider
+    configuration and the exact original-page/hash pairs.  PDF bytes are kept
+    only by the page requests during the active call; ``safe_summary`` never
+    exposes them or any source URL/path.
+    """
+
+    provider: str
+    filing_hash: str
+    source_document: str
+    pages: tuple[VisionPageRequest, ...] = ()
+    max_pages: int = VISION_MAX_PAGES
+    max_bytes: int = VISION_MAX_BYTES
+    configured_model_id: str = ""
+    configuration_version: int = 1
+    page_hashes: tuple[str, ...] | None = None
+    plan_id: str = field(init=False)
+    total_bytes: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not str(self.filing_hash).strip():
+            raise ValueError("VISION_FILING_HASH_REQUIRED")
+        if self.max_pages < 1 or self.max_pages > VISION_MAX_PAGES:
+            raise ValueError("VISION_PAGE_LIMIT")
+        if self.max_bytes < 1 or self.max_bytes > VISION_MAX_BYTES:
+            raise ValueError("VISION_SIZE_LIMIT")
+        unique: dict[tuple[int, str], VisionPageRequest] = {}
+        page_hashes_by_number: dict[int, str] = {}
+        for page in sorted(tuple(self.pages), key=lambda item: (item.original_page, item.content_hash)):
+            previous_hash = page_hashes_by_number.get(page.original_page)
+            if previous_hash is not None and previous_hash != page.content_hash:
+                raise ValueError("VISION_PAGE_AMBIGUOUS")
+            page_hashes_by_number[page.original_page] = page.content_hash
+            unique.setdefault((page.original_page, page.content_hash), page)
+        ordered = tuple(unique.values())
+        hashes = tuple(page.content_hash for page in ordered)
+        if self.page_hashes is not None and tuple(self.page_hashes) != hashes:
+            raise ValueError("VISION_PAGE_HASH_MISMATCH")
+        if not ordered:
+            raise ValueError("VISION_NO_FAILED_PAGES")
+        total_bytes = sum(len(page.pdf_bytes) for page in ordered)
+        if len(ordered) > self.max_pages:
+            raise ValueError("VISION_PAGE_LIMIT")
+        if total_bytes > self.max_bytes:
+            raise ValueError("VISION_SIZE_LIMIT")
+        object.__setattr__(self, "pages", ordered)
+        object.__setattr__(self, "page_hashes", hashes)
+        object.__setattr__(self, "total_bytes", total_bytes)
+        provider_identity = self.provider
+        if self.configured_model_id:
+            provider_identity = (
+                f"{self.provider}:{self.configured_model_id}:"
+                f"configuration-{self.configuration_version}"
+            )
+        object.__setattr__(
+            self,
+            "plan_id",
+            vision_task_key(
+                provider_identity,
+                self.filing_hash,
+                ordered,
+                namespace="plan",
+            ),
+        )
+
+    @property
+    def page_numbers(self) -> tuple[int, ...]:
+        return tuple(page.original_page for page in self.pages)
+
+    def safe_summary(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "provider": self.provider,
+            "configured_model_id": self.configured_model_id,
+            "configuration_version": self.configuration_version,
+            "filing_hash": self.filing_hash,
+            "source_document": re.split(r"[\\/]", str(self.source_document or ""))[-1],
+            "pages": self.page_numbers,
+            "document_hashes": self.page_hashes,
+            "total_bytes": self.total_bytes,
+            "max_pages": self.max_pages,
+            "max_bytes": self.max_bytes,
+        }
+
+    def validate(self) -> None:
+        """Revalidate the immutable manifest immediately before upload.
+
+        ``frozen=True`` protects ordinary callers, but authorization must also
+        defend against reflective mutation or a stale plan object crossing a
+        configuration boundary.  Recomputing the identity makes that check
+        explicit at the network seam.
+        """
+
+        if not self.pages:
+            raise ValueError("VISION_NO_FAILED_PAGES")
+        expected_pages = tuple(
+            sorted(self.pages, key=lambda item: (item.original_page, item.content_hash))
+        )
+        page_hashes_by_number: dict[int, str] = {}
+        for page in expected_pages:
+            previous_hash = page_hashes_by_number.get(page.original_page)
+            if previous_hash is not None and previous_hash != page.content_hash:
+                raise ValueError("VISION_PAGE_AMBIGUOUS")
+            page_hashes_by_number[page.original_page] = page.content_hash
+        expected_unique = tuple({(page.original_page, page.content_hash): page for page in expected_pages}.values())
+        if expected_unique != self.pages:
+            raise ValueError("VISION_UPLOAD_PLAN_CHANGED")
+        if not str(self.filing_hash).strip():
+            raise ValueError("VISION_FILING_HASH_REQUIRED")
+        expected_hashes = tuple(page.content_hash for page in expected_pages)
+        if expected_pages != self.pages or expected_hashes != self.page_hashes:
+            raise ValueError("VISION_UPLOAD_PLAN_CHANGED")
+        total_bytes = sum(len(page.pdf_bytes) for page in self.pages)
+        if len(self.pages) > self.max_pages:
+            raise ValueError("VISION_PAGE_LIMIT")
+        if total_bytes > self.max_bytes:
+            raise ValueError("VISION_SIZE_LIMIT")
+        provider_identity = self.provider
+        if self.configured_model_id:
+            provider_identity = (
+                f"{self.provider}:{self.configured_model_id}:"
+                f"configuration-{self.configuration_version}"
+            )
+        expected_plan_id = vision_task_key(
+            provider_identity,
+            self.filing_hash,
+            self.pages,
+            namespace="plan",
+        )
+        if self.plan_id != expected_plan_id or self.total_bytes != total_bytes:
+            raise ValueError("VISION_UPLOAD_PLAN_CHANGED")
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,27 +386,58 @@ class VisionFinancialSourceAdapter(Protocol):
     ) -> VisionExtractionResult: ...
 
 
-def _check_request(config: VisionFallbackConfig, pages: Sequence[VisionPageRequest], filing: FilingDocument | None = None) -> None:
+def _check_request(
+    config: VisionFallbackConfig,
+    pages: Sequence[VisionPageRequest],
+    filing: FilingDocument | None = None,
+    *,
+    plan: VisionUploadPlan | None = None,
+) -> VisionUploadPlan:
     config.validate()
     if not config.enabled:
         raise VisionAdapterError("VISION_DISABLED")
-    if not pages:
-        raise VisionAdapterError("VISION_NO_FAILED_PAGES")
-    if len(pages) > config.max_pages:
-        raise VisionAdapterError("VISION_PAGE_LIMIT")
-    if sum(len(page.pdf_bytes) for page in pages) > config.max_bytes:
-        raise VisionAdapterError("VISION_SIZE_LIMIT")
-    summary = {
-        "provider": config.provider if config.provider == "mineru_flash" else config.configured_model_id,
-        "pages": tuple(page.original_page for page in pages),
-        "total_bytes": sum(len(page.pdf_bytes) for page in pages),
-        "document_hashes": tuple(page.content_hash for page in pages),
-        "source_document": (filing.primary_document if filing else ""),
-        "filing_hash": (filing.content_hash if filing else ""),
-    }
+    if plan is None:
+        try:
+            plan = VisionUploadPlan(
+                provider=config.provider,
+                configured_model_id=config.configured_model_id,
+                configuration_version=config.configuration_version,
+                filing_hash=filing.content_hash if filing else "",
+                source_document=filing.primary_document if filing else "",
+                pages=tuple(pages),
+                max_pages=config.max_pages,
+                max_bytes=config.max_bytes,
+            )
+        except ValueError as exc:
+            raise VisionAdapterError(str(exc)) from exc
+    else:
+        if tuple(pages) != plan.pages:
+            raise VisionAdapterError("VISION_UPLOAD_PLAN_CHANGED")
+        if plan.provider != config.provider:
+            raise VisionAdapterError("VISION_UPLOAD_PLAN_CHANGED")
+        if plan.configured_model_id != config.configured_model_id or plan.configuration_version != config.configuration_version:
+            raise VisionAdapterError("VISION_UPLOAD_PLAN_CHANGED")
+        if plan.max_pages != config.max_pages or plan.max_bytes != config.max_bytes:
+            raise VisionAdapterError("VISION_UPLOAD_PLAN_CHANGED")
+        if filing is not None and plan.filing_hash != filing.content_hash:
+            raise VisionAdapterError("VISION_UPLOAD_PLAN_CHANGED")
+    try:
+        plan.validate()
+    except ValueError as exc:
+        code = str(exc)
+        if code not in {"VISION_NO_FAILED_PAGES", "VISION_PAGE_LIMIT", "VISION_SIZE_LIMIT", "VISION_FILING_HASH_REQUIRED", "VISION_PAGE_AMBIGUOUS"}:
+            code = "VISION_UPLOAD_PLAN_CHANGED"
+        raise VisionAdapterError(code) from exc
+    summary = plan.safe_summary()
+    # Keep the historical friendly provider field for UI compatibility while
+    # the immutable plan id binds the full provider identity.
+    summary["provider"] = (
+        config.provider if config.provider == "mineru_flash" else config.configured_model_id
+    )
     approver = config.approve_upload
     if approver is not None and not approver(summary):
         raise VisionAdapterError("VISION_UPLOAD_NOT_APPROVED")
+    return plan
 
 
 
@@ -643,6 +813,16 @@ class VisionTaskCoordinator:
                 raise VisionAdapterError("VISION_PAGE_LIMIT")
             if sum(len(page.pdf_bytes) for page in ordered_pages) > config.max_bytes:
                 raise VisionAdapterError("VISION_SIZE_LIMIT")
+            plan = VisionUploadPlan(
+                provider=config.provider,
+                configured_model_id=config.configured_model_id,
+                configuration_version=config.configuration_version,
+                filing_hash=filing.content_hash,
+                source_document=filing.primary_document,
+                pages=ordered_pages,
+                max_pages=config.max_pages,
+                max_bytes=config.max_bytes,
+            )
             provider_identity = _provider_identity(config)
             task_key = vision_task_key(
                 provider_identity,
@@ -667,7 +847,7 @@ class VisionTaskCoordinator:
                     )
                     self._completed_results[task_key] = cached
                     return cached
-            _check_request(config, ordered_pages, filing)
+            _check_request(config, ordered_pages, filing, plan=plan)
             if prior and prior.get("status") in {"created", "uploaded", "running"} and config.provider != "mineru_flash":
                 return VisionExtractionResult(
                     diagnostics=("VISION_RECOVERY_BLOCKED",),

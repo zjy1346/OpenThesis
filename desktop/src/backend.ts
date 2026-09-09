@@ -20,6 +20,8 @@ import type {
   ResearchRequest,
   ResearchPackSummary,
   ThesisVersion,
+  FinancialDiagnostics,
+  MarketSnapshotPreview,
 } from "./types";
 import type {
   BackendMethod,
@@ -60,8 +62,19 @@ export function searchCompanies(query: string, market: Market): Promise<Company[
   return request("company.search", { query, market });
 }
 
+export function captureMarketSnapshot(
+  company: Company,
+  valuation?: ResearchRequest["valuation"],
+): Promise<MarketSnapshotPreview> {
+  return request("research.market_snapshot", { company, ...(valuation ? { valuation } : {}) });
+}
+
 export function listModelProviders(): Promise<ProviderDefinition[]> {
   return invoke<ProviderDefinition[]>("model_center_list_providers");
+}
+
+export function getFinancialDiagnostics(runId: string): Promise<FinancialDiagnostics> {
+  return request("research.financial_diagnostics", { run_id: runId });
 }
 
 export function listProviderConnections(): Promise<ProviderConnectionSummary[]> {
@@ -235,6 +248,13 @@ export function exportResearchReport(report: ResearchReport): Promise<boolean> {
     suggestedName: `${report.ticker || "OpenThesis"}-${report.run_id.slice(0, 12)}.html`,
     markdown: report.markdown,
     html: report.html,
+  });
+}
+
+export function exportFinancialDiagnostics(diagnostics: FinancialDiagnostics): Promise<boolean> {
+  return invoke<boolean>("export_financial_diagnostics", {
+    suggestedName: `OpenThesis-${diagnostics.company.ticker || "research"}-${diagnostics.run.run_id.slice(0, 12)}-diagnostics.json`,
+    dataJson: JSON.stringify(diagnostics, null, 2),
   });
 }
 

@@ -44,6 +44,11 @@ class Company:
     industry: str = ""
     industry_support: str = "standard"
     source_url: str = ""
+    # Optional equity-scope metadata used by market-cap safety checks.  Empty
+    # means the provider must supply a verified market cap; the DCF layer will
+    # not derive one from a single quote across multiple share classes.
+    share_classes: tuple[str, ...] = ()
+    total_shares: float | None = None
 
     def __post_init__(self) -> None:
         self.issuer_id = self.issuer_id or self.cik

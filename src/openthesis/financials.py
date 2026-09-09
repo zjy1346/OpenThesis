@@ -10,6 +10,60 @@ _ANNUAL_PERIODS = frozenset({"", "FY", "CY", "ANNUAL"})
 _INTERIM_PERIOD_ORDER = {"Q1": 1, "H1": 2, "Q2": 2, "Q3": 3, "9M": 3, "Q": 3}
 
 
+_REVERSE_DCF_STATUS_TEXT: dict[str, tuple[str, str, str]] = {
+    "insufficient_data": (
+        "没有足够的正自由现金流数据。",
+        "沒有足夠的正自由現金流資料。",
+        "There is not enough positive free-cash-flow data.",
+    ),
+    "outside_search_range": (
+        "隐含增速超出当前搜索范围。",
+        "隱含增速超出目前搜尋範圍。",
+        "The implied growth rate is outside the current search range.",
+    ),
+    "market_snapshot_unavailable": (
+        "行情快照不可用，无法计算市场隐含增速。",
+        "行情快照無法使用，無法計算市場隱含增速。",
+        "The market snapshot is unavailable, so implied growth cannot be calculated.",
+    ),
+    "currency_mismatch": (
+        "行情与报告币种不一致，无法可靠计算市场隐含增速。",
+        "行情與報告幣別不一致，無法可靠計算市場隱含增速。",
+        "The quote and reporting currencies do not match, so implied growth cannot be calculated reliably.",
+    ),
+    "not_applicable": (
+        "当前公司类型不适用标准自由现金流反向 DCF。",
+        "目前公司類型不適用標準自由現金流反向 DCF。",
+        "Standard free-cash-flow reverse DCF is not applicable to this company type.",
+    ),
+}
+
+_REVERSE_DCF_DEFAULT_TEXT = (
+    "当前数据不足，无法可靠计算市场隐含增速。",
+    "目前資料不足，無法可靠計算市場隱含增速。",
+    "Current data is insufficient to calculate market-implied growth reliably.",
+)
+
+_REVERSE_DCF_DISCLAIMER = (
+    "该结果用于解释市场隐含预期，不是目标价或交易建议。",
+    "該結果用於解釋市場隱含預期，不是目標價或交易建議。",
+    "This result explains market-implied expectations; it is not a price target or trading recommendation.",
+)
+
+
+def reverse_dcf_status_text(status: object, language: str = "zh-CN") -> str:
+    """Return a stable localized reason without exposing provider narrative."""
+    locale = normalize_language(language)
+    index = 2 if locale == EN else 1 if locale == ZH_HANT else 0
+    return _REVERSE_DCF_STATUS_TEXT.get(str(status), _REVERSE_DCF_DEFAULT_TEXT)[index]
+
+
+def reverse_dcf_disclaimer(language: str = "zh-CN") -> str:
+    locale = normalize_language(language)
+    index = 2 if locale == EN else 1 if locale == ZH_HANT else 0
+    return _REVERSE_DCF_DISCLAIMER[index]
+
+
 def _period(value: object) -> str:
     return str(value or "").strip().upper()
 
@@ -127,6 +181,18 @@ def _annual_roe_details(
 
 def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     matrix = latest_by_year(facts)
+    metadata: dict[int, tuple[str, str]] = {}
+    for fact in facts:
+        if _period(fact.get("fiscal_period")) not in _ANNUAL_PERIODS:
+            continue
+        try:
+            year = int(fact["fiscal_year"])
+        except (TypeError, ValueError):
+            continue
+        filed_at = str(fact.get("filed_at", ""))
+        period_end = str(fact.get("end_date", ""))
+        previous = metadata.get(year, ("", ""))
+        metadata[year] = (max(previous[0], filed_at), max(previous[1], period_end))
     years = sorted(matrix, reverse=True)
     results: list[dict[str, Any]] = []
     for index, year in enumerate(years):
@@ -149,6 +215,8 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results.append(
             {
                 "year": year,
+                "filed_at": metadata.get(year, ("", ""))[0],
+                "period_end": metadata.get(year, ("", ""))[1],
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
                 "comparison_year": comparison_year,
@@ -343,14 +411,35 @@ def reverse_dcf_analysis(
     discount_rate: float = 0.10,
     terminal_growth: float = 0.03,
     horizon_years: int = 5,
+    *,
+    market_as_of: str = "",
+    currency: str = "",
+    policy_version: str = "reverse-dcf-policy-v1",
 ) -> dict[str, Any]:
     if not metrics:
         return {"status": "insufficient_data", "reason": "没有财务指标"}
-    base_fcf = metrics[0].get("free_cash_flow")
+    # Keep only complete fiscal-year rows for the FCFE proxy.  Intermediate
+    # Q1/H1/Q3 and YTD rows remain available to other analysis, but must not
+    # be mistaken for a full-year base simply because they sort first.
+    eligible = [
+        row for row in metrics
+        if _reverse_dcf_is_complete_fy(row)
+        and (not market_as_of or not row.get("filed_at") or str(row.get("filed_at", ""))[:10] <= market_as_of)
+    ]
+    eligible.sort(key=lambda row: (
+        str(row.get("filed_at") or "")[:10],
+        str(row.get("end_date") or ""),
+        int(row.get("year") or 0),
+    ), reverse=True)
+    base_metric = eligible[0] if eligible else None
+    base_fcf = base_metric.get("free_cash_flow") if base_metric else None
     if not isinstance(base_fcf, (int, float)) or base_fcf <= 0:
         return {
             "status": "insufficient_data",
-            "reason": "最新财年自由现金流不是正数，无法使用标准反向 DCF",
+            "reason": "行情日之前没有正的 FCFE proxy，无法使用权益反向 DCF",
+            "cash_flow_basis": "FCFE proxy = operating cash flow - capital expenditure",
+            "market_as_of": market_as_of,
+            "policy_version": policy_version,
         }
     implied = implied_fcf_growth(
         market_cap,
@@ -362,7 +451,7 @@ def reverse_dcf_analysis(
     sensitivity = [
         {
             "fcf_growth": growth,
-            "enterprise_value": discounted_cash_flow_value(
+            "equity_value": discounted_cash_flow_value(
                 float(base_fcf),
                 growth,
                 discount_rate,
@@ -374,19 +463,38 @@ def reverse_dcf_analysis(
     ]
     return {
         "status": "ok" if implied is not None else "outside_search_range",
+        # Keep market_cap as a wire-compatibility alias.  The semantic target
+        # is equity market value, never enterprise value.
         "market_cap": market_cap,
+        "equity_market_value": market_cap,
         "base_free_cash_flow": float(base_fcf),
+        "base_fcf_period": (
+            f"{base_metric.get('year')} {base_metric.get('period')}".strip()
+            if base_metric and base_metric.get("period") else str(base_metric.get("year", "")) if base_metric else ""
+        ),
+        "base_fcf_filed_at": str(base_metric.get("filed_at", "")) if base_metric else "",
+        "cash_flow_basis": "FCFE proxy = operating cash flow - capital expenditure",
+        "market_as_of": market_as_of,
+        "currency": currency,
+        "policy_version": policy_version,
         "discount_rate": discount_rate,
         "terminal_growth": terminal_growth,
         "horizon_years": horizon_years,
         "implied_fcf_growth": implied,
         "sensitivity": sensitivity,
         "limitations": [
-            "使用市值近似企业价值，未单独调整净现金或净债务。",
-            "模型假设前五年自由现金流按固定速度增长。",
+            "权益市值与 FCFE proxy 同口径；该 proxy 未替代完整的股东现金流建模。",
+            "模型假设显性预测期内 FCFE proxy 按固定速度增长。",
             "该结果用于解释市场隐含预期，不是目标价。",
         ],
     }
+
+
+def _reverse_dcf_is_complete_fy(row: dict[str, Any]) -> bool:
+    period = str(row.get("period") or row.get("fiscal_period") or "").strip().upper()
+    if not period:
+        return True
+    return period in {"FY", "ANNUAL", "12M", "FULL_YEAR", "FULL-YEAR"}
 
 
 def deterministic_summary(

@@ -78,6 +78,77 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_reverse_dcf_non_ok_reason_and_disclaimer_are_localized(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-valuation",
+            "title": "反向 DCF",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "status": "insufficient_data",
+                "reason": "没有足够的正自由现金流数据。",
+            },
+        }]
+        english = render_research_html("run-dcf-en", artifacts, "en")
+        traditional = render_research_html("run-dcf-hant", artifacts, "zh-Hant")
+        assert "There is not enough positive free-cash-flow data." in english
+        assert "This result explains market-implied expectations; it is not a price target or trading recommendation." in english
+        assert "没有足够的正自由现金流数据。" not in english
+        assert "该结果用于解释市场隐含预期，不是目标价或交易建议。" not in english
+        assert "沒有足夠的正自由現金流資料。" in traditional
+        assert "該結果用於解釋市場隱含預期，不是目標價或交易建議。" in traditional
+        assert "没有足够的正自由现金流数据。" not in traditional
+        assert "该结果用于解释市场隐含预期，不是目标价或交易建议。" not in traditional
+
+    def test_html_uses_latest_deterministic_financial_artifact(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{"year": 2024, "revenue": 10.0}],
+                    "evidence": [{
+                        "evidence_id": "old-evidence",
+                        "concept": "old source",
+                        "source_url": "https://example.test/old",
+                    }],
+                    "financial_quality": {
+                        "rejected_periods": [{"period_end": "2024-12-31"}],
+                    },
+                },
+            },
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{"year": 2025, "revenue": 20.0}],
+                    "evidence": [{
+                        "evidence_id": "new-evidence",
+                        "concept": "new source",
+                        "source_url": "https://example.test/new",
+                    }],
+                    "financial_quality": {"rejected_periods": []},
+                },
+            },
+        ]
+
+        report = render_research_html(
+            "run-latest-financial", artifacts, "en-US", company_name="Example"
+        )
+
+        self.assertIn("2025", report)
+        self.assertIn("20", report)
+        self.assertIn("new source", report)
+        self.assertIn("https://example.test/new", report)
+        self.assertNotIn("2024", report)
+        self.assertNotIn("old source", report)
+        self.assertNotIn("https://example.test/old", report)
+        self.assertNotIn("Some annual data failed validation", report)
+
     def test_financial_metric_gaps_show_specific_retry_relevant_reasons(self) -> None:
         artifacts = sample_artifacts()
         metric = artifacts[0]["content"]["metrics"][0]
@@ -209,6 +280,18 @@ class HtmlReportTests(unittest.TestCase):
         self.assertNotIn("filing:secret", report)
         self.assertNotIn(">inference<", report)
         self.assertIn("推论", report)
+
+    def test_upstream_counter_analysis_aliases_reach_html_projection(self) -> None:
+        artifacts = sample_artifacts()
+        artifacts[-1]["content"]["report"]["counterarguments"] = {
+            "strongest_counterarguments": ["产业价格战压缩利润"],
+            "unsupported_assumptions": ["高端化会自动成功"],
+            "missing_evidence": ["海外关税敏感性尚待验证"],
+        }
+        report = render_research_html("run-counter-upstream", artifacts, "zh-CN")
+        self.assertIn("产业价格战压缩利润", report)
+        self.assertIn("高端化会自动成功", report)
+        self.assertIn("海外关税敏感性尚待验证", report)
 
     def test_english_and_html_escaping(self) -> None:
         artifacts = sample_artifacts()

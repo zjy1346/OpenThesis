@@ -132,8 +132,18 @@ class JsonLineServer:
                 language=language,
                 include_technical=include_technical,
             )
+        if method == "research.financial_diagnostics":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            return self.service.financial_diagnostics(run_id)
         if method == "research.start":
             return self.service.start_research(params)
+        if method == "research.market_snapshot":
+            company = params.get("company")
+            if not isinstance(company, dict):
+                raise ValueError("company is required")
+            return self.service.preview_market_snapshot(params)
         if method == "research.retry_synthesis":
             run_id = params.get("run_id")
             model = params.get("model")

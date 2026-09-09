@@ -24,6 +24,7 @@ from openthesis.domain import (
 )
 from openthesis.markets import build_company
 from openthesis.market_data import MarketDataError
+from openthesis.market_snapshot import QuoteSnapshot
 from openthesis.ot import compile_studio_draft, minimal_studio_draft
 from openthesis.service import (
     AppService,
@@ -34,6 +35,8 @@ from openthesis.service import (
     _market_snapshot,
     _request_secrets,
     _vision_config_from_request,
+    _vision_batch_upload_allowed,
+    VisionFallbackConfig,
     _research_history_years,
     _research_data_message,
     _ResearchJob,
@@ -43,9 +46,12 @@ from openthesis.service import (
     _canonical_retry_snapshot,
     _canonical_snapshot_digest,
     _filing_identity_matches,
+    _latest_annual_validations,
 )
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
+from openthesis.financial_compiler import FactGroupValidation
 from openthesis.market_financials import FinancialValidation, ValidationStatus
+from openthesis.vision_financials import VisionPageRequest, VisionUploadPlan
 
 
 class _FakeSecClient:
@@ -97,6 +103,25 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_financial_diagnostics_is_bounded_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            company = build_company("09988.HK", "BABA", reporting_currency="CNY")
+            service.storage.save_company(company)
+            service.storage.save_run(ResearchRun(
+                run_id="diagnostics-redacted", company=company, workflow_id="test",
+                research_pack_id="builtin", research_pack_version="1", provider_id="provider",
+                model_id="model", data_as_of=utc_now_iso(), status=RunStatus.FAILED,
+                model_configuration={"api_key": "do-not-export", "endpoint": "https://secret.invalid"},
+                data_snapshot={"local_path": "C:\\Users\\admin\\secret.pdf"},
+            ))
+            diagnostics = service.financial_diagnostics("diagnostics-redacted")
+            encoded = json.dumps(diagnostics, ensure_ascii=False)
+            self.assertEqual(diagnostics["schema"], "openthesis.financial-diagnostics.v1")
+            self.assertNotIn("do-not-export", encoded)
+            self.assertNotIn("secret.pdf", encoded)
+            self.assertNotIn("api_key", encoded)
+
     def test_filing_cache_reuse_requires_source_revision_and_period_identity(self) -> None:
         base = FilingDocument(
             "doc", "cik", "acc", "10-K", "FY", "2025-12-31", "2026-02-01",
@@ -434,6 +459,124 @@ class AppServiceTests(unittest.TestCase):
                         secret_name: "must-not-enter-python",
                     })
 
+    def test_vision_approval_modes_are_explicit_and_batch_is_run_scoped(self) -> None:
+        for mode in ("review_each_plan", "approve_current_research"):
+            config = _vision_config_from_request({
+                "enabled": True,
+                "consent": True,
+                "provider": "mineru_flash",
+                "require_page_approval": True,
+                "approval_mode": mode,
+            })
+            self.assertEqual(config.approval_mode, mode)
+
+        batch = _vision_config_from_request({
+            "enabled": True,
+            "consent": True,
+            "provider": "mineru_flash",
+            "require_page_approval": True,
+            "approval_mode": "approve_current_research",
+        })
+        summary = VisionUploadPlan(
+            provider="mineru_flash", filing_hash="selected-hash", source_document="report.pdf",
+            pages=(VisionPageRequest(4, b"a" * 512), VisionPageRequest(2, b"b" * 512)),
+        ).safe_summary()
+        self.assertTrue(_vision_batch_upload_allowed(
+            summary, batch, {"selected-hash"}, job_active=True, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            summary, batch, {"other-hash"}, job_active=True, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            summary, batch, {"selected-hash"}, job_active=False, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            summary, batch, {"selected-hash"}, job_active=True, cancelled=True,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**summary, "provider": "configured_model"}, batch, {"selected-hash"},
+            job_active=True, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**summary, "total_bytes": batch.max_bytes + 1}, batch,
+            {"selected-hash"}, job_active=True, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**summary, "pages": (4, 2, 4), "document_hashes": ("hash-4", "hash-2", "hash-4")},
+            batch, {"selected-hash"}, job_active=True, cancelled=False,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**summary, "document_hashes": ("hash-4",)},
+            batch, {"selected-hash"}, job_active=True, cancelled=False,
+        ))
+
+    def test_vision_batch_approval_ledger_is_idempotent_and_run_bounded(self) -> None:
+        batch = VisionFallbackConfig(
+            enabled=True, consent=True, provider="mineru_flash",
+            require_page_approval=True, approve_upload=lambda _: True,
+            max_pages=2, max_bytes=10 * 1024 * 1024,
+            approval_mode="approve_current_research",
+        )
+        first = VisionUploadPlan(
+            provider="mineru_flash", filing_hash="selected-hash", source_document="report.pdf",
+            pages=(VisionPageRequest(4, b"a" * (6 * 1024 * 1024)),),
+        ).safe_summary()
+        second = VisionUploadPlan(
+            provider="mineru_flash", filing_hash="selected-hash", source_document="report.pdf",
+            pages=(VisionPageRequest(5, b"b" * (6 * 1024 * 1024)),),
+        ).safe_summary()
+        ledger: dict[str, tuple[str, int, int]] = {}
+        self.assertTrue(_vision_batch_upload_allowed(
+            first, batch, {"selected-hash"}, job_active=True, cancelled=False,
+            approved_plans=ledger,
+        ))
+        self.assertEqual(len(ledger), 1)
+        self.assertTrue(_vision_batch_upload_allowed(
+            first, batch, {"selected-hash"}, job_active=True, cancelled=False,
+            approved_plans=ledger,
+        ))
+        self.assertEqual(len(ledger), 1)
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**first, "total_bytes": first["total_bytes"] + 1}, batch,
+            {"selected-hash"}, job_active=True, cancelled=False, approved_plans=ledger,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            second, batch, {"selected-hash"}, job_active=True, cancelled=False,
+            approved_plans=ledger,
+        ))
+        self.assertEqual(len(ledger), 1)
+        self.assertFalse(_vision_batch_upload_allowed(
+            {**first, "plan_id": "plan-c"}, batch, {"selected-hash"},
+            job_active=True, cancelled=True, approved_plans=ledger,
+        ))
+        self.assertEqual(len(ledger), 1)
+
+    def test_vision_batch_approval_ledger_enforces_cumulative_page_cap(self) -> None:
+        batch = VisionFallbackConfig(
+            enabled=True, consent=True, provider="mineru_flash",
+            require_page_approval=True, approve_upload=lambda _: True,
+            max_pages=1, max_bytes=10 * 1024 * 1024,
+            approval_mode="approve_current_research",
+        )
+        first = VisionUploadPlan(
+            provider="mineru_flash", filing_hash="selected-hash", source_document="report.pdf",
+            pages=(VisionPageRequest(4, b"a"),),
+        ).safe_summary()
+        second = VisionUploadPlan(
+            provider="mineru_flash", filing_hash="selected-hash", source_document="report.pdf",
+            pages=(VisionPageRequest(5, b"b"),),
+        ).safe_summary()
+        ledger: dict[str, tuple[str, int, int]] = {}
+        self.assertTrue(_vision_batch_upload_allowed(
+            first, batch, {"selected-hash"}, job_active=True, cancelled=False,
+            approved_plans=ledger,
+        ))
+        self.assertFalse(_vision_batch_upload_allowed(
+            second, batch, {"selected-hash"}, job_active=True, cancelled=False,
+            approved_plans=ledger,
+        ))
+        self.assertEqual(len(ledger), 1)
+
     def test_vision_journal_persists_only_safe_task_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
@@ -484,6 +627,22 @@ class AppServiceTests(unittest.TestCase):
             self.assertNotIn("api_key", snapshot["vision_upload_preview"])
             with self.assertRaises(ValueError):
                 service.vision_decision(job.job_id, False)
+    def test_latest_annual_fy_anchor_survives_interim_research_target(self) -> None:
+        facts = tuple(SimpleNamespace(concept=concept) for concept in (
+            "revenue", "net_income", "operating_cash_flow",
+            "assets", "liabilities", "equity",
+        ))
+        annual = FactGroupValidation(
+            ("fy", "2025-12-31", "FY", "consolidated", "CNY"),
+            ValidationStatus.VERIFIED.value, accepted=facts,
+        )
+        interim = FactGroupValidation(
+            ("q1", "2026-03-31", "Q1", "consolidated", "CNY"),
+            ValidationStatus.VERIFIED.value, accepted=facts,
+        )
+        selected = _latest_annual_validations((annual, interim), "2025-12-31")
+        self.assertEqual(selected, [annual])
+
     def test_latest_annual_rejected_does_not_fall_back_to_old_verified_group(self) -> None:
         company = build_company("300750.SZ", "CATL")
         old = FilingDocument(
@@ -942,7 +1101,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertIn(result["preferences"]["ui_language"], {"zh-CN", "zh-Hant", "en"})
             self.assertEqual(result["preferences"]["ui_language_mode"], "system")
             self.assertEqual(result["preferences"]["report_language"], result["preferences"]["ui_language"])
-            self.assertEqual(result["preferences"]["parallel_agents"], "false")
+            self.assertEqual(result["preferences"]["parallel_agents"], "true")
             self.assertEqual(result["recent_runs"], [])
             self.assertEqual(
                 {item["market"] for item in result["market_catalog"]},
@@ -1460,6 +1619,152 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(status["available_periods"], ["2025", "2024", "2023"])
             self.assertTrue(status["snapshot_stale"])
 
+    def test_us_retry_uses_canonical_local_facts_when_company_facts_is_unavailable(self) -> None:
+        """A transient SEC facts outage must not discard a trusted local group."""
+        company = Company(
+            cik="0000000003", ticker="LOCAL", name="Local SEC Corp", exchange="NASDAQ",
+            market="US", security_id="US:NASDAQ:LOCAL", listing_currency="USD",
+            reporting_currency="USD", accounting_standard="US_GAAP",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.update_preferences(
+                {"sec_contact_profile": "personal", "sec_contact_email": "me@example.com"}
+            )
+            service.storage.save_company(company)
+            pdf = Path(directory) / "local-annual.pdf"
+            pdf.write_bytes(b"local annual report")
+            filing = FilingDocument(
+                "local-doc", company.cik, "local-annual", "10-K", "FY",
+                "2025-12-31", "2026-02-01", "annual.htm", "https://sec.test/local",
+                local_path=str(pdf), content_hash=hashlib.sha256(pdf.read_bytes()).hexdigest(),
+            )
+            service.storage.save_filings([filing])
+            local_facts = [
+                FinancialFact(**{
+                    **item,
+                    "company_cik": company.cik,
+                    "accession_number": "local-annual",
+                    "form_type": "DEMO",
+                    "fiscal_year": 2025,
+                    "end_date": "2025-12-31",
+                })
+                for item in demo_facts()
+            ]
+            service.storage.save_facts(local_facts)
+
+            class Client:
+                def list_annual_filings(self, _company, *, limit=5):
+                    return [filing][:limit]
+
+                def get_company_facts(self, _company):
+                    raise RuntimeError("SEC facts temporarily unavailable")
+
+            service._sec_client_factory = lambda *_args: Client()
+            trace = {
+                "targets": set(), "downloaded": set(), "processed": set(),
+                "warnings": set(), "diagnostics": set(), "freshness": set(),
+                "terminal_state": set(), "next_action": set(),
+            }
+            errors = service._retry_us_financials(
+                company,
+                {"research_configuration": {"annual_history_years": 2}},
+                trace=trace,
+            )
+
+            self.assertEqual(errors, [])
+            self.assertIn("local-annual", trace["processed"])
+
+    def test_financial_status_merges_verified_total_equity_facts(self) -> None:
+        company = build_company("300005.SZ", "Status Alias Company")
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.storage.save_company(company)
+            for year in (2025, 2024, 2023):
+                accession = f"status-{year}"
+                filing = FilingDocument(
+                    f"status-doc-{year}", company.security_id, accession,
+                    "ANNUAL_REPORT", "FY", f"{year}-12-31", f"{year + 1}-03-01",
+                    f"status-{year}.pdf", f"https://example.test/{accession}",
+                )
+                service.storage.save_filings([filing])
+                fact = FinancialFact(
+                    f"status-equity-{year}", company.security_id, "total_equity", "Total equity",
+                    100.0, "CNY", year, "FY", "ANNUAL_REPORT", f"{year}-01-01",
+                    f"{year}-12-31", f"{year + 1}-03-01", accession, filing.source_url,
+                    currency="CNY", statement="balance_sheet", validation_status="VERIFIED",
+                )
+                validation = FinancialValidation(
+                    ValidationStatus.VERIFIED, (), frozenset({
+                        "revenue", "net_income", "operating_cash_flow", "assets", "liabilities",
+                    }), (), (),
+                )
+                service.storage.replace_financial_ingestion(
+                    company.security_id, [accession], [fact], [],
+                    [FinancialGroupValidation((accession, filing.period_end, "FY", "consolidated", "CNY"), validation)],
+                )
+
+            status = _financial_status(
+                service.storage,
+                company.to_dict(),
+                {"company": company.to_dict(), "research_configuration": {"annual_history_years": 2}},
+            )
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["unverified_periods"], [])
+
+    def test_financial_status_does_not_invent_an_annual_gap_from_newer_interim_reports(self) -> None:
+        company = build_company("002594.SZ", "BYD", reporting_currency="CNY")
+        required = frozenset({
+            "revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.storage.save_company(company)
+            filings: list[FilingDocument] = []
+            groups: list[FinancialGroupValidation] = []
+            for year in range(2020, 2026):
+                accession = f"annual-{year}"
+                filing = FilingDocument(
+                    f"doc-{accession}", company.security_id, accession,
+                    "ANNUAL_REPORT", "FY", f"{year}-12-31", f"{year + 1}-03-01",
+                    f"{year}-annual.pdf", f"https://example.test/{accession}",
+                )
+                filings.append(filing)
+                groups.append(FinancialGroupValidation(
+                    (accession, filing.period_end, "FY", "consolidated", "CNY"),
+                    FinancialValidation(ValidationStatus.VERIFIED, (), required, (), ()),
+                ))
+            for period, end in (("Q1", "2026-03-31"), ("H1", "2026-06-30")):
+                accession = f"interim-{period.lower()}-2026"
+                filing = FilingDocument(
+                    f"doc-{accession}", company.security_id, accession,
+                    "QUARTERLY_REPORT" if period == "Q1" else "INTERIM_REPORT",
+                    period, end, "2026-08-01", f"2026-{period}.pdf",
+                    f"https://example.test/{accession}",
+                )
+                filings.append(filing)
+                groups.append(FinancialGroupValidation(
+                    (accession, end, period, "consolidated", "CNY"),
+                    FinancialValidation(ValidationStatus.VERIFIED, (), required, (), ()),
+                ))
+            service.storage.save_filings(filings)
+            service.storage.replace_financial_ingestion(
+                company.security_id,
+                [item.accession_number for item in filings],
+                [], [], groups,
+            )
+
+            status = _financial_status(
+                service.storage,
+                company.to_dict(),
+                {"research_configuration": {"annual_history_years": 5}},
+            )
+
+            self.assertEqual(status["state"], "complete")
+            self.assertEqual(status["expected_periods"], ["2025", "2024", "2023", "2022", "2021", "2020"])
+            self.assertNotIn("2026", status["available_periods"])
+            self.assertEqual(status["missing_periods"], [])
+
     def test_demo_research_job_reports_progress_and_produces_a_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
@@ -1570,7 +1875,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(market_data.calls, [("832982", "CN_A", 15)])
 
     def test_manual_market_snapshot_is_explicit_and_currency_aware(self) -> None:
-        company = build_company("00700.HK", "Tencent")
+        company = Company(cik="HK:00700", ticker="00700.HK", name="Tencent", exchange="HKEX", market="HK", listing_currency="HKD", reporting_currency="CNY")
 
         snapshot = _market_snapshot(
             {
@@ -1587,6 +1892,44 @@ class AppServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["currency"], "HKD")
         with self.assertRaisesRegex(ValueError, "as-of date"):
             _market_snapshot({"price": 1}, company)
+
+    def test_completed_run_does_not_inherit_old_financial_retry_state(self) -> None:
+        class StorageStub:
+            def get_filings(self, _key): return []
+            def get_facts(self, _key): return []
+            def get_validation_groups(self, _key): return []
+            def get_financial_retry_state(self, _key):
+                return {"attempt_count": 4, "last_stage": "filing-validation", "last_error": "FILING_FETCH_FAILED", "updated_at": "2026-09-07"}
+            def get_financial_recovery_cases(self, _run_id): return []
+        payload = {"cik": "0001", "ticker": "002594.SZ", "name": "Fixture", "market": "CN_A", "listing_currency": "CNY", "reporting_currency": "CNY"}
+        status = _financial_status(StorageStub(), payload, {"status": "completed"}, run_id="new-run")
+        self.assertEqual(status["attempt_count"], 0)
+        self.assertEqual(status["last_stage"], "")
+        self.assertNotIn("FILING_FETCH_FAILED", json.dumps(status))
+
+    def test_default_snapshot_service_uses_fx_and_secure_configured_adapter_seam(self) -> None:
+        class Configured:
+            name = "configured"
+            def quote(self, company, mapping, *, policy):
+                return QuoteSnapshot("configured", mapping.provider_symbol, mapping.exchange, 300, 100, "HKD", "2026-09-07", "2026-09-08T00:00:00+00:00")
+        class Noop:
+            def __init__(self, *args, **kwargs): self.name = "disabled"
+            def quote(self, company, mapping, *, policy): raise ValueError("disabled")
+        class Fx:
+            def rate(self, source, target, as_of):
+                return type("FxResult", (), {"rate": 0.13, "as_of": as_of, "source": "fixture-ecb"})()
+        company = Company(cik="HK:00700", ticker="00700.HK", name="Tencent", exchange="HKEX", market="HK", listing_currency="HKD", reporting_currency="CNY")
+        with patch("openthesis.service.EcbFxAdapter", return_value=Fx()), patch(
+            "openthesis.service.EastmoneyPublicQuoteAdapter", Noop
+        ), patch("openthesis.service.YahooChartQuoteAdapter", Noop):
+            with tempfile.TemporaryDirectory() as directory:
+                service = AppService(Path(directory), market_quote_adapter_factory=lambda storage: Configured())
+                result = service.preview_market_snapshot({"company": company.to_dict()})
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["quote_currency"], "HKD")
+        self.assertEqual(result["valuation_currency"], "CNY")
+        self.assertEqual(result["equity_market_value"], 13.0)
+        self.assertNotIn("api_key", json.dumps(result))
 
     def test_model_discovery_and_credentials_are_owned_by_rust(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,11 +1,15 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { COPY } from "../../i18n";
+import { exportFinancialDiagnostics, getFinancialDiagnostics } from "../../backend";
 import { stripReportPreamble } from "./ReportWorkspace";
 import { ReportWorkspace } from "./ReportWorkspace";
 
-vi.mock("../../backend", () => ({ getResearchReport: vi.fn(), exportResearchReport: vi.fn() }));
+vi.mock("../../backend", () => ({
+  getResearchReport: vi.fn(), exportResearchReport: vi.fn(),
+  getFinancialDiagnostics: vi.fn(), exportFinancialDiagnostics: vi.fn(),
+}));
 
 describe("report presentation", () => {
   it("moves the generated Chinese report preamble out of the document body", () => {
@@ -112,5 +116,45 @@ describe("report presentation", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(await screen.findByText(COPY.en.financialReportRefreshFailed)).toBeInTheDocument();
     expect(screen.getByText(/Report refresh: Failed/)).toBeInTheDocument();
+  });
+
+  it("shows readable financial recovery details without exposing stable error codes", () => {
+    render(<ReportWorkspace report={{
+      run_id: "run", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      financial_status: {
+        state: "warning", retryable: true, history_years: 2, expected_periods: ["2025", "2024"],
+        available_periods: ["2024"], missing_periods: ["2025"], nodes: [], issues: [], attempt_count: 2,
+        last_stage: "filing-validation", last_error: "FILING_DATA_QUALITY_FAILED", updated_at: "",
+        next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0,
+        recovery_cases: [{ accession_number: "acc-2025", period: "2025", pages: [4], fields: ["revenue"], stage: "filing-validation", error_code: "FILING_DATA_QUALITY_FAILED", attempts: 2, status: "open", next_action: "retry_local_parse" }],
+      }, markdown: "# Report", html: "",
+    }} copy={COPY.en} onRetryFinancials={vi.fn(async () => undefined)} />);
+
+    expect(screen.getByText("Failed reports: 2025")).toBeInTheDocument();
+    expect(screen.getByText("Failed fields: revenue")).toBeInTheDocument();
+    expect(screen.getByText("Failed stage: Financial validation")).toBeInTheDocument();
+    expect(screen.getByText(/Official filing retrieval or parsing did not complete/)).toBeInTheDocument();
+    expect(screen.queryByText(/FILING_DATA_QUALITY_FAILED/)).not.toBeInTheDocument();
+  });
+
+  it("exports a diagnostics snapshot through the dedicated JSON path", async () => {
+    vi.mocked(getFinancialDiagnostics).mockResolvedValue({
+      schema: "openthesis.financial-diagnostics.v1", app: { version: "2.4.2", contract_version: "2.0" },
+      run: { run_id: "run", status: "completed" }, company: { ticker: "1211" },
+      financial_status: { state: "complete", expected_periods: [], available_periods: [], missing_periods: [], unverified_periods: [], attempt_count: 0, last_stage: "", updated_at: "", next_action: "none", snapshot_stale: false },
+      recovery_cases: [], issues: [], active_compatibility_pack: null,
+    });
+    vi.mocked(exportFinancialDiagnostics).mockResolvedValue(true);
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en", financial_status: { state: "complete", retryable: false, history_years: 2, expected_periods: [], available_periods: [], missing_periods: [], nodes: [], issues: [], attempt_count: 0, last_stage: "", last_error: "", updated_at: "", next_action: "none", model_calls: 0, token_delta: 0 }, markdown: "# Report", html: "" }} copy={COPY.en} />);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.financialExportDiagnostics }));
+    await waitFor(() => expect(getFinancialDiagnostics).toHaveBeenCalledWith("run"));
+    await waitFor(() => expect(exportFinancialDiagnostics).toHaveBeenCalled());
+  });
+
+  it("offers cloud configuration when visual recognition is not configured", () => {
+    const configure = vi.fn();
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en", financial_status: { state: "warning", retryable: true, history_years: 2, expected_periods: [], available_periods: [], missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-parse", last_error: "", updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0, recovery_cases: [{ accession_number: "acc", period: "2025", fields: [], stage: "filing-parse", error_code: "VISION_MODEL_REQUIRED", attempts: 1, status: "open", next_action: "configure_cloud" }] }, markdown: "# Report", html: "" }} copy={COPY.en} onConfigureCloud={configure} />);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.financialConfigureCloud }));
+    expect(configure).toHaveBeenCalledTimes(1);
   });
 });

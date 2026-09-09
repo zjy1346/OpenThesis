@@ -17,6 +17,7 @@ from openthesis.vision_financials import (
     VisionFallbackConfig,
     VisionExtractionResult,
     VisionPageRequest,
+    VisionUploadPlan,
     VisionTaskCoordinator,
     vision_task_key,
     default_pdf_to_png,
@@ -47,6 +48,7 @@ def _filing() -> FilingDocument:
         "2026-04-01",
         "2025 Annual Report",
         "https://example.invalid/report.pdf",
+        content_hash="filing-hash",
     )
 
 
@@ -164,6 +166,73 @@ class BoundedVisionAdapter:
 
 
 class VisionFinancialTests(unittest.TestCase):
+    def test_upload_plan_is_deterministic_sorted_deduplicated_and_safe(self):
+        pages = (_page(132, b"same"), _page(130, b"one"), _page(131, b"same"), _page(130, b"one"))
+        plan = VisionUploadPlan(
+            provider="configured_model",
+            configured_model_id="vision.ready",
+            configuration_version=4,
+            filing_hash=_filing().content_hash,
+            source_document="2025 Annual Report",
+            pages=pages,
+        )
+        self.assertEqual(plan.page_numbers, (130, 131, 132))
+        self.assertEqual(plan.page_hashes, tuple(page.content_hash for page in (pages[1], pages[2], pages[0])))
+        self.assertEqual(plan.total_bytes, len(b"one") + len(b"same") + len(b"same"))
+        self.assertEqual(len(plan.plan_id), 64)
+        summary = plan.safe_summary()
+        self.assertEqual(summary["pages"], (130, 131, 132))
+        self.assertNotIn("pdf_bytes", summary)
+        self.assertNotIn("local_path", summary)
+        self.assertNotIn("source_url", summary)
+        self.assertNotIn("api_key", summary)
+        self.assertEqual(summary["source_document"], "2025 Annual Report")
+
+    def test_upload_plan_rejects_ambiguous_page_and_empty_filing_hash(self):
+        with self.assertRaisesRegex(ValueError, "VISION_PAGE_AMBIGUOUS"):
+            VisionUploadPlan(
+                provider="mineru_flash", filing_hash="filing", source_document="report.pdf",
+                pages=(_page(130, b"one"), _page(130, b"two")),
+            )
+        with self.assertRaisesRegex(ValueError, "VISION_FILING_HASH_REQUIRED"):
+            VisionUploadPlan(
+                provider="mineru_flash", filing_hash="", source_document="report.pdf",
+                pages=(_page(),),
+            )
+
+    def test_upload_plan_safe_summary_uses_document_basename(self):
+        plan = VisionUploadPlan(
+            provider="mineru_flash", filing_hash=_filing().content_hash,
+            source_document=r"C:\private\reports\annual.pdf", pages=(_page(),),
+        )
+        summary = plan.safe_summary()
+        self.assertEqual(summary["source_document"], "annual.pdf")
+        self.assertNotRegex(summary["source_document"], r"[\\/]")
+
+    def test_upload_plan_rejects_tampering_and_caps(self):
+        page = _page()
+        with self.assertRaises(ValueError):
+            VisionUploadPlan(
+                provider="configured_model", filing_hash="wrong", source_document="report",
+                pages=(page,), page_hashes=("not-the-page-hash",),
+            )
+        with self.assertRaises(ValueError):
+            VisionUploadPlan(
+                provider="configured_model", filing_hash="filing", source_document="report",
+                pages=(page,), max_pages=0,
+            )
+        plan = VisionUploadPlan(
+            provider="configured_model", configured_model_id="vision.ready",
+            filing_hash=_filing().content_hash, source_document="report", pages=(page,),
+        )
+        object.__setattr__(plan, "plan_id", "tampered")
+        with self.assertRaisesRegex(ValueError, "VISION_UPLOAD_PLAN_CHANGED"):
+            plan.validate()
+
+    def test_approval_mode_must_be_known(self):
+        with self.assertRaisesRegex(Exception, "VISION_APPROVAL_MODE_UNSUPPORTED"):
+            _config(approval_mode="unsafe_mode").validate()
+
     def test_missing_consent_stops_before_render_or_gateway(self):
         provider = RecordingVisionProvider()
         adapter = GatewayVisionAdapter(provider, image_renderer=lambda _: b"png")
@@ -282,7 +351,7 @@ class VisionFinancialTests(unittest.TestCase):
         page_limited = adapter.extract(
             _company(),
             _filing(),
-            [_page()] * 21,
+            [_page(number) for number in range(1, 22)],
             _config(),
         )
         byte_limited = adapter.extract(

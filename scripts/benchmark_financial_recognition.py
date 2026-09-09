@@ -195,6 +195,7 @@ def main() -> int:
         },
         "status": "RUNNING",
         "cold": cold,
+        "warm_seed": None,
         "warm": warm,
         "checkpoint": {"phase": "cold", "completed_rounds": 0},
     }
@@ -227,6 +228,21 @@ def main() -> int:
                 }, ensure_ascii=False))
                 return 1
         last_successful_cold_cache = root / f"cold-{len(cold) - 1}"
+        # Keep the seed explicit in the result without running a redundant
+        # recognition pass.  The cache directory is the final successful
+        # cold run; warm rounds below reuse it directly.
+        result["warm_seed"] = {
+            "source": "last_successful_cold",
+            "cold_index": len(cold) - 1,
+            "state": cold[-1].get("state", ""),
+            "snapshot_sha256": cold[-1].get("snapshot_sha256", ""),
+        }
+        result["checkpoint"] = {
+            "phase": "warm",
+            "completed_rounds": 0,
+            "warm_seed": result["warm_seed"],
+        }
+        _atomic_checkpoint(args.output, result)
         # Warm runs intentionally reuse the last successful cold cache. There
         # is no separate warm seed: the first warm round is the first reuse.
         for _index in range(3):

@@ -12,7 +12,13 @@ from openthesis.ot import compile_studio_draft, minimal_studio_draft
 from openthesis.packs import builtin_pack, load_pack
 from openthesis.markets import build_company
 from openthesis.providers import ModelConfig, ProviderError
-from openthesis.research import ResearchCancelled, ResearchWorkflow, verify_agent_output
+from openthesis.research import (
+    ResearchCancelled,
+    ResearchWorkflow,
+    _synthesis_prior_artifacts,
+    _synthesis_repair_input,
+    verify_agent_output,
+)
 from openthesis.storage import Storage
 
 
@@ -36,6 +42,48 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_synthesis_projection_is_bounded_and_preserves_sections_ids_and_numbers(self) -> None:
+        long = "evidence:fact:revenue-2025 " + ("narrative " * 500)
+        projected = _synthesis_prior_artifacts(
+            {"analyses": {"financial_quality": long, "claims": [{"text": long, "evidence_ids": ["evidence:fact:revenue-2025"], "value": 42}]}},
+            {"opportunities": [long]},
+            {"strongest_counterarguments": [long]},
+            {"scenarios": [{"name": "base", "value": 12.5}]},
+        )
+        encoded = json.dumps(projected, ensure_ascii=False).encode("utf-8")
+        self.assertLessEqual(len(encoded), 32_000)
+        self.assertIn("financial_quality", projected["base_analyses"])
+        self.assertIn("evidence:fact:revenue-2025", encoded.decode("utf-8"))
+        self.assertEqual(projected["forecast"]["scenarios"][0]["value"], 12.5)
+
+    def test_synthesis_repair_input_targets_only_missing_sections(self) -> None:
+        verification = {"issues": ["Missing required report sections: counterarguments"], "unsupported_fact_count": 0}
+        synthesis = {key: "ok" for key in ("executive_summary", "business_model", "financial_quality", "balance_sheet", "competitive_position", "growth_opportunities", "scenarios", "thesis", "invalidation_conditions", "leading_indicators", "unresolved_questions", "claims")}
+        repair = _synthesis_repair_input(
+            synthesis, verification,
+            {"financial_quality": "dossier"}, {"opportunities": ["growth"]},
+            {"strongest_counterarguments": ["risk"]}, {"scenarios": ["base"]},
+        )
+        self.assertEqual(repair["repair_sections"], ["counterarguments"])
+        self.assertNotIn("invalid_synthesis", repair)
+        self.assertNotIn("growth_opportunities", repair["section_context"])
+        self.assertLessEqual(len(json.dumps(repair, ensure_ascii=False).encode("utf-8")), 24_000)
+
+    def test_synthesis_projection_has_hard_limit_for_extreme_width_and_depth(self) -> None:
+        deep: object = "evidence:fact:critical-id " + ("redundant prose " * 4000)
+        for _ in range(12):
+            deep = {"repeated": [deep] * 40, "claims": [{"evidence_ids": ["evidence:fact:critical-id"], "value": 99}]}
+        projected = _synthesis_prior_artifacts(
+            {"analyses": {"financial_quality": deep, "business_model": deep}},
+            {"opportunities": [deep] * 40},
+            {"strongest_counterarguments": [deep] * 40, "unsupported_assumptions": ["assumption"]},
+            {"scenarios": [{"name": "base", "value": 12.5}] * 40},
+        )
+        self.assertLessEqual(len(json.dumps(projected, ensure_ascii=False).encode("utf-8")), 32_000)
+        self.assertEqual(set(projected), {"base_analyses", "growth_opportunities", "counter_analysis", "forecast", "source_evidence_ids"})
+        self.assertIn("evidence:fact:critical-id", projected["source_evidence_ids"])
+        self.assertEqual(projected["forecast"]["scenarios"][0]["value"], 12.5)
+
     def test_staged_fallback_uses_latest_annual_metric_row_for_balance_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workflow = ResearchWorkflow(
@@ -401,14 +449,16 @@ class DeterministicWorkflowTests(unittest.TestCase):
         class EmptyFinalProvider:
             def __init__(self) -> None:
                 self.count = 0
+                self.system_prompts: list[str] = []
 
             def test_connection(self) -> str:
                 return "ok"
 
             def generate(
-                self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True
+                self, system_prompt: str, user_prompt: str, *, json_mode: bool = True
             ) -> dict[str, object]:
                 self.count += 1
+                self.system_prompts.append(system_prompt)
                 if json.loads(user_prompt).get("agent") == "growth-opportunity-analyst":
                     return _valid_growth_output()
                 if self.count == 7:
@@ -489,6 +539,10 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertNotIn("claims", fallback["business_model"])
             self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
             self.assertEqual(provider.count, 8, "run performs one bounded final repair call")
+            repair_system_prompt = provider.system_prompts[7]
+            self.assertIn("section_patches", repair_system_prompt)
+            self.assertNotIn("return one complete report", repair_system_prompt.casefold())
+            self.assertIn("only", repair_system_prompt.casefold())
 
             retried = workflow.retry_synthesis(
                 run,

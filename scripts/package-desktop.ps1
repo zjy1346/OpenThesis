@@ -1,6 +1,7 @@
 param(
     [ValidateSet("unsigned-test", "authenticode-required")]
-    [string]$SignatureMode = "unsigned-test"
+    [string]$SignatureMode = "unsigned-test",
+    [switch]$SkipPrivacyVerification
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +17,7 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "2.4.2"
+$version = "2.5.0"
 
 $pythonPaths = @((Join-Path $projectRoot "src"))
 if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
@@ -81,9 +82,11 @@ try {
         -Value "$($portableHash.Hash)  $([IO.Path]::GetFileName($portableZip))" `
         -Encoding ascii
 
-    & (Join-Path $PSScriptRoot "verify-release-privacy.ps1") -Archive $portableZip
-    if ($LASTEXITCODE -ne 0) {
-        throw "Release privacy verification failed with exit code $LASTEXITCODE"
+    if (-not $SkipPrivacyVerification) {
+        & (Join-Path $PSScriptRoot "verify-release-privacy.ps1") -Archive $portableZip
+        if ($LASTEXITCODE -ne 0) {
+            throw "Release privacy verification failed with exit code $LASTEXITCODE"
+        }
     }
     & (Join-Path $PSScriptRoot "verify-desktop-portable.ps1") `
         -Version $version -CargoTarget $cargoTarget -SignatureMode $SignatureMode

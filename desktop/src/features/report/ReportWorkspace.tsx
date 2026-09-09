@@ -12,7 +12,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { exportResearchReport, getResearchReport } from "../../backend";
+import { exportFinancialDiagnostics, exportResearchReport, getFinancialDiagnostics, getResearchReport } from "../../backend";
 import type { ResearchReport } from "../../types";
 
 type ReportCopy = {
@@ -67,6 +67,19 @@ type ReportCopy = {
   rebuildFinancials: string;
   rebuildFinancialsConfirm: string;
   financialSnapshotStale: string;
+  financialRecoveryDiagnostics: string;
+  financialNextAction: string;
+  financialExportDiagnostics: string;
+  financialDiagnosticsExported: string;
+  financialDiagnosticsFailed: string;
+  financialFailedReports: string;
+  financialFailedFields: string;
+  financialFailedStage: string;
+  financialConfigureCloud: string;
+  financialConsentRequired: string;
+  financialErrorGeneric: string;
+  financialErrorIntegrity: string;
+  financialErrorConfiguration: string;
   partialReport: string;
   listingCurrency: string;
   reportingCurrency: string;
@@ -101,13 +114,14 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void> }) {
+export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: () => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
   const [technicalLoading, setTechnicalLoading] = useState(false);
   const [technicalError, setTechnicalError] = useState("");
   const [exportState, setExportState] = useState<ExportState>("idle");
+  const [diagnosticsState, setDiagnosticsState] = useState<ExportState>("idle");
   const [focusState, setFocusState] = useState<FocusState>("normal");
   const [retryState, setRetryState] = useState<RetryState>("idle");
   const [retryTarget, setRetryTarget] = useState<RetryTarget>("synthesis");
@@ -143,6 +157,36 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   );
   const financialRetryPartial = financialOperation?.status === "partial";
   const financialStage = displayedReport.financial_status?.last_stage ?? "";
+  const recoveryCases = displayedReport.financial_status?.recovery_cases ?? [];
+  const failedReports = Array.from(new Set([
+    ...recoveryCases.filter((item) => item.status !== "resolved").map((item) => item.period || item.accession_number),
+    ...(displayedReport.financial_status?.missing_periods ?? []),
+  ].filter(Boolean)));
+  const failedFields = Array.from(new Set(recoveryCases.flatMap((item) => item.fields ?? []))).filter(Boolean);
+  const stableError = (value: string): string => {
+    const code = value.toUpperCase();
+    if (code.includes("VISION_MODEL_REQUIRED") || code.includes("VISION_UNAUTHORIZED") || code.includes("NEEDS_CONFIGURATION")) return copy.financialErrorConfiguration;
+    if (code.includes("INTEGRITY") || code.includes("CONTENT_UNSAFE")) return copy.financialErrorIntegrity;
+    if (code.includes("NO_FILINGS") || code.includes("FETCH") || code.includes("DOWNLOAD") || code.includes("TIMEOUT")) return copy.financialErrorGeneric;
+    return value ? copy.financialErrorGeneric : "";
+  };
+  const stageDescription = (stage: string): string => ({
+    "filing-download": copy.financialStageDownload,
+    "filing-discovery": copy.financialStageDownload,
+    "filing-parse": copy.financialStageValidation,
+    "filing-validation": copy.financialStageValidation,
+    "artifact-rebuild": copy.financialStageProjection,
+    "report-refresh": copy.financialStageRefresh,
+  }[stage] ?? copy.financialStageValidation);
+  const nextActionDescription = (action: string): string => ({
+    retry_local_parse: copy.retryFinancials,
+    retry_discovery: copy.retryFinancials,
+    retry_missing_periods: copy.retryFinancials,
+    retry_failed_nodes: copy.retryFinancials,
+    continue_local_validation: copy.financialComplete,
+  }[action] ?? copy.financialIncomplete);
+  const needsConfiguration = recoveryCases.some((item) => ["VISION_MODEL_REQUIRED", "VISION_UNAUTHORIZED"].includes(item.error_code)) || stableError(displayedReport.financial_status?.last_error ?? "") === copy.financialErrorConfiguration;
+  const needsConsent = recoveryCases.some((item) => item.error_code === "VISION_CONSENT_REQUIRED");
   const stageRank = (stage: string): number => ({
     "filing-download": 1,
     "filing-parse": 2,
@@ -197,6 +241,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
     setTechnical(false);
     setTechnicalError("");
     setExportState("idle");
+    setDiagnosticsState("idle");
     setRetryState("idle");
     setRetryTarget("synthesis");
   }, [report]);
@@ -272,6 +317,17 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
     }
   };
 
+  const exportDiagnostics = async () => {
+    setDiagnosticsState("exporting");
+    try {
+      const diagnostics = await getFinancialDiagnostics(displayedReport.run_id);
+      const saved = await exportFinancialDiagnostics(diagnostics);
+      setDiagnosticsState(saved ? "exported" : "idle");
+    } catch {
+      setDiagnosticsState("failed");
+    }
+  };
+
   const retryStage = async (target: RetryTarget) => {
     const action = target === "rebuild-financials"
       ? onRebuildFinancials
@@ -290,6 +346,16 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
       setRetryState("failed");
     }
   };
+
+  const showFinancialHealth = Boolean(
+    displayedReport.financial_status && (
+      displayedReport.financial_status.retryable
+      || displayedReport.financial_status.state !== "complete"
+      || financialOperation?.status === "partial"
+      || financialOperation?.status === "failed"
+      || retryState === "retrying"
+    ),
+  );
 
   return (
     <article
@@ -341,7 +407,21 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
             {displayedReport.financial_status.snapshot_stale && (
               <small className="financial-snapshot-warning">{copy.financialSnapshotStale}</small>
             )}
-            {(financialOperation || displayedReport.financial_status.attempt_count > 0) && (
+            {displayedReport.financial_status.last_error && (
+              <small className="financial-recovery-diagnostics">
+                {copy.financialRecoveryDiagnostics}: {stableError(displayedReport.financial_status.last_error)}
+              </small>
+            )}
+            {displayedReport.financial_status.next_action && displayedReport.financial_status.next_action !== "none" && (
+              <small className="financial-recovery-diagnostics">
+                {copy.financialNextAction}: {nextActionDescription(displayedReport.financial_status.next_action)}
+              </small>
+            )}
+            {failedReports.length > 0 && <small className="financial-recovery-diagnostics">{copy.financialFailedReports}: {failedReports.join(", ")}</small>}
+            {failedFields.length > 0 && <small className="financial-recovery-diagnostics">{copy.financialFailedFields}: {failedFields.join(", ")}</small>}
+            {recoveryCases.some((item) => item.status !== "resolved" && item.stage) && <small className="financial-recovery-diagnostics">{copy.financialFailedStage}: {stageDescription(recoveryCases.find((item) => item.status !== "resolved" && item.stage)?.stage ?? "")}</small>}
+            {needsConsent && <small className="financial-recovery-diagnostics">{copy.financialConsentRequired}</small>}
+            {showFinancialHealth && (financialOperation || displayedReport.financial_status.attempt_count > 0) && (
               <div className="financial-stage-status" aria-label={copy.financialStageStatus}>
                 <span>{copy.financialStageDownload}: {stageText(1)}</span>
                 <span>{copy.financialStageValidation}: {stageText(2)}</span>
@@ -350,8 +430,12 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
               </div>
             )}
           </div>
-          {displayedReport.financial_status.retryable && (
-            <div className="financial-health-actions">
+          <div className="financial-health-actions">
+              <button type="button" className="report-retry-button" aria-label={copy.financialExportDiagnostics} disabled={diagnosticsState === "exporting"} onClick={() => void exportDiagnostics()}>
+                <Download size={16} /><span>{diagnosticsState === "exported" ? copy.financialDiagnosticsExported : diagnosticsState === "failed" ? copy.financialDiagnosticsFailed : copy.financialExportDiagnostics}</span>
+              </button>
+              {needsConfiguration && onConfigureCloud && <button type="button" className="report-retry-button" aria-label={copy.financialConfigureCloud} onClick={onConfigureCloud}>{copy.financialConfigureCloud}</button>}
+              {displayedReport.financial_status.retryable && <>
               {financialRefreshFailed && onRefreshFinancialReport && (
                 <button type="button" className="report-retry-button" aria-label={copy.refreshFinancialReport} disabled={retryState === "retrying"} onClick={() => void retryStage("financial-report")}>
                   <RefreshCw size={16} /><span>{copy.refreshFinancialReport}</span>
@@ -373,8 +457,8 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
                   </button>
                 </details>
               )}
-            </div>
-          )}
+              </>}
+          </div>
         </section>
       )}
       {reportStatus && <div className={`report-status report-status-${reportStatus.tone}`} role={reportStatus.role}>{reportStatus.text}</div>}

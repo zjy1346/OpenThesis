@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import hashlib
+import json
+import pickle
+import random
 import sys
 import tempfile
 import threading
@@ -30,16 +33,23 @@ from openthesis.financial_ingestion import (
     _known_label,
     _revenue_group_total_rows,
     _net_income_candidate_allowed,
+    _net_income_candidate_priority,
+    _is_narrative_date_header,
+    _LABELS,
     _attribution_context,
     _manifest_for,
     _period_start,
     _statement_context,
     _vision_failed_pages,
       _parse_local_pdfs_bounded,
-      _candidate_financial_pages,
+    _candidate_financial_pages,
+    _candidate_pages_from_text,
       _safe_pdf_worker_count,
+    _PDF_PARSER_VERSION,
+    parse_financial_pages,
 )
 from openthesis.financial_compiler import _prefetch_vision_batches
+from openthesis.financial_compatibility import FinancialRulesSnapshot
 from openthesis.financials import calculate_interim_metrics
 from openthesis.market_financials import FinancialValidation, ValidationStatus
 from openthesis.vision_financials import VisionExtractionResult, VisionFallbackConfig, VisionPageRequest
@@ -82,6 +92,13 @@ def _spawn_scheduler_test_entry(key, _company, filing, _manifest, _candidate_pag
     result_queue.put(("filing-result", (key, [], [], error)))
     active.unlink(missing_ok=True)
     Path(filing.local_path + ".done").write_text("done", encoding="utf-8")
+
+
+def _spawn_scheduler_exit_after_result(key, _company, _filing, _manifest, _candidate_pages, result_queue):
+    """Exit immediately after publishing the final queue message."""
+
+    result_queue.put(("filing-index", key, frozenset({1}), None))
+    result_queue.put(("filing-result", (key, [], [], None)))
 
 
 def _acceptance_pdf(env_name: str, relative_path: str, acceptance_name: str) -> str:
@@ -149,6 +166,39 @@ def _formal_rows(title: str = "Consolidated balance sheet") -> tuple[PdfRowAST, 
 
 
 class FinancialIngestionEngineTests(unittest.TestCase):
+    def test_compatibility_rule_snapshot_changes_parser_seams_and_cache_identity(self) -> None:
+        rules = FinancialRulesSnapshot(
+            pack_id="issuer-hotfix",
+            version="1.0.0",
+            payload_sha256="a" * 64,
+            trust_status="local_trusted/hash_verified",
+            title_aliases=(("income_statement", ("Issuer earnings ledger",)),),
+            scope_aliases=(("consolidated", ("group-wide",)),),
+            unit_aliases=(
+                ("million", ("megaunit",)),
+                ("CNY", ("renminbi-special",)),
+            ),
+            taxonomy_aliases=(("revenue", ("turnover-special",)),),
+        )
+        restored = pickle.loads(pickle.dumps(rules))
+        self.assertEqual(restored, rules)
+        self.assertEqual(
+            _statement_context("Issuer earnings ledger group-wide", rules),
+            ("income_statement", "consolidated"),
+        )
+        self.assertEqual(_unit_scale("megaunit renminbi-special", rules), (1_000_000.0, "CNY"))
+        self.assertEqual(_explicit_unit_info("megaunit renminbi-special", rules), (1_000_000.0, "CNY", True))
+        self.assertTrue(_known_label("turnover-special", rules))
+
+        filing = _filing("compat-cache")
+        base = FinancialIngestionEngine()
+        patched = base.with_compatibility_rules(rules)
+        self.assertIsNot(base, patched)
+        self.assertNotEqual(
+            base._parse_cache_key("unused.pdf", _company(), filing, "b" * 64),
+            patched._parse_cache_key("unused.pdf", _company(), filing, "b" * 64),
+        )
+
     def test_financial_page_prepass_selects_titles_and_bounded_continuations(self) -> None:
         from unittest.mock import patch
 
@@ -211,7 +261,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                 self.closed = True
 
         document = Document()
-        fake_pdfium = type("Pdfium", (), {"PdfDocument": lambda _path: document})
+        fake_pdfium = type("Pdfium", (), {"PdfDocument": staticmethod(lambda _path: document)})
         with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
                 patch("pypdf.PdfReader") as reader:
             selected = _candidate_financial_pages("annual.pdf")
@@ -244,7 +294,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         class PdfReader:
             pages = [PdfPage("CONSOLIDATED INCOME STATEMENT"), PdfPage("CONSOLIDATED BALANCE SHEET"), PdfPage("CONSOLIDATED STATEMENT OF CASH FLOWS")]
 
-        fake_pdfium = type("Pdfium", (), {"PdfDocument": lambda _path: IncompleteDocument()})
+        fake_pdfium = type("Pdfium", (), {"PdfDocument": staticmethod(lambda _path: IncompleteDocument())})
         with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
                 patch("pypdf.PdfReader", return_value=PdfReader()):
             selected = _candidate_financial_pages("annual.pdf")
@@ -381,6 +431,23 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertFalse(Path(blocked.local_path + ".done").exists())
 
+    def test_isolated_scheduler_drains_result_after_worker_exit(self) -> None:
+        """A queued result must win over the worker-exited diagnostic."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "exit-race.pdf"
+            path.write_bytes(b"fixture")
+            filing = _filing("exit-race", path=str(path))
+            filing.content_hash = ""
+            result = _parse_local_pdfs_bounded(
+                FinancialIngestionEngine(), _company(), [filing],
+                {filing.document_id: _manifest_for(filing)},
+                worker_entry=_spawn_scheduler_exit_after_result,
+                max_workers=1,
+                parse_timeout_seconds=2,
+            )
+            self.assertIsNone(result[filing.document_id][2])
+
     def test_batch_watchdog_blocks_running_and_queued_reports_without_reducing_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             filings = []
@@ -469,6 +536,29 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertIn(filing.document_id, first)
             self.assertIn(filing.document_id, third)
             self.assertEqual(len(calls), 2)
+
+    def test_pdf_parse_cache_rejects_stale_payload_and_normalizes_fact_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic-cache.pdf"
+            path.write_bytes(b"semantic-cache")
+            filing = _filing("semantic-cache", path=str(path))
+            filing.content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            cache_dir = Path(directory) / "cache"
+            engine = FinancialIngestionEngine(cache_dir=cache_dir)
+            key = engine._parse_cache_key(str(path), _company(), filing, filing.content_hash)
+            fact = _fact(filing, "revenue", 100)
+            engine._store_parse_cache(key, [fact], [])
+            payload_path = cache_dir / f"{key}.json"
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["parser_version"], _PDF_PARSER_VERSION)
+            self.assertEqual(payload["facts"][0]["parser_version"], _PDF_PARSER_VERSION)
+
+            stale = dict(payload)
+            stale["parser_version"] = "financial-ingestion-ast-v3"
+            stale["facts"] = [dict(payload["facts"][0], parser_version="financial-ingestion-ast-v3")]
+            payload_path.write_text(json.dumps(stale), encoding="utf-8")
+            fresh_engine = FinancialIngestionEngine(cache_dir=cache_dir)
+            self.assertIsNone(fresh_engine._load_parse_cache(key))
 
     def test_default_pdf_pipeline_reports_cache_and_index_stages_before_all_files(self) -> None:
         events: list[tuple[str, int, int]] = []
@@ -1157,10 +1247,86 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertTrue(_known_label("Net cash flows generated from operating activities"))
         self.assertTrue(_known_label("Equity attributable to equity holders of the Company"))
 
+    def test_ifrs_generic_profit_is_a_net_income_candidate(self) -> None:
+        fact = _fact(_filing("generic-profit"), "net_income", 100)
+        fact.reported_concept = "Profit for the year"
+        self.assertEqual(_net_income_candidate_priority(fact), 1)
+        self.assertIn("profit for the year", {item.casefold() for item in _LABELS["net_income"]})
+
+    def test_ifrs_attributable_profit_outranks_generic_profit(self) -> None:
+        generic = _fact(_filing("generic-profit"), "net_income", 100)
+        generic.reported_concept = "Profit for the year"
+        attributable = _fact(_filing("generic-profit"), "net_income", 120)
+        attributable.reported_concept = "Profit attributable to owners"
+        self.assertGreater(_net_income_candidate_priority(attributable), _net_income_candidate_priority(generic))
+
+    def test_narrative_date_header_is_not_a_financial_row(self) -> None:
+        text = "The segment results and revenue information for the years ended December 31, 2025 and 2024 are as follows"
+        self.assertTrue(_is_narrative_date_header(text))
+        rows = (_row((text, 10, 600)),)
+        self.assertEqual(_period_columns(rows), ())
+
+    def test_normal_bilingual_revenue_header_remains_period_aligned(self) -> None:
+        header = _row(("2025", 100, 140), ("2024", 220, 260))
+        revenue = _row(("Revenue 营业收入", 10, 90), ("200", 100, 140), ("180", 220, 260))
+        columns = _period_columns((header, revenue))
+        selected = _select_period_cell(revenue, 90, columns, 2025)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "200")
+
     def test_net_income_equity_holder_label_requires_attributable_context(self) -> None:
         self.assertTrue(_net_income_candidate_allowed("Attributable to: Equity holders of the Company 224,842"))
         self.assertFalse(_net_income_candidate_allowed("Earnings per share for profit attributable to equity holders of the Company"))
         self.assertFalse(_net_income_candidate_allowed("Basic and diluted EPS attributable to equity holders of the Company"))
+
+    def test_byd_formal_context_preserves_scope_unit_and_parser_version(self) -> None:
+        """Formal statement context is not replaced by a later parent table."""
+
+        company = Company(
+            "CN_A:SZSE:002594.SZ", "002594.SZ", "BYD", "SZSE",
+            "CN:BYD", "CN_A", "CN_A:SZSE:002594.SZ", "CNY", "CNY", "CAS",
+        )
+        filing = FilingDocument(
+            "cninfo:1212730520", company.security_id, "1212730520",
+            "ANNUAL_REPORT", "FY", "2021-12-31", "2022-03-30",
+            "2021 Annual Report", "https://example.invalid/byd-2021.pdf",
+        )
+        rows = (
+            _row(("合并利润表", 10, 180)),
+            _row(("2021", 220, 280), ("2020", 320, 380)),
+            _row(("Revenue", 10, 120), ("216142395", 220, 280), ("156000000", 320, 380)),
+        )
+        consolidated = _page_sections(None, "合并利润表 单位：人民币千元", rows, 1, "CNY")
+        parent_rows = (
+            _row(("母公司利润表", 10, 180)),
+            rows[1],
+            rows[2],
+        )
+        parent = _page_sections(consolidated[-1].context, "母公司利润表", parent_rows, 2, "CNY")
+        self.assertEqual(consolidated[-1].context.scope, "consolidated")
+        self.assertEqual(consolidated[-1].context.multiplier, 1_000.0)
+        self.assertEqual(parent[-1].context.scope, "parent")
+
+        facts, _refs = parse_financial_pages(
+            [(1, "合并利润表\n单位：人民币千元\nrevenue=216142395")],
+            filing,
+            company,
+        )
+        revenue = next(fact for fact in facts if fact.concept == "revenue")
+        self.assertEqual(revenue.value, 216142395000.0)
+        self.assertEqual(revenue.unit_scale, 1_000.0)
+        self.assertEqual(revenue.parser_version, _PDF_PARSER_VERSION)
+
+    def test_statement_title_at_page_break_inherits_next_page_period_columns(self) -> None:
+        title = (_row(("合并利润表", 10, 180)),)
+        first = _page_sections(None, "合并利润表", title, 1, "CNY")
+        continuation = (
+            _row(("2021", 220, 280), ("2020", 320, 380)),
+            _row(("营业收入", 10, 120), ("216142395", 220, 280), ("156000000", 320, 380)),
+        )
+        second = _page_sections(first[-1].context, "", continuation, 2, "CNY")
+        self.assertEqual(second[-1].context.statement, "income_statement")
+        self.assertEqual([column.year for column in second[-1].context.periods], [2021, 2020])
 
     def test_split_attribution_context_is_bounded_and_eps_is_excluded(self) -> None:
         rows = (
@@ -1194,6 +1360,46 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(_statement_context("Consolidated Balance Sheets"), ("balance_sheet", "consolidated"))
         self.assertEqual(_statement_context("Consolidated Statements of Cash Flows"), ("cash_flow", "consolidated"))
 
+    def test_candidate_index_keeps_split_income_statement_title_and_ignores_note_mentions(self) -> None:
+        """A wrapped formal title must win over narrative note references."""
+
+        pages = (
+            "CONSOLIDATED BALANCE SHEET\nAs of December 31, 2025",
+            "CONSOLIDATED STATEMENTS OF CASH FLOWS\nFor the year ended December 31, 2025",
+            "CONSOLIDATED INCOME\nSTATEMENT\nFor the year ended December 31, 2025\nRevenue 457,286,687 365,906,350",
+            "NOTES TO THE CONSOLIDATED FINANCIAL STATEMENTS\nThe charge is recognized in the consolidated income statement.",
+        )
+        selected = _candidate_pages_from_text(pages, continuation_pages=0)
+        self.assertIsNotNone(selected)
+        self.assertIn(3, selected)
+        self.assertNotIn(4, selected)
+
+    def test_candidate_index_accepts_wrapped_singular_cash_flow_title(self) -> None:
+        """A common IFRS title variant must keep the three-statement index bounded."""
+
+        pages = (
+            "CONSOLIDATED INCOME\nSTATEMENT\nRevenue 100 90",
+            "CONSOLIDATED BALANCE SHEET\nAssets 200 180",
+            "CONSOLIDATED STATEMENT OF\nCASH FLOWS\nNet cash generated from operating activities 30 25",
+        )
+        selected = _candidate_pages_from_text(pages, continuation_pages=1)
+        self.assertIsNotNone(selected)
+        self.assertIn(1, selected)
+        self.assertIn(3, selected)
+
+    def test_candidate_index_accepts_wrapped_singular_cash_flow_title(self) -> None:
+        """A common IFRS title variant must keep the three-statement index bounded."""
+
+        pages = (
+            "CONSOLIDATED INCOME\nSTATEMENT\nRevenue 100 90",
+            "CONSOLIDATED BALANCE SHEET\nAssets 200 180",
+            "CONSOLIDATED STATEMENT OF\nCASH FLOWS\nNet cash generated from operating activities 30 25",
+        )
+        selected = _candidate_pages_from_text(pages, continuation_pages=1)
+        self.assertIsNotNone(selected)
+        self.assertIn(1, selected)
+        self.assertIn(3, selected)
+
     def test_column_level_currency_follows_visual_unit_header(self) -> None:
         rows = (
             _row(("2024", 100, 140), ("2025", 220, 260), ("US$", 320, 360)),
@@ -1204,6 +1410,156 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         target = next(column for column in columns if column.year == 2025)
         self.assertEqual(target.currency, "CNY")
         self.assertEqual(target.unit_scale, 1_000_000.0)
+
+    def test_income_statement_title_handles_bilingual_and_whitespace_variants(self) -> None:
+        """Title identity must survive harmless PDF whitespace/encoding noise."""
+
+        rng = random.Random(2400)
+        titles = (
+            "合并利润表",
+            "Consolidated Income Statement",
+            "Consolidated Income Statements",
+            "合并利润表\nConsolidated Income Statement",
+        )
+        whitespace = ("", " ", "\t", "\u00a0", "\u2003")
+        cases = [
+            (f"{prefix}{title}{suffix}", title)
+            for title in titles
+            for prefix in whitespace
+            for suffix in whitespace
+        ]
+        rng.shuffle(cases)
+        self.assertGreaterEqual(len(cases), 100)
+
+        for page_text, _base_title in cases:
+            with self.subTest(page_text=repr(page_text)):
+                self.assertEqual(
+                    _statement_context(page_text),
+                    ("income_statement", "consolidated"),
+                )
+                # Exercise the same title seam used by the AST page parser,
+                # not just the compatibility text classifier.
+                section = _page_sections(
+                    None,
+                    page_text,
+                    (_row((page_text, 10, 220)),),
+                    1,
+                    "CNY",
+                )
+                self.assertEqual(len(section), 1)
+                self.assertEqual(section[0].context.statement, "income_statement")
+                self.assertEqual(section[0].context.scope, "consolidated")
+
+    def test_table_header_unit_wins_over_page_unit_without_double_scaling(self) -> None:
+        """Every page/header-unit pair keeps the table unit as the value scale."""
+
+        units = (
+            ("元", "单位：元", 1.0),
+            ("千元", "单位：千元", 1_000.0),
+            ("万元", "单位：万元", 10_000.0),
+            ("RMB'000", "Unit: RMB'000", 1_000.0),
+            ("RMB million", "Unit: RMB million", 1_000_000.0),
+        )
+        cases = [
+            (broad, explicit, expected)
+            for broad, _, _ in units
+            for explicit in units
+            for expected in (explicit[2],)
+        ]
+        self.assertEqual(len(cases), 25)
+
+        for broad, (explicit_name, explicit_header, expected_scale), _ in cases:
+            rows = (
+                _row(("合并利润表", 10, 180)),
+                _row(("2025", 100, 140), ("2024", 220, 260)),
+                _row((explicit_header, 10, 180)),
+                # Explicit currency markers bind the header scale to each
+                # visual value column; this mirrors bilingual annual reports.
+                _row(("RMB", 100, 140), ("RMB", 220, 260)),
+                _row(("营业收入", 10, 80), ("100", 100, 140), ("90", 220, 260)),
+            )
+            sections = _page_sections(
+                None,
+                f"页面概览（报告单位：{broad}）",
+                rows,
+                1,
+                "CNY",
+            )
+            with self.subTest(page_unit=broad, table_unit=explicit_name):
+                self.assertEqual(len(sections), 1)
+                context = sections[0].context
+                target = next(column for column in context.periods if column.year == 2025)
+                data_row = rows[-1]
+                selected = _select_period_cell(data_row, 80.0, context.periods, 2025)
+                self.assertIsNotNone(selected)
+                self.assertEqual(selected.text, "100")
+                self.assertEqual(target.currency, "CNY")
+                self.assertEqual(target.unit_scale, expected_scale)
+                # A parsed table value is scaled once by the selected column,
+                # never once by the page and again by the table header.
+                self.assertEqual(100.0 * target.unit_scale, 100.0 * expected_scale)
+
+    def test_period_cells_remain_geometry_bound_under_deterministic_order_perturbations(self) -> None:
+        """Cell iteration order is irrelevant when coordinates identify periods."""
+
+        rng = random.Random(2401)
+        header_base = (
+            ("2026", 100, 140),
+            ("2025", 220, 260),
+            ("2024", 340, 380),
+        )
+        data_base = (
+            ("营业收入", 10, 80),
+            ("300", 100, 140),
+            ("200", 220, 260),
+            ("100", 340, 380),
+        )
+        cases = []
+        for _ in range(72):
+            header = tuple(rng.sample(header_base, len(header_base)))
+            data = tuple(rng.sample(data_base, len(data_base)))
+            cases.append((header, data))
+        self.assertEqual(len(cases), 72)
+
+        for index, (header_cells, data_cells) in enumerate(cases):
+            with self.subTest(case=index):
+                header = _row(*header_cells)
+                data = _row(*data_cells)
+                columns = _period_columns((header,), "CNY")
+                self.assertEqual([column.year for column in columns], [2026, 2025, 2024])
+                selected = _select_period_cell(data, 80.0, columns, 2025)
+                self.assertIsNotNone(selected)
+                self.assertEqual(selected.text, "200")
+
+    def test_ambiguous_or_parent_scope_never_promotes_to_consolidated(self) -> None:
+        """Conflicting titles and parent-only excerpts stay out of consolidated facts."""
+
+        filing = _filing("scope-property")
+        company = _company()
+        cases = (
+            "母公司利润表\nrevenue=100",
+            "Consolidated Income Statement\n母公司利润表\nrevenue=100",
+            "合并利润表\n母公司利润表\nrevenue=100",
+        )
+        for raw_text in cases:
+            with self.subTest(raw_text=raw_text):
+                facts, _refs = parse_financial_pages([(1, raw_text)], filing, company)
+                self.assertEqual(len(facts), 1)
+                self.assertEqual(facts[0].statement, "income_statement")
+                self.assertEqual(facts[0].consolidated_scope, "parent")
+                self.assertNotEqual(facts[0].consolidated_scope, "consolidated")
+
+        rows = (
+            _row(("合并利润表", 10, 180)),
+            _row(("2025", 100, 140), ("2024", 220, 260)),
+            _row(("营业收入", 10, 80), ("100", 100, 140), ("90", 220, 260)),
+            _row(("母公司利润表", 10, 180)),
+            _row(("2025", 100, 140), ("2024", 220, 260)),
+            _row(("营业收入", 10, 80), ("70", 100, 140), ("60", 220, 260)),
+        )
+        sections = _page_sections(None, "合并利润表 母公司利润表", rows, 1, "CNY")
+        self.assertEqual([section.context.scope for section in sections], ["consolidated", "parent"])
+        self.assertNotIn("母公司利润表", sections[0].rows[-1].text)
 
     def test_reporting_currency_wins_over_current_year_convenience_translation(self) -> None:
         rows = (

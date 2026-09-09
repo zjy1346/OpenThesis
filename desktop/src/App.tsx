@@ -259,7 +259,7 @@ export default function App() {
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} />
+            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
           ) : (
             <EmptyState title={copy.emptyTitle} body={copy.emptyBody} demoAction={copy.startDemo}
               realAction={copy.startReal} hint={copy.demoHint}

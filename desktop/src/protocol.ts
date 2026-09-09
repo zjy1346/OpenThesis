@@ -15,6 +15,8 @@ import type {
   ResearchReport,
   ResearchRequest,
   ThesisVersion,
+  FinancialDiagnostics,
+  MarketSnapshotPreview,
 } from "./types";
 
 /**
@@ -37,7 +39,9 @@ export const BACKEND_METHODS = [
   "research.list",
   "research.delete",
   "research.get_report",
-  "research.start",
+  "research.financial_diagnostics",
+    "research.start",
+  "research.market_snapshot",
   "research.retry_growth",
   "research.retry_financials",
   "research.refresh_financial_report",
@@ -74,7 +78,9 @@ export type BackendParams = {
     language?: Language;
     include_technical?: boolean;
   };
+  "research.financial_diagnostics": { run_id: string };
   "research.start": ResearchRequest;
+  "research.market_snapshot": { company: Company; valuation?: ResearchRequest["valuation"] };
   "research.retry_growth": { run_id: string; model: ModelSelection };
   "research.retry_financials": { run_id: string };
   "research.refresh_financial_report": { run_id: string; language?: Language };
@@ -101,7 +107,9 @@ export type BackendResult = {
   "research.list": BootstrapResult["recent_runs"];
   "research.delete": { run_id: string; deleted: boolean };
   "research.get_report": ResearchReport;
+  "research.financial_diagnostics": FinancialDiagnostics;
   "research.start": ResearchJob;
+  "research.market_snapshot": MarketSnapshotPreview;
   "research.retry_growth": ResearchReport;
   "research.retry_financials": ResearchReport;
   "research.refresh_financial_report": ResearchReport;

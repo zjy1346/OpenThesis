@@ -27,7 +27,7 @@ import time
 import types
 
 
-_PDF_PARSER_VERSION = "financial-ingestion-ast-v3"
+_PDF_PARSER_VERSION = "financial-ingestion-ast-v5"
 _PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
 _PDF_CACHE_POLICY_VERSION = "parse-cache-v1"
 
@@ -44,6 +44,7 @@ _PDF_FLIGHT_LOCK = threading.Lock()
 _PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .financial_compatibility import FinancialRulesSnapshot
 from .market_financials import FinancialValidation, ValidationStatus
 from .vision_financials import (
     VISION_MAX_PAGES,
@@ -331,6 +332,9 @@ _LABELS: dict[str, tuple[str, ...]] = {
         "归属于上市公司股东的净利润", "net income attributable to owners",
         "equity holders of the company", "net profit attributable to shareholders of the parent company",
         "net income attributable to alibaba group holding limited",
+        "profit attributable to owners", "profit attributable to equity holders",
+        "profit attributable to shareholders", "profit for the year attributable to owners",
+        "owners of the company", "profit for the year", "profit after tax", "net profit", "净利润",
     ),
     "operating_cash_flow": (
         "经营活动产生的现金流量净额", "经营活动所得现金净额",
@@ -384,9 +388,51 @@ _COVERAGE_WARNING_ISSUES = frozenset({
 _STATEMENT_MARKERS = {
     "balance_sheet": ("合并资产负债表", "资产负债表", "consolidated balance sheet", "consolidated balance sheets", "statement of financial position"),
     "income_statement": ("合并利润表", "利润表", "consolidated income statement", "consolidated income statements", "statement of profit or loss"),
-    "cash_flow": ("合并现金流量表", "现金流量表", "consolidated cash flow statement", "consolidated statements of cash flows", "statement of cash flows"),
+    "cash_flow": ("合并现金流量表", "现金流量表", "consolidated cash flow statement", "consolidated statement of cash flows", "consolidated statements of cash flows", "statement of cash flows"),
 }
 _NUM = re.compile(r"(?:\(\s*[+-]?[\d,]+(?:\.\d+)?\s*\)|[+-]?[\d,]+(?:\.\d+)?)")
+
+
+def _rules_aliases(rules: FinancialRulesSnapshot | None, kind: str, key: str) -> tuple[str, ...]:
+    return rules.aliases(kind, key) if rules is not None else ()
+
+
+def _labels_for_rules(rules: FinancialRulesSnapshot | None) -> dict[str, tuple[str, ...]]:
+    labels = {key: tuple(values) for key, values in _LABELS.items()}
+    if rules is None:
+        return labels
+    for canonical, aliases in rules.taxonomy_aliases:
+        key = canonical.casefold()
+        if key not in labels:
+            key = next((name for name, values in labels.items() if any(_label_compact(canonical) == _label_compact(value) for value in values)), "")
+        if key and key in labels:
+            labels[key] = tuple(dict.fromkeys((*labels[key], *aliases)))
+    return labels
+
+
+def _statement_markers_for_rules(rules: FinancialRulesSnapshot | None) -> dict[str, tuple[str, ...]]:
+    markers = {key: tuple(values) for key, values in _STATEMENT_MARKERS.items()}
+    if rules is None:
+        return markers
+    aliases = {"consolidated_income": "income_statement", "income": "income_statement",
+               "consolidated_balance": "balance_sheet", "balance": "balance_sheet",
+               "consolidated_cash_flow": "cash_flow", "cashflow": "cash_flow"}
+    for canonical, values in rules.title_aliases:
+        key = aliases.get(canonical.casefold(), canonical.casefold())
+        if key in markers:
+            markers[key] = tuple(dict.fromkeys((*markers[key], *values)))
+    return markers
+
+
+def _scope_from_text(text: str, rules: FinancialRulesSnapshot | None = None) -> str:
+    folded = text.casefold()
+    consolidated = ("合并", "consolidated", *_rules_aliases(rules, "scope_aliases", "consolidated"))
+    parent = ("母公司", "parent", "company only", *_rules_aliases(rules, "scope_aliases", "parent"))
+    if any(token.casefold() in folded for token in consolidated):
+        return "consolidated"
+    if any(token.casefold() in folded for token in parent):
+        return "parent"
+    return "parent"
 
 
 def _manifest_for(filing: FilingDocument) -> FilingManifest | None:
@@ -423,9 +469,23 @@ def _manifest_for(filing: FilingDocument) -> FilingManifest | None:
     )
 
 
-def _unit_scale(text: str) -> tuple[float, str]:
+def _unit_scale(text: str, rules: FinancialRulesSnapshot | None = None) -> tuple[float, str]:
     """Parse explicit currency and unit markers from one table context."""
     normalized = re.sub(r"\s+", "", text.casefold()).translate(str.maketrans({"’": "'", "‘": "'", "′": "'", "＇": "'", "ʼ": "'"}))
+    custom_currency = ""
+    custom_scale = 1.0
+    scale_names = {"yuan": 1.0, "元": 1.0, "thousand": 1_000.0, "千元": 1_000.0,
+                   "million": 1_000_000.0, "百万元": 1_000_000.0, "ten_thousand": 10_000.0, "万元": 10_000.0}
+    if rules is not None:
+        for canonical, aliases in rules.unit_aliases:
+            if any(str(alias).casefold().replace(" ", "") in normalized for alias in aliases):
+                key = canonical.casefold().replace(" ", "")
+                if key in {"cny", "rmb", "人民币"}: custom_currency = "CNY"
+                elif key in {"usd", "美元"}: custom_currency = "USD"
+                elif key in {"hkd", "港元", "港币"}: custom_currency = "HKD"
+                for name, scale in scale_names.items():
+                    if key == name:
+                        custom_scale = scale
     if any(token in normalized for token in ("hk$", "hk£", "hkd", "港元", "港币")):
         currency = "HKD"
     elif any(token in normalized for token in ("usd", "us$", "美元")):
@@ -434,6 +494,39 @@ def _unit_scale(text: str) -> tuple[float, str]:
         currency = "CNY"
     else:
         currency = ""
+    currency = custom_currency or currency
+    if custom_scale != 1.0:
+        return custom_scale, currency or "CNY"
+    # A report can describe the document broadly as "thousand yuan" while a
+    # following formal statement declares its own displayed unit as yuan.  A
+    # table-header declaration is the narrowest and most authoritative unit
+    # context; use the last such declaration rather than a page-wide token.
+    unit_headers = list(re.finditer(
+        r"(?:单位|unit)[:：]?"
+        r"(?:人民币|rmb|cny|美元|usd|港元|hkd|港币|港幣)?"
+        r"(百万元|千元|万元|元|rmb'000|rmbmillion|million|thousand)",
+        normalized,
+    ))
+    if unit_headers:
+        header = unit_headers[-1]
+        token = header.group(1)
+        header_text = header.group(0)
+        header_currency = (
+            "HKD" if any(value in header_text for value in ("港元", "港币", "港幣", "hkd"))
+            else "USD" if any(value in header_text for value in ("美元", "usd"))
+            else "CNY" if any(value in header_text for value in ("人民币", "rmb", "cny"))
+            else currency
+        )
+        return {
+            "元": 1.0,
+            "千元": 1_000.0,
+            "万元": 10_000.0,
+            "百万元": 1_000_000.0,
+            "rmb'000": 1_000.0,
+            "rmbmillion": 1_000_000.0,
+            "million": 1_000_000.0,
+            "thousand": 1_000.0,
+        }[token], header_currency
     if any(token in normalized for token in ("千元", "千人民币", "rmb'000", "inthousands", "thousand")):
         return 1_000.0, currency or "CNY"
     if any(token in normalized for token in ("万元", "万人民币", "rmbten-thousand")):
@@ -450,7 +543,7 @@ def _unit_scale(text: str) -> tuple[float, str]:
     return 1.0, currency
 
 
-def _explicit_currencies(text: str) -> frozenset[str]:
+def _explicit_currencies(text: str, rules: FinancialRulesSnapshot | None = None) -> frozenset[str]:
     """Return currencies explicitly named in a bounded table context.
 
     Official HKEX statements commonly append a current-year US-dollar
@@ -468,28 +561,101 @@ def _explicit_currencies(text: str) -> frozenset[str]:
         currencies.add("USD")
     if any(token in normalized for token in ("cny", "rmb", "人民币", "人民幣")):
         currencies.add("CNY")
+    if rules is not None:
+        for canonical, aliases in rules.unit_aliases:
+            if any(str(alias).casefold().replace(" ", "") in normalized for alias in aliases):
+                key = canonical.casefold()
+                if key in {"cny", "rmb", "人民币"}: currencies.add("CNY")
+                elif key in {"usd", "美元"}: currencies.add("USD")
+                elif key in {"hkd", "港元", "港币"}: currencies.add("HKD")
     return frozenset(currencies)
 
 
-def _statement_context(text: str) -> tuple[str, str] | None:
+def _statement_context(text: str, rules: FinancialRulesSnapshot | None = None) -> tuple[str, str] | None:
     positions: list[tuple[int, str, str]] = []
-    folded = text.casefold()
+    markers_by_statement = _statement_markers_for_rules(rules)
+    raw_lines = text.splitlines()
+    lines: list[tuple[int, str]] = []
     offset = 0
-    for line in text.splitlines():
-        clean = line.strip()
+    for raw_line in raw_lines:
+        lines.append((offset, raw_line.strip()))
+        offset += len(raw_line) + 1
+
+    def add_marker_candidates(line_number: int, line_offset: int, clean: str) -> None:
+        """Add only title-like marker hits, not narrative note mentions."""
+
         line_folded = clean.casefold()
-        for statement, markers in _STATEMENT_MARKERS.items():
+        for statement, markers in markers_by_statement.items():
             for marker in markers:
-                if marker.casefold() not in line_folded:
+                marker_folded = marker.casefold()
+                if marker_folded not in line_folded:
                     continue
-                # Narrative sentences such as “不是利润表” are not table
-                # identities. Require a short title-like line.
+                # A formal title may have a page number/report label before it,
+                # but prose such as ``charge to the consolidated income
+                # statement`` must not establish a statement context.
+                prefix = line_folded.split(marker_folded, 1)[0].strip()
+                if prefix and not re.fullmatch(
+                    r"(?:\d{1,4}\s*(?:[、.)]|\u3001)|[（(][一二三四五六七八九十0-9ivx]+[）)])?"
+                    r"(?:20\d{2}\s+annual\s+report)?", prefix
+                ) and not any(
+                    marker in prefix
+                    for marker in ("母公司", "parent", "company only", "company-only", "separate")
+                ):
+                    continue
                 if len(clean) > 48 or "不是" in clean or "说明" in clean:
                     continue
-                pos = offset + line_folded.find(marker.casefold())
-                scope = "consolidated" if "合并" in clean or "consolidated" in line_folded else "parent"
+                pos = line_offset + line_folded.find(marker_folded)
+                suffix = line_folded.split(marker_folded, 1)[1].strip()
+                scope_aliases = (
+                    "合并", "consolidated", "母公司", "parent", "company only",
+                    "company-only", "separate",
+                    *_rules_aliases(rules, "scope_aliases", "consolidated"),
+                    *_rules_aliases(rules, "scope_aliases", "parent"),
+                )
+                has_scope_suffix = any(
+                    str(alias).casefold() in suffix for alias in scope_aliases
+                )
+                if suffix and not (
+                    re.fullmatch(
+                        r"(?:[\s:：,，.。()（）\[\]{}\-–—]|continued|continuation|cont[.'’_-]*d)*",
+                        suffix,
+                    )
+                    or re.match(
+                        r"(?:单位|编制单位|unit|project|项目|for\s+the\s+year|as\s+of|year\s+ended)",
+                        suffix,
+                    )
+                    or has_scope_suffix
+                ):
+                    continue
+                scope = _scope_from_text(clean, rules)
                 positions.append((pos, statement, scope))
-        offset += len(line) + 1
+
+    for line_number, (line_offset, clean) in enumerate(lines):
+        add_marker_candidates(line_number, line_offset, clean)
+        # PDF text extraction frequently wraps a statement title at the word
+        # boundary (e.g. ``CONSOLIDATED INCOME`` / ``STATEMENT``). Join only
+        # short adjacent lines and require the marker to start the first line;
+        # this keeps narrative references in notes out of the index.
+        if line_number + 1 < len(lines):
+            next_offset, next_clean = lines[line_number + 1]
+            if clean and next_clean and len(clean) <= 36 and len(next_clean) <= 36:
+                joined = f"{clean} {next_clean}"
+                joined_folded = joined.casefold()
+                for statement, markers in markers_by_statement.items():
+                    for marker in markers:
+                        marker_folded = marker.casefold()
+                        if marker_folded not in joined_folded:
+                            continue
+                        first_word = marker_folded.split(None, 1)[0]
+                        if not joined_folded.startswith(first_word):
+                            continue
+                        # Reuse the strict prefix check for the joined title;
+                        # unlike a body sentence, its marker begins the line.
+                        add_marker_candidates(line_number, line_offset, joined)
+                        break
+                    else:
+                        continue
+                    break
     if not positions:
         return None
     _, statement, scope = max(positions)
@@ -592,19 +758,21 @@ def _effective_period_year(text: str) -> int | None:
 
 
 def _period_columns(
-    rows: Sequence[PdfRowAST], preferred_currency: str = ""
+    rows: Sequence[PdfRowAST], preferred_currency: str = "", rules: FinancialRulesSnapshot | None = None
 ) -> tuple[_PeriodColumn, ...]:
     """Choose visual year columns before any one-year title/date row."""
     dual: list[tuple[int, float]] | None = None
     fallback: list[tuple[int, float]] | None = None
     all_text = " ".join(row.text for row in rows)
-    global_scale, _ = _unit_scale(all_text)
+    global_scale, _ = _unit_scale(all_text, rules)
     unit_cells: list[tuple[float, str]] = []
     for row_index, row in enumerate(rows):
+        if _is_narrative_date_header(row.text):
+            continue
         for cell in row.cells:
             normalized = re.sub(r"\s+", "", cell.text.casefold()).translate(str.maketrans({"’": "'", "‘": "'", "＇": "'"}))
             if normalized in {"rmb", "cny", "rmb'000", "rmbmillion", "us$", "usd", "hkd", "hk$"}:
-                _, currency = _unit_scale(cell.text)
+                _, currency = _unit_scale(cell.text, rules)
                 if currency:
                     unit_cells.append(((cell.x0 + cell.x1) / 2, currency))
         by_year: dict[int, float] = {}
@@ -742,7 +910,7 @@ def _select_period_cell(
     return min(in_column, key=lambda cell: abs((cell.x0 + cell.x1) / 2 - target.center))
 
 
-def _explicit_unit_info(text: str) -> tuple[float, str, bool]:
+def _explicit_unit_info(text: str, rules: FinancialRulesSnapshot | None = None) -> tuple[float, str, bool]:
     """Return ``(scale, currency, explicit)`` for a page/table heading.
 
     ``_unit_scale`` intentionally defaults to one for compatibility.  The
@@ -750,8 +918,8 @@ def _explicit_unit_info(text: str) -> tuple[float, str, bool]:
     ``元``/``RMB`` heading so an empty continuation page cannot reset a
     thousand-yuan context to a unit scale of one.
     """
-    scale, currency = _unit_scale(text)
-    if len(_explicit_currencies(text)) > 1:
+    scale, currency = _unit_scale(text, rules)
+    if len(_explicit_currencies(text, rules)) > 1:
         # A page with both the reporting currency and a convenience translation
         # has no single page-wide currency.  The caller supplies the issuer's
         # reporting currency while period columns retain their explicit units.
@@ -772,21 +940,33 @@ def _explicit_unit_info(text: str) -> tuple[float, str, bool]:
         r"(?:元|yuan|千元|万元|百万元|million|thousand)",
         compact,
     ))
-    return scale, currency, any(marker.casefold() in compact for marker in markers) or explicit_unit_header
+    custom_marker = bool(
+        rules is not None
+        and any(
+            str(alias).casefold().replace(" ", "") in compact
+            for _canonical, aliases in rules.unit_aliases
+            for alias in aliases
+        )
+    )
+    return scale, currency, (
+        any(marker.casefold() in compact for marker in markers)
+        or explicit_unit_header
+        or custom_marker
+    )
 
 
-def _row_title_context(row: PdfRowAST) -> tuple[str, str] | None:
+def _row_title_context(row: PdfRowAST, rules: FinancialRulesSnapshot | None = None) -> tuple[str, str] | None:
     """Identify a formal statement title from positioned row text."""
     text = row.text.strip()
     folded = text.casefold()
-    for statement, markers in _STATEMENT_MARKERS.items():
+    for statement, markers in _statement_markers_for_rules(rules).items():
         for marker in markers:
             marker_folded = marker.casefold()
             if marker_folded not in folded:
                 continue
             if len(text) > 64 or "不是" in text or "说明" in text:
                 continue
-            scope = "consolidated" if "合并" in text or "consolidated" in folded else "parent"
+            scope = _scope_from_text(text, rules)
             return statement, scope
     return None
 
@@ -874,13 +1054,16 @@ def _equity_group_total_rows(
     return totals
 
 
-def _continuation_compatible(context: PdfTableContext, rows: Sequence[PdfRowAST]) -> bool:
+def _continuation_compatible(context: PdfTableContext, rows: Sequence[PdfRowAST], rules: FinancialRulesSnapshot | None = None) -> bool:
     """Require a labelled target row and a value in a known period column."""
-    if not context.periods or not rows:
+    if not rows:
+        return False
+    periods = context.periods or _period_columns(rows, rules=rules)
+    if not periods:
         return False
     for index in range(len(rows)):
-        merged = _merge_visual_rows(rows, index)
-        if not _known_label(_row_label_text(merged)):
+        merged = _merge_visual_rows(rows, index, rules=rules)
+        if not _known_label(_row_label_text(merged), rules=rules):
             continue
         label_end = max(
             (cell.x1 for cell in merged.cells if _parse_number(cell.text) is None),
@@ -890,7 +1073,7 @@ def _continuation_compatible(context: PdfTableContext, rows: Sequence[PdfRowAST]
             if _parse_number(cell.text) is None or cell.x0 < label_end:
                 continue
             center = (cell.x0 + cell.x1) / 2
-            if any(column.left <= center <= column.right for column in context.periods):
+            if any(column.left <= center <= column.right for column in periods):
                 return True
     return False
 
@@ -901,6 +1084,7 @@ def _page_sections(
     rows: Sequence[PdfRowAST],
     page_number: int,
     default_currency: str,
+    rules: FinancialRulesSnapshot | None = None,
 ) -> tuple[PdfPageSection, ...]:
     """Pure page-context state transition used by the PDF adapter.
 
@@ -911,16 +1095,31 @@ def _page_sections(
     reclassifying the consolidated rows above it.
     """
     rows_tuple = tuple(rows)
-    scale, currency, explicit = _explicit_unit_info(page_text)
-    if _is_summary_page(page_text, rows_tuple):
+    scale, currency, explicit = _explicit_unit_info(page_text, rules)
+    if _is_summary_page(page_text, rows_tuple, rules=rules):
         return (PdfPageSection(
             PdfTableContext("summary", "consolidated", scale, currency or default_currency,
-                            explicit, _period_columns(rows_tuple, default_currency), page_number, 0),
+                            explicit, _period_columns(rows_tuple, default_currency, rules), page_number, 0),
             rows_tuple, True, False,
         ),)
 
-    titles = [(index, _row_title_context(row)) for index, row in enumerate(rows_tuple)]
+    titles = [(index, _row_title_context(row, rules)) for index, row in enumerate(rows_tuple)]
     titles = [(index, context) for index, context in titles if context is not None]
+    titled_indices = {index for index, _context in titles}
+    # PDF word extraction keeps each visual line as a separate AST row.  Join
+    # only adjacent short rows when neither row is already a title so wrapped
+    # formal identities such as ``CONSOLIDATED INCOME`` / ``STATEMENT`` still
+    # establish a section without admitting narrative note mentions.
+    for index in range(len(rows_tuple) - 1):
+        if index in titled_indices or index + 1 in titled_indices:
+            continue
+        left, right = rows_tuple[index], rows_tuple[index + 1]
+        if len(left.text.strip()) > 36 or len(right.text.strip()) > 36:
+            continue
+        joined_context = _statement_context(f"{left.text} {right.text}", rules)
+        if joined_context is not None:
+            titles.append((index, joined_context))
+    titles.sort(key=lambda item: item[0])
     sections: list[PdfPageSection] = []
     if titles:
         # A title below a continuation's rows is a table boundary.  Keep the
@@ -935,7 +1134,7 @@ def _page_sections(
         # leakage.
         if first_index and previous and previous.statement != "summary" and previous.last_page + 1 == page_number and previous.inherited_pages < 3:
             prefix = rows_tuple[:first_index]
-            if _continuation_compatible(previous, prefix):
+            if _continuation_compatible(previous, prefix, rules):
                 sections.append(PdfPageSection(
                     PdfTableContext(previous.statement, previous.scope, previous.multiplier,
                                     previous.currency, previous.unit_explicit,
@@ -947,7 +1146,7 @@ def _page_sections(
             section_rows = rows_tuple[title_index:end]
             section_scale = scale if explicit else 1.0
             section_currency = currency or default_currency
-            periods = _period_columns(section_rows, default_currency)
+            periods = _period_columns(section_rows, default_currency, rules)
             title_text = section_rows[0].text.casefold() if section_rows else ""
             continuation_title = bool(re.search(
                 r"续|continued|continuation|cont[\s.'’_-]*d", title_text
@@ -979,13 +1178,14 @@ def _page_sections(
         and previous.statement != "summary"
         and previous.last_page + 1 == page_number
         and previous.inherited_pages < 2
-        and _continuation_compatible(previous, rows_tuple)
+        and _continuation_compatible(previous, rows_tuple, rules)
     ):
         inherited_scale = previous.multiplier if not explicit else scale
         inherited_currency = currency or previous.currency or default_currency
+        inherited_periods = previous.periods or _period_columns(rows_tuple, default_currency, rules)
         return (PdfPageSection(
             PdfTableContext(previous.statement, previous.scope, inherited_scale, inherited_currency,
-                            previous.unit_explicit or explicit, previous.periods, page_number,
+                            previous.unit_explicit or explicit, inherited_periods, page_number,
                             previous.inherited_pages + 1),
             rows_tuple, False, True,
         ),)
@@ -1013,9 +1213,9 @@ def _row_label_text(row: PdfRowAST) -> str:
     return re.sub(r"\s+", "", "".join(fragments))
 
 
-def _known_label(text: str) -> bool:
+def _known_label(text: str, rules: FinancialRulesSnapshot | None = None) -> bool:
     compact = _label_compact(text)
-    return any(_label_compact(label) in compact for labels in _LABELS.values() for label in labels)
+    return any(_label_compact(label) in compact for labels in _labels_for_rules(rules).values() for label in labels)
 
 
 def _label_compact(text: str) -> str:
@@ -1030,6 +1230,45 @@ def _net_income_candidate_allowed(compact: str) -> bool:
     if any(token in normalized for token in ("earningspershare", "basic", "diluted")):
         return False
     return "attributableto" in normalized
+
+
+_GENERIC_NET_INCOME_LABELS = frozenset({
+    "净利润", "profit for the year", "profit after tax", "net profit",
+})
+
+
+def _is_narrative_date_header(text: str) -> bool:
+    """Reject prose date ranges before they can become period/value cells.
+
+    Bilingual IFRS notes often contain sentences such as ``results for the
+    years ended December 31, 2025 and 2024 are as follows``.  Their numbers
+    are dates, not financial values.  Requiring both a date-range phrase and
+    two distinct years keeps ordinary ``Revenue | 2025 | 2024`` headers valid.
+    """
+    folded = re.sub(r"\s+", " ", text.casefold()).strip()
+    years = set(re.findall(r"(?:19|20)\d{2}", folded))
+    if len(years) < 2:
+        return False
+    date_phrase = (
+        "year ended", "years ended", "for the years", "as at",
+        "截至", "年度", "年末",
+    )
+    narrative_tail = ("as follows", "如下", "information", "results", "资料")
+    return any(marker in folded for marker in date_phrase) and any(
+        marker in folded for marker in narrative_tail
+    )
+
+
+def _net_income_candidate_priority(fact: FinancialFact) -> int:
+    """Prefer attributable profit over a generic IFRS profit row."""
+    compact = _label_compact(fact.reported_concept or fact.raw_text)
+    if any(token in compact for token in (
+        "归属于", "attributableto", "equityholders", "parentcompany", "ownersofthecompany",
+    )):
+        return 2
+    if compact in {_label_compact(label) for label in _GENERIC_NET_INCOME_LABELS}:
+        return 1
+    return 0
 
 
 def _attribution_context(rows: Sequence[PdfRowAST], start: int) -> str:
@@ -1058,7 +1297,7 @@ def _attribution_context(rows: Sequence[PdfRowAST], start: int) -> str:
     return ""
 
 
-def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
+def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRulesSnapshot | None = None) -> PdfRowAST:
     """Merge at most three tightly-spaced visual rows from one table row.
 
     The merge is deliberately conservative.  Rows must overlap or be within
@@ -1107,7 +1346,7 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
             break
         if current_has_values and candidate_has_values and candidate_label:
             break
-        if candidate_label and current_label and _known_label(candidate_label) and (
+        if candidate_label and current_label and _known_label(candidate_label, rules) and (
             "现金流" in current_label
             or "资产总计" in candidate_label
             or "负债合计" in candidate_label
@@ -1115,7 +1354,7 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
         ):
             break
         # A separate complete row label is never a continuation fragment.
-        if candidate_label and _known_label(candidate_label) and not _known_label(combined_label):
+        if candidate_label and _known_label(candidate_label, rules) and not _known_label(combined_label, rules):
             break
         variants.append(candidate)
         merged_probe = PdfRowAST(
@@ -1123,7 +1362,7 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
             variants[0].top,
             variants[0].bbox,
         )
-        if _known_label(_row_label_text(merged_probe)) and any(
+        if _known_label(_row_label_text(merged_probe), rules) and any(
             _parse_number(cell.text) is not None
             for row in variants
             for cell in row.cells
@@ -1142,13 +1381,14 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int) -> PdfRowAST:
     )
 
 
-def _is_summary_page(page_text: str, rows: Sequence[PdfRowAST]) -> bool:
+def _is_summary_page(page_text: str, rows: Sequence[PdfRowAST], rules: FinancialRulesSnapshot | None = None) -> bool:
     """Detect the metrics page even when PDF text wraps its labels."""
     compact = re.sub(r"\s+", "", page_text).casefold()
-    if any(label.casefold() in compact for label in _LABELS["reported_roe"]):
+    labels = _labels_for_rules(rules)
+    if any(label.casefold() in compact for label in labels["reported_roe"]):
         return True
     return any(
-        any(label.casefold() in _row_label_text(_merge_visual_rows(rows, index)).casefold() for label in _LABELS["reported_roe"])
+        any(label.casefold() in _row_label_text(_merge_visual_rows(rows, index, rules)).casefold() for label in labels["reported_roe"])
         for index in range(len(rows))
     )
 
@@ -1667,11 +1907,12 @@ def _parse_pdf_process_worker(
     filing: FilingDocument,
     manifest: FilingManifest,
     candidate_pages: frozenset[int] | None,
+    rules: FinancialRulesSnapshot | None = None,
 ) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
     """Pickle-safe worker used only for CPU-heavy local statement pages."""
 
     try:
-        facts, refs = FinancialIngestionEngine()._parse_pdf_ast(
+        facts, refs = FinancialIngestionEngine(compatibility_rules=rules)._parse_pdf_ast(
             filing.local_path,
             company,
             filing,
@@ -1691,13 +1932,14 @@ def _parse_pdf_process_worker_entry(
     manifest: FilingManifest,
     candidate_pages: frozenset[int] | None,
     result_queue: Any,
+    rules: FinancialRulesSnapshot | None = None,
 ) -> None:
     """Process entrypoint which returns one bounded, pickle-safe result."""
 
     try:
         index_error = None
         try:
-            indexed_pages = _candidate_financial_pages(filing.local_path)
+            indexed_pages = _candidate_financial_pages(filing.local_path, rules=rules)
         except Exception as exc:
             indexed_pages = None
             index_error = f"pdf_index_failed:{type(exc).__name__}"
@@ -1705,7 +1947,7 @@ def _parse_pdf_process_worker_entry(
         # A partial index is deliberately represented by None; the AST parser
         # then fails open to its full-document path for correctness.
         result_queue.put(("filing-result", _parse_pdf_process_worker(
-            key, company, filing, manifest, indexed_pages
+            key, company, filing, manifest, indexed_pages, rules
         )))
     except BaseException as exc:  # pragma: no cover - process boundary safety
         try:
@@ -1808,9 +2050,12 @@ def _parse_local_pdfs_isolated(
             if cancel_check is not None and cancel_check():
                 return
             result_queue = context.Queue(maxsize=2)
+            worker_args = (key, company, filing, manifest, None, result_queue)
+            if worker_entry is None:
+                worker_args = (*worker_args, engine._compatibility_rules)
             process = context.Process(
                 target=entrypoint,
-                args=(key, company, filing, manifest, None, result_queue),
+                args=worker_args,
                 name=f"financial-pdf-{key[-12:]}",
             )
             process.daemon = True
@@ -2033,7 +2278,7 @@ def _safe_pdf_worker_count(
 
 
 def _candidate_pages_from_text(
-    page_texts: Sequence[str], *, continuation_pages: int
+    page_texts: Sequence[str], *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
 ) -> frozenset[int] | None:
     """Convert one page-index text stream into the bounded candidate set."""
 
@@ -2042,13 +2287,14 @@ def _candidate_pages_from_text(
     statement_kinds: set[str] = set()
     for page_number, text in enumerate(page_texts, 1):
         compact = re.sub(r"\s+", "", text).casefold()
-        if any(label.casefold() in compact for label in _LABELS["reported_roe"]):
+        labels = _labels_for_rules(rules)
+        if any(label.casefold() in compact for label in labels["reported_roe"]):
             # ROE is commonly disclosed in a standalone performance table
             # outside the three formal statements. Keep the exact page in
             # the bounded coordinate pass without widening its continuation
             # window to unrelated narrative pages.
             summary_pages.add(page_number)
-        statement_context = _statement_context(text)
+        statement_context = _statement_context(text, rules)
         if statement_context is not None:
             starts.append(page_number)
             statement_kinds.add(statement_context[0])
@@ -2079,7 +2325,7 @@ def _close_pdf_resource(resource: Any) -> None:
 
 
 def _candidate_financial_pages_pypdfium(
-    path: str, *, continuation_pages: int
+    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
 ) -> frozenset[int] | None:
     """Index page text through PDFium, closing page/text/document resources."""
 
@@ -2100,11 +2346,11 @@ def _candidate_financial_pages_pypdfium(
                 _close_pdf_resource(page)
     finally:
         _close_pdf_resource(document)
-    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages)
+    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
 
 
 def _candidate_financial_pages_pypdf(
-    path: str, *, continuation_pages: int
+    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
 ) -> frozenset[int] | None:
     """Compatibility indexer used when PDFium is unavailable or incomplete."""
 
@@ -2112,10 +2358,10 @@ def _candidate_financial_pages_pypdf(
 
     reader = PdfReader(path)
     page_texts = [(page.extract_text() or "") for page in reader.pages]
-    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages)
+    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
 
 
-def _candidate_financial_pages(path: str, *, continuation_pages: int = 3) -> frozenset[int] | None:
+def _candidate_financial_pages(path: str, *, continuation_pages: int = 3, rules: FinancialRulesSnapshot | None = None) -> frozenset[int] | None:
     """Find formal statement pages with a low-memory text prepass.
 
     PDFium supplies the fast text layer for the normal path. If PDFium cannot
@@ -2126,7 +2372,7 @@ def _candidate_financial_pages(path: str, *, continuation_pages: int = 3) -> fro
 
     try:
         indexed = _candidate_financial_pages_pypdfium(
-            path, continuation_pages=continuation_pages
+            path, continuation_pages=continuation_pages, rules=rules
         )
         if indexed is not None:
             return indexed
@@ -2134,7 +2380,7 @@ def _candidate_financial_pages(path: str, *, continuation_pages: int = 3) -> fro
         pass
     try:
         return _candidate_financial_pages_pypdf(
-            path, continuation_pages=continuation_pages
+            path, continuation_pages=continuation_pages, rules=rules
         )
     except Exception:
         return None
@@ -2160,6 +2406,7 @@ class FinancialIngestionEngine:
         max_workers: int = 3,
         parse_timeout_seconds: float = 120.0,
         batch_timeout_seconds: float = 280.0,
+        compatibility_rules: FinancialRulesSnapshot | None = None,
     ) -> None:
         # The cache is deliberately optional so fixture/injected engines keep
         # their historical behavior. Production supplies a workspace-owned
@@ -2169,6 +2416,27 @@ class FinancialIngestionEngine:
         self._max_workers = max(1, min(3, int(max_workers)))
         self._parse_timeout_seconds = max(0.1, float(parse_timeout_seconds))
         self._batch_timeout_seconds = max(0.1, min(280.0, float(batch_timeout_seconds)))
+        self._compatibility_rules = compatibility_rules or FinancialRulesSnapshot.empty()
+
+    def with_compatibility_rules(
+        self, rules: FinancialRulesSnapshot | None
+    ) -> "FinancialIngestionEngine":
+        """Return an isolated engine view for one research run.
+
+        Compatibility packs are selected per issuer/run.  A cloned engine
+        avoids mutating shared parser state while preserving the same
+        content-addressed cache directory and bounded worker policy.
+        """
+        selected = rules or FinancialRulesSnapshot.empty()
+        if selected == self._compatibility_rules:
+            return self
+        return FinancialIngestionEngine(
+            cache_dir=self._parse_cache_dir,
+            max_workers=self._max_workers,
+            parse_timeout_seconds=self._parse_timeout_seconds,
+            batch_timeout_seconds=self._batch_timeout_seconds,
+            compatibility_rules=selected,
+        )
 
     @staticmethod
     def _file_sha256(path: str) -> str:
@@ -2192,6 +2460,7 @@ class FinancialIngestionEngine:
                 _PDF_PARSER_VERSION,
                 _PDF_TAXONOMY_VERSION,
                 _PDF_CACHE_POLICY_VERSION,
+                self._compatibility_rules.semantic_fingerprint(),
                 profile,
                 policy,
             )
@@ -2209,8 +2478,16 @@ class FinancialIngestionEngine:
         cache_path = self._parse_cache_dir / f"{key}.json"
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            # The digest key prevents ordinary v3/v4 collisions, while this
+            # payload marker protects against a stale or manually copied
+            # payload being placed under a current key.  Cached facts must be
+            # emitted by the same semantic parser revision as the key.
+            if payload.get("parser_version") != _PDF_PARSER_VERSION:
+                return None
             facts = [FinancialFact(**item) for item in payload["facts"]]
             refs = [EvidenceRef(**item) for item in payload["evidence"]]
+            if any(item.parser_version != _PDF_PARSER_VERSION for item in facts):
+                return None
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
         self._parse_cache_memory[key] = (facts, refs)
@@ -2222,13 +2499,21 @@ class FinancialIngestionEngine:
         facts: Sequence[FinancialFact],
         refs: Sequence[EvidenceRef],
     ) -> None:
-        safe_facts = [replace(item) for item in facts]
+        # Keep the parser revision in the fact payload and in the cache
+        # envelope sourced from one constant.  Injected test/legacy parsers
+        # may omit it; normalizing here prevents those facts from becoming a
+        # semantically unlabelled cache hit.
+        safe_facts = [replace(item, parser_version=_PDF_PARSER_VERSION) for item in facts]
         safe_refs = [replace(item) for item in refs]
         self._parse_cache_memory[key] = (safe_facts, safe_refs)
         if self._parse_cache_dir is None:
             return
         payload = json.dumps(
-            {"facts": [item.to_dict() for item in safe_facts], "evidence": [item.to_dict() for item in safe_refs]},
+            {
+                "parser_version": _PDF_PARSER_VERSION,
+                "facts": [item.to_dict() for item in safe_facts],
+                "evidence": [item.to_dict() for item in safe_refs],
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -2561,14 +2846,16 @@ class FinancialIngestionEngine:
         *,
         candidate_pages: frozenset[int] | None = None,
         index_precomputed: bool = False,
+        compatibility_rules: FinancialRulesSnapshot | None = None,
     ):
         import pdfplumber
 
         facts: list[FinancialFact] = []
         refs: list[EvidenceRef] = []
         previous: PdfTableContext | None = None
+        rules = compatibility_rules or self._compatibility_rules
         if not index_precomputed:
-            candidate_pages = _candidate_financial_pages(path)
+            candidate_pages = _candidate_financial_pages(path, rules=rules)
         with pdfplumber.open(path) as pdf:
             for page_number, page in enumerate(pdf.pages, 1):
                 if candidate_pages is not None and page_number not in candidate_pages:
@@ -2586,14 +2873,14 @@ class FinancialIngestionEngine:
                             rows_by_top.append([cell])
                 rows = tuple(PdfRowAST(tuple(sorted(cells, key=lambda c: c.x0)), min(c.top for c in cells), (min(c.x0 for c in cells), min(c.top for c in cells), max(c.x1 for c in cells), max(c.bottom for c in cells))) for cells in rows_by_top if cells)
                 page_text = page.extract_text() or ""
-                sections = _page_sections(previous, page_text, rows, page_number, company.reporting_currency)
+                sections = _page_sections(previous, page_text, rows, page_number, company.reporting_currency, rules)
                 for section in sections:
                     context = section.context
                     statement, scope = context.statement, context.scope
                     multiplier, table_currency = context.multiplier, context.currency
                     table_rows = section.rows
                     table = PdfTableAST(page_number, statement, scope, table_currency, multiplier, _period_headers(table_rows), table_rows)
-                    columns = context.periods or _period_columns(table.rows)
+                    columns = context.periods or _period_columns(table.rows, rules=rules)
                     summary_page = section.summary
                     revenue_totals = _revenue_group_total_rows(
                         table.rows, columns, int(manifest.period_end[:4])
@@ -2602,8 +2889,12 @@ class FinancialIngestionEngine:
                         table.rows, columns, int(manifest.period_end[:4])
                     ) if statement == "balance_sheet" and not summary_page else {}
                     for row_index, row in enumerate(table.rows):
-                        merged_row = _merge_visual_rows(table.rows, row_index)
+                        merged_row = _merge_visual_rows(table.rows, row_index, rules)
                         compact = _row_label_text(merged_row)
+                        # A prose date range is not a financial statement row;
+                        # do not let its years become revenue/net-income values.
+                        if _is_narrative_date_header(merged_row.text):
+                            continue
                         # Attribution headings are often a separate visual
                         # row; keep the context bounded to this table/column.
                         attribution = _attribution_context(table.rows, row_index)
@@ -2670,14 +2961,52 @@ class FinancialIngestionEngine:
                                     )
                                     compact = _row_label_text(merged_row)
                                     break
-                        for concept, labels in _LABELS.items():
+                        for concept, labels in _labels_for_rules(rules).items():
                             if concept == "operating_cash_flow" and "现金流出小计" in compact:
                                 continue
                             if concept == "assets" and "资产合计" in compact and "资产总计" not in compact and any(prefix in compact for prefix in ("流动资产", "非流动资产")):
                                 continue
                             if concept == "liabilities" and "负债合计" in compact and any(prefix in compact for prefix in ("流动负债", "非流动负债")):
                                 continue
-                            label = next((label for label in labels if _label_compact(label) in _label_compact(compact)), None)
+                            # ``revenue`` is a substring of cost-of-revenue
+                            # rows in many IFRS income statements.  A cost
+                            # row is not a revenue fact; keep matching bounded
+                            # to the formal revenue line instead of allowing
+                            # first-match selection to leak a nearby value.
+                            if concept == "revenue" and any(
+                                marker in _label_compact(compact)
+                                for marker in ("costofrevenue", "costofsales", "营业成本")
+                            ):
+                                continue
+                            compact_normalized = _label_compact(compact)
+                            label = next(
+                                (
+                                    candidate
+                                    for candidate in labels
+                                    if _label_compact(candidate) in compact_normalized
+                                    and not (
+                                        concept == "net_income"
+                                        and _label_compact(candidate) in {"netprofit", "profitaftertax"}
+                                        and re.search(
+                                            rf"{re.escape(_label_compact(candidate))}[a-z]",
+                                            compact_normalized,
+                                        )
+                                    )
+                                ),
+                                None,
+                            )
+                            if (
+                                concept == "profit_after_tax"
+                                and label is not None
+                                and _label_compact(label) in {
+                                    _label_compact(item) for item in _GENERIC_NET_INCOME_LABELS
+                                }
+                            ):
+                                # Generic IFRS profit is represented as a
+                                # conservative net_income candidate.  Keep
+                                # profit_after_tax distinct for non-generic
+                                # labels rather than globally renaming facts.
+                                continue
                             if label is None and concept == "revenue" and row.bbox in revenue_totals:
                                 label = "revenue"
                             if label is None and concept == "equity" and row.bbox in equity_totals:
@@ -2771,7 +3100,7 @@ class FinancialIngestionEngine:
                                 revision=manifest.revision,
                                 source_document=manifest.primary_document, source_page=page_number,
                                 source_bbox=merged_row.bbox,
-                                raw_text=merged_row.text, parser_version="financial-ingestion-ast-v2",
+                                raw_text=merged_row.text, parser_version=_PDF_PARSER_VERSION,
                                 validation_status=ValidationStatus.READY_WITH_WARNINGS.value,
                             )
                             ref = EvidenceRef(
@@ -2791,6 +3120,12 @@ class FinancialIngestionEngine:
                                 facts[existing_index] = fact
                                 refs[existing_index] = ref
                             elif concept == "net_income":
+                                if _net_income_candidate_priority(fact) > _net_income_candidate_priority(facts[existing_index]):
+                                    facts[existing_index] = fact
+                                    refs[existing_index] = ref
+                                    continue
+                                if _net_income_candidate_priority(fact) < _net_income_candidate_priority(facts[existing_index]):
+                                    continue
                                 # Wrapped bilingual rows can prepend the prior
                                 # line's non-controlling-interest values before
                                 # the canonical attributable row. Prefer the
@@ -2844,23 +3179,23 @@ class FinancialIngestionEngine:
 # the same label/unit policy as the engine and never bypass its validation gate.
 # ---------------------------------------------------------------------------
 
-def parse_structured_snapshot(raw_excerpt: str) -> dict[str, float]:
+def parse_structured_snapshot(raw_excerpt: str, compatibility_rules: FinancialRulesSnapshot | None = None) -> dict[str, float]:
     """Parse a bounded, provider-supplied excerpt into normalized values.
 
     This is intentionally limited to one row at a time; it is not a PDF page
     parser and therefore cannot silently infer a value from unrelated prose.
     """
-    scale, _ = _unit_scale(raw_excerpt)
+    scale, _ = _unit_scale(raw_excerpt, compatibility_rules)
     result: dict[str, float] = {}
     compact = re.sub(r"\s+", " ", raw_excerpt)
     # Structured adapters commonly serialize a bounded snapshot as
     # concept=value pairs. Accept only the known concept identifiers.
     for key, token in re.findall(r"([a-z_]+)\s*=\s*([-+]?\d[\d,]*(?:\.\d+)?)", raw_excerpt, flags=re.IGNORECASE):
-        if key in _LABELS:
+        if key in _labels_for_rules(compatibility_rules):
             result[key] = float(token.replace(",", "")) * (1.0 if key == "reported_roe" else scale)
     if result:
         return result
-    for concept, labels in _LABELS.items():
+    for concept, labels in _labels_for_rules(compatibility_rules).items():
         for label in sorted(labels, key=len, reverse=True):
             match = re.search(re.escape(label), compact, flags=re.IGNORECASE)
             if not match:
@@ -2878,7 +3213,8 @@ def parse_structured_snapshot(raw_excerpt: str) -> dict[str, float]:
 
 
 def parse_financial_pages(
-    pages: Sequence[tuple[int, str]], filing: FilingDocument, company: Company
+    pages: Sequence[tuple[int, str]], filing: FilingDocument, company: Company,
+    compatibility_rules: FinancialRulesSnapshot | None = None,
 ) -> tuple[list[FinancialFact], list[EvidenceRef]]:
     """Compatibility adapter for bounded provider excerpts and unit tests."""
     manifest = _manifest_for(filing)
@@ -2887,8 +3223,8 @@ def parse_financial_pages(
     facts: list[FinancialFact] = []
     evidence: list[EvidenceRef] = []
     for page_number, raw_text in pages:
-        values = parse_structured_snapshot(raw_text)
-        statement_context = _statement_context(raw_text)
+        values = parse_structured_snapshot(raw_text, compatibility_rules)
+        statement_context = _statement_context(raw_text, compatibility_rules)
         if statement_context is None and "=" not in raw_text:
             # A free-form narrative is not a statement table. Structured
             # key=value snapshots are the only context-free compatibility form.
@@ -2897,7 +3233,7 @@ def parse_financial_pages(
             statement = _STATEMENT_FOR[concept]
             if statement_context and statement_context[0] != statement and concept != "reported_roe":
                 continue
-            scale, currency_hint = _unit_scale(raw_text)
+            scale, currency_hint = _unit_scale(raw_text, compatibility_rules)
             scope = statement_context[1] if statement_context else "consolidated"
             period_start = None if statement == "balance_sheet" else _period_start(manifest)
             fact_id = hashlib.sha256(f"{filing.document_id}|{concept}|{page_number}|{value}".encode()).hexdigest()[:24]
@@ -2910,7 +3246,7 @@ def parse_financial_pages(
                 statement=statement, period_start=period_start, consolidated_scope=scope,
                 currency=currency_hint or company.reporting_currency, unit_scale=1.0 if concept == "reported_roe" else scale,
                 source_document=manifest.primary_document, source_page=page_number,
-                raw_text=raw_text[:2000], parser_version="financial-ingestion-v2",
+                raw_text=raw_text[:2000], parser_version=_PDF_PARSER_VERSION,
                 validation_status=ValidationStatus.READY_WITH_WARNINGS.value,
             )
             facts.append(fact)

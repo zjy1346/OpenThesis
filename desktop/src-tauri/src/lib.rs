@@ -63,6 +63,26 @@ fn content_for_export<'a>(path: &Path, markdown: &'a str, html: &'a str) -> &'a 
     }
 }
 
+fn sanitize_json_export_name(value: &str) -> String {
+    let stem = value
+        .strip_suffix(".json")
+        .or_else(|| value.strip_suffix(".JSON"))
+        .unwrap_or(value);
+    let mut safe = String::new();
+    let mut separator_pending = false;
+    for character in stem.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            if separator_pending && !safe.is_empty() && !safe.ends_with('-') {
+                safe.push('-');
+            }
+            separator_pending = false;
+            if safe.len() < 80 { safe.push(character); }
+        } else { separator_pending = true; }
+    }
+    let stem = safe.trim_matches('-');
+    format!("{}.json", if stem.is_empty() { "OpenThesis-diagnostics" } else { stem })
+}
+
 fn is_allowed_external_url(value: &str) -> bool {
     if value.len() > 2048 {
         return false;
@@ -108,6 +128,38 @@ async fn export_report(
     })
     .await
     .map_err(|_| "the export dialog stopped unexpectedly".to_string())?
+}
+
+#[tauri::command]
+async fn export_financial_diagnostics(
+    app: AppHandle,
+    suggested_name: String,
+    data_json: String,
+) -> Result<bool, String> {
+    if data_json.len() > MAX_EXPORT_BYTES || data_json.trim().is_empty() {
+        return Err("diagnostics are too large or empty".to_string());
+    }
+    let file_name = sanitize_json_export_name(&suggested_name);
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_title("Export OpenThesis financial diagnostics")
+            .set_file_name(file_name)
+            .add_filter("JSON", &["json"])
+            .blocking_save_file();
+        let Some(selected) = selected else { return Ok(false); };
+        let path = selected
+            .into_path()
+            .map_err(|_| "the selected diagnostics location is unavailable".to_string())?;
+        if path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() != Some("json") {
+            return Err("diagnostic exports must use the .json extension".to_string());
+        }
+        std::fs::write(path, data_json).map_err(|_| "the diagnostics could not be written".to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|_| "the diagnostics export dialog stopped unexpectedly".to_string())?
 }
 
 #[tauri::command]
@@ -175,7 +227,7 @@ fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_for_export, is_allowed_external_url, sanitize_export_name};
+    use super::{content_for_export, is_allowed_external_url, sanitize_export_name, sanitize_json_export_name};
     use std::path::PathBuf;
 
     #[test]
@@ -203,6 +255,8 @@ mod tests {
         assert!(is_allowed_external_url("https://example.com/help"));
         assert!(!is_allowed_external_url("file:///private/data"));
         assert!(!is_allowed_external_url("javascript:alert(1)"));
+        assert_eq!(sanitize_json_export_name("Alibaba:../diagnostics.JSON"), "Alibaba-diagnostics.json");
+        assert_eq!(sanitize_json_export_name("..."), "OpenThesis-diagnostics.json");
     }
 }
 
@@ -228,6 +282,7 @@ pub fn run() {
             model_gateway::model_gateway_test_connection,
             model_gateway::model_gateway_rotate_connection_secret,
             export_report,
+            export_financial_diagnostics,
             export_ot,
             open_external_url
         ])
