@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from openthesis.demo import demo_facts
+from openthesis.application_services import ReportService, ResearchOrchestrator
 from openthesis.domain import (
     Company,
     FilingDocument,
@@ -47,6 +48,7 @@ from openthesis.service import (
     _canonical_snapshot_digest,
     _filing_identity_matches,
     _latest_annual_validations,
+    _scanner_diagnostic_code,
 )
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
 from openthesis.financial_compiler import FactGroupValidation
@@ -103,6 +105,61 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_application_components_are_unique_views_of_injected_dependencies(self) -> None:
+        market = _FakeMarketData()
+        engine = object()
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory), market_data=market, financial_ingestion_engine=engine)
+            self.assertIs(service._disclosure_service.market_data, market)
+            self.assertIs(service._financial_pipeline.ingestion, engine)
+            self.assertIs(service._financial_ingestion, service._financial_pipeline.ingestion)
+            self.assertIs(service._financial_recognition, service._financial_pipeline.recognition)
+            self.assertIs(service._financial_recovery, service._financial_pipeline.recovery)
+            self.assertIs(service._research_orchestrator.storage, service.storage)
+
+    def test_research_orchestrator_transparently_forwards_factory_and_workflow_options(self) -> None:
+        from openthesis.providers import ModelConfig
+        from unittest.mock import patch
+
+        config = ModelConfig(configured_model_id="fixture.model", configuration_version=7, role="comparison")
+        provider = object()
+        factory_calls: list[object] = []
+
+        def factory(received):
+            factory_calls.append(received)
+            return provider
+
+        orchestrator = ResearchOrchestrator(object(), factory)
+        with patch("openthesis.application_services.ResearchWorkflow", return_value="workflow") as workflow_ctor:
+            result = orchestrator.create(
+                "pack", config, report_language="en", ui_language="zh-Hant",
+                parallel_agents=True,
+            )
+        self.assertEqual(result, "workflow")
+        self.assertEqual(factory_calls, [config])
+        self.assertEqual(workflow_ctor.call_args.args[:4], (orchestrator.storage, "pack", provider, config))
+        self.assertEqual(workflow_ctor.call_args.kwargs["report_language"], "en")
+        self.assertEqual(workflow_ctor.call_args.kwargs["ui_language"], "zh-Hant")
+
+    def test_report_service_renders_each_language_from_same_canonical_artifacts(self) -> None:
+        seen: list[tuple[str, int, str]] = []
+        artifacts = [{"artifact_id": "canonical-1", "artifact_type": "research-report"}]
+
+        def markdown(run_id, items, **kwargs):
+            seen.append(("markdown", id(items), kwargs["language"]))
+            return run_id + ":md"
+
+        def html(run_id, items, **kwargs):
+            seen.append(("html", id(items), kwargs["language"]))
+            return run_id + ":html"
+
+        renderer = ReportService(markdown, html)
+        for language in ("zh-CN", "zh-Hant", "en"):
+            result = renderer.render("run-1", artifacts, language=language, company_name="Fixture")
+            self.assertEqual(result, ("run-1:md", "run-1:html"))
+        self.assertEqual({entry[1] for entry in seen}, {id(artifacts)})
+        self.assertEqual([entry[2] for entry in seen], ["zh-CN", "zh-CN", "zh-Hant", "zh-Hant", "en", "en"])
+
     def test_financial_diagnostics_is_bounded_and_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = AppService(Path(directory))
@@ -141,6 +198,30 @@ class AppServiceTests(unittest.TestCase):
             message = _research_data_message("FILING_CONTENT_UNSAFE", language)
             self.assertIn(marker, message)
             self.assertNotIn("FILING_CONTENT_UNSAFE", message)
+
+    def test_scanned_filing_diagnostics_have_actionable_localized_messages(self) -> None:
+        self.assertEqual(
+            _scanner_diagnostic_code(("filing:SCANNED_IMAGE_FILING_DETECTED",)),
+            "SCANNED_IMAGE_FILING_DETECTED",
+        )
+        self.assertEqual(
+            _scanner_diagnostic_code(("filing:SCANNED_IMAGE_LAYOUT_UNRESOLVED",)),
+            "SCANNED_IMAGE_LAYOUT_UNRESOLVED",
+        )
+        for language in ("zh-CN", "zh-Hant", "en"):
+            detected_message = _research_data_message(
+                "SCANNED_IMAGE_FILING_DETECTED", language
+            )
+            unresolved_message = _research_data_message(
+                "SCANNED_IMAGE_LAYOUT_UNRESOLVED", language
+            )
+            self.assertTrue(detected_message and unresolved_message)
+            self.assertNotEqual(detected_message, unresolved_message)
+            self.assertNotIn("SCANNED_IMAGE_", detected_message)
+            self.assertNotIn("SCANNED_IMAGE_", unresolved_message)
+            if language == "en":
+                self.assertIn("scanned", detected_message.lower())
+                self.assertIn("could not be located safely", unresolved_message.lower())
 
     def test_filing_fetch_failure_gets_one_model_free_automatic_retry(self) -> None:
         calls = 0
@@ -1351,8 +1432,8 @@ class AppServiceTests(unittest.TestCase):
                 service.rebuild_financials("financial-retry")
             service.rebuild_financials("financial-retry", confirmed=True)
             self.assertEqual(
-                set(download_calls[1:]),
-                {unhealthy.accession_number, good.accession_number},
+                download_calls,
+                [unhealthy.accession_number],
             )
             self.assertEqual(provider_calls, [])
 
@@ -2123,6 +2204,21 @@ class AppServiceTests(unittest.TestCase):
 
 
 class FinancialRetryContractTests(unittest.TestCase):
+    def test_legacy_snapshot_without_derived_contract_is_stale(self) -> None:
+        company = build_company("legacy-snapshot", "LEGACY", reporting_currency="CNY")
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.storage.save_company(company)
+            status = _financial_status(
+                service.storage,
+                company.to_dict(),
+                {
+                    "status": "completed",
+                    "data_snapshot": {"financial_fact_ids_sha256": "old-digest"},
+                },
+            )
+            self.assertTrue(status["snapshot_stale"])
+
     def test_canonical_retry_snapshot_requires_matching_saved_hash(self) -> None:
         company = build_company("300750.SZ", "CATL", reporting_currency="CNY")
         filing = FilingDocument(

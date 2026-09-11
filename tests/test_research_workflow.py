@@ -4,21 +4,33 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
 from openthesis.domain import FinancialFact, RunStatus
+from openthesis.financials import NormalizedMoney
 from openthesis.ot import compile_studio_draft, minimal_studio_draft
 from openthesis.packs import builtin_pack, load_pack
 from openthesis.markets import build_company
 from openthesis.providers import ModelConfig, ProviderError
 from openthesis.research import (
     ResearchCancelled,
+    ResearchContext,
     ResearchWorkflow,
+    _trusted_stage_result,
     _synthesis_prior_artifacts,
     _synthesis_repair_input,
+    _partition_synthesis_context,
+    _skeptical_prior_artifacts,
+    _gate_stage_output,
+    ProviderContextCapability,
+    SynthesisContextLimitError,
+    provider_context_capability,
     verify_agent_output,
+    build_fact_evidence,
 )
+from openthesis.growth import normalize_growth_output
 from openthesis.storage import Storage
 
 
@@ -33,7 +45,7 @@ def _valid_growth_output() -> dict[str, object]:
                 "maturity_stage": "early",
                 "time_horizon_years": 3,
                 "probability_range": [0.3, 0.5],
-                "supporting_evidence_ids": [],
+                "supporting_evidence_ids": ["fact:808ac9481ae812762bdc728c"],
                 "contradicting_evidence_ids": [],
                 "scenario_eligibility": ["base"],
             }
@@ -42,6 +54,234 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_growth_lineage_records_cap_and_retained_counts(self) -> None:
+        template = _valid_growth_output()["opportunities"][0]
+        output = {"opportunities": [
+            {**template, "opportunity_id": f"growth-{index}"}
+            for index in range(1, 7)
+        ]}
+        normalized = normalize_growth_output(
+            output,
+            {"fact:808ac9481ae812762bdc728c"},
+            "en",
+        ).output
+        lineage = normalized["_lineage"]
+        self.assertEqual(lineage["raw_candidate_count"], 6)
+        self.assertEqual(lineage["normalized_count"], 5)
+        self.assertTrue(lineage["cap_applied"])
+        self.assertEqual(lineage["cap_limit"], 5)
+        self.assertEqual(lineage["rejected_count"], 1)
+
+    def test_fact_evidence_retains_canonical_identity_and_unit_provenance(self) -> None:
+        fact = {
+            "fact_id": "revenue-1",
+            "company_cik": "issuer-1",
+            "entity": "Issuer One",
+            "market": "CN_A",
+            "concept": "revenue",
+            "value": 123,
+            "unit": "CNY",
+            "unit_scale": 1000,
+            "unit_provenance": "explicit",
+            "scope": "consolidated",
+            "consolidated_scope": "consolidated",
+            "fiscal_year": 2025,
+            "fiscal_period": "FY",
+            "form_type": "ANNUAL_REPORT",
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "filed_at": "2026-03-01",
+            "accession_number": "acc-1",
+            "source_document": "report.pdf",
+            "source_url": "https://example.test/report.pdf",
+        }
+        record = build_fact_evidence([fact])[0]
+        for key in (
+            "company_cik", "entity", "market", "scope", "consolidated_scope",
+            "unit_scale", "unit_provenance", "start_date", "end_date", "filed_at",
+            "form_type", "fiscal_period", "accession_number", "source_document",
+        ):
+            self.assertEqual(record[key], fact[key])
+
+    def test_conflicting_same_target_citation_cannot_hide_behind_one_match(self) -> None:
+        records = {
+            "fact:good": {
+                "kind": "financial_fact", "concept": "revenue", "value": 100,
+                "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY",
+                "end_date": "2025-12-31", "scope": "consolidated",
+            },
+            "fact:bad": {
+                "kind": "financial_fact", "concept": "revenue", "value": 900,
+                "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY",
+                "end_date": "2025-12-31", "scope": "consolidated",
+            },
+        }
+        result = verify_agent_output(
+            {"claims": [{"kind": "fact", "concept": "revenue", "value": 100,
+                         "unit": "CNY", "fiscal_year": 2025,
+                         "fiscal_period": "FY", "end_date": "2025-12-31",
+                         "scope": "consolidated",
+                         "evidence_ids": list(records)}]},
+            set(records), "en", records,
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["claim_verifications"][0]["state"], "contradicted")
+
+    def test_same_target_scope_or_currency_conflict_is_not_unrelated(self) -> None:
+        records = {
+            "fact:cny": {"kind": "financial_fact", "concept": "revenue", "value": 100,
+                         "unit": "CNY", "currency": "CNY", "fiscal_year": 2025,
+                         "fiscal_period": "FY", "end_date": "2025-12-31",
+                         "scope": "consolidated"},
+            "fact:usd": {"kind": "financial_fact", "concept": "revenue", "value": 100,
+                         "unit": "USD", "currency": "USD", "fiscal_year": 2025,
+                         "fiscal_period": "FY", "end_date": "2025-12-31",
+                         "scope": "consolidated"},
+        }
+        result = verify_agent_output(
+            {"claims": [{"kind": "fact", "concept": "revenue", "value": 100,
+                         "unit": "CNY", "currency": "CNY", "fiscal_year": 2025,
+                         "fiscal_period": "FY", "end_date": "2025-12-31",
+                         "scope": "consolidated", "evidence_ids": list(records)}]},
+            set(records), "en", records,
+        )
+        self.assertEqual(result["claim_verifications"][0]["state"], "contradicted")
+
+    def test_incomplete_fact_or_calculation_cannot_be_numeric_verified(self) -> None:
+        records = {"fact:raw": {"kind": "financial_fact", "concept": "revenue", "value": 100,
+                                "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY",
+                                "end_date": "2025-12-31"}}
+        fact = verify_agent_output(
+            {"claims": [{"kind": "fact", "concept": "revenue", "evidence_ids": ["fact:raw"]}]},
+            set(records), "en", records,
+        )
+        calc = verify_agent_output(
+            {"claims": [{"kind": "calculation", "value": 100, "unit": "CNY",
+                         "fiscal_year": 2025, "fiscal_period": "FY",
+                         "evidence_ids": ["fact:raw"]}]},
+            set(records), "en", records,
+        )
+        self.assertEqual(fact["claim_verifications"][0]["state"], "insufficient_evidence")
+        self.assertEqual(calc["claim_verifications"][0]["state"], "insufficient_evidence")
+
+    def test_semantic_reviewer_only_assists_qualitative_inference(self) -> None:
+        records = {"filing:text": {"kind": "filing_text", "raw_text": "Demand remains stable."}}
+        calls: list[str] = []
+
+        def reviewer(claim: dict[str, object], _records: list[dict[str, object]]) -> str:
+            calls.append(str(claim.get("kind")))
+            return "entailed"
+
+        result = verify_agent_output(
+            {"claims": [{"kind": "inference", "text": "The addressable opportunity is durable.",
+                         "evidence_ids": ["filing:text"]}]},
+            set(records), "en", records, semantic_reviewer=reviewer,
+        )
+        self.assertEqual(result["claim_verifications"][0]["state"], "text_supported")
+        self.assertEqual(calls, ["inference"])
+        assumption = verify_agent_output(
+            {"claims": [{"kind": "assumption", "text": "Demand is stable.",
+                         "evidence_ids": ["filing:text"]}]},
+            set(records), "en", records,
+            semantic_reviewer=lambda *_: "entailed",
+        )
+        self.assertEqual(assumption["claim_verifications"][0]["state"], "reference_only")
+        incomplete = verify_agent_output(
+            {"claims": [{"kind": "fact", "concept": "revenue",
+                         "text": "The addressable opportunity is durable.",
+                         "evidence_ids": ["filing:text"]}]},
+            set(records), "en", records, semantic_reviewer=lambda *_: "entailed",
+        )
+        self.assertEqual(incomplete["claim_verifications"][0]["state"], "insufficient_evidence")
+        conflicting = verify_agent_output(
+            {"claims": [{"kind": "fact", "concept": "revenue", "value": 200,
+                         "unit": "USD", "fiscal_year": 2025, "fiscal_period": "FY",
+                         "end_date": "2025-12-31", "evidence_ids": ["fact:raw"]}]},
+            {"fact:raw"}, "en", {
+                "fact:raw": {"kind": "financial_fact", "concept": "revenue", "value": 100,
+                              "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY",
+                              "end_date": "2025-12-31"}
+            }, semantic_reviewer=lambda *_: "entailed",
+        )
+        self.assertEqual(conflicting["claim_verifications"][0]["state"], "contradicted")
+
+    def test_skeptical_input_contains_all_canonical_evidence_and_claim_graph(self) -> None:
+        evidence = [{"evidence_id": f"fact:{index}"} for index in range(41)]
+        dossier = {"trusted_channels": {"verified_facts": [{"text": "Revenue", "evidence_ids": ["fact:40"]}]}}
+        context = ResearchContext(DEMO_COMPANY, [], [], [], evidence)
+        payload = _skeptical_prior_artifacts(context, dossier, {})
+        encoded = json.dumps(payload, ensure_ascii=False)
+        self.assertIn("fact:40", encoded)
+        self.assertTrue(payload["thesis_claim_graph"])
+
+        class CaptureProvider:
+            context_window_tokens = 100_000
+
+            def __init__(self) -> None:
+                self.user_prompt = ""
+
+            def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
+                self.user_prompt = user_prompt
+                return {"claims": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = CaptureProvider()
+            workflow = ResearchWorkflow(
+                Storage(Path(directory)), builtin_pack(), provider,
+                ModelConfig(configured_model_id="test.fake", role="primary"),
+                report_language="en",
+            )
+            workflow._run_agent(
+                "skeptical-analyst", "prompts/skeptical-analyst.md",
+                context.compact_json(), payload,
+            )
+        self.assertIn("fact:40", provider.user_prompt)
+        self.assertIn("canonical_evidence", provider.user_prompt)
+        self.assertIn("thesis_claim_graph", provider.user_prompt)
+
+    def test_compact_context_retains_all_evidence_and_metrics(self) -> None:
+        context = ResearchContext(
+            DEMO_COMPANY,
+            [],
+            [{"year": index} for index in range(8)],
+            [],
+            [{"evidence_id": f"fact:{index}"} for index in range(41)],
+        )
+        payload = json.loads(context.compact_json())
+        self.assertEqual(len(payload["metrics"]), 8)
+        self.assertEqual(len(payload["evidence"]), 41)
+
+    def test_factual_prose_without_deterministic_fields_stays_unresolved(self) -> None:
+        records = {
+            "filing:text": {
+                "kind": "filing_text",
+                "raw_text": "营业收入同比增长20%。",
+            }
+        }
+        result = verify_agent_output(
+            {"claims": [{"kind": "fact", "text": "营业收入同比增长20%。",
+                         "evidence_ids": ["filing:text"]}]},
+            set(records), "zh-CN", records,
+        )
+        self.assertEqual(result["claim_verifications"][0]["state"], "insufficient_evidence")
+        self.assertFalse(result["passed"])
+
+    def test_trusted_stage_result_exposes_typed_channels(self) -> None:
+        records = {
+            "fact:revenue": {
+                "kind": "financial_fact", "concept": "revenue", "value": 100,
+                "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY",
+                "end_date": "2025-12-31",
+            }
+        }
+        result = {"claims": [{"kind": "fact", "concept": "revenue", "value": 100,
+                               "unit": "CNY", "fiscal_year": 2025,
+                               "fiscal_period": "FY",
+                               "evidence_ids": ["fact:revenue"]}]}
+        verification = verify_agent_output(result, set(records), "en", records)
+        trusted = _trusted_stage_result(result, verification)
+        self.assertEqual(trusted["trusted_channels"]["verified_facts"][0]["concept"], "revenue")
+
     def test_synthesis_projection_is_bounded_and_preserves_sections_ids_and_numbers(self) -> None:
         long = "evidence:fact:revenue-2025 " + ("narrative " * 500)
         projected = _synthesis_prior_artifacts(
@@ -69,7 +309,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
         self.assertNotIn("growth_opportunities", repair["section_context"])
         self.assertLessEqual(len(json.dumps(repair, ensure_ascii=False).encode("utf-8")), 24_000)
 
-    def test_synthesis_projection_has_hard_limit_for_extreme_width_and_depth(self) -> None:
+    def test_synthesis_projection_preserves_extreme_width_and_depth_losslessly(self) -> None:
         deep: object = "evidence:fact:critical-id " + ("redundant prose " * 4000)
         for _ in range(12):
             deep = {"repeated": [deep] * 40, "claims": [{"evidence_ids": ["evidence:fact:critical-id"], "value": 99}]}
@@ -79,7 +319,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             {"strongest_counterarguments": [deep] * 40, "unsupported_assumptions": ["assumption"]},
             {"scenarios": [{"name": "base", "value": 12.5}] * 40},
         )
-        self.assertLessEqual(len(json.dumps(projected, ensure_ascii=False).encode("utf-8")), 32_000)
+        self.assertGreater(len(json.dumps(projected, ensure_ascii=False).encode("utf-8")), 32_000)
         self.assertEqual(set(projected), {"base_analyses", "growth_opportunities", "counter_analysis", "forecast", "source_evidence_ids"})
         self.assertIn("evidence:fact:critical-id", projected["source_evidence_ids"])
         self.assertEqual(projected["forecast"]["scenarios"][0]["value"], 12.5)
@@ -117,17 +357,314 @@ class DeterministicWorkflowTests(unittest.TestCase):
             }
         }
         valid = verify_agent_output(
-            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 100.0, "unit": "CNY", "fiscal_year": 2025}]},
+            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 100.0, "unit": "CNY", "fiscal_year": 2025, "fiscal_period": "FY"}]},
             set(evidence), "en", evidence,
         )
         invalid = verify_agent_output(
-            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 120.0, "unit": "CNY", "fiscal_year": 2024}]},
+            {"claims": [{"kind": "fact", "evidence_ids": ["fact:revenue-2025"], "concept": "revenue", "value": 120.0, "unit": "CNY", "fiscal_year": 2024, "fiscal_period": "FY"}]},
             set(evidence), "en", evidence,
         )
 
         self.assertTrue(valid["passed"])
         self.assertFalse(invalid["passed"])
         self.assertIn("period/value", invalid["issues"][0])
+
+    def test_claim_with_opposite_direction_is_contradicted_even_with_valid_evidence_id(self) -> None:
+        evidence = {
+            "fact:revenue-growth": {
+                "evidence_id": "fact:revenue-growth",
+                "kind": "financial_fact",
+                "concept": "revenue_growth",
+                "value": -0.20,
+                "unit": "ratio",
+                "fiscal_year": 2025,
+                "fiscal_period": "FY",
+                "end_date": "2025-12-31",
+                "raw_text": "Revenue decreased by 20% year over year.",
+            }
+        }
+        result = verify_agent_output(
+            {
+                "claims": [{
+                    "kind": "fact",
+                    "text": "Revenue grew by 80% year over year.",
+                    "evidence_ids": ["fact:revenue-growth"],
+                }]
+            },
+            set(evidence),
+            "en",
+            evidence,
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["claim_verifications"][0]["state"], "contradicted")
+
+    def test_chinese_filing_text_opposite_direction_is_contradicted(self) -> None:
+        evidence = {
+            "filing:text:revenue": {
+                "evidence_id": "filing:text:revenue",
+                "kind": "filing_text",
+                "raw_text": "营业收入同比下降20%。",
+            }
+        }
+        result = verify_agent_output(
+            {
+                "claims": [{
+                    "kind": "inference",
+                    "text": "营业收入同比增长80%。",
+                    "evidence_ids": ["filing:text:revenue"],
+                }]
+            },
+            set(evidence),
+            "zh-CN",
+            evidence,
+        )
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["claim_verifications"][0]["state"], "contradicted")
+
+    def test_failed_stage_material_is_not_packaged_as_verified_dossier(self) -> None:
+        result = {
+            "claims": [{
+                "kind": "fact",
+                "text": "Revenue grew by 80%.",
+                "evidence_ids": ["fact:missing"],
+            }],
+            "analysis": "unverified stage text",
+        }
+        verification = verify_agent_output(result, set(), "en", {})
+        self.assertFalse(verification["passed"])
+        self.assertEqual(verification["claim_verifications"][0]["state"], "insufficient_evidence")
+        trusted = _trusted_stage_result(result, verification)
+        self.assertNotIn("unverified stage text", trusted)
+        self.assertEqual(trusted["_verification_state"], "failed_verification")
+
+    def test_arbitrary_no_claims_analysis_cannot_become_verified(self) -> None:
+        result = {"analysis": "营业收入与竞争力均表现良好，但没有可核验引用。"}
+        verification = verify_agent_output(result, set(), "zh-CN", {})
+        trusted = _trusted_stage_result(result, verification)
+        self.assertEqual(trusted["_verification_state"], "failed_verification")
+        self.assertNotIn("analysis", trusted)
+
+    def test_growth_opportunity_without_supporting_evidence_is_not_verified(self) -> None:
+        opportunity = {
+            "title": "Unsupported opportunity",
+            "mechanism": "A market may expand.",
+            "supporting_evidence_ids": [],
+            "contradicting_evidence_ids": [],
+        }
+        trusted, verification = _gate_stage_output(
+            {"opportunities": [opportunity]},
+            {"fact:revenue"},
+            {
+                "fact:revenue": {
+                    "evidence_id": "fact:revenue",
+                    "kind": "financial_fact",
+                }
+            },
+            "en",
+        )
+        self.assertFalse(verification["passed"])
+        self.assertEqual(trusted["_verification_state"], "failed_verification")
+        self.assertEqual(trusted["opportunities"], [])
+
+    def test_forecast_scenarios_use_partial_assumption_channel(self) -> None:
+        trusted, verification = _gate_stage_output(
+            {
+                "scenarios": [
+                    {
+                        "name": "base",
+                        "probability_range": [0.3, 0.7],
+                        "assumption": "Demand remains stable.",
+                    }
+                ]
+            },
+            set(),
+            {},
+            "en",
+        )
+        self.assertFalse(verification["passed"])
+        self.assertEqual(trusted["_verification_state"], "completed_partial")
+        self.assertEqual(trusted["scenarios"][0]["name"], "base")
+
+    def test_reference_only_growth_claim_is_partial_but_retained(self) -> None:
+        trusted, verification = _gate_stage_output(
+            {
+                "opportunities": [
+                    {
+                        "title": "Potential expansion",
+                        "claim": "A new market may expand.",
+                        "supporting_evidence_ids": ["fact:revenue"],
+                        "contradicting_evidence_ids": [],
+                    }
+                ]
+            },
+            {"fact:revenue"},
+            {
+                "fact:revenue": {
+                    "evidence_id": "fact:revenue",
+                    "kind": "financial_fact",
+                }
+            },
+            "en",
+        )
+        self.assertFalse(verification["passed"])
+        self.assertEqual(trusted["_verification_state"], "completed_partial")
+        self.assertEqual(len(trusted["opportunities"]), 1)
+
+    def test_context_budget_subtracts_output_and_repair_reserve_without_floor(self) -> None:
+        capability = ProviderContextCapability(
+            max_input_tokens=3_000,
+            reserved_output_tokens=1_000,
+            reserved_repair_tokens=1_000,
+        )
+        self.assertEqual(capability.max_input_bytes, 4_000)
+        self.assertLess(capability.max_input_bytes, 16_384)
+
+    def test_large_synthesis_keeps_unique_claim_and_sections_without_byte_clipping(self) -> None:
+        unique_claim = {"text": "UNIQUE CLAIM RETAIN", "evidence_ids": ["fact:unique"]}
+        projected = _synthesis_prior_artifacts(
+            {"analyses": {"financial_quality": "x" * 100_000, "claims": [unique_claim]}},
+            {"opportunities": ["y" * 100_000]},
+            {"strongest_counterarguments": ["z" * 100_000]},
+            {"scenarios": [{"name": "base", "value": 1.0}]},
+        )
+        self.assertIn("financial_quality", projected["base_analyses"])
+        self.assertIn(unique_claim, projected["base_analyses"]["claims"])
+        self.assertEqual(projected["forecast"]["scenarios"][0]["name"], "base")
+
+    def test_oversized_synthesis_uses_lossless_named_sections(self) -> None:
+        projected = _synthesis_prior_artifacts(
+            {"analyses": {"financial_quality": ["Q" * 3_000 for _ in range(3)]}},
+            {"opportunities": [{"text": "GROWTH UNIQUE"}]},
+            {"strongest_counterarguments": ["RISK UNIQUE"], "notes": ["R" * 3_000 for _ in range(3)]},
+            {"scenarios": [{"name": "base"}]},
+        )
+        sectioned = _partition_synthesis_context(
+            projected, ProviderContextCapability(max_input_tokens=8_000)
+        )
+        self.assertGreater(len(sectioned), 1)
+        self.assertEqual(
+            {part["name"] for part in sectioned},
+            {"base_analyses", "growth_opportunities", "counter_analysis", "forecast"},
+        )
+        self.assertIn("financial_quality", sectioned[0]["content"])
+
+    def test_oversized_nested_claims_are_partitioned_without_loss(self) -> None:
+        claims = [
+            {"text": f"UNIQUE CLAIM {index} " + ("detail " * 60), "evidence_ids": [f"fact:{index}"]}
+            for index in range(12)
+        ]
+        projected = _synthesis_prior_artifacts(
+            {"analyses": {"financial_quality": "Q", "claims": claims}},
+            {},
+            {},
+            {},
+        )
+        capability = ProviderContextCapability(
+            max_input_tokens=2_600,
+            reserved_output_tokens=1_000,
+            reserved_repair_tokens=1_000,
+        )
+        parts = _partition_synthesis_context(projected, capability)
+        self.assertGreater(len(parts), 1)
+        serialized = json.dumps(parts, ensure_ascii=False)
+        for claim in claims:
+            self.assertIn(claim["text"], serialized)
+        self.assertTrue(all(len(json.dumps(part, ensure_ascii=False).encode("utf-8")) <= capability.max_input_bytes for part in parts))
+
+    def test_oversized_synthesis_rejects_before_provider_call(self) -> None:
+        class RecordingProvider:
+            context_window_tokens = 8_000
+
+            def __init__(self) -> None:
+                self.payload_sizes: list[int] = []
+
+            def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
+                self.payload_sizes.append(len(user_prompt.encode("utf-8")))
+                return {"claims": [{"text": "section result", "kind": "inference", "evidence_ids": []}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = RecordingProvider()
+            workflow = ResearchWorkflow(
+                Storage(Path(directory)),
+                builtin_pack(),
+                provider,
+                ModelConfig(configured_model_id="test.fake", role="primary"),
+            )
+            context = ResearchContext(DEMO_COMPANY, [], [], [], [])
+            with self.assertRaises(SynthesisContextLimitError) as error:
+                workflow._run_synthesis_with_budget(
+                    context,
+                    {"analyses": {"financial_quality": ["Q" * 2_000 for _ in range(5)]}},
+                    {"opportunities": ["G" * 2_000 for _ in range(5)]},
+                    {"strongest_counterarguments": ["R" * 2_000 for _ in range(5)]},
+                    {"scenarios": [{"name": "base"}]},
+                )
+            self.assertEqual(provider.payload_sizes, [])
+            self.assertGreater(error.exception.required_bytes, error.exception.available_bytes)
+
+    def test_run_context_capacity_saves_complete_staged_fallback_without_final_call(self) -> None:
+        class CapacityProvider:
+            context_window_tokens = 100_000
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.max_input_bytes = 100_000
+
+            def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
+                agent = str(json.loads(user_prompt).get("agent", ""))
+                self.calls.append(agent)
+                if len(self.calls) == 6:
+                    # Make only the final synthesis envelope too small.  All
+                    # preceding stage calls retain their normal capability.
+                    self.max_input_bytes = 1
+                if agent == "growth-opportunity-analyst":
+                    return _valid_growth_output()
+                return {
+                    "analysis": f"preserved {agent}",
+                    "claims": [{
+                        "text": f"Stage output from {agent}",
+                        "kind": "inference",
+                        "evidence_ids": [],
+                    }],
+                    "scenarios": ["A bounded scenario"] if agent == "forecast-analyst" else [],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            provider = CapacityProvider()
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(configured_model_id="test.capacity", role="primary"),
+                parallel_agents=False,
+            )
+            run = workflow.run(DEMO_COMPANY, demo_facts())
+            report = next(
+                item for item in storage.get_artifacts(run.run_id)
+                if item["artifact_type"] == "research-report"
+            )
+            content = report["content"]
+            self.assertEqual(content["mode"], "staged-fallback")
+            self.assertEqual(provider.calls.count("research-synthesizer"), 0)
+            self.assertEqual(
+                content["report"]["cross_section_synthesis_status"],
+                "not_completed_context_capacity",
+            )
+            self.assertTrue(content["report"]["research_complete"])
+            self.assertGreater(
+                content["report"]["context_budget"]["required_bytes"],
+                content["report"]["context_budget"]["available_bytes"],
+            )
+            self.assertTrue(content["report"]["context_budget"]["counting_mode"])
+            required = {
+                "executive_summary", "business_model", "financial_quality",
+                "balance_sheet", "competitive_position", "growth_opportunities",
+                "counterarguments", "scenarios", "thesis", "claims",
+            }
+            self.assertTrue(required.issubset(content["report"]))
+            self.assertTrue(content["report"]["financial_quality"])
 
     def test_compiled_custom_ot_executes_its_own_dependency_graph(self) -> None:
         class OtProvider:
@@ -231,7 +768,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                                 "maturity_stage": "early",
                                 "time_horizon_years": 3,
                                 "probability_range": [0.3, 0.5],
-                                "supporting_evidence_ids": [],
+                                "supporting_evidence_ids": ["fact:808ac9481ae812762bdc728c"],
                                 "contradicting_evidence_ids": [],
                                 "scenario_eligibility": ["base"],
                             }
@@ -371,6 +908,32 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 if item["artifact_type"] == "deterministic-valuation"
             )
             self.assertEqual(valuation["content"]["status"], "currency_mismatch")
+
+    def test_authoritative_reverse_dcf_receives_explicit_normalized_money(self) -> None:
+        directory = Path.cwd() / "tmp" / "research-dcf-typed"
+        storage = Storage(directory)
+        try:
+            storage.save_company(DEMO_COMPANY)
+            workflow = ResearchWorkflow(storage, builtin_pack(), None, ModelConfig())
+            with patch("openthesis.research.reverse_dcf_analysis", return_value={"status": "ok"}) as dcf:
+                workflow.run(
+                    DEMO_COMPANY,
+                    demo_facts(),
+                    valuation_inputs={"market_cap": 1_000_000_000, "discount_rate": 0.1,
+                                      "terminal_growth": 0.03, "horizon_years": 5},
+                    market_snapshot={
+                        "source": "verified-fixture", "market_cap": 1_000_000_000,
+                        "valuation_currency": "USD", "currency": "USD",
+                        "market_cap_unit_scale": 1, "market_cap_unit_provenance": "normalized",
+                        "as_of": "2026-08-09",
+                    },
+                )
+            self.assertIsInstance(dcf.call_args.args[1], NormalizedMoney)
+            self.assertEqual(dcf.call_args.args[1].currency, "USD")
+            self.assertEqual(dcf.call_args.args[1].normalized_value, 1_000_000_000.0)
+            self.assertTrue(dcf.call_args.kwargs.get("require_typed"))
+        finally:
+            pass
 
     def test_multi_agent_workflow_with_fake_provider(self) -> None:
         class FakeProvider:
@@ -535,7 +1098,9 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 "leading_indicators", "unresolved_questions", "claims",
             }
             self.assertTrue(required.issubset(fallback))
-            self.assertTrue(fallback["claims"])
+            # Claims without a cited, verified record are intentionally kept
+            # out of the staged report rather than promoted as facts.
+            self.assertFalse(fallback["claims"])
             self.assertNotIn("claims", fallback["business_model"])
             self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
             self.assertEqual(provider.count, 8, "run performs one bounded final repair call")

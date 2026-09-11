@@ -87,7 +87,7 @@ class _HkexJsonTransport(_Transport):
         title = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("title", [""])[0]
         annual = [
             {
-                "DATE_TIME": f"{28 - index:02d}/03/{year} 12:00",
+                "DATE_TIME": f"{28 - index:02d}/03/{year + 1} 12:00",
                 "TITLE": f"202{year - 2020} Annual Report",
                 "FILE_LINK": f"/listedco/listconews/sehk/{year + 1}/0328/annual-{year}.pdf",
             }

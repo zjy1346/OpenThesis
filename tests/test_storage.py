@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import sqlite3
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
@@ -38,6 +39,7 @@ class StorageTests(unittest.TestCase):
             consolidated_scope="consolidated",
             currency="CNY",
             unit_scale=1000.0,
+            unit_provenance="explicit",
             revision="original",
             source_document="report.pdf",
             source_page=4,
@@ -63,6 +65,21 @@ class StorageTests(unittest.TestCase):
             groups = storage.get_validation_groups(company.security_id)
             self.assertEqual(groups[0]["status"], "VERIFIED")
             self.assertEqual(groups[0]["covered_concepts"], ["revenue"])
+            self.assertEqual(groups[0]["derived_version"], "financial-facts-v2")
+            self.assertEqual(storage.get_validation_groups_audit(company.security_id), groups)
+
+    def test_unit_provenance_roundtrips_and_unknown_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("unit-co", "UNIT", reporting_currency="CNY")
+            storage.save_company(company)
+            fact = replace(self._fact(company.security_id), fact_id="unit-explicit", unit_provenance="explicit")
+            evidence = EvidenceRef("fact:unit-explicit", "doc-unit", fact.source_url, "Revenue", "page:4", fact.raw_text, fact.filed_at, bbox=fact.source_bbox)
+            validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ())
+            group = FinancialGroupValidation(("acc-rich", "2025-12-31", "FY", "consolidated", "CNY"), validation)
+            storage.replace_financial_ingestion(company.security_id, ["acc-rich"], [fact], [], [group], [evidence])
+            saved = storage.get_facts_audit(company.security_id)
+            self.assertEqual(saved[0]["unit_provenance"], "explicit")
 
     def test_reparse_removes_stale_evidence_for_accession(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -183,6 +200,39 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(storage.get_facts(company.security_id), [])
             self.assertEqual(len(storage.get_facts_audit(company.security_id)), 1)
 
+    def test_audit_only_fact_is_not_rewritten_as_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("audit-co", "AUDIT")
+            storage.save_company(company)
+            audit_fact = self._fact(company.security_id)
+            storage.replace_financial_ingestion(
+                company.security_id,
+                [audit_fact.accession_number],
+                [], [], [], [], [audit_fact],
+            )
+            audit_rows = storage.get_facts_audit(company.security_id)
+            self.assertEqual(len(audit_rows), 1)
+            self.assertEqual(audit_rows[0]["usage_status"], "audit_only")
+            self.assertNotEqual(audit_rows[0]["validation_status"], "REJECTED")
+            self.assertEqual(storage.get_facts(company.security_id), [])
+
+    def test_new_schema_defaults_are_fail_closed_for_unclassified_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            db = sqlite3.connect(storage.db_path)
+            try:
+                columns = {
+                    row[1]: row[4]
+                    for row in db.execute("PRAGMA table_info(financial_facts)").fetchall()
+                }
+            finally:
+                db.close()
+            self.assertEqual(columns["extraction_status"], "'unresolved'")
+            self.assertEqual(columns["usage_status"], "'audit_only'")
+            self.assertEqual(columns["provenance_status"], "'unresolved'")
+            self.assertEqual(columns["derived_version"], "'legacy'")
+
     def test_run_and_rebuilt_artifacts_are_committed_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))
@@ -237,10 +287,135 @@ class StorageTests(unittest.TestCase):
             finally:
                 db.close()
             storage = Storage(data_dir)
-            self.assertEqual(storage.get_facts("legacy")[0]["fact_id"], "legacy-fact")
+            # Legacy rows remain auditable but are not silently upgraded into
+            # the current canonical derived view.
+            self.assertEqual(storage.get_facts("legacy"), [])
+            legacy_row = storage.get_facts_audit("legacy")[0]
+            self.assertEqual(legacy_row["fact_id"], "legacy-fact")
+            self.assertEqual(legacy_row["unit_provenance"], "unknown")
             with storage.connect() as db:
                 columns = {row[1] for row in db.execute("PRAGMA table_info(financial_facts)")}
             self.assertIn("source_bbox_json", columns)
+
+    def test_v10_sqlite_migration_preserves_sources_and_marks_rebuild_required(self) -> None:
+        """A real pre-v11 schema migrates additively and remains fail-closed."""
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            db_path = data_dir / "openthesis.db"
+            db = sqlite3.connect(db_path)
+            db.executescript(
+                """
+                CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE companies(cik TEXT PRIMARY KEY, ticker TEXT NOT NULL, name TEXT NOT NULL, exchange_name TEXT NOT NULL DEFAULT '');
+                CREATE TABLE filings(document_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, accession_number TEXT NOT NULL, form_type TEXT NOT NULL, fiscal_period TEXT NOT NULL, period_end TEXT NOT NULL, filed_at TEXT NOT NULL, primary_document TEXT NOT NULL, source_url TEXT NOT NULL, local_path TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL DEFAULT '', ingested_at TEXT NOT NULL);
+                CREATE TABLE financial_facts(fact_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, concept TEXT NOT NULL, reported_concept TEXT NOT NULL, value REAL NOT NULL, unit TEXT NOT NULL, fiscal_year INTEGER NOT NULL, fiscal_period TEXT NOT NULL, form_type TEXT NOT NULL, start_date TEXT, end_date TEXT NOT NULL, filed_at TEXT NOT NULL, accession_number TEXT NOT NULL, source_url TEXT NOT NULL, scope TEXT NOT NULL);
+                CREATE TABLE financial_evidence(evidence_id TEXT PRIMARY KEY, document_id TEXT NOT NULL, source_url TEXT NOT NULL, title TEXT NOT NULL, locator TEXT NOT NULL, excerpt TEXT NOT NULL, published_at TEXT NOT NULL, content_hash TEXT NOT NULL DEFAULT '');
+                CREATE TABLE financial_validation_groups(group_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, accession_number TEXT NOT NULL, period_end TEXT NOT NULL, fiscal_period TEXT NOT NULL, consolidated_scope TEXT NOT NULL, currency TEXT NOT NULL, status TEXT NOT NULL, issues_json TEXT NOT NULL, covered_concepts_json TEXT NOT NULL, updated_at TEXT NOT NULL);
+                CREATE TABLE research_runs(run_id TEXT PRIMARY KEY, company_cik TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT);
+                CREATE TABLE artifacts(artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, artifact_type TEXT NOT NULL, title TEXT NOT NULL, payload_json TEXT NOT NULL, model_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at TEXT NOT NULL);
+                INSERT INTO metadata VALUES('schema_version','10');
+                INSERT INTO companies VALUES('legacy-v10','LEG10','Legacy v10','');
+                INSERT INTO filings VALUES('legacy-doc','legacy-v10','legacy-acc','ANNUAL_REPORT','FY','2025-12-31','2026-03-01','legacy.pdf','https://example.test/legacy.pdf','','','2026-03-02');
+                INSERT INTO financial_facts VALUES('legacy-v10-fact','legacy-v10','revenue','Revenue',1,'CNY',2025,'FY','ANNUAL_REPORT','2025-01-01','2025-12-31','2026-03-01','legacy-acc','https://example.test/legacy.pdf','consolidated');
+                INSERT INTO financial_evidence VALUES('legacy-v10-evidence','legacy-doc','https://example.test/legacy.pdf','Legacy','page:1','Revenue 1','2026-03-01','legacy-hash');
+                INSERT INTO financial_validation_groups VALUES('legacy-v10-group','legacy-v10','legacy-acc','2025-12-31','FY','consolidated','CNY','VERIFIED','[]','["revenue"]','2026-03-02');
+                INSERT INTO research_runs VALUES('legacy-v10-run','legacy-v10','{"old":true}','completed','2026-03-02',NULL);
+                INSERT INTO artifacts VALUES('legacy-v10-artifact','legacy-v10-run','research-report','Old report','{"old":true}','old-model','old-agent','2026-03-02');
+                """
+            )
+            db.commit()
+            db.close()
+
+            storage = Storage(data_dir)
+            with storage.connect() as migrated:
+                metadata = dict(migrated.execute("SELECT key, value FROM metadata").fetchall())
+                group_columns = {row[1] for row in migrated.execute("PRAGMA table_info(financial_validation_groups)")}
+            self.assertEqual(metadata["schema_version"], "11")
+            self.assertEqual(metadata["derived_rebuild_required"], "1")
+            self.assertIn("derived_version", group_columns)
+            self.assertEqual(storage.get_facts("legacy-v10"), [])
+            self.assertEqual(storage.get_validation_groups("legacy-v10"), [])
+            self.assertEqual(len(storage.get_facts_audit("legacy-v10")), 1)
+            self.assertEqual(len(storage.get_validation_groups_audit("legacy-v10")), 1)
+            self.assertEqual(len(storage.get_filings("legacy-v10")), 1)
+            self.assertEqual(len(storage.get_financial_evidence("legacy-doc")), 1)
+            self.assertIsNotNone(storage.get_run("legacy-v10-run"))
+            self.assertEqual(len(storage.get_artifacts("legacy-v10-run")), 1)
+
+            restarted = Storage(data_dir)
+            with restarted.connect() as stable:
+                metadata_again = dict(stable.execute("SELECT key, value FROM metadata").fetchall())
+            self.assertEqual(metadata_again["schema_version"], "11")
+            self.assertEqual(metadata_again["derived_rebuild_required"], "1")
+            self.assertEqual(restarted.get_facts("legacy-v10"), [])
+            self.assertEqual(len(restarted.get_validation_groups_audit("legacy-v10")), 1)
+            self.assertEqual(len(restarted.get_filings("legacy-v10")), 1)
+
+    def test_legacy_derived_rows_remain_audit_only_across_idempotent_restart(self) -> None:
+        """A 2.5-style database is never upgraded into current facts/groups."""
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            storage = Storage(data_dir)
+            company = build_company("legacy-issuer", "LEGACY", reporting_currency="CNY")
+            storage.save_company(company)
+            filing = FilingDocument(
+                "legacy-doc", company.security_id, "legacy-acc", "ANNUAL_REPORT", "FY",
+                "2025-12-31", "2026-03-01", "legacy.pdf", "https://example.test/legacy.pdf",
+            )
+            storage.save_filings([filing])
+            fact = replace(self._fact(company.security_id), fact_id="legacy-derived-fact", accession_number="legacy-acc")
+            evidence = EvidenceRef(
+                "fact:legacy-derived-fact", filing.document_id, filing.source_url,
+                "Legacy revenue", "page:4", fact.raw_text, filing.filed_at,
+            )
+            group = FinancialGroupValidation(
+                ("legacy-acc", "2025-12-31", "FY", "consolidated", "CNY"),
+                FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ()),
+            )
+            storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], [fact], [], [group], [evidence]
+            )
+            with storage.connect() as db:
+                db.execute(
+                    "UPDATE financial_facts SET derived_version = 'legacy', usage_status = 'audit_only' WHERE fact_id = ?",
+                    (fact.fact_id,),
+                )
+                db.execute(
+                    "UPDATE financial_validation_groups SET derived_version = 'legacy' WHERE accession_number = ?",
+                    (filing.accession_number,),
+                )
+                db.execute(
+                    "INSERT INTO research_runs(run_id, company_cik, payload_json, status, started_at) VALUES(?,?,?,?,?)",
+                    ("legacy-run", company.security_id, json.dumps({"legacy": True}), "completed", "2026-03-02"),
+                )
+                db.execute(
+                    "INSERT INTO artifacts(artifact_id, run_id, artifact_type, title, payload_json, model_id, agent_id, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    ("legacy-artifact", "legacy-run", "research-report", "old report", json.dumps({"old": True}), "old-model", "old-agent", "2026-03-02"),
+                )
+
+            before = {
+                "filings": len(storage.get_filings(company.security_id)),
+                "evidence": len(storage.get_financial_evidence(filing.document_id)),
+                "audit_facts": len(storage.get_facts_audit(company.security_id)),
+                "audit_groups": len(storage.get_validation_groups_audit(company.security_id)),
+                "run": storage.get_run("legacy-run"),
+                "artifacts": storage.get_artifacts("legacy-run"),
+            }
+            self.assertEqual(storage.get_facts(company.security_id), [])
+            self.assertEqual(storage.get_validation_groups(company.security_id), [])
+
+            restarted = Storage(data_dir)
+            after = {
+                "filings": len(restarted.get_filings(company.security_id)),
+                "evidence": len(restarted.get_financial_evidence(filing.document_id)),
+                "audit_facts": len(restarted.get_facts_audit(company.security_id)),
+                "audit_groups": len(restarted.get_validation_groups_audit(company.security_id)),
+                "run": restarted.get_run("legacy-run"),
+                "artifacts": restarted.get_artifacts("legacy-run"),
+            }
+            self.assertEqual(before, after)
+            self.assertEqual(restarted.get_facts(company.security_id), [])
+            self.assertEqual(restarted.get_validation_groups(company.security_id), [])
     def test_delete_run_removes_artifacts_and_generated_thesis_but_keeps_user_thesis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))

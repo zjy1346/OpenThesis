@@ -351,6 +351,19 @@ def normalize_growth_output(
 
     normalized = source
     normalized["opportunities"] = normalized_items
+    normalized["_lineage"] = {
+        "raw_candidate_count": len(raw_items),
+        "normalized_count": len(normalized_items),
+        "verified_count": sum(
+            1 for item in normalized_items
+            if int(item.get("supporting_evidence_count", 0) or 0) > 0
+        ),
+        "retained_count": len(normalized_items),
+        "rejected_count": max(0, len(raw_items) - len(normalized_items)),
+        "rejected_reasons": list(issues),
+        "cap_applied": len(raw_items) > MAX_GROWTH_OPPORTUNITIES,
+        "cap_limit": MAX_GROWTH_OPPORTUNITIES,
+    }
     normalized["_validation"] = {
         "passed": not issues,
         "issues": list(issues),

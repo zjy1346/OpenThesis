@@ -100,6 +100,17 @@ _FIELD_LABELS_HANT = {
     "confidence": "信心程度", "text": "結論", "kind": "類型",
     "financial_analysis": "財務分析", "accounting_risk": "會計風險",
     "information_gaps": "資訊缺口",
+    "risk_flags": "風險信號", "benign_explanations": "可能的合理解釋",
+    "follow_up_questions": "後續核查問題", "strongest_counterarguments": "核心反方觀點",
+    "unsupported_assumptions": "證據不足的假設", "missing_evidence": "缺失證據",
+    "scenarios": "情境", "capital_requirements": "資本需求",
+    "maturity_stage": "成熟階段", "category": "類別", "mechanism": "增長機制",
+    "time_horizon_years": "時間跨度（年）", "argument": "反方論點",
+    "assumption": "假設", "assumptions": "關鍵假設", "challenge": "質疑",
+    "base": "基準情境", "bear": "悲觀情境", "bull": "樂觀情境",
+    "probability": "可能性", "probability_range": "可能性區間",
+    "revenue_cagr_range": "營收複合增速區間",
+    "operating_margin_range": "營業利潤率區間",
 }
 
 _DISPLAY_VALUES_ZH = {
@@ -116,15 +127,39 @@ _DISPLAY_VALUES_ZH = {
     "bull": "乐观",
 }
 
+_DISPLAY_VALUES_EN = {
+    "calculation": "Calculation",
+    "assumption": "Assumption",
+    "forecast": "Forecast",
+    "risk": "Risk",
+    "inference": "Inference",
+    "fact": "Fact",
+    "opinion": "Opinion",
+    "unknown": "Unknown",
+    "base": "Base",
+    "bear": "Bear",
+    "bull": "Bull",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low",
+}
+
 
 _DISPLAY_VALUES_ZH.update({"high": "高", "medium": "中", "low": "低"})
 
 _DISPLAY_VALUES_HANT = {
     **_DISPLAY_VALUES_ZH,
     "calculation": "計算",
+    "assumption": "假設",
     "forecast": "預測",
+    "risk": "風險",
     "inference": "推論",
+    "fact": "事實",
     "opinion": "觀點",
+    "unknown": "未知",
+    "base": "基準",
+    "bear": "悲觀",
+    "bull": "樂觀",
     "high": "高",
     "medium": "中",
     "low": "低",
@@ -132,6 +167,10 @@ _DISPLAY_VALUES_HANT = {
 
 
 _INTERNAL_ID_RE = re.compile(
+    r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
+    r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b"
+)
+_INTERNAL_ID_TOKEN_RE = re.compile(
     r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
     r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b"
 )
@@ -177,7 +216,13 @@ def _project_scalar(value: Any, *, parent_key: str | None) -> Any:
         allowed = _PROTOCOL_VALUE_FIELDS.get(parent_key or "")
         if allowed is not None and value.casefold().strip() not in allowed:
             return _MISSING
-        cleaned = _INTERNAL_ID_RE.sub("", value).strip()
+        def remove_id_group(match: re.Match[str]) -> str:
+            parts = [part.strip() for part in match.group(1).split(",")]
+            return "" if parts and all(_INTERNAL_ID_TOKEN_RE.fullmatch(part) for part in parts) else match.group(0)
+
+        cleaned = re.sub(r"\[([^\[\]]+)\]", remove_id_group, value)
+        cleaned = _INTERNAL_ID_RE.sub("", cleaned)
+        cleaned = re.sub(r"\[\s*(?:,\s*)+\]", "", cleaned)
         return cleaned or _MISSING
     return value
 
@@ -208,10 +253,8 @@ def _project_value(
                         for item in evidence_ids
                         if str(item).strip()
                         and str(item).strip() not in unknown_evidence
-                        and (
-                            available_evidence is None
-                            or str(item).strip() in available_evidence
-                        )
+                        and available_evidence is not None
+                        and str(item).strip() in available_evidence
                     }
                 )
         for key, child in value.items():
@@ -220,6 +263,20 @@ def _project_value(
             # never copy model-supplied count values back over that result.
             if name in {"supporting_evidence_count", "contradicting_evidence_count"}:
                 continue
+            if (
+                allowed is not None
+                and name not in allowed
+                and isinstance(child, str)
+                and not name.startswith("_")
+                and name not in _INTERNAL_FIELDS
+            ):
+                # Preserve safe human prose from an extensible section under
+                # its generic text field while diagnostics still records the
+                # unknown protocol key.  Do not expose unknown enum values or
+                # implementation IDs as readable fallback content.
+                fallback = _project_scalar(child, parent_key=None)
+                if fallback is not _MISSING and "text" not in projected:
+                    projected["text"] = fallback
             if (
                 name in _INTERNAL_FIELDS
                 or name.startswith("_")
@@ -271,6 +328,14 @@ def project_report_value(
 
     if include_technical:
         return value
+    if section and isinstance(value, dict) and section in value:
+        return {
+            section: _project_value(
+                value[section],
+                parent_key=section,
+                available_evidence=available_evidence,
+            )
+        }
     return _project_value(
         value, parent_key=section, available_evidence=available_evidence
     )
@@ -372,7 +437,7 @@ def project_report_diagnostics(value: Any, *, include_technical: bool = False) -
 def report_display_value(value: str, language: str) -> str:
     locale = normalize_language(language)
     if locale == EN:
-        return value
+        return _DISPLAY_VALUES_EN.get(value.casefold().strip(), value)
     if locale == ZH_HANT:
         return _DISPLAY_VALUES_HANT.get(value.casefold().strip(), value)
     return _DISPLAY_VALUES_ZH.get(value.casefold().strip(), value)

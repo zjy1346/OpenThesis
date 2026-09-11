@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import unittest
+import openthesis.financials as financials_module
 
 from openthesis.demo import demo_facts
 from openthesis.financials import (
+    NormalizedMoney,
     calculate_metrics,
     calculate_interim_metrics,
     discounted_cash_flow_value,
     implied_fcf_growth,
     reverse_dcf_analysis,
+    reverse_dcf_status_text,
     deterministic_summary,
 )
 
@@ -184,6 +187,186 @@ class FinancialMetricTests(unittest.TestCase):
         analysis = reverse_dcf_analysis(metrics, 8_000_000_000)
         self.assertIn(analysis["status"], {"ok", "outside_search_range"})
         self.assertEqual(len(analysis["sensitivity"]), 7)
+
+    def test_reverse_dcf_requires_typed_normalized_money_boundary(self) -> None:
+        """Table-unit inputs must not be compared to base-currency market value."""
+        money = financials_module.NormalizedMoney
+        market = money.from_normalized(9_500_000_000, "CNY")
+        raw_table_metrics = [{
+            "year": 2025,
+            "period": "FY",
+            "filed_at": "2026-03-01",
+            "free_cash_flow": 380,
+            "free_cash_flow_currency": "CNY",
+            "free_cash_flow_unit_scale": 1_000_000,
+            "free_cash_flow_unit_provenance": "declared",
+        }]
+        rejected = reverse_dcf_analysis(raw_table_metrics, market)
+        self.assertEqual(rejected["status"], "valuation_unit_mismatch")
+
+        normalized = [{
+            **raw_table_metrics[0],
+            "free_cash_flow_money": money.from_raw(380, "CNY", 1_000_000),
+        }]
+        accepted = reverse_dcf_analysis(normalized, market)
+        self.assertEqual(accepted["status"], "ok")
+        self.assertEqual(accepted["base_free_cash_flow"], 380_000_000)
+        self.assertAlmostEqual(accepted["implied_fcf_growth"], 0.159291, places=4)
+
+        mismatch = reverse_dcf_analysis(
+            normalized, money.from_normalized(9_500_000_000, "USD")
+        )
+        self.assertEqual(mismatch["status"], "valuation_currency_mismatch")
+
+    def test_interim_metrics_uses_same_filing_comparator_column(self) -> None:
+        facts = [
+            {
+                "fact_id": "current-revenue", "concept": "revenue", "value": 120.0,
+                "fiscal_year": 2025, "fiscal_period": "H1", "end_date": "2025-06-30",
+                "filed_at": "2025-08-20", "accession_number": "current-filing",
+                "source_document": "2025-h1.pdf", "source_page": 10,
+                "source_column": "2025 H1 current",
+            },
+            {
+                "fact_id": "same-filing-comparator-revenue", "concept": "revenue", "value": 100.0,
+                "fiscal_year": 2024, "fiscal_period": "H1", "end_date": "2024-06-30",
+                "filed_at": "2025-08-20", "accession_number": "current-filing",
+                "source_document": "2025-h1.pdf", "source_page": 10,
+                "source_column": "2024 H1 comparative",
+                "usage_status": "comparator",
+            },
+        ]
+        interim = calculate_interim_metrics(facts)
+        current = next(item for item in interim if item["year"] == 2025)
+        self.assertEqual(current["comparison_period"], "2024 H1")
+        self.assertAlmostEqual(current["revenue_growth"], 0.2)
+
+    def test_same_filing_comparator_has_explicit_metric_priority(self) -> None:
+        facts = [
+            {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
+             "fiscal_period": "FY", "filed_at": "2026-03-01", "fact_id": "current"},
+            {"concept": "revenue", "value": 100.0, "fiscal_year": 2024,
+             "fiscal_period": "FY", "filed_at": "2025-03-01", "fact_id": "history"},
+            {"concept": "revenue", "value": 120.0, "fiscal_year": 2024,
+             "fiscal_period": "FY", "filed_at": "2026-03-01", "fact_id": "same-filing",
+             "usage_status": "comparator"},
+        ]
+        metric = next(item for item in calculate_metrics(facts) if item["year"] == 2025)
+        self.assertAlmostEqual(metric["revenue_growth"], 0.25)
+        self.assertEqual(metric["comparison_source"], "same_filing_comparator")
+        self.assertEqual(metric["comparison_basis"], "same_filing_comparator")
+        self.assertEqual(metric["comparison_fact_ids"], ["same-filing"])
+        self.assertTrue(metric["restatement_available"])
+
+    def test_same_filing_interim_comparator_priority_is_not_filed_at_accidental(self) -> None:
+        facts = [
+            {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
+             "fiscal_period": "H1", "end_date": "2025-06-30",
+             "filed_at": "2026-08-01", "fact_id": "current"},
+            {"concept": "revenue", "value": 100.0, "fiscal_year": 2024,
+             "fiscal_period": "H1", "end_date": "2024-06-30",
+             "filed_at": "2025-08-01", "fact_id": "history"},
+            {"concept": "revenue", "value": 120.0, "fiscal_year": 2024,
+             "fiscal_period": "H1", "end_date": "2024-06-30",
+             "filed_at": "2026-08-01", "fact_id": "same-filing",
+             "usage_status": "comparator"},
+        ]
+        metric = next(item for item in calculate_interim_metrics(facts) if item["year"] == 2025)
+        self.assertAlmostEqual(metric["revenue_growth"], 0.25)
+        self.assertEqual(metric["comparison_source"], "same_filing_comparator")
+        self.assertEqual(metric["comparison_basis"], "same_filing_comparator")
+        self.assertEqual(metric["comparison_fact_ids"], ["same-filing"])
+
+    def test_same_filing_comparator_is_not_rendered_as_an_annual_row(self) -> None:
+        facts = [
+            {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
+             "fiscal_period": "FY", "filed_at": "2026-03-01", "fact_id": "current"},
+            {"concept": "revenue", "value": 120.0, "fiscal_year": 2024,
+             "fiscal_period": "FY", "filed_at": "2026-03-01", "fact_id": "same-filing",
+             "usage_status": "comparator"},
+        ]
+        metrics = calculate_metrics(facts)
+        self.assertEqual([item["year"] for item in metrics], [2025])
+        self.assertAlmostEqual(metrics[0]["revenue_growth"], 0.25)
+
+    def test_same_filing_comparator_is_not_rendered_as_an_interim_row(self) -> None:
+        facts = [
+            {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
+             "fiscal_period": "H1", "end_date": "2025-06-30", "filed_at": "2026-08-01",
+             "fact_id": "current"},
+            {"concept": "revenue", "value": 120.0, "fiscal_year": 2024,
+             "fiscal_period": "H1", "end_date": "2024-06-30", "filed_at": "2026-08-01",
+             "fact_id": "same-filing", "usage_status": "comparator"},
+        ]
+        metrics = calculate_interim_metrics(facts)
+        self.assertEqual([(item["year"], item["period"]) for item in metrics], [(2025, "H1")])
+        self.assertAlmostEqual(metrics[0]["revenue_growth"], 0.25)
+
+    def test_reverse_dcf_unit_and_currency_statuses_are_localized(self) -> None:
+        for status, simplified, traditional, english in (
+            ("valuation_unit_mismatch", "金额单位", "金額單位", "monetary unit"),
+            ("valuation_currency_mismatch", "币种", "幣別", "currencies"),
+        ):
+            self.assertIn(simplified, reverse_dcf_status_text(status, "zh-CN"))
+            self.assertIn(traditional, reverse_dcf_status_text(status, "zh-Hant"))
+            self.assertIn(english, reverse_dcf_status_text(status, "en"))
+
+    def test_reverse_dcf_strict_requires_verified_normalized_fcf(self) -> None:
+        market = NormalizedMoney.from_normalized(
+            9_500_000_000, "CNY", source_id="quote:fixture", as_of="2026-01-01"
+        )
+        metrics = [{
+            "year": 2025,
+            "period": "FY",
+            "free_cash_flow": 380_000_000,
+            "free_cash_flow_currency": "CNY",
+            "free_cash_flow_unit_scale": 1,
+        }]
+        result = reverse_dcf_analysis(metrics, market, require_typed=True)
+        self.assertEqual(result["status"], "valuation_unit_mismatch")
+
+    def test_reverse_dcf_strict_accepts_normalized_fcf_money(self) -> None:
+        market = NormalizedMoney.from_normalized(9_500_000_000, "CNY")
+        metrics = [{
+            "year": 2025,
+            "period": "FY",
+            "free_cash_flow": 380_000_000,
+            "free_cash_flow_money": {
+                "value": 380_000_000,
+                "currency": "CNY",
+                "unit_scale": 1,
+                "unit_provenance": "normalized",
+            },
+        }]
+        result = reverse_dcf_analysis(metrics, market, require_typed=True)
+        self.assertNotEqual(result["status"], "valuation_unit_mismatch")
+
+    def test_reverse_dcf_strict_rejects_money_without_explicit_provenance(self) -> None:
+        market = NormalizedMoney.from_normalized(9_500_000_000, "CNY")
+        result = reverse_dcf_analysis(
+            [{
+                "year": 2025,
+                "period": "FY",
+                "free_cash_flow_money": {
+                    "value": 380_000_000,
+                    "currency": "CNY",
+                    "unit_scale": 1,
+                    "unit_provenance": "unknown",
+                },
+            }],
+            market,
+            require_typed=True,
+        )
+        self.assertEqual(result["status"], "valuation_unit_mismatch")
+
+    def test_demo_facts_are_eligible_for_strict_dcf(self) -> None:
+        metrics = calculate_metrics(demo_facts())
+        result = reverse_dcf_analysis(
+            metrics,
+            NormalizedMoney.from_normalized(1_000_000_000, "USD"),
+            require_typed=True,
+        )
+        self.assertNotEqual(result["status"], "valuation_unit_mismatch")
 
 
 if __name__ == "__main__":

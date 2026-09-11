@@ -16,7 +16,7 @@ import inspect
 import time
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 
-from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .domain import CURRENT_DERIVED_VERSION, Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_ingestion import FinancialIngestionEngine
 from .market_financials import ValidationStatus
 
@@ -291,6 +291,12 @@ class StructuredFactExtractor:
         facts, refs, failure = self.source.fetch(subject, filing)
         if failure:
             return CandidateBatch(filing, diagnostics=(str(failure),))
+        facts = [
+            replace(fact, unit_provenance="structured_normalized")
+            if fact.unit_provenance == "unknown" and fact.concept != "reported_roe"
+            else fact
+            for fact in facts
+        ]
         refs_by_fact = {fact.fact_id: ref for fact, ref in zip(facts, refs)}
         candidates = tuple(
             FactCandidate(fact, ((refs_by_fact[fact.fact_id],) if fact.fact_id in refs_by_fact else ()), self.name)
@@ -342,6 +348,9 @@ class FinancialDataset:
     research_facts: tuple[FinancialFact, ...] = ()
     research_validations: tuple[FactGroupValidation, ...] = ()
     manifests: tuple[Any, ...] = ()
+    annual_facts: tuple[FinancialFact, ...] = ()
+    interim_facts: tuple[FinancialFact, ...] = ()
+    comparator_facts: tuple[FinancialFact, ...] = ()
 
     @property
     def accepted_facts(self) -> tuple[FinancialFact, ...]:
@@ -992,11 +1001,17 @@ class FinancialFactCompiler:
                 status = validation.validation.status.value
                 if missing:
                     status = "INCOMPLETE"
+                # The group is the sole owner of validation state.  Facts
+                # emitted by an extractor must never retain a stale default
+                # (or a stronger state from a previous projection).
+                accepted = tuple(replace(fact, validation_status=status) for fact in accepted)
                 resolved.extend(accepted)
                 selected_evidence.extend(refs.values())
             else:
                 status = "CONFLICTED" if group_quarantine else "INCOMPLETE" if missing else ValidationStatus.REJECTED.value
-                quarantined.extend(rejected or tuple(group_facts))
+                quarantined.extend(
+                    replace(fact, validation_status=status) for fact in (rejected or tuple(group_facts))
+                )
             validations.append(
                 FactGroupValidation(
                     identity, status, tuple(dict.fromkeys(issues)), covered,
@@ -1004,19 +1019,93 @@ class FinancialFactCompiler:
                 )
             )
 
+        filing_by_accession = {filing.accession_number: filing for filing in filings}
+
+        def identity_has_valid_disclosure_date(identity: tuple[str, str, str, str, str]) -> bool:
+            filing = filing_by_accession.get(identity[0])
+            group_facts = tuple(
+                fact
+                for item in validations
+                if item.identity == identity
+                for fact in item.accepted
+            )
+            # An extractor may resolve a provisional discovery manifest from
+            # the statement itself.  Prefer that source-supported fact identity
+            # over stale provider metadata, while still requiring an observed
+            # date no later than filed_at.
+            if group_facts:
+                supported = [
+                    fact for fact in group_facts
+                    if str(fact.revision or "").casefold() != "period_end_provisional"
+                    and str(fact.end_date or "")[:10] == identity[1][:10]
+                ]
+                if supported:
+                    return all(
+                        not (
+                            len(str(fact.end_date or "")[:10]) == 10
+                            and len(str(fact.filed_at or "")[:10]) == 10
+                            and str(fact.end_date)[:10] > str(fact.filed_at)[:10]
+                        )
+                        for fact in supported
+                    )
+            if filing is None:
+                return True
+            # A provider-supplied annual-looking 12/31 on an interim filing is
+            # provisional and cannot become a research fact without an observed
+            # statement date.  Never pass a date later than the filing date to
+            # the compiler either.
+            if str(getattr(filing, "revision", "") or "").casefold() == "period_end_provisional":
+                return False
+            end = str(identity[1] or "")[:10]
+            filed = str(getattr(filing, "filed_at", "") or "")[:10]
+            return not (len(end) == 10 and len(filed) == 10 and end > filed)
+
         def target_identity(identity: tuple[str, str, str, str, str]) -> bool:
             _accession, end_date, fiscal_period, scope, currency = identity
             if fiscal_period.upper() != target_fiscal_period:
                 return False
+            return identity_in_scope(identity)
+
+        def identity_in_scope(identity: tuple[str, str, str, str, str]) -> bool:
+            _accession, end_date, _fiscal_period, scope, currency = identity
             if scope.strip().lower() != target_scope:
                 return False
             if target_currency and currency.strip().upper() != target_currency:
+                return False
+            if not identity_has_valid_disclosure_date(identity):
                 return False
             if range_start and end_date[:10] < range_start:
                 return False
             if range_end and end_date[:10] > range_end:
                 return False
             return True
+
+        def is_same_filing_comparator(item: FactGroupValidation) -> bool:
+            """Identify the hidden comparative column without treating it as a filing."""
+            return any(
+                str(getattr(fact, "usage_status", "")) == "comparator"
+                for fact in item.accepted
+            )
+
+        def comparator_identity_compatible(item: FactGroupValidation) -> bool:
+            """Apply target scope/currency/date rules without annual range filtering."""
+            identity = item.identity
+            filing = filing_by_accession.get(identity[0])
+            filing_end = str(getattr(filing, "period_end", "") or "")[:10]
+            comparator_end = str(identity[1] or "")[:10]
+            return (
+                identity[3].strip().lower() == target_scope
+                and (not target_currency or identity[4].strip().upper() == target_currency)
+                and identity_has_valid_disclosure_date(identity)
+                # Same-filing comparisons must represent the same fiscal
+                # period shape (for example H1 against H1), not an unrelated
+                # quarter or a stale period silently relabeled as FY.
+                and (
+                    not filing_end
+                    or len(comparator_end) < 10
+                    or comparator_end[5:] == filing_end[5:]
+                )
+            )
 
         target_validations = tuple(
             item for item in validations if target_identity(item.identity)
@@ -1044,8 +1133,273 @@ class FinancialFactCompiler:
             not expected_target_filings
             or expected_target_filings.issubset(complete_target_keys)
         )
-        research_facts = tuple(
-            fact for item in target_complete for fact in item.accepted
+        def authority_key(item: FactGroupValidation) -> tuple[int, str, str]:
+            filing = filing_by_accession.get(item.identity[0])
+            if filing is None:
+                return 0, "", item.identity[0]
+            revision = str(getattr(filing, "revision", "") or "").casefold()
+            revision_rank = 1 if revision not in {"", "original", "orig", "period_end_provisional"} else 0
+            return revision_rank, str(getattr(filing, "filed_at", "") or ""), item.identity[0]
+
+        def select_latest_per_identity(items: Iterable[FactGroupValidation], limit: int | None = None) -> tuple[FactGroupValidation, ...]:
+            # A correction/mirror is one fiscal cohort, not another year.  Keep
+            # the authoritative member while retaining all other facts in the
+            # audit-resolved view below.
+            by_cohort: dict[tuple[str, str, str], FactGroupValidation] = {}
+            for item in items:
+                key = (item.identity[1][:10], item.identity[3].casefold(), item.identity[4].upper())
+                current = by_cohort.get(key)
+                if current is None or authority_key(item) > authority_key(current):
+                    by_cohort[key] = item
+            ordered = sorted(
+                by_cohort.values(),
+                key=lambda item: (item.identity[1][:10], authority_key(item)),
+                reverse=True,
+            )
+            return tuple(ordered[:limit] if limit is not None else ordered)
+
+        annual_candidates = tuple(
+            item for item in validations
+            if item.status == ValidationStatus.VERIFIED.value
+            and item.identity[2].upper() == "FY"
+            and identity_in_scope(item.identity)
+            and not is_same_filing_comparator(item)
+        )
+        # Five displayed years plus one hidden comparison cohort. Older
+        # verified groups remain in resolved_facts as audit_only.
+        annual_validations = select_latest_per_identity(annual_candidates, limit=6)
+        interim_all_candidates = tuple(
+            item for item in validations
+            if item.identity[2].upper() != "FY"
+            and identity_in_scope(item.identity)
+        )
+        interim_candidates = tuple(
+            item for item in interim_all_candidates
+            if item.status == ValidationStatus.VERIFIED.value
+        )
+        # Select one globally newest interim cohort.  Per-period selection
+        # would incorrectly mix Q1/H1/Q3 into a single research snapshot.
+        latest_interim_validation = (
+            max(
+                interim_all_candidates,
+                key=lambda item: (item.identity[1][:10], authority_key(item)),
+            ) if interim_all_candidates else None
+        )
+        if (
+            latest_interim_validation is not None
+            and (
+                latest_interim_validation.status != ValidationStatus.VERIFIED.value
+                or not concepts_cover_profile(
+                    (fact.concept for fact in latest_interim_validation.accepted),
+                    required_concepts,
+                )
+            )
+        ):
+            diagnostics.append("latest_interim_incomplete")
+        interim_validations = (latest_interim_validation,) if latest_interim_validation else ()
+        # Same-filing comparative columns have a distinct prior-period group.
+        # Keep them in the hidden comparator lane even when the containing
+        # filing is the only discovered document for that period.
+        comparator_validations: tuple[FactGroupValidation, ...] = tuple(
+            item for item in validations
+            if item.status == ValidationStatus.VERIFIED.value
+            and is_same_filing_comparator(item)
+            and comparator_identity_compatible(item)
+            and concepts_cover_profile(
+                (fact.concept for fact in item.accepted), required_concepts
+            )
+        )
+        incompatible_same_filing_comparator = any(
+            is_same_filing_comparator(item)
+            and not comparator_identity_compatible(item)
+            for item in validations
+        )
+        if incompatible_same_filing_comparator:
+            diagnostics.append("same_filing_comparator_identity_mismatch")
+        interim_comparator_complete = latest_interim_validation is None
+        if (
+            latest_interim_validation is not None
+            and latest_interim_validation.status == ValidationStatus.VERIFIED.value
+            and concepts_cover_profile(
+                (fact.concept for fact in latest_interim_validation.accepted), required_concepts
+            )
+        ):
+            latest_period = latest_interim_validation.identity[2].upper()
+            latest_year = int(latest_interim_validation.identity[1][:4])
+            same_filing_prior = tuple(
+                item for item in comparator_validations
+                if item.identity[0] == latest_interim_validation.identity[0]
+                and item.identity[2].upper() == latest_period
+                and item.identity[1][:4].isdigit()
+                and int(item.identity[1][:4]) == latest_year - 1
+            )
+            if same_filing_prior:
+                interim_comparator_complete = True
+            prior_all = tuple(
+                item for item in interim_all_candidates
+                if item.identity[2].upper() == latest_period
+                and item.identity[1][:4].isdigit()
+                and int(item.identity[1][:4]) == latest_year - 1
+            )
+            prior_verified = tuple(
+                item for item in prior_all
+                if item.status == ValidationStatus.VERIFIED.value
+                and concepts_cover_profile(
+                    (fact.concept for fact in item.accepted), required_concepts
+                )
+            )
+            if prior_verified and not same_filing_prior:
+                prior = max(prior_verified, key=authority_key)
+                if not any(item.identity == prior.identity for item in comparator_validations):
+                    comparator_validations = (*comparator_validations, prior)
+                interim_comparator_complete = True
+            elif not same_filing_prior:
+                interim_comparator_complete = False
+
+        def cohort_facts(items: Iterable[FactGroupValidation], usage: str) -> tuple[FinancialFact, ...]:
+            return tuple(
+                replace(
+                    fact,
+                    validation_status=item.status,
+                    extraction_status="extracted",
+                    usage_status=usage,
+                    provenance_status="verified",
+                    derived_version=CURRENT_DERIVED_VERSION,
+                )
+                for item in items
+                if item.status == ValidationStatus.VERIFIED.value
+                and concepts_cover_profile(
+                    (fact.concept for fact in item.accepted), required_concepts
+                )
+                for fact in item.accepted
+            )
+
+        annual_facts = cohort_facts(annual_validations, "canonical_research")
+        interim_facts = cohort_facts(interim_validations, "canonical_research")
+        comparator_facts = cohort_facts(comparator_validations, "comparator")
+        research_facts = annual_facts + interim_facts + comparator_facts
+        # Compare unit declarations for the same concept across annual
+        # cohorts.  Only exact order-of-magnitude changes are suspicious;
+        # genuine business changes at one stable scale are not rejected.
+        continuity_issues: list[dict[str, Any]] = []
+        facts_by_concept: dict[str, list[FinancialFact]] = {}
+        for fact in annual_facts:
+            if fact.concept == "reported_roe" or not fact.statement:
+                continue
+            facts_by_concept.setdefault(fact.concept, []).append(fact)
+        for concept, concept_facts in facts_by_concept.items():
+            scales = sorted({Decimal(str(fact.unit_scale)) for fact in concept_facts})
+            if len(scales) < 2:
+                continue
+            for low, high in zip(scales, scales[1:]):
+                if low <= 0 or high <= 0:
+                    continue
+                ratio = high / low
+                if any(
+                    abs(ratio - Decimal(str(power))) <= Decimal("0.000001")
+                    for power in (1000, 10000, 1000000)
+                ):
+                    continuity_issues.append({
+                        "concept": concept,
+                        "scales": tuple(str(scale) for scale in scales),
+                        "reason": "unit_scale_order_of_magnitude_jump",
+                    })
+                    break
+        if continuity_issues:
+            diagnostics.append("unit_scale_continuity_failed")
+        current_scales = {
+            (fact.accession_number, fact.concept, fact.statement, fact.currency): Decimal(str(fact.unit_scale))
+            for fact in annual_facts + interim_facts
+        }
+        comparator_unit_mismatch = any(
+            current_scales.get((fact.accession_number, fact.concept, fact.statement, fact.currency))
+            not in (None, Decimal(str(fact.unit_scale)))
+            for fact in comparator_facts
+        )
+        if comparator_unit_mismatch:
+            diagnostics.append("same_filing_comparator_unit_mismatch")
+        # A comparative column is an issuer's restatement of a prior period,
+        # not a replacement for the separately filed historical fact.  Keep
+        # both auditable values, but surface a deterministic conflict when
+        # their semantic identity differs.  Evidence location and fact IDs
+        # are deliberately excluded from the matching key.
+        comparator_facts_all = [
+            fact for item in validations
+            if is_same_filing_comparator(item)
+            for fact in item.accepted
+        ]
+        historical_facts_all = [
+            fact for item in validations
+            if not is_same_filing_comparator(item)
+            and item.status == ValidationStatus.VERIFIED.value
+            for fact in item.accepted
+        ]
+        restatement_conflicts: set[tuple[object, ...]] = set()
+        for comparative in comparator_facts_all:
+            if not str(comparative.fiscal_year or "").isdigit():
+                continue
+            key = (
+                comparative.concept,
+                int(comparative.fiscal_year),
+                str(comparative.end_date or "")[:10],
+                str(comparative.scope or comparative.consolidated_scope or "").casefold(),
+                str(comparative.currency or comparative.unit or "").upper(),
+                str(comparative.statement or "").casefold(),
+            )
+            for historical in historical_facts_all:
+                historical_key = (
+                    historical.concept,
+                    int(historical.fiscal_year) if str(historical.fiscal_year or "").isdigit() else -1,
+                    str(historical.end_date or "")[:10],
+                    str(historical.scope or historical.consolidated_scope or "").casefold(),
+                    str(historical.currency or historical.unit or "").upper(),
+                    str(historical.statement or "").casefold(),
+                )
+                if (
+                    key != historical_key
+                    or comparative.accession_number == historical.accession_number
+                ):
+                    continue
+                if Decimal(str(comparative.value)) == Decimal(str(historical.value)):
+                    continue
+                conflict_key = (*key, comparative.accession_number)
+                if conflict_key in restatement_conflicts:
+                    continue
+                restatement_conflicts.add(conflict_key)
+                conflicts.append({
+                    "identity": key,
+                    "concept": comparative.concept,
+                    "fact_ids": (comparative.fact_id, historical.fact_id),
+                    "reason": "restatement_conflict",
+                })
+        if restatement_conflicts:
+            diagnostics.append("same_filing_restatement_conflict")
+        selected_validations_list: list[FactGroupValidation] = []
+        selected_validation_keys: set[tuple[str, str, str, str, str]] = set()
+        for item in (*annual_validations, *interim_validations, *comparator_validations):
+            if item.identity not in selected_validation_keys:
+                selected_validation_keys.add(item.identity)
+                selected_validations_list.append(item)
+        selected_validations = tuple(selected_validations_list)
+        annual_ids = {fact.fact_id for fact in annual_facts}
+        interim_ids = {fact.fact_id for fact in interim_facts}
+        comparator_ids = {fact.fact_id for fact in comparator_facts}
+        resolved_for_dataset = tuple(
+            replace(
+                fact,
+                derived_version=CURRENT_DERIVED_VERSION,
+                usage_status=(
+                    "canonical_research"
+                    if fact.fact_id in annual_ids or fact.fact_id in interim_ids
+                    else "comparator"
+                    if fact.fact_id in comparator_ids
+                    else "audit_only"
+                ),
+            )
+            for fact in resolved
+        )
+        quarantined_for_dataset = tuple(
+            replace(fact, usage_status="quarantined") for fact in quarantined
         )
         required = set(required_concepts)
         coverage = {
@@ -1062,9 +1416,71 @@ class FinancialFactCompiler:
             "target_group_count": len(target_validations),
             "target_complete_group_count": len(target_complete),
         }
-        allow_ai = target_groups_complete and all(
-            item.status == ValidationStatus.VERIFIED.value for item in target_validations
+        if continuity_issues:
+            coverage["unit_scale_continuity_issues"] = tuple(
+                (item["concept"], item["scales"]) for item in continuity_issues
+            )
+        annual_years = sorted({
+            int(item.identity[1][:4]) for item in annual_validations
+            if item.identity[1][:4].isdigit()
+        })
+        annual_missing_years: list[int] = []
+        if len(annual_years) > 1:
+            for year in range(annual_years[-1], annual_years[0], -1):
+                if year not in annual_years:
+                    annual_missing_years.append(year)
+        # A multi-year requested FY window must include every requested annual
+        # cohort (the oldest one is the hidden YoY comparator).  A deliberately
+        # single-year request remains a valid compatibility mode.
+        if (
+            target_fiscal_period == "FY"
+            and annual_years
+            and range_start
+            and range_end
+            and len(range_start) >= 4
+            and len(range_end) >= 4
+            and range_start[:4].isdigit()
+            and range_end[:4].isdigit()
+            and min(int(range_end[:4]), annual_years[-1]) > int(range_start[:4])
+        ):
+            for year in range(int(range_start[:4]), min(int(range_end[:4]), annual_years[-1]) + 1):
+                if year not in annual_years and year not in annual_missing_years:
+                    annual_missing_years.append(year)
+            annual_missing_years.sort(reverse=True)
+        if annual_missing_years:
+            diagnostics.append("annual_comparator_missing:" + ",".join(map(str, annual_missing_years)))
+            coverage["annual_missing_years"] = tuple(annual_missing_years)
+        if latest_interim_validation is not None and not interim_comparator_complete:
+            diagnostics.append("interim_comparator_missing")
+            coverage["interim_comparator_status"] = "missing_or_incomplete"
+        elif latest_interim_validation is not None:
+            coverage["interim_comparator_status"] = "verified"
+        selected_interim_complete = (
+            not interim_validations
+            or all(
+                item.status == ValidationStatus.VERIFIED.value
+                and concepts_cover_profile(
+                    (fact.concept for fact in item.accepted), required_concepts
+                )
+                for item in interim_validations
+            )
         )
+        allow_ai = (
+            target_groups_complete
+            and selected_interim_complete
+            and interim_comparator_complete
+            and not annual_missing_years
+            and all(
+            item.status == ValidationStatus.VERIFIED.value
+            for item in target_validations
+            )
+        )
+        if continuity_issues:
+            allow_ai = False
+        if comparator_unit_mismatch:
+            allow_ai = False
+        if incompatible_same_filing_comparator:
+            allow_ai = False
         if not allow_ai:
             diagnostics.append("compiler_quality_gate_failed")
         # Preserve every source ref for audit, while deduplicating IDs.
@@ -1072,8 +1488,9 @@ class FinancialFactCompiler:
         for ref in (*evidence, *selected_evidence):
             unique_refs.setdefault(ref.evidence_id, ref)
         return FinancialDataset(
-            filings, tuple(resolved), tuple(quarantined), tuple(unique_refs.values()),
+            filings, resolved_for_dataset, quarantined_for_dataset, tuple(unique_refs.values()),
             tuple(conflicts), tuple(validations), coverage,
             tuple(dict.fromkeys(diagnostics)), allow_ai,
-            research_facts, target_validations,
+            research_facts, selected_validations, (),
+            annual_facts, interim_facts, comparator_facts,
         )

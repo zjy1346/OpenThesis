@@ -78,6 +78,87 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_html_staged_context_capacity_callout_is_localized_and_keeps_byte_budget(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test",
+            "content": {
+                "mode": "staged-fallback",
+                "report": {
+                    "executive_summary": "已完成阶段资料。",
+                    "cross_section_synthesis_status": "not_completed_context_capacity",
+                    "context_budget": {
+                        "required_bytes": 36327,
+                        "available_bytes": 36000,
+                        "counting_mode": "conservative_utf8_byte_upper_bound",
+                    },
+                },
+            },
+        }]
+        expected = {
+            "zh-CN": "研究阶段数据已完整保留，但跨章节最终综合因当前模型容量不足未完成",
+            "zh-Hant": "研究階段資料已完整保留，但跨章節最終綜合因目前模型容量不足未完成",
+            "en": "All completed research-stage data was preserved, but cross-section final synthesis was not completed because the model context capacity was insufficient",
+        }
+        for language, phrase in expected.items():
+            report = render_research_html("capacity-callout", artifacts, language)
+            self.assertIn(phrase, report)
+            self.assertIn("36,327", report)
+            self.assertIn("36,000", report)
+            self.assertIn("conservative UTF-8 byte upper bound", report) if language == "en" else None
+
+        normal = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test",
+            "content": {
+                "mode": "synthesized",
+                "report": {
+                    "executive_summary": "正常综合。",
+                    "cross_section_synthesis_status": "not_completed_context_capacity",
+                    "context_budget": {"required_bytes": 36327, "available_bytes": 36000},
+                },
+            },
+        }]
+        self.assertNotIn("跨章节最终综合因当前模型容量不足未完成", render_research_html("normal", normal, "zh-CN"))
+
+    def test_html_period_coverage_shows_actual_years_and_interim_boundary(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{"year": 2025, "revenue": 10.0}],
+                "currency": "CNY",
+                "evidence": [],
+                "financial_quality": {
+                    "period_coverage": {
+                        "displayed_annual_years": [2023, 2025],
+                        "hidden_comparator_years": [2022],
+                        "interim_periods": ["2026 H1"],
+                        "missing_or_rejected_years": [{"year": 2024, "status": "rejected", "reason_code": "OFFICIAL_ANNUAL_UNAVAILABLE"}],
+                    }
+                },
+            },
+        }]
+        for language, title in (("zh-CN", "年度披露范围"), ("zh-Hant", "年度披露範圍"), ("en", "Annual disclosure coverage")):
+            html = render_research_html("coverage-html", artifacts, language, company_name="Example")
+            self.assertIn(title, html)
+            self.assertIn("2023", html)
+            self.assertIn("2025", html)
+            self.assertIn("2026 H1", html)
+            self.assertIn("2024", html)
+            if language == "en":
+                self.assertNotIn("截至研究日未获取到有效官方年报", html)
+            if language == "zh-Hant":
+                self.assertNotIn("截至研究日未获取到有效官方年报", html)
+                self.assertIn("截至研究日未取得有效官方年報", html)
+            if language == "zh-CN":
+                self.assertIn("截至研究日未获取到有效官方年报", html)
+            if language == "en":
+                self.assertIn("No valid official annual report was available", html)
+
     def test_reverse_dcf_non_ok_reason_and_disclaimer_are_localized(self) -> None:
         artifacts = [{
             "artifact_type": "deterministic-valuation",

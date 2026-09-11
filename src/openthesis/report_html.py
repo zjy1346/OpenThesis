@@ -23,6 +23,7 @@ from .reporting import (
     SECTION_LABELS_EN,
     SECTION_LABELS_HANT,
     SECTION_LABELS_ZH,
+    staged_context_capacity_notice,
 )
 
 
@@ -435,10 +436,11 @@ def _financial_section(
     rows = metrics if isinstance(metrics, list) else []
     interim_rows = interim_metrics if isinstance(interim_metrics, list) else []
     interim_html = _interim_financial_snapshot(interim_rows, language, currency)
+    coverage_html = _period_coverage_html(financial_quality, language)
     if not rows:
         return _section(
             _pick(language, "财务概览", "Financial Overview"),
-            interim_html
+            coverage_html + interim_html
             + f"<div class=\"callout callout-warning\">{_escape(_pick(language, '没有可用的标准化年度财务数据。', 'No normalized annual financial data is available.'))}</div>",
             section_id="financials",
         )
@@ -568,9 +570,59 @@ def _financial_section(
         )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + metric_gap_note + note,
+        coverage_html + snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + metric_gap_note + note,
         section_id="financials",
     )
+
+
+def _period_coverage_html(financial_quality: object, language: str) -> str:
+    if not isinstance(financial_quality, dict):
+        return ""
+    coverage = financial_quality.get("period_coverage")
+    if not isinstance(coverage, dict):
+        return ""
+    traditional = language == ZH_HANT
+    english = language == EN
+    title = "年度披露範圍" if traditional else "Annual disclosure coverage" if english else "年度披露范围"
+    available = [str(item) for item in coverage.get("displayed_annual_years", []) if item is not None]
+    hidden = [str(item) for item in coverage.get("hidden_comparator_years", []) if item is not None]
+    interim = [str(item) for item in coverage.get("interim_periods", []) if item]
+    lines = [f"<strong>{_escape(title)}</strong>"]
+    requested_range = coverage.get("requested_annual_range")
+    if isinstance(requested_range, (list, tuple)) and requested_range:
+        lines.append(_escape(("要求的年度範圍：" if traditional else "Requested annual range: " if english else "要求的年度范围：") + " – ".join(str(item) for item in requested_range)))
+    if available:
+        lines.append(_escape(("實際採用的年度：" if traditional else "Annual years actually used: " if english else "实际采用的年度：") + ", ".join(available)))
+    if hidden:
+        lines.append(_escape(("隱藏比較年度：" if traditional else "Hidden comparator years: " if english else "隐藏比较年度：") + ", ".join(hidden)))
+    if coverage.get("latest_official_fy") is not None:
+        lines.append(_escape(("最新有效官方財年：" if traditional else "Latest available official FY: " if english else "最新有效官方财年：") + str(coverage["latest_official_fy"])))
+    if interim:
+        lines.append(_escape(("中期期間（不替代完整財年）：" if traditional else "Interim periods (not a substitute for FY): " if english else "中期期间（不替代完整财年）：") + ", ".join(interim)))
+    missing = coverage.get("missing_or_rejected_years")
+    missing_reason_code = str(coverage.get("missing_reason_code") or "").strip()
+    if missing_reason_code or missing:
+        missing_years = [
+            str(item.get("year")) for item in (missing if isinstance(missing, list) else [])
+            if isinstance(item, dict) and item.get("year") is not None
+        ]
+        localized_missing = (
+            "截至研究日未取得有效官方年報"
+            if traditional
+            else "No valid official annual report was available as of the research date."
+            if english
+            else "截至研究日未获取到有效官方年报"
+        )
+        if missing_years:
+            localized_missing += (
+                ("（年度：" if traditional else " (years: " if english else "（年度：")
+                + ", ".join(missing_years)
+                + (")" if english else "）")
+            )
+        lines.append(_escape(localized_missing))
+    if coverage.get("research_as_of"):
+        lines.append(_escape(("研究截至：" if traditional else "Research as of: " if english else "研究截至：") + str(coverage["research_as_of"])))
+    return '<div class="callout callout-warning period-coverage">' + "<br>".join(lines) + "</div>"
 
 
 def _valuation_section(value: object, language: str) -> str:
@@ -648,6 +700,7 @@ def _growth_section(
     language: str,
     include_technical: bool,
     available_evidence: set[str] | None = None,
+    counts_projected: bool = False,
 ) -> str:
     if isinstance(value, dict) and isinstance(value.get("opportunities"), list):
         opportunities = list(value["opportunities"])
@@ -714,6 +767,9 @@ def _growth_section(
             contradicting_count = len(
                 {str(item).strip() for item in contradicting if str(item).strip() in available_evidence}
             )
+        elif available_evidence is not None:
+            supporting_count = opportunity.get("supporting_evidence_count", 0) if counts_projected else 0
+            contradicting_count = opportunity.get("contradicting_evidence_count", 0) if counts_projected else 0
         else:
             supporting_count = opportunity.get("supporting_evidence_count", 0)
             contradicting_count = opportunity.get("contradicting_evidence_count", 0)
@@ -1008,6 +1064,7 @@ def _report_sections(
                     language,
                     include_technical,
                     available_evidence,
+                    counts_projected=True,
                 )
             )
             continue
@@ -1249,6 +1306,19 @@ def render_research_html(
                         section_id="staged-report-status",
                     )
                 )
+                capacity_notice = staged_context_capacity_notice(content.get("report"), language)
+                if capacity_notice:
+                    notice_html = "".join(
+                        f"<p>{_escape(capacity_notice[key])}</p>"
+                        for key in ("summary", "budget", "counting", "retry")
+                    )
+                    body.append(
+                        _section(
+                            capacity_notice["title"],
+                            f'<div class="callout callout-warning">{notice_html}</div>',
+                            section_id="context-capacity-status",
+                        )
+                    )
             report = content.get("report", content)
             projected_growth = (
                 project_report_value(
@@ -1297,6 +1367,7 @@ def render_research_html(
                 language,
                 include_technical,
                 available_evidence,
+                counts_projected=True,
             )
         )
 

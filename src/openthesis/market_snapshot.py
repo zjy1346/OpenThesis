@@ -269,7 +269,7 @@ class StdlibJsonTransport:
     def get_json(self, url: str, *, timeout: float, headers: Mapping[str, str] | None = None) -> Any:
         request_headers = {
             "Accept": "application/json",
-            "User-Agent": "OpenThesis/2.5.0",
+            "User-Agent": "OpenThesis/2.6.1",
         }
         request_headers.update(dict(headers or {}))
         request = urllib.request.Request(url, headers=request_headers)
@@ -286,7 +286,7 @@ class StdlibTextTransport:
         "Accept": "text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
         "Referer": "https://gu.qq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.5.0",
+        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
     }
 
     def get_text(self, url: str, *, timeout: float, headers: Mapping[str, str] | None = None) -> str:
@@ -430,7 +430,7 @@ class NasdaqPublicQuoteAdapter:
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.nasdaq.com",
         "Referer": "https://www.nasdaq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.5.0",
+        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
     }
 
     def __init__(self, transport: JsonTransport | Callable[..., Any] | None = None):
@@ -515,7 +515,7 @@ class TencentPublicQuoteAdapter:
         "Accept": "text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
         "Referer": "https://gu.qq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.5.0",
+        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
     }
 
     def __init__(self, transport: TextTransport | Callable[..., Any] | None = None):

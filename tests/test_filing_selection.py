@@ -92,6 +92,15 @@ class FilingSelectionTests(unittest.TestCase):
             ["2026", "2024", "2023", "2022"],
         )
 
+    def test_interim_placeholder_period_end_is_provisional_and_not_researched(self) -> None:
+        filing = _filing("h1-placeholder", "INTERIM_REPORT", "H1", "2025-12-31")
+        filing.primary_document = "2025年半年度报告"
+        filing.filed_at = "2025-08-20T00:00:00+00:00"
+        result = select_research_filings([filing])
+        self.assertEqual(len(result.documents), 1)
+        self.assertEqual(result.documents[0].period_end, "")
+        self.assertEqual(result.documents[0].revision, "period_end_provisional")
+
 
 def _filing(document_id: str, form_type: str, period: str, period_end: str) -> FilingDocument:
     return FilingDocument(

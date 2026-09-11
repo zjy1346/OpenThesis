@@ -4,7 +4,7 @@ import unittest
 
 from openthesis.report_html import render_research_html
 from openthesis.reporting import render_research_run
-from openthesis.report_projection import project_report_diagnostics
+from openthesis.report_projection import project_report_diagnostics, project_report_value
 
 
 def _artifacts() -> list[dict[str, object]]:
@@ -41,6 +41,83 @@ def _artifacts() -> list[dict[str, object]]:
 
 
 class ReportProjectionSchemaTests(unittest.TestCase):
+    def test_three_locales_render_the_same_canonical_claims_without_protocol_leaks(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test:model",
+            "content": {"report": {
+                "business_model": {
+                    "summary": "CANONICAL_SUMMARY",
+                    "possible_moats": ["CANONICAL_MOAT"],
+                    "risks": ["CANONICAL_RISK"],
+                },
+                "claims": [
+                    {"text": "CANONICAL_FACT", "kind": "fact", "confidence": 0.9},
+                    {"text": "CANONICAL_CALCULATION", "kind": "calculation", "confidence": 0.9},
+                    {"text": "CANONICAL_INFERENCE", "kind": "inference", "confidence": 0.4},
+                ],
+                "scenarios": [{"summary": "CANONICAL_SCENARIO", "base": "base", "bear": "bear", "bull": "bull"}],
+            }},
+        }]
+
+        rendered = {
+            language: render_research_run(
+                f"run-{language}", artifacts, language, include_technical=False
+            )
+            for language in ("zh-CN", "zh-Hant", "en")
+        }
+        canonical_markers = (
+            "CANONICAL_SUMMARY", "CANONICAL_MOAT", "CANONICAL_RISK",
+            "CANONICAL_FACT", "CANONICAL_CALCULATION", "CANONICAL_INFERENCE",
+            "CANONICAL_SCENARIO",
+        )
+        for report in rendered.values():
+            for marker in canonical_markers:
+                self.assertEqual(report.count(marker), 1)
+            for raw_key in ("business_model", "claims", "kind"):
+                self.assertNotIn(raw_key, report)
+        for report in (rendered["zh-CN"], rendered["zh-Hant"]):
+            for raw_value in ("calculation", "inference", "fact", "base", "bear", "bull"):
+                self.assertNotIn(raw_value, report)
+        self.assertIn("主要结论", rendered["zh-CN"])
+        self.assertIn("主要結論", rendered["zh-Hant"])
+        self.assertIn("Key Claims", rendered["en"])
+        self.assertIn("事實", rendered["zh-Hant"])
+        self.assertIn("計算", rendered["zh-Hant"])
+        self.assertIn("推論", rendered["zh-Hant"])
+        self.assertIn("基準", rendered["zh-Hant"])
+        self.assertIn("悲觀", rendered["zh-Hant"])
+        self.assertIn("樂觀", rendered["zh-Hant"])
+
+    def test_scenarios_projection_preserves_structured_values(self) -> None:
+        projected = project_report_value(
+            {"scenarios": [{"summary": "Base case", "probability": 0.6}]},
+            include_technical=False,
+            section="scenarios",
+        )
+        self.assertEqual(projected["scenarios"][0]["summary"], "Base case")
+        self.assertEqual(projected["scenarios"][0]["probability"], 0.6)
+
+    def test_identifier_only_bracket_groups_are_removed_as_a_unit(self) -> None:
+        projected = project_report_value(
+            {"summary": "Growth [fact:revenue, fact:margin] remains supported."},
+            include_technical=False,
+            section="executive_summary",
+        )
+        self.assertNotIn("fact:", projected["summary"])
+        self.assertNotIn("[, ]", projected["summary"])
+        self.assertNotIn("[ , ]", projected["summary"])
+        self.assertIn("Growth", projected["summary"])
+
+    def test_unknown_safe_text_in_typed_section_has_readable_fallback(self) -> None:
+        projected = project_report_value(
+            {"scenarios": [{"summary": "Base", "analyst_note": "Watch demand elasticity."}]},
+            include_technical=False,
+            section="scenarios",
+        )
+        self.assertIn("Watch demand elasticity.", projected["scenarios"][0]["text"])
+
     def test_required_sections_have_localized_missing_content_in_all_languages(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",
