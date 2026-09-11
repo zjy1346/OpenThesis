@@ -9,6 +9,7 @@ from typing import Any, Iterator, Sequence
 
 from .domain import (
     Company,
+    CURRENT_DERIVED_VERSION,
     FilingDocument,
     FinancialFact,
     ResearchArtifact,
@@ -18,7 +19,20 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
+
+# One immutable description of the derived-data inputs.  Source records are
+# never migrated in place; a changed input contract makes current reads miss
+# until a new deterministic research pass writes the current version.
+DERIVED_PIPELINE_CONTRACT = {
+    "version": "financial-derived-pipeline-v1",
+    "disclosure_identity": "disclosure-identity-v1",
+    "parser": "financial-ingestion-ast-v6",
+    "rules": "financial-rules-v1",
+    "facts": CURRENT_DERIVED_VERSION,
+    "validation": "financial-validation-v1",
+    "report_projection": "report-projection-v1",
+}
 
 
 class Storage:
@@ -45,6 +59,19 @@ class Storage:
 
     def _initialize(self) -> None:
         with self.connect() as db:
+            # Read the prior contract before migration.  A changed/missing
+            # contract plus legacy derived rows requires a future rebuild;
+            # startup itself must never pretend that rebuild completed.
+            try:
+                prior_contract_row = db.execute(
+                    "SELECT value FROM metadata WHERE key = 'derived_pipeline_contract'"
+                ).fetchone()
+                prior_rebuild_row = db.execute(
+                    "SELECT value FROM metadata WHERE key = 'derived_rebuild_required'"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                prior_contract_row = None
+                prior_rebuild_row = None
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -126,13 +153,19 @@ class Storage:
                     consolidated_scope TEXT NOT NULL DEFAULT 'consolidated',
                     currency TEXT NOT NULL DEFAULT '',
                     unit_scale REAL NOT NULL DEFAULT 1.0,
+                    unit_provenance TEXT NOT NULL DEFAULT 'unknown',
                     revision TEXT NOT NULL DEFAULT 'original',
-                    source_document TEXT NOT NULL DEFAULT '',
-                    source_page INTEGER,
-                    source_bbox_json TEXT,
-                    raw_text TEXT NOT NULL DEFAULT '',
+                     source_document TEXT NOT NULL DEFAULT '',
+                     source_page INTEGER,
+                     source_bbox_json TEXT,
+                     source_column TEXT NOT NULL DEFAULT '',
+                     raw_text TEXT NOT NULL DEFAULT '',
                     parser_version TEXT NOT NULL DEFAULT '',
                     validation_status TEXT NOT NULL DEFAULT 'unvalidated',
+                    extraction_status TEXT NOT NULL DEFAULT 'unresolved',
+                    usage_status TEXT NOT NULL DEFAULT 'audit_only',
+                    provenance_status TEXT NOT NULL DEFAULT 'unresolved',
+                    derived_version TEXT NOT NULL DEFAULT 'legacy',
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
@@ -163,6 +196,7 @@ class Storage:
                     issues_json TEXT NOT NULL,
                     covered_concepts_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    derived_version TEXT NOT NULL DEFAULT 'legacy',
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
@@ -296,13 +330,19 @@ class Storage:
                     "consolidated_scope": "TEXT NOT NULL DEFAULT 'consolidated'",
                     "currency": "TEXT NOT NULL DEFAULT ''",
                     "unit_scale": "REAL NOT NULL DEFAULT 1.0",
+                    "unit_provenance": "TEXT NOT NULL DEFAULT 'unknown'",
                     "revision": "TEXT NOT NULL DEFAULT 'original'",
-                    "source_document": "TEXT NOT NULL DEFAULT ''",
-                    "source_page": "INTEGER",
-                    "source_bbox_json": "TEXT",
-                    "raw_text": "TEXT NOT NULL DEFAULT ''",
+                     "source_document": "TEXT NOT NULL DEFAULT ''",
+                     "source_page": "INTEGER",
+                     "source_bbox_json": "TEXT",
+                     "source_column": "TEXT NOT NULL DEFAULT ''",
+                     "raw_text": "TEXT NOT NULL DEFAULT ''",
                     "parser_version": "TEXT NOT NULL DEFAULT ''",
                     "validation_status": "TEXT NOT NULL DEFAULT 'unvalidated'",
+                    "extraction_status": "TEXT NOT NULL DEFAULT 'unresolved'",
+                    "usage_status": "TEXT NOT NULL DEFAULT 'audit_only'",
+                    "provenance_status": "TEXT NOT NULL DEFAULT 'unresolved'",
+                    "derived_version": "TEXT NOT NULL DEFAULT 'legacy'",
                 },
             )
             self._ensure_columns(
@@ -310,9 +350,40 @@ class Storage:
                 "vision_task_journal",
                 {"page_numbers_json": "TEXT NOT NULL DEFAULT '[]'"},
             )
+            self._ensure_columns(
+                db,
+                "financial_validation_groups",
+                {"derived_version": "TEXT NOT NULL DEFAULT 'legacy'"},
+            )
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('derived_pipeline_contract', ?)",
+                (json.dumps(DERIVED_PIPELINE_CONTRACT, sort_keys=True),),
+            )
+            prior_contract = None
+            if prior_contract_row is not None:
+                try:
+                    prior_contract = json.loads(str(prior_contract_row[0]))
+                except (TypeError, json.JSONDecodeError):
+                    prior_contract = None
+            legacy_rows = db.execute(
+                "SELECT (SELECT COUNT(*) FROM financial_facts "
+                "WHERE COALESCE(derived_version, 'legacy') <> ?) + "
+                "(SELECT COUNT(*) FROM financial_validation_groups "
+                "WHERE COALESCE(derived_version, 'legacy') <> ?)",
+                (CURRENT_DERIVED_VERSION, CURRENT_DERIVED_VERSION),
+            ).fetchone()[0]
+            prior_required = str(prior_rebuild_row[0]) if prior_rebuild_row else "0"
+            rebuild_required = "1" if (
+                int(legacy_rows or 0) > 0
+                and prior_contract != DERIVED_PIPELINE_CONTRACT
+            ) else prior_required
+            db.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('derived_rebuild_required', ?)",
+                (rebuild_required,),
             )
 
     @staticmethod
@@ -726,7 +797,7 @@ class Storage:
 
     def save_facts(self, facts: list[FinancialFact]) -> None:
         with self.connect() as db:
-            self._insert_facts(db, facts)
+            self._insert_facts(db, [self._canonical_fact(fact) for fact in facts])
 
     def replace_facts_for_filings(
         self,
@@ -743,7 +814,7 @@ class Storage:
                     "DELETE FROM financial_facts WHERE company_cik = ? AND accession_number = ?",
                     (company_cik, accession_number),
                 )
-            self._insert_facts(db, facts)
+            self._insert_facts(db, [self._canonical_fact(fact) for fact in facts])
 
     def replace_financial_ingestion(
         self,
@@ -753,6 +824,7 @@ class Storage:
         quarantined_facts: list[FinancialFact] | None = None,
         validation_groups: list[Any] | tuple[Any, ...] = (),
         evidence: list[Any] | tuple[Any, ...] = (),
+        audit_facts: list[FinancialFact] | tuple[FinancialFact, ...] = (),
     ) -> None:
         """Atomically replace facts, evidence, and validation decisions.
 
@@ -800,10 +872,25 @@ class Storage:
             # never allow that metadata omission to expose a rejected fact via
             # the normal ``get_facts`` query.
             rejected_facts = [
-                replace(fact, validation_status="REJECTED")
+                replace(
+                    fact,
+                    validation_status="REJECTED",
+                    usage_status="quarantined",
+                )
                 for fact in (quarantined_facts or ())
             ]
-            self._insert_facts(db, list(accepted_facts) + rejected_facts)
+            # Audit-only facts are retained for traceability but are never
+            # rewritten as REJECTED and never appear in the canonical view.
+            retained_audit = [
+                replace(fact, usage_status="audit_only")
+                for fact in audit_facts
+            ]
+            self._insert_facts(
+                db,
+                [self._canonical_fact(fact) for fact in accepted_facts]
+                + retained_audit
+                + rejected_facts,
+            )
             for item in evidence:
                 bbox = getattr(item, "bbox", None)
                 db.execute(
@@ -835,17 +922,50 @@ class Storage:
                     INSERT OR REPLACE INTO financial_validation_groups(
                         group_id, company_cik, accession_number, period_end,
                         fiscal_period, consolidated_scope, currency, status,
-                        issues_json, covered_concepts_json, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        issues_json, covered_concepts_json, updated_at, derived_version
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         group_id, company_cik, identity[0], identity[1], identity[2],
                         identity[3], identity[4], status,
                         json.dumps(list(getattr(validation, "issues", ())), ensure_ascii=False),
                         json.dumps(sorted(getattr(validation, "covered_concepts", frozenset())), ensure_ascii=False),
-                        utc_now_iso(),
+                        utc_now_iso(), CURRENT_DERIVED_VERSION,
                     ),
                 )
+            self._clear_rebuild_marker_if_fully_rebuilt(db)
+
+    @staticmethod
+    def _clear_rebuild_marker_if_fully_rebuilt(db: sqlite3.Connection) -> None:
+        """Clear the migration marker only after no legacy derived rows remain."""
+        legacy_rows = db.execute(
+            "SELECT (SELECT COUNT(*) FROM financial_facts "
+            "WHERE COALESCE(derived_version, 'legacy') <> ?) + "
+            "(SELECT COUNT(*) FROM financial_validation_groups "
+            "WHERE COALESCE(derived_version, 'legacy') <> ?)",
+            (CURRENT_DERIVED_VERSION, CURRENT_DERIVED_VERSION),
+        ).fetchone()[0]
+        if int(legacy_rows or 0) == 0:
+            db.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('derived_rebuild_required', '0')"
+            )
+
+    @staticmethod
+    def _canonical_fact(fact: FinancialFact) -> FinancialFact:
+        """Mark facts entering the accepted compatibility write path.
+
+        The dataclass default is fail-closed for untrusted construction.  The
+        historical ``save_facts``/accepted-ingestion methods are explicit
+        accepted write seams, so they add the current derived version and
+        verified provenance while audit/quarantine inputs remain untouched.
+        """
+        return replace(
+            fact,
+            extraction_status="extracted",
+            usage_status="canonical_research",
+            provenance_status="verified",
+            derived_version=CURRENT_DERIVED_VERSION,
+        )
 
     @staticmethod
     def _insert_facts(db: sqlite3.Connection, facts: list[FinancialFact]) -> None:
@@ -856,9 +976,10 @@ class Storage:
                 unit, fiscal_year, fiscal_period, form_type, start_date,
                 end_date, filed_at, accession_number, source_url, scope,
                 entity, market, statement, period_start, consolidated_scope,
-                currency, unit_scale, revision, source_document, source_page,
-                source_bbox_json, raw_text, parser_version, validation_status
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 currency, unit_scale, unit_provenance, revision, source_document, source_page,
+                 source_bbox_json, source_column, raw_text, parser_version, validation_status
+                , extraction_status, usage_status, provenance_status, derived_version
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -884,13 +1005,19 @@ class Storage:
                     fact.consolidated_scope,
                     fact.currency,
                     fact.unit_scale,
+                    fact.unit_provenance,
                     fact.revision,
                     fact.source_document,
-                    fact.source_page,
-                    json.dumps(fact.source_bbox) if fact.source_bbox is not None else None,
-                    fact.raw_text,
+                     fact.source_page,
+                     json.dumps(fact.source_bbox) if fact.source_bbox is not None else None,
+                     fact.source_column,
+                     fact.raw_text,
                     fact.parser_version,
                     fact.validation_status,
+                    fact.extraction_status,
+                    fact.usage_status,
+                    fact.provenance_status,
+                    fact.derived_version,
                 )
                 for fact in facts
             ],
@@ -904,6 +1031,8 @@ class Storage:
                 LEFT JOIN security_listings l ON l.security_id = f.company_cik
                 WHERE f.company_cik = ?
                   AND COALESCE(f.validation_status, 'unvalidated') <> 'REJECTED'
+                  AND COALESCE(f.usage_status, 'audit_only') IN ('canonical_research', 'comparator')
+                  AND COALESCE(f.derived_version, 'legacy') = ?
                   AND COALESCE(f.consolidated_scope, 'consolidated') = 'consolidated'
                   AND (
                       l.reporting_currency IS NULL
@@ -912,7 +1041,7 @@ class Storage:
                   )
                 ORDER BY fiscal_year DESC, concept
                 """,
-                (cik,),
+                (cik, CURRENT_DERIVED_VERSION),
             ).fetchall()
         return [self._fact_row(row) for row in rows]
 
@@ -938,10 +1067,24 @@ class Storage:
         return item
 
     def get_validation_groups(self, cik: str) -> list[dict[str, Any]]:
+        """Return only groups produced by the current derived contract."""
+        return self._get_validation_groups(cik, current_only=True)
+
+    def get_validation_groups_audit(self, cik: str) -> list[dict[str, Any]]:
+        """Return all historical group decisions for diagnostics/audit."""
+        return self._get_validation_groups(cik, current_only=False)
+
+    def _get_validation_groups(
+        self, cik: str, *, current_only: bool
+    ) -> list[dict[str, Any]]:
+        clause = " AND COALESCE(derived_version, 'legacy') = ?" if current_only else ""
+        params: tuple[Any, ...] = (cik, CURRENT_DERIVED_VERSION) if current_only else (cik,)
         with self.connect() as db:
             rows = db.execute(
-                "SELECT * FROM financial_validation_groups WHERE company_cik = ? ORDER BY period_end DESC, accession_number",
-                (cik,),
+                "SELECT * FROM financial_validation_groups WHERE company_cik = ?"
+                + clause
+                + " ORDER BY period_end DESC, accession_number",
+                params,
             ).fetchall()
         result = []
         for row in rows:

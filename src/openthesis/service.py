@@ -19,6 +19,12 @@ from typing import Any, Callable
 
 from . import __version__
 from .comparison import compare_research_runs
+from .application_services import (
+    DisclosureService,
+    FinancialPipeline,
+    ReportService,
+    ResearchOrchestrator,
+)
 from .demo import DEMO_COMPANY, demo_facts
 from .domain import Company, FilingDocument, FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso
 from .filing_parser import build_filing_evidence
@@ -65,7 +71,7 @@ from .report_html import render_research_html
 from .research import ResearchCancelled, ResearchWorkflow
 from .reporting import render_research_run
 from .sec_client import SEC_HK_ISSUERS, SecClient, SecClientError, SecFinancialSourceAdapter
-from .storage import Storage
+from .storage import DERIVED_PIPELINE_CONTRACT, Storage
 from .vision_financials import (
     GatewayVisionAdapter,
     MineruFlashAdapter,
@@ -327,8 +333,10 @@ class AppService:
                 adapters=snapshot_adapters,
                 cache=StorageSnapshotCache(self.storage), fx_adapter=EcbFxAdapter()
             )
+        self._disclosure_service = DisclosureService(self._market_data, self._market_snapshot)
         self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine(
-            cache_dir=self.storage.data_dir / "financial-parse-cache"
+            cache_dir=self.storage.data_dir / "financial-parse-cache",
+            checkpoint_dir=self.storage.data_dir / "financial-window-checkpoints",
         )
         self._financial_recognition = FinancialRecognitionCoordinator(
             self._financial_ingestion
@@ -336,6 +344,15 @@ class AppService:
         self._financial_recovery = FinancialRecoveryController(
             self.storage, app_version=self.app_version
         )
+        self._financial_pipeline = FinancialPipeline(
+            self._financial_ingestion,
+            self._financial_recognition,
+            self._financial_recovery,
+        )
+        self._research_orchestrator = ResearchOrchestrator(
+            self.storage, self._provider_factory
+        )
+        self._report_service = ReportService(render_research_run, render_research_html)
         self._vision_adapter_factory = vision_adapter_factory or _default_vision_adapter_factory
         self._jobs: dict[str, _ResearchJob] = {}
         self._jobs_lock = threading.Lock()
@@ -343,23 +360,14 @@ class AppService:
     def _ingestion_for(
         self, company: Company, filings: Sequence[FilingDocument]
     ) -> Any:
-        """Bind one immutable compatibility-rule snapshot to one run."""
-        clone = getattr(self._financial_ingestion, "with_compatibility_rules", None)
-        if not callable(clone):
-            return self._financial_ingestion
-        report_type = "annual" if any(
-            str(item.fiscal_period or "FY").upper() == "FY" for item in filings
-        ) else "quarterly"
-        rules = self._financial_recovery.compatibility_rules(company, report_type)
-        return clone(rules)
+        """Compatibility alias; ownership lives in :class:`FinancialPipeline`."""
+        return self._financial_pipeline.ingestion_for(company, filings)
 
     def _recognition_for(
         self, company: Company, filings: Sequence[FilingDocument]
     ) -> FinancialRecognitionCoordinator:
-        engine = self._ingestion_for(company, filings)
-        if engine is self._financial_ingestion:
-            return self._financial_recognition
-        return FinancialRecognitionCoordinator(engine)
+        """Compatibility alias; ownership lives in :class:`FinancialPipeline`."""
+        return self._financial_pipeline.recognition_for(company, filings)
 
     def hello(self) -> dict[str, Any]:
         return {
@@ -597,7 +605,7 @@ class AppService:
         if selected_market != Market.US:
             return [
                 company.to_dict()
-                for company in self._market_data.resolve(
+                for company in self._disclosure_service.resolve(
                     normalized,
                     selected_market,
                     limit=bounded_limit,
@@ -712,14 +720,14 @@ class AppService:
             "retryable_synthesis": _report_retryable(artifacts),
             "retryable_growth": _growth_retryable(artifacts),
             "financial_status": financial_status,
-            "markdown": render_research_run(
+            "markdown": self._report_service.markdown(
                 run_id,
                 artifacts,
                 language=report_language,
                 company_name=run["name"],
                 include_technical=include_technical,
             ),
-            "html": render_research_html(
+            "html": self._report_service.html(
                 run_id,
                 artifacts,
                 language=report_language,
@@ -768,7 +776,7 @@ class AppService:
                 "freshness": "stale" if status.get("snapshot_stale") else "current",
             })
         market = str(company.get("market", "US"))
-        pack = self._financial_recovery.compatibility_summary(market, "annual")
+        pack = self._financial_pipeline.compatibility_summary(market, "annual")
         return {
             "schema": "openthesis.financial-diagnostics.v1",
             "app": {"version": self.app_version, "contract_version": CONTRACT_VERSION},
@@ -1182,6 +1190,12 @@ class AppService:
             groups,
             company.reporting_currency,
             selected_filings=self.storage.get_filings(storage_key),
+            requested_annual_count=(
+                int(payload.get("research_configuration", {}).get("annual_history_years"))
+                if isinstance(payload.get("research_configuration"), dict)
+                and str(payload.get("research_configuration", {}).get("annual_history_years", "")).isdigit()
+                else None
+            ),
         )
         from .research import build_fact_evidence
 
@@ -1201,6 +1215,7 @@ class AppService:
             "status": profile.status.value,
             "rejected_periods": list(profile.rejected_periods),
             "period_continuity": list(profile.period_continuity),
+            "period_coverage": dict(profile.period_coverage),
         }
         summary_artifact = ResearchArtifact(
             artifact_id=f"{run_id}:deterministic-financial-summary:retry-{digest}",
@@ -1265,6 +1280,7 @@ class AppService:
                 "status": profile.status.value,
                 "metrics": metrics,
                 "interim_metrics": interim_metrics,
+                "period_coverage": dict(profile.period_coverage),
             }
             run_data = dict(payload)
             run = ResearchRun(
@@ -1302,14 +1318,14 @@ class AppService:
         cancel_check = cancel_check or (lambda: False)
         if cancel_check():
             raise ResearchCancelled()
-        adapter = self._market_data.adapter_for(company)
+        adapter = self._disclosure_service.adapter_for(company)
         configuration = payload.get("research_configuration", {})
         history_years = _research_history_years({
             "evidence_policy": {
                 "annual_history_years": configuration.get("annual_history_years", 5)
             }
         } if isinstance(configuration, dict) else {})
-        recovery = self._financial_recovery.discover(
+        recovery = self._financial_pipeline.discover(
             adapter, company, annual_limit=history_years, force=force
         )
         if trace is not None:
@@ -1392,10 +1408,10 @@ class AppService:
             return []
         target_dir = self.storage.filings_dir / company.security_id.replace(":", "_")
         discovery_stale = recovery.state is RecoveryState.RESOLVED_STALE
-        cached = [] if force and not discovery_stale else [
-            item for item in targets
-            if _filing_cache_valid(item)
-        ]
+        # ``force`` invalidates derived facts, not verified source bytes.  A
+        # valid local document is still the authoritative offline input and
+        # must be reparsed without an unnecessary download.
+        cached = [item for item in targets if _filing_cache_valid(item)]
         needs_download = [item for item in targets if item not in cached]
         progress("filing-download", 0, len(needs_download))
         downloaded, download_errors = _bounded_download_filings(
@@ -1464,8 +1480,13 @@ class AppService:
                 )
                 canonical = dataset
                 accepted_facts = [
-                    fact for fact in canonical.resolved_facts
+                    fact for fact in canonical.research_facts
                     if fact.accession_number == accession
+                ]
+                accepted_ids = {fact.fact_id for fact in accepted_facts}
+                audit_only_facts = [
+                    fact for fact in canonical.resolved_facts
+                    if fact.accession_number == accession and fact.fact_id not in accepted_ids
                 ]
                 quarantined: list[FinancialFact] = [
                     fact for fact in canonical.quarantined_facts
@@ -1498,6 +1519,7 @@ class AppService:
                     quarantined.extend(group.validation.quarantined)
                 quarantined.extend(canonical.quarantined_facts)
                 accepted_facts = list(canonical.resolved_facts)
+                audit_only_facts = []
                 canonical_groups = _compiler_validation_groups(canonical.validations)
                 evidence = list(dataset.evidence)
                 source_groups = ()
@@ -1522,6 +1544,7 @@ class AppService:
                 quarantined,
                 canonical_groups,
                 evidence + list(build_filing_evidence([filing])),
+                audit_only_facts,
             )
             incomplete = production_dataset and (
                 not source_groups
@@ -1635,7 +1658,7 @@ class AppService:
             ),
             self.storage.data_dir / "sec-cache",
         )
-        recovery = self._financial_recovery.discover(
+        recovery = self._financial_pipeline.discover(
             client, company, annual_limit=history
         )
         if trace is not None:
@@ -1647,8 +1670,12 @@ class AppService:
         if not recovery.filings:
             return [recovery.error_code or "FILING_FETCH_FAILED"]
         filings = list(recovery.filings)
-        if recovery.state is RecoveryState.RESOLVED_STALE and _cached_us_annual_window_is_complete(
+        if (
+            not force
+            and recovery.state is RecoveryState.RESOLVED_STALE
+            and _cached_us_annual_window_is_complete(
             company, stored_filings, stored_facts, required_count=history + 1
+            )
         ):
             if trace is not None:
                 trace["processed"].update(
@@ -1679,12 +1706,10 @@ class AppService:
                 item.accession_number for item in targets if item.accession_number
             )
         target_dir = self.storage.filings_dir / company.cik
-        download_targets = targets
-        if discovery_stale and force:
-            # A forced rebuild remains useful while offline: reparse valid
-            # local documents, but never replace them with an unavailable
-            # network download.
-            download_targets = [item for item in targets if not _filing_cache_valid(item)]
+        # A forced rebuild reparses all selected filings, but downloads only
+        # missing or identity-invalid local inputs.  Existing verified bytes
+        # are never deleted or replaced merely because derivations are stale.
+        download_targets = [item for item in targets if not _filing_cache_valid(item)]
         downloaded, download_errors = _bounded_download_filings(client, download_targets, target_dir)
         if cancel_check():
             raise ResearchCancelled()
@@ -1826,11 +1851,8 @@ class AppService:
             report_language=normalize_language(str(payload.get("report_language", "zh-CN"))),
             market_snapshot=payload.get("market_snapshot"),
         )
-        workflow = ResearchWorkflow(
-            self.storage,
-            self._select_pack(run.research_pack_id),
-            self._provider_factory(config),
-            config,
+        workflow = self._research_orchestrator.create(
+            self._select_pack(run.research_pack_id), config,
             report_language=run.report_language,
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=False,
@@ -1873,11 +1895,8 @@ class AppService:
             report_language=normalize_language(str(payload.get("report_language", "zh-CN"))),
             market_snapshot=payload.get("market_snapshot"),
         )
-        workflow = ResearchWorkflow(
-            self.storage,
-            self._select_pack(run.research_pack_id),
-            self._provider_factory(config),
-            config,
+        workflow = self._research_orchestrator.create(
+            self._select_pack(run.research_pack_id), config,
             report_language=run.report_language,
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=False,
@@ -1902,7 +1921,7 @@ class AppService:
             discount_rate=float(values.get("discount_rate_percent", 10) or 10) / 100,
             terminal_growth=float(values.get("terminal_growth_percent", 3) or 3) / 100,
         )
-        return self._market_snapshot.capture(company, policy).to_dict()
+        return self._disclosure_service.capture(company, policy).to_dict()
 
     def start_research(self, request: dict[str, Any]) -> dict[str, Any]:
         mode = request.get("mode")
@@ -2185,12 +2204,12 @@ class AppService:
             # Keeping it explicit preserves old protocol clients and prevents
             # their offline test/replay runs from making an unsolicited call.
             if request.get("auto_market_snapshot") and manual_market_snapshot is None:
-                captured = self._market_snapshot.capture(company, valuation_policy)
+                captured = self._disclosure_service.capture(company, valuation_policy)
                 market_snapshot = captured.to_dict()
             elif manual_market_snapshot is not None:
                 # Normalize an explicit manual value through the same audit
                 # seam; it remains visibly manual and may receive FX metadata.
-                captured = self._market_snapshot.capture(company, valuation_policy, manual_market_snapshot)
+                captured = self._disclosure_service.capture(company, valuation_policy, manual_market_snapshot)
                 market_snapshot = captured.to_dict()
             if (
                 market_snapshot
@@ -2358,7 +2377,7 @@ class AppService:
                     message=_ui_message(ui_language, "Loading SEC annual filings", "正在获取 SEC 年报清单", "正在取得 SEC 年報清單"),
                     percent=5,
                 )
-                recovery = self._financial_recovery.discover(
+                recovery = self._financial_pipeline.discover(
                     client, company, annual_limit=history_years
                 )
                 if not recovery.filings:
@@ -2509,7 +2528,7 @@ class AppService:
                         and not any(item.accession_number in matched_accessions for item in normalized):
                     self.storage.save_facts(list(latest_sec))
             else:
-                adapter = self._market_data.adapter_for(company)
+                adapter = self._disclosure_service.adapter_for(company)
                 market_label = _ui_message(ui_language, "A/H-share", "A/港股", "A/港股")
                 self._update_job(
                     job,
@@ -2522,7 +2541,7 @@ class AppService:
                     ),
                     percent=5,
                 )
-                recovery = self._financial_recovery.discover(
+                recovery = self._financial_pipeline.discover(
                     adapter, company, annual_limit=history_years
                 )
                 if not recovery.filings:
@@ -2776,7 +2795,13 @@ class AppService:
                         item.accession_number for item in research_reports
                         if item.accession_number
                     ]
-                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                    scanner_code = _scanner_diagnostic_code(
+                        getattr(canonical, "diagnostics", ()),
+                        getattr(dataset, "diagnostics", ()),
+                    )
+                    raise _ResearchDataUnavailable(
+                        scanner_code or "FILING_DATA_QUALITY_FAILED"
+                    )
                 # The ingestion engine may retain accepted facts from multiple
                 # statement scopes/currencies for auditability.  Only the
                 # consolidated facts in the issuer's reporting currency are a
@@ -2788,7 +2813,7 @@ class AppService:
                 # belong to the research scope as audit-only; do not mutate
                 # their VERIFIED status into REJECTED.
                 audit_only = [
-                    fact for fact in dataset.accepted_facts
+                    fact for fact in canonical.resolved_facts
                     if fact.fact_id not in accepted_ids
                 ]
                 quarantined = [
@@ -2804,7 +2829,6 @@ class AppService:
                     fact for fact in canonical.quarantined_facts
                     if fact.fact_id not in {item.fact_id for item in quarantined}
                 )
-                quarantined.extend(audit_only)
                 self.storage.replace_financial_ingestion(
                     company.security_id,
                     [item.accession_number for item in research_reports],
@@ -2812,6 +2836,7 @@ class AppService:
                     quarantined,
                     canonical_groups,
                     list(dataset.evidence),
+                    audit_only,
                 )
                 facts = [item.to_dict() for item in accepted]
                 financial_profile = build_financial_profile(
@@ -2820,13 +2845,20 @@ class AppService:
                     company.reporting_currency,
                     selected_filings=research_reports,
                     manifests=dataset.manifest,
+                    requested_annual_count=history_years,
                 )
                 if not facts:
                     request["_financial_recovery_targets"] = [
                         item.accession_number for item in research_reports
                         if item.accession_number
                     ]
-                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                    scanner_code = _scanner_diagnostic_code(
+                        getattr(canonical, "diagnostics", ()),
+                        getattr(dataset, "diagnostics", ()),
+                    )
+                    raise _ResearchDataUnavailable(
+                        scanner_code or "FILING_DATA_QUALITY_FAILED"
+                    )
 
             if mode == "company" and not facts:
                 raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
@@ -2862,11 +2894,8 @@ class AppService:
                             "accounting-risk-analyst": "risk-analysis",
                         }.get(agent_id, job.stage)
 
-            workflow = ResearchWorkflow(
-                self.storage,
-                selected_pack,
-                self._provider_factory(config),
-                config,
+            workflow = self._research_orchestrator.create(
+                selected_pack, config,
                 cancel_check=job.cancel_event.is_set,
                 report_language=report_language,
                 ui_language=ui_language,
@@ -2926,11 +2955,8 @@ class AppService:
             for index, comparison_config in enumerate(comparison_configs, start=1):
                 if job.cancel_event.is_set():
                     raise ResearchCancelled()
-                comparison_workflow = ResearchWorkflow(
-                    self.storage,
-                    selected_pack,
-                    self._provider_factory(comparison_config),
-                    comparison_config,
+                comparison_workflow = self._research_orchestrator.create(
+                    selected_pack, comparison_config,
                     cancel_check=job.cancel_event.is_set,
                     report_language=report_language,
                     ui_language=ui_language,
@@ -3273,6 +3299,32 @@ def _download_error_is_transient(error: Exception) -> bool:
     return False
 
 
+_SCANNED_DIAGNOSTIC_CODES = (
+    "SCANNED_IMAGE_FILING_DETECTED",
+    "SCANNED_IMAGE_LAYOUT_UNRESOLVED",
+)
+
+
+def _scanner_diagnostic_code(*diagnostic_sources: Any) -> str | None:
+    """Return the highest-confidence scanner diagnostic from canonical output."""
+    for source in diagnostic_sources:
+        if isinstance(source, str):
+            values = (source,)
+        elif isinstance(source, dict):
+            values = tuple(source.values())
+        else:
+            try:
+                values = tuple(source or ())
+            except TypeError:
+                values = ()
+        for value in values:
+            text = str(value)
+            for code in _SCANNED_DIAGNOSTIC_CODES:
+                if code in text:
+                    return code
+    return None
+
+
 def _research_data_message(code: str, language: str) -> str:
     messages = {
         "zh-CN": {
@@ -3286,6 +3338,8 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_DATA_QUALITY_FAILED": "已获取官方披露文件，但关键财务字段未通过一致性校验。为避免错误数据进入 AI，本次研究已停止。",
             "FILING_DATA_QUALITY_PARTIAL": "财务资料已重建，但仍有字段未通过校验；已保留可验证数据。",
             "FILING_REPORT_REFRESH_FAILED": "财务资料已重建，但报告刷新失败；可单独重试报告刷新。",
+            "SCANNED_IMAGE_FILING_DETECTED": "已定位到疑似扫描版合并财报页面。请在模型中心配置具备视觉能力的解析方式并授权这些页面后重试；未授权前不会上传页面。",
+            "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "当前文件疑似包含图片版财报，但无法安全定位合并报表页。未上传任何页面；请人工核对或更换可解析的官方文件后重试。",
             "VISION_CONSENT_REQUIRED": "视觉财报兜底需要明确上传同意。",
             "VISION_UPLOAD_NOT_APPROVED": "视觉财报页面上传未获批准。",
             "VISION_RATE_LIMITED": "视觉服务暂时限流，请稍后重试。",
@@ -3318,6 +3372,8 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_DATA_QUALITY_FAILED": "Official disclosures were retrieved, but critical financial fields failed consistency checks. Research stopped before any data was sent to AI.",
             "FILING_DATA_QUALITY_PARTIAL": "Financial data was rebuilt, but some fields remain unverified; validated data was preserved.",
             "FILING_REPORT_REFRESH_FAILED": "Financial data was rebuilt, but report refresh failed; retry report refresh separately.",
+            "SCANNED_IMAGE_FILING_DETECTED": "Scanned consolidated-statement pages were located. Configure and authorize a vision-capable parser, then retry; no pages are uploaded without approval.",
+            "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "The filing appears image-based, but consolidated-statement pages could not be located safely. Nothing was uploaded; verify the filing manually or use a parseable official file.",
             "VISION_CONSENT_REQUIRED": "Vision fallback requires explicit upload consent.",
             "VISION_UPLOAD_NOT_APPROVED": "The selected financial pages were not approved for upload.",
             "VISION_RATE_LIMITED": "The vision service is rate limited; try again later.",
@@ -3350,6 +3406,8 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_DATA_QUALITY_FAILED": "已取得官方披露，但關鍵財務欄位未通過一致性檢查。為避免錯誤資料送入 AI，本次研究已停止。",
             "FILING_DATA_QUALITY_PARTIAL": "財務資料已重建，但仍有欄位未通過校驗；已保留可驗證資料。",
             "FILING_REPORT_REFRESH_FAILED": "財務資料已重建，但報告刷新失敗；可單獨重試報告刷新。",
+            "SCANNED_IMAGE_FILING_DETECTED": "已定位疑似掃描版合併財報頁面。請在模型中心設定具備視覺能力的解析方式並授權這些頁面後重試；未獲授權前不會上傳頁面。",
+            "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "目前檔案疑似包含圖片版財報，但無法安全定位合併報表頁面。未傳送任何頁面；請人工核對或更換可解析的官方檔案後重試。",
             "VISION_CONSENT_REQUIRED": "雲端視覺備援需要明確的上傳同意。",
             "VISION_UPLOAD_NOT_APPROVED": "雲端視覺財報頁面未獲准上傳。",
             "VISION_RATE_LIMITED": "雲端視覺服務目前受限流，請稍後重試。",
@@ -3992,6 +4050,14 @@ def _financial_status(
         expected_fact_ids_digest
         and expected_fact_ids_digest != current_fact_ids_digest
     )
+    # A legacy report may still be rendered, but its deterministic artifacts
+    # cannot be presented as current when the derived-data contract is absent
+    # or differs.  Initialization deliberately does not rewrite that report;
+    # the next research/rebuild creates a fresh snapshot.
+    if "data_snapshot" in run_payload and isinstance(data_snapshot, dict):
+        stored_contract = data_snapshot.get("derived_pipeline_contract")
+        if stored_contract != DERIVED_PIPELINE_CONTRACT:
+            snapshot_stale = True
 
     discovered_years = {
             int(str(item.period_end)[:4])
@@ -4308,6 +4374,7 @@ def _build_research_snapshot(
             )),
             "filing_evidence_sha256": _canonical_snapshot_digest(filing_evidence),
             "filing_evidence_count": len(filing_evidence),
+            "derived_pipeline_contract": dict(DERIVED_PIPELINE_CONTRACT),
         },
         "research_configuration": {
             "report_language": report_language,

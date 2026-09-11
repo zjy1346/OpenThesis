@@ -64,6 +64,7 @@ def _facts(filing: FilingDocument, *, net_income: float) -> tuple[FactCandidate,
             scope="consolidated", entity="Tencent", market="HK", statement=statements[concept],
             period_start=f"{int(filing.period_end[:4]) - 1}-01-01" if concept not in {"assets", "liabilities", "equity"} else None,
             consolidated_scope="consolidated", currency="CNY", unit_scale=1_000_000,
+            unit_provenance="structured_normalized",
             source_document=filing.primary_document, source_page=132,
             raw_text="Attributable to: Equity holders of the Company " + str(value),
             parser_version="fixture-official-tencent-v1",
@@ -98,6 +99,205 @@ class FinancialFactCompilerTests(unittest.TestCase):
         })
         self.assertFalse(dataset.quarantined_facts)
         self.assertTrue(all(ref.locator == "page:132" for ref in dataset.evidence))
+
+    def test_same_filing_comparator_lane_is_research_visible_but_not_annual(self):
+        filing = replace(
+            _filing("same-filing-comparator", "2025-12-31", "Tencent 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        comparison = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:comparison",
+                    fiscal_year=2024,
+                    end_date="2024-12-31",
+                    start_date=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    period_start=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    usage_status="comparator",
+                ),
+                item.evidence,
+                item.extractor,
+            )
+            for item in current
+        )
+        dataset = self._compile(filing, current + comparison)
+        self.assertEqual({fact.end_date for fact in dataset.annual_facts}, {"2025-12-31"})
+        self.assertEqual({fact.end_date for fact in dataset.comparator_facts}, {"2024-12-31"})
+        self.assertTrue(any(fact.end_date == "2024-12-31" for fact in dataset.research_facts))
+
+    def test_same_filing_comparator_currency_mismatch_is_fail_closed(self):
+        filing = replace(
+            _filing("same-filing-currency", "2025-12-31", "Tencent 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        foreign = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:foreign-comparison",
+                    fiscal_year=2024,
+                    end_date="2024-12-31",
+                    start_date=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    period_start=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    usage_status="comparator",
+                    unit="USD", currency="USD",
+                ),
+                item.evidence,
+                item.extractor,
+            )
+            for item in current
+        )
+        dataset = self._compile(filing, current + foreign)
+        self.assertFalse(dataset.allow_ai)
+        self.assertIn("same_filing_comparator_identity_mismatch", dataset.diagnostics)
+        self.assertFalse(any(fact.currency == "USD" for fact in dataset.research_facts))
+
+    def test_same_filing_comparator_unit_mismatch_is_fail_closed(self):
+        filing = replace(
+            _filing("same-filing-unit", "2025-12-31", "Tencent 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        mismatched = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:unit-mismatch",
+                    fiscal_year=2024,
+                    end_date="2024-12-31",
+                    start_date=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    period_start=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    usage_status="comparator",
+                    unit_scale=1,
+                ),
+                item.evidence,
+                item.extractor,
+            )
+            for item in current
+        )
+        dataset = self._compile(filing, current + mismatched)
+        self.assertFalse(dataset.allow_ai)
+        self.assertIn("same_filing_comparator_unit_mismatch", dataset.diagnostics)
+
+    def test_same_filing_restatement_and_historical_fact_are_retained_and_conflicted(self):
+        filing = replace(
+            _filing("same-filing-restatement", "2025-12-31", "Tencent 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        historical = replace(
+            _filing("independent-history", "2024-12-31", "Tencent 2024 Annual Report"),
+            filed_at="2025-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        same_filing_prior = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:restated",
+                    fiscal_year=2024,
+                    end_date="2024-12-31",
+                    start_date=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    period_start=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    usage_status="comparator",
+                ),
+                item.evidence,
+                item.extractor,
+            )
+            for item in current
+        )
+        independent = _facts(historical, net_income=177_000_000_000.0)
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2024-01-01", "2025-12-31"),
+            CompilerPolicy(
+                filings=(filing, historical),
+                extractors=(InMemoryFactExtractor({
+                    filing.document_id: CandidateBatch(filing, current + same_filing_prior),
+                    historical.document_id: CandidateBatch(historical, independent),
+                }),),
+                reporting_currency="CNY",
+            ),
+        )
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
+        self.assertTrue(any(item.get("reason") == "restatement_conflict" for item in dataset.conflicts))
+        self.assertTrue(any(fact.usage_status == "comparator" for fact in dataset.comparator_facts))
+        self.assertTrue(any(
+            fact.accession_number == historical.accession_number
+            and fact.concept == "net_income"
+            for fact in dataset.annual_facts
+        ))
+
+    def test_same_filing_interim_comparator_satisfies_like_for_like_gate(self):
+        filing = replace(
+            _filing("same-filing-h1", "2025-06-30", "Tencent 2025 H1 Report"),
+            fiscal_period="H1", form_type="INTERIM_REPORT", filed_at="2025-08-20",
+        )
+        current = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:h1",
+                    fiscal_year=2025,
+                    fiscal_period="H1", form_type="INTERIM_REPORT",
+                    start_date="2025-01-01", period_start="2025-01-01",
+                    end_date="2025-06-30", usage_status="audit_only",
+                ), item.evidence, item.extractor,
+            )
+            for item in _facts(filing, net_income=188_243_000_000.0)
+        )
+        comparison = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:h1-comparison",
+                    fiscal_year=2024,
+                    fiscal_period="H1", form_type="INTERIM_REPORT",
+                    start_date="2024-01-01", period_start="2024-01-01",
+                    end_date="2024-06-30", usage_status="comparator",
+                ), item.evidence, item.extractor,
+            )
+            for item in current
+        )
+        dataset = FinancialFactCompiler().compile(
+            _subject(), (filing.period_end, filing.period_end),
+            CompilerPolicy(
+                filings=(filing,),
+                extractors=(InMemoryFactExtractor({
+                    filing.document_id: CandidateBatch(filing, current + comparison),
+                }),),
+                reporting_currency="CNY", fiscal_period="H1",
+            ),
+        )
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
+        self.assertEqual({fact.end_date for fact in dataset.comparator_facts}, {"2024-06-30"})
+
+    def test_same_filing_comparator_period_shape_mismatch_is_fail_closed(self):
+        filing = replace(
+            _filing("same-filing-period", "2025-12-31", "Tencent 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        wrong_period = tuple(
+            FactCandidate(
+                replace(
+                    item.fact,
+                    fact_id=f"{item.fact.fact_id}:wrong-period",
+                    fiscal_year=2024,
+                    end_date="2024-06-30",
+                    start_date=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    period_start=None if item.fact.statement == "balance_sheet" else "2024-01-01",
+                    usage_status="comparator",
+                ),
+                item.evidence,
+                item.extractor,
+            )
+            for item in current
+        )
+        dataset = self._compile(filing, current + wrong_period)
+        self.assertFalse(dataset.allow_ai)
+        self.assertIn("same_filing_comparator_identity_mismatch", dataset.diagnostics)
 
     def test_incomplete_candidate_batch_cannot_bypass_quality_gate(self):
         filing = _filing("2022040701694", "2021-12-31", "Tencent 2021 Annual Report")
@@ -148,7 +348,195 @@ class FinancialFactCompilerTests(unittest.TestCase):
         by_end = {fact.end_date: fact.value for fact in dataset.resolved_facts if fact.concept == "net_income"}
         self.assertEqual(by_end["2022-12-31"], 188_243_000_000.0)
         self.assertEqual(by_end["2021-12-31"], 224_822_000_000.0)
+
+    def test_dataset_exposes_annual_and_interim_cohorts_without_latest_wiping(self):
+        annual = _filing("annual-cohort", "2022-12-31", "Annual Report")
+        interim = replace(
+            annual,
+            document_id="interim-cohort",
+            accession_number="interim-cohort",
+            fiscal_period="H1",
+            period_end="2023-06-30",
+            filed_at="2023-07-06",
+        )
+        prior_interim = replace(
+            interim,
+            document_id="prior-interim-cohort",
+            accession_number="prior-interim-cohort",
+            period_end="2022-06-30",
+            filed_at="2022-07-06",
+        )
+        interim_facts = tuple(
+            FactCandidate(
+                replace(
+                    candidate.fact,
+                    fact_id=candidate.fact.fact_id.replace("annual-cohort", "interim-cohort"),
+                accession_number=interim.accession_number,
+                fiscal_year=2023,
+                fiscal_period="H1",
+                start_date="2023-01-01",
+                period_start="2023-01-01",
+                    end_date=interim.period_end,
+                ),
+                candidate.evidence,
+                candidate.extractor,
+            )
+            for candidate in _facts(interim, net_income=188_243_000_000.0)
+        )
+        prior_interim_facts = tuple(
+            FactCandidate(
+                replace(
+                    candidate.fact,
+                    fact_id=candidate.fact.fact_id.replace("interim-cohort", "prior-interim-cohort"),
+                    accession_number=prior_interim.accession_number,
+                    fiscal_year=2022,
+                    fiscal_period="H1",
+                    start_date="2022-01-01",
+                    period_start="2022-01-01",
+                    end_date=prior_interim.period_end,
+                ),
+                candidate.evidence,
+                candidate.extractor,
+            )
+            for candidate in interim_facts
+        )
+        extractor = InMemoryFactExtractor({
+            annual.document_id: CandidateBatch(annual, _facts(annual, net_income=188_243_000_000.0)),
+            interim.document_id: CandidateBatch(interim, interim_facts),
+            prior_interim.document_id: CandidateBatch(prior_interim, prior_interim_facts),
+        })
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2022-01-01", "2023-06-30"),
+            CompilerPolicy(
+                filings=(annual, interim, prior_interim), extractors=(extractor,), reporting_currency="CNY",
+            ),
+        )
+        self.assertTrue(dataset.annual_facts)
+        self.assertTrue(dataset.interim_facts)
+        self.assertTrue(dataset.comparator_facts)
+        self.assertTrue(any(fact.fiscal_period == "FY" for fact in dataset.research_facts))
+        self.assertTrue(any(fact.fiscal_period == "H1" for fact in dataset.research_facts))
         self.assertTrue(dataset.allow_ai)
+
+    def test_interim_cohort_is_global_latest_with_same_period_comparator(self):
+        annual = _filing("cohort-annual", "2022-12-31", "Annual Report")
+        h1 = replace(
+            annual, document_id="cohort-h1", accession_number="cohort-h1",
+            fiscal_period="H1", period_end="2023-06-30", filed_at="2023-07-06",
+        )
+        q1 = replace(
+            annual, document_id="cohort-q1", accession_number="cohort-q1",
+            fiscal_period="Q1", period_end="2023-03-31", filed_at="2023-04-06",
+        )
+        prior_h1 = replace(
+            h1, document_id="cohort-prior-h1", accession_number="cohort-prior-h1",
+            period_end="2022-06-30", filed_at="2022-07-06",
+        )
+        batches = {}
+        for filing in (annual, h1, q1, prior_h1):
+            period_facts = tuple(
+                FactCandidate(
+                    replace(
+                        candidate.fact,
+                        fiscal_year=int(filing.period_end[:4]),
+                        fiscal_period=filing.fiscal_period,
+                        form_type=filing.form_type,
+                        end_date=filing.period_end,
+                    ),
+                    candidate.evidence,
+                    candidate.extractor,
+                )
+                for candidate in _facts(filing, net_income=188_243_000_000.0)
+            )
+            batches[filing.document_id] = CandidateBatch(filing, period_facts)
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2022-01-01", "2023-12-31"),
+            CompilerPolicy(
+                filings=(annual, h1, q1, prior_h1), extractors=(InMemoryFactExtractor(batches),),
+                reporting_currency="CNY",
+            ),
+        )
+        self.assertEqual({fact.fiscal_period for fact in dataset.interim_facts}, {"H1"})
+        self.assertEqual({fact.end_date for fact in dataset.interim_facts}, {"2023-06-30"})
+        self.assertEqual({fact.end_date for fact in dataset.comparator_facts}, {"2022-06-30"})
+        self.assertNotIn("2023-03-31", {fact.end_date for fact in dataset.research_facts})
+
+    def test_latest_incomplete_interim_cannot_be_masked_by_older_verified(self):
+        annual = _filing("latest-annual", "2022-12-31", "Annual Report")
+        latest = replace(
+            annual, document_id="latest-h1", accession_number="latest-h1",
+            fiscal_period="H1", period_end="2023-06-30", filed_at="2023-07-06",
+        )
+        older = replace(
+            latest, document_id="older-h1", accession_number="older-h1",
+            period_end="2022-06-30", filed_at="2022-07-06",
+        )
+        def batch(filing, omit=()):
+            return CandidateBatch(
+                filing,
+                tuple(
+                    FactCandidate(
+                        replace(
+                            candidate.fact,
+                            fiscal_year=int(filing.period_end[:4]),
+                            fiscal_period="H1",
+                            form_type="INTERIM_REPORT",
+                            end_date=filing.period_end,
+                        ),
+                        candidate.evidence,
+                        candidate.extractor,
+                    )
+                    for candidate in _facts(filing, net_income=188_243_000_000.0)
+                    if candidate.fact.concept not in omit
+                ),
+            )
+        batches = {
+            annual.document_id: CandidateBatch(annual, _facts(annual, net_income=188_243_000_000.0)),
+            latest.document_id: batch(latest, {"net_income"}),
+            older.document_id: batch(older),
+        }
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2022-01-01", "2023-12-31"),
+            CompilerPolicy(
+                filings=(annual, latest, older),
+                extractors=(InMemoryFactExtractor(batches),),
+                reporting_currency="CNY",
+            ),
+        )
+        self.assertFalse(dataset.allow_ai)
+        self.assertEqual(dataset.interim_facts, ())
+        self.assertIn("interim_comparator_missing", dataset.diagnostics)
+        self.assertIn("latest_interim_incomplete", dataset.diagnostics)
+
+    def test_annual_cohorts_are_deduplicated_and_limited_to_six(self):
+        filings = tuple(
+            replace(
+                _filing(f"annual-{year}", f"{year}-12-31", "Annual Report"),
+                filed_at=f"{year + 1}-03-30",
+            )
+            for year in range(2015, 2022)
+        )
+        batches = {
+            filing.document_id: CandidateBatch(filing, _facts(filing, net_income=188_243_000_000.0))
+            for filing in filings
+        }
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2015-01-01", "2021-12-31"),
+            CompilerPolicy(
+                filings=filings, extractors=(InMemoryFactExtractor(batches),),
+                reporting_currency="CNY",
+            ),
+        )
+        self.assertEqual({fact.end_date for fact in dataset.annual_facts}, {
+            f"{year}-12-31" for year in range(2016, 2022)
+        })
+        self.assertEqual(len({fact.end_date for fact in dataset.annual_facts}), 6)
+        self.assertTrue(all(
+            fact.validation_status == next(
+                item.status for item in dataset.validations if item.identity[0] == fact.accession_number
+            )
+            for fact in dataset.annual_facts
+        ))
 
     def test_minimal_coordinate_pdf_fixture_uses_formal_ast_and_excludes_eps(self):
         """CI fixture: PDF words -> formal AST -> candidates -> compiler gate."""
@@ -233,13 +621,14 @@ class FinancialFactCompilerTests(unittest.TestCase):
             concepts = {item.fact.concept for item in batch.candidates}
             self.assertTrue({"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"} <= concepts)
             net_income = [item.fact for item in batch.candidates if item.fact.concept == "net_income"]
-            self.assertEqual(len(net_income), 1)
-            self.assertEqual(net_income[0].value, 188243000000.0)
-            self.assertEqual(net_income[0].source_page, 1)
-            self.assertTrue(net_income[0].source_bbox)
-            self.assertEqual(net_income[0].currency, "CNY")
-            self.assertEqual(net_income[0].unit_scale, 1_000_000.0)
-            self.assertEqual(net_income[0].consolidated_scope, "consolidated")
+            self.assertEqual({item.fiscal_year for item in net_income}, {2022, 2021})
+            current_net_income = next(item for item in net_income if item.fiscal_year == 2022)
+            self.assertEqual(current_net_income.value, 188243000000.0)
+            self.assertEqual(current_net_income.source_page, 1)
+            self.assertTrue(current_net_income.source_bbox)
+            self.assertEqual(current_net_income.currency, "CNY")
+            self.assertEqual(current_net_income.unit_scale, 1_000_000.0)
+            self.assertEqual(current_net_income.consolidated_scope, "consolidated")
             compiler = FinancialFactCompiler().compile(
                 subject,
                 (filing.period_end, filing.period_end),
@@ -314,6 +703,45 @@ class FinancialFactCompilerTests(unittest.TestCase):
         )
         self.assertTrue(dataset.allow_ai)
 
+    def test_cross_year_typical_scale_jump_blocks_research(self):
+        first = _filing("scale-2022", "2022-12-31", "Scale 2022")
+        second = _filing("scale-2021", "2021-12-31", "Scale 2021")
+        first_items = list(_facts(first, net_income=72_000_000.0))
+        second_items = list(_facts(second, net_income=72_000_000.0))
+        first_items = [replace(item, fact=replace(item.fact, unit_scale=1.0)) for item in first_items]
+        second_items = [replace(item, fact=replace(item.fact, unit_scale=1000.0)) for item in second_items]
+        first_items[0] = replace(first_items[0], fact=replace(first_items[0].fact, value=265_000_000_000.0))
+        second_items[0] = replace(second_items[0], fact=replace(second_items[0].fact, value=265_000_000.0))
+        extractor = InMemoryFactExtractor({
+            first.document_id: CandidateBatch(first, tuple(first_items)),
+            second.document_id: CandidateBatch(second, tuple(second_items)),
+        })
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2021-01-01", "2022-12-31"),
+            CompilerPolicy(filings=(first, second), extractors=(extractor,), reporting_currency="CNY"),
+        )
+        self.assertFalse(dataset.allow_ai)
+        self.assertIn("unit_scale_continuity_failed", dataset.diagnostics)
+
+    def test_same_scale_large_business_change_does_not_block_research(self):
+        first = _filing("legal-2022", "2022-12-31", "Legal 2022")
+        second = _filing("legal-2021", "2021-12-31", "Legal 2021")
+        first_items = list(_facts(first, net_income=72_000_000.0))
+        second_items = list(_facts(second, net_income=72_000_000.0))
+        first_items = [replace(item, fact=replace(item.fact, unit_scale=1.0)) for item in first_items]
+        second_items = [replace(item, fact=replace(item.fact, unit_scale=1.0)) for item in second_items]
+        first_items[0] = replace(first_items[0], fact=replace(first_items[0].fact, value=265_000_000_000.0))
+        second_items[0] = replace(second_items[0], fact=replace(second_items[0].fact, value=265_000_000.0))
+        extractor = InMemoryFactExtractor({
+            first.document_id: CandidateBatch(first, tuple(first_items)),
+            second.document_id: CandidateBatch(second, tuple(second_items)),
+        })
+        dataset = FinancialFactCompiler().compile(
+            _subject(), ("2021-01-01", "2022-12-31"),
+            CompilerPolicy(filings=(first, second), extractors=(extractor,), reporting_currency="CNY"),
+        )
+        self.assertNotIn("unit_scale_continuity_failed", dataset.diagnostics)
+
     def test_research_view_selects_target_scope_currency_and_complete_groups(self):
         filing = _filing("target-groups", "2022-12-31", "Target Groups")
         base = list(_facts(filing, net_income=188_243_000_000.0))
@@ -369,7 +797,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
         self.assertFalse(dataset.allow_ai)
         self.assertEqual({fact.end_date for fact in dataset.research_facts}, {"2022-12-31"})
         self.assertNotIn("2021-12-31", {fact.end_date for fact in dataset.research_facts})
-        self.assertEqual({item.identity[1] for item in dataset.research_validations}, {"2021-12-31", "2022-12-31"})
+        self.assertEqual({item.identity[1] for item in dataset.research_validations}, {"2022-12-31"})
 
     def test_period_range_limits_research_target_window(self):
         first = _filing("range-2021", "2021-12-31", "Range 2021")
@@ -577,6 +1005,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
             _filing("q1-cross-source", "2026-03-31", "First Quarterly Report"),
             form_type="QUARTERLY_REPORT",
             fiscal_period="Q1",
+            filed_at="2026-04-06",
         )
         candidates = tuple(
             replace(
@@ -614,7 +1043,8 @@ class FinancialFactCompilerTests(unittest.TestCase):
             _subject(), [filing], Collector(), reporting_currency="CNY"
         )
 
-        self.assertTrue(dataset.allow_ai)
+        self.assertFalse(dataset.allow_ai)
+        self.assertIn("interim_comparator_missing", dataset.diagnostics)
         self.assertEqual(dataset.coverage["target_fiscal_period"], "Q1")
         self.assertEqual({fact.fiscal_period for fact in dataset.research_facts}, {"Q1"})
 

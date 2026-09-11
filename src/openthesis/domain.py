@@ -6,6 +6,9 @@ from enum import StrEnum
 from typing import Any
 
 
+CURRENT_DERIVED_VERSION = "financial-facts-v2"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -106,6 +109,9 @@ class FinancialFact:
     consolidated_scope: str = "consolidated"
     currency: str = ""
     unit_scale: float = 1.0
+    # Unit/scale origin is separate from validation and usage status. Unknown
+    # units must never be made to look explicit by a compatibility projection.
+    unit_provenance: str = "unknown"
     revision: str = "original"
     source_document: str = ""
     source_page: int | None = None
@@ -113,6 +119,16 @@ class FinancialFact:
     raw_text: str = ""
     parser_version: str = ""
     validation_status: str = "unvalidated"
+    # Orthogonal lifecycle fields.  ``validation_status`` remains a
+    # compatibility projection for older callers; it must not be used to
+    # encode whether a fact is intended for research or audit only.
+    extraction_status: str = "unresolved"
+    usage_status: str = "audit_only"
+    provenance_status: str = "unresolved"
+    derived_version: str = CURRENT_DERIVED_VERSION
+    # Original visual column header for same-filing comparison provenance.
+    # Appended so older positional/database callers remain compatible.
+    source_column: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

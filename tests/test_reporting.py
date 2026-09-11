@@ -8,6 +8,136 @@ from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_staged_context_capacity_callout_is_localized_and_keeps_byte_budget(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test",
+            "content": {
+                "mode": "staged-fallback",
+                "report": {
+                    "executive_summary": "已完成阶段资料。",
+                    "cross_section_synthesis_status": "not_completed_context_capacity",
+                    "context_budget": {
+                        "required_bytes": 36327,
+                        "available_bytes": 36000,
+                        "counting_mode": "conservative_utf8_byte_upper_bound",
+                    },
+                },
+            },
+        }]
+        expected = {
+            "zh-CN": "研究阶段数据已完整保留，但跨章节最终综合因当前模型容量不足未完成",
+            "zh-Hant": "研究階段資料已完整保留，但跨章節最終綜合因目前模型容量不足未完成",
+            "en": "All completed research-stage data was preserved, but cross-section final synthesis was not completed because the model context capacity was insufficient",
+        }
+        for language, phrase in expected.items():
+            report = render_research_run("capacity-callout", artifacts, language)
+            self.assertIn(phrase, report)
+            self.assertIn("36,327", report)
+            self.assertIn("36,000", report)
+            self.assertIn("conservative UTF-8 byte upper bound", report) if language == "en" else None
+
+        normal = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test",
+            "content": {
+                "mode": "synthesized",
+                "report": {
+                    "executive_summary": "正常综合。",
+                    "cross_section_synthesis_status": "not_completed_context_capacity",
+                    "context_budget": {"required_bytes": 36327, "available_bytes": 36000},
+                },
+            },
+        }]
+        self.assertNotIn("跨章节最终综合因当前模型容量不足未完成", render_research_run("normal", normal, "zh-CN"))
+
+    def test_five_valid_growth_opportunities_survive_both_renderers_and_sixth_is_diagnosed(self) -> None:
+        opportunities = [
+            {
+                "title": f"Opportunity {index}",
+                "mechanism": "A verified market mechanism.",
+                "evidence_grade": "C",
+                "time_horizon_years": 3,
+                "probability_range": [0.3, 0.5],
+                "supporting_evidence_ids": [f"fact:opportunity:{index}"],
+            }
+            for index in range(1, 7)
+        ]
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{"year": 2025, "revenue": 10.0}],
+                    "evidence": [{"evidence_id": f"fact:opportunity:{index}"} for index in range(1, 7)],
+                },
+            },
+            {
+                "artifact_type": "growth-opportunities",
+                "agent_id": "growth-opportunity-analyst",
+                "model_id": "test",
+                "content": {
+                    "opportunities": opportunities[:5],
+                    "_lineage": {
+                        "raw_candidate_count": 6,
+                        "normalized_count": 5,
+                        "verified_count": 5,
+                        "retained_count": 5,
+                        "rejected_count": 1,
+                        "cap_applied": True,
+                        "cap_limit": 5,
+                        "rejected_reasons": ["growth opportunity cap applied"],
+                    },
+                },
+            },
+        ]
+        markdown = render_research_run("growth-lineage", artifacts, "en")
+        html = render_research_html("growth-lineage", artifacts, "en")
+        for report in (markdown, html):
+            for index in range(1, 6):
+                self.assertIn(f"Opportunity {index}", report)
+            self.assertNotIn("Opportunity 6", report)
+
+    def test_period_coverage_shows_actual_range_and_missing_reason_in_all_languages(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "currency": "CNY",
+                "metrics": [{"year": 2025, "revenue": 10.0}],
+                "evidence": [],
+                "financial_quality": {
+                    "period_coverage": {
+                        "available_annual_years": [2023, 2025],
+                        "displayed_annual_years": [2023, 2025],
+                        "hidden_comparator_years": [2022],
+                        "latest_official_fy": 2025,
+                        "interim_periods": ["2026 H1"],
+                        "missing_or_rejected_years": [{"year": 2024, "status": "rejected", "reason_code": "OFFICIAL_ANNUAL_UNAVAILABLE"}],
+                    }
+                },
+            },
+        }]
+        for language, present in (("zh-CN", "年度披露范围"), ("zh-Hant", "年度披露範圍"), ("en", "Annual disclosure coverage")):
+            report = render_research_run("coverage", artifacts, language, company_name="Example")
+            self.assertIn(present, report)
+            self.assertIn("2023", report)
+            self.assertIn("2025", report)
+            self.assertIn("2024", report)
+            if language == "en":
+                self.assertNotIn("截至研究日未获取到有效官方年报", report)
+            if language == "zh-Hant":
+                self.assertNotIn("截至研究日未获取到有效官方年报", report)
+                self.assertIn("截至研究日未取得有效官方年報", report)
+            if language == "zh-CN":
+                self.assertIn("截至研究日未获取到有效官方年报", report)
+            if language == "en":
+                self.assertIn("No valid official annual report was available", report)
     def test_markdown_uses_latest_deterministic_financial_artifact(self) -> None:
         artifacts = [
             {

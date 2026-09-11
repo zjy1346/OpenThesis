@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 
 from .domain import FilingDocument
+from .disclosure_identity import DisclosureIdentityResolver
 
 
 ANNUAL = "ANNUAL_REPORT"
@@ -44,11 +45,41 @@ def select_research_filings(
     included only when no annual report exists anywhere in the discovered set.
     """
 
+    resolver = DisclosureIdentityResolver()
+    normalised_candidates: list[FilingDocument] = []
+    for item in candidates:
+        identity = resolver.resolve(
+            title=item.primary_document,
+            filed_at=item.filed_at,
+            provider_metadata={
+                "period_end": item.period_end,
+                "fiscal_period": item.fiscal_period,
+                "revision": item.revision,
+            },
+        )
+        updates: dict[str, object] = {}
+        if identity.fiscal_period and identity.fiscal_period != item.fiscal_period:
+            updates["fiscal_period"] = identity.fiscal_period
+        item_end = str(item.period_end or "")[:10]
+        filed_at = str(item.filed_at or "")[:10]
+        if (
+            identity.provisional
+            and identity.fiscal_period in {"H1", "Q1", "Q2", "Q3", "Q4"}
+            and item_end.endswith("-12-31")
+        ) or (
+            len(item_end) == 10 and len(filed_at) == 10 and item_end > filed_at
+        ):
+            # Do not pass an invented/future date into parsing.  The period
+            # remains provisional until an observed statement date resolves it.
+            updates["period_end"] = ""
+            updates["revision"] = "period_end_provisional"
+        normalised_candidates.append(replace(item, **updates) if updates else item)
+
     # De-duplicate by fiscal period, not announcement date/document id.  A
     # correction/revision is a new document id but must replace the original
     # for analysis while the original remains available to audit callers.
     by_period: dict[tuple[int, str], FilingDocument] = {}
-    for item in candidates:
+    for item in normalised_candidates:
         key = (_fiscal_year(item), (item.fiscal_period or "FY").upper())
         current = by_period.get(key)
         if current is None or _revision_rank(item) > _revision_rank(current):

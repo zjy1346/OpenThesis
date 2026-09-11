@@ -96,6 +96,9 @@ def demo_facts() -> list[dict[str, Any]]:
                     "reported_concept": f"demo:{concept}",
                     "value": float(value),
                     "unit": "USD",
+                    "currency": "USD",
+                    "unit_scale": 1.0,
+                    "unit_provenance": "structured_normalized",
                     "fiscal_year": year,
                     "fiscal_period": "FY",
                     "form_type": "DEMO",
@@ -108,4 +111,3 @@ def demo_facts() -> list[dict[str, Any]]:
                 }
             )
     return facts
-

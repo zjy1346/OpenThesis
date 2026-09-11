@@ -98,20 +98,100 @@ def _pick(language: str, chinese: str, english: str) -> str:
     return chinese
 
 
+def _locale_text(language: str, simplified: str, traditional: str, english: str) -> str:
+    """Select program-authored copy without translating model-authored prose."""
+
+    locale = normalize_language(language)
+    if locale == EN:
+        return english
+    if locale == ZH_HANT:
+        return traditional
+    return simplified
+
+
+def staged_context_capacity_notice(
+    report: object,
+    language: str,
+) -> dict[str, str] | None:
+    """Return safe, localized copy for a capacity-limited staged report."""
+
+    if not isinstance(report, dict) or report.get("cross_section_synthesis_status") != "not_completed_context_capacity":
+        return None
+
+    budget_data = report.get("context_budget")
+    budget_data = budget_data if isinstance(budget_data, dict) else {}
+    required = budget_data.get("required_bytes")
+    available = budget_data.get("available_bytes")
+
+    def format_bytes(value: object) -> str:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _locale_text(language, "不可用", "無法取得", "unavailable")
+        amount = int(value)
+        kib = amount / 1024
+        return f"{amount:,} bytes ({kib:,.1f} KiB)"
+
+    budget = _locale_text(
+        language,
+        f"模型输入预算：需要 {format_bytes(required)}；可用 {format_bytes(available)}。",
+        f"模型輸入預算：需要 {format_bytes(required)}；可用 {format_bytes(available)}。",
+        f"Model input budget: required {format_bytes(required)}; available {format_bytes(available)}.",
+    )
+    mode = budget_data.get("counting_mode")
+    if mode == "conservative_utf8_byte_upper_bound":
+        counting = _locale_text(
+            language,
+            "输入大小按 UTF-8 字节保守上界估算，并非官方精确 token 计数。",
+            "輸入大小按 UTF-8 位元組保守上界估算，並非官方精確 token 計數。",
+            "Input size uses a conservative UTF-8 byte upper bound estimate, not an official exact token count.",
+        )
+    elif mode == "explicit_max_input_bytes":
+        counting = _locale_text(
+            language,
+            "可用容量来自提供方明确的最大输入字节预算。",
+            "可用容量來自提供方明確的最大輸入位元組預算。",
+            "Available capacity comes from the provider's explicit maximum input-byte budget.",
+        )
+    else:
+        counting = _locale_text(
+            language,
+            "当前模型输入容量不足，未对内容作截断或猜测。",
+            "目前模型輸入容量不足，未對內容作截斷或猜測。",
+            "The model input capacity was insufficient; no content was truncated or guessed.",
+        )
+
+    return {
+        "title": _locale_text(language, "最终综合容量状态", "最終綜合容量狀態", "Final synthesis capacity"),
+        "summary": _locale_text(
+            language,
+            "研究阶段数据已完整保留，但跨章节最终综合因当前模型容量不足未完成。",
+            "研究階段資料已完整保留，但跨章節最終綜合因目前模型容量不足未完成。",
+            "All completed research-stage data was preserved, but cross-section final synthesis was not completed because the model context capacity was insufficient.",
+        ),
+        "budget": budget,
+        "counting": counting,
+        "retry": _locale_text(
+            language,
+            "可选择支持更大上下文的模型，然后仅重试“综合”；无需重新下载财报或重跑其他研究阶段。",
+            "可選擇支援更大上下文的模型，然後僅重試「綜合」；無需重新下載財報或重跑其他研究階段。",
+            "You can choose a model with a larger context window and retry only synthesis; financial filings and other research stages do not need to run again.",
+        ),
+    }
+
+
 def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[str]:
     english = normalize_language(language) == EN
     labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if normalize_language(language) == ZH_HANT else SECTION_LABELS_ZH
     if value is None:
-        return ["Insufficient evidence or not provided." if english else "证据不足或尚未提供。"]
+        return [_locale_text(language, "证据不足或尚未提供。", "證據不足或尚未提供。", "Insufficient evidence or not provided.")]
     if isinstance(value, str):
         return [report_display_value(value, language)]
     if isinstance(value, bool):
-        return ["Yes" if value else "No"] if english else ["是" if value else "否"]
+        return [_locale_text(language, "是" if value else "否", "是" if value else "否", "Yes" if value else "No")]
     if isinstance(value, (int, float)):
         return [str(value)]
     if isinstance(value, list):
         if not value:
-            return ["None." if english else "暂无。"]
+            return [_locale_text(language, "暂无。", "暫無。", "None.")]
         lines: list[str] = []
         for item in value:
             rendered = _render_value(item, language, level + 1)
@@ -161,18 +241,19 @@ def _render_claims(value: object, language: str) -> list[str]:
         key=lambda item: (item is None, 0.0 if item is None else -item),
     ):
         if confidence is None:
-            heading = "Confidence not provided" if english else "置信度未提供"
+            heading = _locale_text(language, "置信度未提供", "信心程度未提供", "Confidence not provided")
         elif confidence >= 0.8:
-            heading = "High confidence" if english else "高置信度"
+            heading = _locale_text(language, "高置信度", "高信心程度", "High confidence")
         elif confidence >= 0.55:
-            heading = "Medium confidence" if english else "中等置信度"
+            heading = _locale_text(language, "中等置信度", "中等信心程度", "Medium confidence")
         else:
-            heading = "Low confidence" if english else "低置信度"
+            heading = _locale_text(language, "低置信度", "低信心程度", "Low confidence")
         score = "" if confidence is None else f" · {confidence:.2f}"
-        count = (
-            f" · {len(grouped[confidence])} items"
-            if english
-            else f" · {len(grouped[confidence])} 条"
+        count = _locale_text(
+            language,
+            f" · {len(grouped[confidence])} 条",
+            f" · {len(grouped[confidence])} 條",
+            f" · {len(grouped[confidence])} items",
         )
         lines.extend([f"### {heading}{score}{count}", ""])
         for claim in grouped[confidence]:
@@ -191,6 +272,7 @@ def _render_growth_opportunities(
     *,
     include_technical: bool = False,
     available_evidence: set[str] | None = None,
+    counts_projected: bool = False,
 ) -> list[str]:
     english = normalize_language(language) == EN
     if isinstance(value, dict) and isinstance(value.get("opportunities"), list):
@@ -204,31 +286,34 @@ def _render_growth_opportunities(
         validation = value.get("_validation") if isinstance(value, dict) else None
         if response_error in {"empty_content", "invalid_json", "invalid_shape"}:
             return [
-                (
-                    "The growth-opportunity model returned no usable content. You can retry only this stage."
-                    if english
-                    else "增长机会模型未返回有效内容，可单独重试该阶段。"
+                _locale_text(
+                    language,
+                    "增长机会模型未返回有效内容，可单独重试该阶段。",
+                    "增長機會模型未返回有效內容，可單獨重試該階段。",
+                    "The growth-opportunity model returned no usable content. You can retry only this stage.",
                 )
             ]
         if isinstance(validation, dict) and validation.get("passed") is False:
             return [
-                (
-                    "The growth-opportunity output did not pass structure or evidence validation. You can retry only this stage."
-                    if english
-                    else "增长机会输出未通过结构或证据校验，可单独重试该阶段。"
+                _locale_text(
+                    language,
+                    "增长机会输出未通过结构或证据校验，可单独重试该阶段。",
+                    "增長機會輸出未通過結構或證據校驗，可單獨重試該階段。",
+                    "The growth-opportunity output did not pass structure or evidence validation. You can retry only this stage.",
                 )
             ]
         return [
-            (
-                "Current evidence is insufficient to present a growth opportunity."
-                if english
-                else "当前证据不足，未形成可展示的增长机会。"
+            _locale_text(
+                language,
+                "当前证据不足，未形成可展示的增长机会。",
+                "目前證據不足，未形成可展示的增長機會。",
+                "Current evidence is insufficient to present a growth opportunity.",
             )
         ]
     lines: list[str] = []
     for opportunity in opportunities:
-        title = opportunity.get("title") or (
-            "Unnamed opportunity" if english else "未命名机会"
+        title = opportunity.get("title") or _locale_text(
+            language, "未命名机会", "未命名機會", "Unnamed opportunity"
         )
         lines.extend([f"### {title}", ""])
         badges = [
@@ -244,22 +329,14 @@ def _render_growth_opportunities(
         )
         horizon = opportunity.get("time_horizon_years")
         horizon_text = (
-            (f"{horizon} years" if english else f"{horizon} 年")
+            _locale_text(language, f"{horizon} 年", f"{horizon} 年", f"{horizon} years")
             if horizon
-            else ("Insufficient evidence" if english else "证据不足")
+            else _locale_text(language, "证据不足", "證據不足", "Insufficient evidence")
         )
         lines.extend(
             [
-                (
-                    f"- Probability: {probability}"
-                    if english
-                    else f"- 可能性：{probability}"
-                ),
-                (
-                    f"- Time horizon: {horizon_text}"
-                    if english
-                    else f"- 时间跨度：{horizon_text}"
-                ),
+                _locale_text(language, f"- 可能性：{probability}", f"- 可能性：{probability}", f"- Probability: {probability}"),
+                _locale_text(language, f"- 时间跨度：{horizon_text}", f"- 時間跨度：{horizon_text}", f"- Time horizon: {horizon_text}"),
             ]
         )
         scenarios = [
@@ -269,20 +346,16 @@ def _render_growth_opportunities(
         if scenarios:
             separator = ", " if english else "、"
             lines.append(
-                (
-                    "- Eligible scenarios: "
-                    if english
-                    else "- 适用情景："
-                )
+                _locale_text(language, "- 适用情景：", "- 適用情境：", "- Eligible scenarios: ")
                 + separator.join(scenarios)
             )
         lines.extend(
             [
                 "",
-                "**Growth mechanism**" if english else "**增长机制**",
+                _locale_text(language, "**增长机制**", "**增長機制**", "**Growth mechanism**"),
                 "",
-                str(opportunity.get("mechanism") or (
-                    "Insufficient evidence." if english else "证据不足。"
+                str(opportunity.get("mechanism") or _locale_text(
+                    language, "证据不足。", "證據不足。", "Insufficient evidence."
                 )),
                 "",
             ]
@@ -299,6 +372,9 @@ def _render_growth_opportunities(
             contradicting_count = len(
                 {str(item).strip() for item in contradicting if str(item).strip() in available_evidence}
             )
+        elif available_evidence is not None:
+            supporting_count = opportunity.get("supporting_evidence_count", 0) if counts_projected else 0
+            contradicting_count = opportunity.get("contradicting_evidence_count", 0) if counts_projected else 0
         else:
             supporting_count = opportunity.get("supporting_evidence_count", 0)
             contradicting_count = opportunity.get("contradicting_evidence_count", 0)
@@ -315,7 +391,7 @@ def _render_growth_opportunities(
             lines.extend(
                 [
                     "",
-                    "**Leading indicators**" if english else "**领先指标**",
+                    _locale_text(language, "**领先指标**", "**領先指標**", "**Leading indicators**"),
                     *[
                         f"- {item}"
                         for item in opportunity["leading_indicators"]
@@ -326,11 +402,7 @@ def _render_growth_opportunities(
             lines.extend(
                 [
                     "",
-                    (
-                        "**Invalidation conditions**"
-                        if english
-                        else "**失效条件**"
-                    ),
+                    _locale_text(language, "**失效条件**", "**失效條件**", "**Invalidation conditions**"),
                     *[
                         f"- {item}"
                         for item in opportunity["invalidation_conditions"]
@@ -341,26 +413,19 @@ def _render_growth_opportunities(
             lines.extend(
                 [
                     "",
-                    (
-                        f"> Opportunity ID: `{opportunity.get('opportunity_id', '')}`"
-                        if english
-                        else f"> 机会 ID：`{opportunity.get('opportunity_id', '')}`"
+                    _locale_text(
+                        language,
+                        f"> 机会 ID：`{opportunity.get('opportunity_id', '')}`",
+                        f"> 機會 ID：`{opportunity.get('opportunity_id', '')}`",
+                        f"> Opportunity ID: `{opportunity.get('opportunity_id', '')}`",
                     ),
-                    (
-                        "> Supporting evidence IDs: "
-                        if english
-                        else "> 支持证据 ID："
-                    )
+                    _locale_text(language, "> 支持证据 ID：", "> 支援證據 ID：", "> Supporting evidence IDs: ")
                     + (
                         ", ".join(map(str, supporting))
                         if supporting
                         else "—"
                     ),
-                    (
-                        "> Contradicting evidence IDs: "
-                        if english
-                        else "> 相反证据 ID："
-                    )
+                    _locale_text(language, "> 相反证据 ID：", "> 相反證據 ID：", "> Contradicting evidence IDs: ")
                     + (
                         ", ".join(map(str, contradicting))
                         if contradicting
@@ -523,6 +588,99 @@ def render_research_run(
                     ),
                     "",
                 ])
+            coverage = quality.get("period_coverage") if isinstance(quality, dict) else None
+            if isinstance(coverage, dict):
+                available_years = [
+                    str(year) for year in coverage.get("displayed_annual_years", [])
+                    if year is not None
+                ]
+                hidden_years = [
+                    str(year) for year in coverage.get("hidden_comparator_years", [])
+                    if year is not None
+                ]
+                missing = coverage.get("missing_or_rejected_years", [])
+                missing_years = [
+                    str(item.get("year")) for item in missing
+                    if isinstance(item, dict) and item.get("year") is not None
+                ]
+                missing_reason_code = str(
+                    coverage.get("missing_reason_code") or ""
+                ).strip()
+                coverage_title = (
+                    "年度披露範圍" if traditional
+                    else "Annual disclosure coverage" if english
+                    else "年度披露范围"
+                )
+                coverage_lines = [f"## {coverage_title}", ""]
+                requested_range = coverage.get("requested_annual_range")
+                if isinstance(requested_range, (list, tuple)) and requested_range:
+                    coverage_lines.append(
+                        (
+                            "- 要求的年度範圍：" if traditional
+                            else "- Requested annual range: " if english
+                            else "- 要求的年度范围："
+                        ) + " – ".join(str(item) for item in requested_range)
+                    )
+                if available_years:
+                    coverage_lines.append(
+                        (
+                            "- 實際採用的年度：" if traditional
+                            else "- Annual years actually used: " if english
+                            else "- 实际采用的年度："
+                        ) + ", ".join(available_years)
+                    )
+                if hidden_years:
+                    coverage_lines.append(
+                        (
+                            "- 隱藏比較年度：" if traditional
+                            else "- Hidden comparator years: " if english
+                            else "- 隐藏比较年度："
+                        ) + ", ".join(hidden_years)
+                    )
+                latest_fy = coverage.get("latest_official_fy")
+                if latest_fy is not None:
+                    coverage_lines.append(
+                        (
+                            "- 最新有效官方財年：" if traditional
+                            else "- Latest available official FY: " if english
+                            else "- 最新有效官方财年："
+                        ) + str(latest_fy)
+                    )
+                interim = [str(item) for item in coverage.get("interim_periods", []) if item]
+                if interim:
+                    coverage_lines.append(
+                        (
+                            "- 中期期間（不替代完整財年）：" if traditional
+                            else "- Interim periods (not a substitute for FY): " if english
+                            else "- 中期期间（不替代完整财年）："
+                        ) + ", ".join(interim)
+                    )
+                if missing_reason_code or missing:
+                    localized_missing = (
+                        "截至研究日未取得有效官方年報"
+                        if traditional
+                        else "No valid official annual report was available as of the research date."
+                        if english
+                        else "截至研究日未获取到有效官方年报"
+                    )
+                    if missing_years:
+                        localized_missing += (
+                            ("（年度：" if traditional else " (years: " if english else "（年度：")
+                            + ", ".join(missing_years)
+                            + (")" if english else "）")
+                        )
+                    coverage_lines.append(
+                        "- " + localized_missing
+                    )
+                if coverage.get("research_as_of"):
+                    coverage_lines.append(
+                        (
+                            "- 研究截至：" if traditional
+                            else "- Research as of: " if english
+                            else "- 研究截至："
+                        ) + str(coverage["research_as_of"])
+                    )
+                lines.extend(coverage_lines + [""])
             snapshot = content.get("market_snapshot")
             if isinstance(snapshot, dict):
                 values: list[str] = []
@@ -679,6 +837,20 @@ def render_research_run(
                     ),
                     "",
                 ])
+            if content.get("mode") == "staged-fallback":
+                capacity_notice = staged_context_capacity_notice(content.get("report"), language)
+                if capacity_notice:
+                    lines.extend(
+                        [
+                            f"## {capacity_notice['title']}",
+                            "",
+                            f"> {capacity_notice['summary']}",
+                            f"> {capacity_notice['budget']}",
+                            f"> {capacity_notice['counting']}",
+                            f"> {capacity_notice['retry']}",
+                            "",
+                        ]
+                    )
             report = content.get("report", content)
             if isinstance(report, dict):
                 display_report = normalize_report_sections(report, language)
@@ -697,6 +869,7 @@ def render_research_run(
                             language,
                             include_technical=include_technical,
                             available_evidence=available_evidence,
+                            counts_projected=True,
                         )
                         if key == "growth_opportunities"
                         else _render_claims(
@@ -781,6 +954,7 @@ def render_research_run(
                     language,
                     include_technical=include_technical,
                     available_evidence=available_evidence,
+                    counts_projected=True,
                 ),
                 "",
             ]

@@ -8,7 +8,7 @@ page-wide regular-expression match.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from concurrent.futures import CancelledError, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, timedelta
 from io import BytesIO
@@ -27,7 +27,7 @@ import time
 import types
 
 
-_PDF_PARSER_VERSION = "financial-ingestion-ast-v5"
+_PDF_PARSER_VERSION = "financial-ingestion-ast-v6"
 _PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
 _PDF_CACHE_POLICY_VERSION = "parse-cache-v1"
 
@@ -44,6 +44,7 @@ _PDF_FLIGHT_LOCK = threading.Lock()
 _PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .disclosure_identity import DisclosureIdentityResolver, _date_tokens
 from .financial_compatibility import FinancialRulesSnapshot
 from .market_financials import FinancialValidation, ValidationStatus
 from .vision_financials import (
@@ -100,7 +101,12 @@ class InMemoryFinancialSource:
         failure = (self.failure_by_document or {}).get(filing.document_id)
         if failure:
             return [], [], failure
-        facts = list(self.facts_by_document.get(filing.document_id, ()))
+        facts = [
+            replace(fact, unit_provenance="structured_normalized")
+            if fact.unit_provenance == "unknown" and fact.concept != "reported_roe"
+            else fact
+            for fact in self.facts_by_document.get(filing.document_id, ())
+        ]
         refs = list((self.evidence_by_document or {}).get(filing.document_id, ()))
         return facts, refs, None if facts else "structured_source_empty"
 
@@ -154,6 +160,58 @@ class PdfTableContext:
     periods: tuple["_PeriodColumn", ...]
     last_page: int
     inherited_pages: int = 0
+    unit_provenance: str = "unknown"
+
+
+def _checkpoint_context_to_dict(context: PdfTableContext | None) -> dict[str, Any]:
+    if context is None:
+        return {}
+    return {
+        "statement": context.statement,
+        "scope": context.scope,
+        "multiplier": context.multiplier,
+        "currency": context.currency,
+        "unit_explicit": context.unit_explicit,
+        "periods": [
+            {
+                "year": item.year,
+                "center": item.center,
+                "left": item.left,
+                "right": item.right,
+                "currency": item.currency,
+                "unit_scale": item.unit_scale,
+                "header": item.header,
+            }
+            for item in context.periods
+        ],
+        "last_page": context.last_page,
+        "inherited_pages": context.inherited_pages,
+        "unit_provenance": context.unit_provenance,
+    }
+
+
+def _checkpoint_context_from_dict(value: dict[str, Any] | None) -> PdfTableContext | None:
+    if not isinstance(value, dict) or not value.get("statement"):
+        return None
+    try:
+        periods = tuple(
+            _PeriodColumn(
+                int(item["year"]), float(item["center"]), float(item["left"]),
+                float(item["right"]), str(item.get("currency", "")),
+                float(item.get("unit_scale", 1.0)),
+                str(item.get("header", "")),
+            )
+            for item in value.get("periods", ())
+        )
+        return PdfTableContext(
+            str(value["statement"]), str(value.get("scope", "consolidated")),
+            float(value.get("multiplier", 1.0)), str(value.get("currency", "")),
+            bool(value.get("unit_explicit", False)), periods,
+            int(value.get("last_page", 0)), int(value.get("inherited_pages", 0)),
+            str(value.get("unit_provenance", "unknown")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +241,39 @@ class FilingManifest:
     revision: str
     supersedes_document_id: str
     content_hash: str
+    # Discovery/provider identity is retained when a parser later promotes a
+    # provisional date from statement evidence.
+    original_period_end: str = ""
+    original_fiscal_period: str = ""
+    original_revision: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointPdfWindowWorker:
+    """Pickle-safe worker for the durable PDF-window scheduler."""
+
+    local_path: str
+    company: Company
+    filing: FilingDocument
+    manifest: FilingManifest
+    compatibility_rules: FinancialRulesSnapshot
+
+    def __call__(self, window: Any, initial_context: dict[str, Any] | None = None):
+        engine = FinancialIngestionEngine(
+            max_workers=1,
+            compatibility_rules=self.compatibility_rules,
+        )
+        facts, refs = engine._parse_pdf_ast(
+            self.local_path,
+            self.company,
+            self.filing,
+            self.manifest,
+            candidate_pages=frozenset(window.pages),
+            index_precomputed=True,
+            compatibility_rules=self.compatibility_rules,
+            initial_context=initial_context,
+        )
+        return facts, refs, _checkpoint_context_to_dict(engine._last_pdf_context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +303,7 @@ class FinancialProfile:
     reporting_currency: str
     status: ValidationStatus
     period_continuity: tuple[dict[str, Any], ...] = ()
+    period_coverage: dict[str, Any] = field(default_factory=dict)
 
 
 def build_financial_profile(
@@ -221,6 +313,8 @@ def build_financial_profile(
     *,
     selected_filings: Sequence[FilingDocument] = (),
     manifests: Sequence[FilingManifest] = (),
+    requested_annual_count: int | None = None,
+    research_as_of: str | None = None,
 ) -> FinancialProfile:
     """Build one trusted, period-aware profile without reimplementing gate logic.
 
@@ -303,6 +397,108 @@ def build_financial_profile(
         for row in period_continuity
         if row["status"] == "rejected"
     )
+    annual_rows = [
+        row for row in period_continuity
+        if str(row.get("fiscal_period", "")).upper() in {"", "FY", "CY", "ANNUAL"}
+    ]
+    annual_years = sorted({
+        int(str(row["period_end"])[:4])
+        for row in annual_rows
+        if str(row.get("period_end", ""))[:4].isdigit()
+        and row.get("status") == "accepted"
+    })
+    rejected_years = tuple(sorted({
+        int(str(row["period_end"])[:4])
+        for row in annual_rows
+        if str(row.get("period_end", ""))[:4].isdigit()
+        and row.get("status") in {"rejected", "no_facts"}
+    }))
+    all_comparator_years = sorted({
+        int(fact.fiscal_year) for fact in facts
+        if str(getattr(fact, "usage_status", "")).casefold() == "comparator"
+    })
+    interim_periods = sorted({
+        f"{fact.fiscal_year} {fact.fiscal_period}"
+        for fact in accepted
+        if str(fact.fiscal_period).upper() not in {"", "FY", "CY", "ANNUAL"}
+    })
+    requested_annual = [
+        filing for filing in selected_filings
+        if str(filing.fiscal_period or "").upper() in {"", "FY", "CY", "ANNUAL"}
+    ]
+    display_limit = (
+        max(1, int(requested_annual_count))
+        if requested_annual_count is not None and int(requested_annual_count) > 0
+        else 5
+    )
+    displayed_years = tuple(annual_years[-display_limit:])
+    latest_display_year = displayed_years[-1] if displayed_years else None
+    expected_years = (
+        tuple(range(latest_display_year - display_limit + 1, latest_display_year + 1))
+        if latest_display_year is not None
+        else ()
+    )
+    annual_end_by_year = {
+        int(str(row.get("period_end", ""))[:4]): str(row.get("period_end", ""))[:10]
+        for row in annual_rows
+        if str(row.get("period_end", ""))[:4].isdigit()
+        and int(str(row.get("period_end", ""))[:4]) in displayed_years
+    }
+    latest_period_end = annual_end_by_year.get(latest_display_year) if latest_display_year is not None else None
+    if latest_period_end and expected_years:
+        requested_range = (
+            f"{expected_years[0]}{latest_period_end[4:10]}",
+            latest_period_end,
+        )
+    else:
+        requested_ends = sorted(annual_end_by_year.values())
+        requested_range = (requested_ends[0], requested_ends[-1]) if requested_ends else None
+    hidden_comparator_years = sorted(
+        year for year in all_comparator_years if year not in displayed_years
+    )
+    research_dates = [
+        str(fact.filed_at) for fact in accepted if str(fact.filed_at)
+    ] + [str(filing.filed_at) for filing in selected_filings if str(filing.filed_at)]
+    rejected_status_by_year = {
+        int(str(row.get("period_end", ""))[:4]): str(row.get("status", ""))
+        for row in annual_rows
+        if str(row.get("period_end", ""))[:4].isdigit()
+    }
+    missing_or_rejected = tuple(
+        {
+            "year": year,
+            "status": (
+                "rejected" if rejected_status_by_year.get(year) == "rejected" else "missing"
+            ),
+            "reason_code": (
+                "OFFICIAL_ANNUAL_REJECTED"
+                if rejected_status_by_year.get(year) == "rejected"
+                else "OFFICIAL_ANNUAL_UNAVAILABLE"
+            ),
+        }
+        for year in expected_years
+        if year not in annual_years or rejected_status_by_year.get(year) == "rejected"
+    )
+    period_coverage = {
+        "requested_annual_count": (
+            int(requested_annual_count)
+            if requested_annual_count is not None
+            else len(requested_annual) if selected_filings else None
+        ),
+        "requested_annual_range": requested_range,
+        "available_annual_years": tuple(annual_years),
+        "displayed_annual_years": displayed_years,
+        "hidden_comparator_years": tuple(hidden_comparator_years),
+        "latest_official_fy": annual_years[-1] if annual_years else None,
+        "interim_periods": tuple(interim_periods),
+        "missing_or_rejected_years": missing_or_rejected,
+        "missing_reason_code": (
+            "OFFICIAL_ANNUAL_REJECTED"
+            if any(item["reason_code"] == "OFFICIAL_ANNUAL_REJECTED" for item in missing_or_rejected)
+            else "OFFICIAL_ANNUAL_UNAVAILABLE" if missing_or_rejected else None
+        ),
+        "research_as_of": research_as_of or (max(research_dates) if research_dates else None),
+    }
     statuses = {group.validation.status for group in groups}
     has_missing_periods = any(item["status"] == "no_facts" for item in period_continuity)
     status = (
@@ -322,6 +518,7 @@ def build_financial_profile(
         str(reporting_currency or (accepted[0].currency if accepted else "")),
         status,
         period_continuity,
+        period_coverage,
     )
 
 
@@ -386,7 +583,7 @@ _COVERAGE_WARNING_ISSUES = frozenset({
     "core_coverage_insufficient",
 })
 _STATEMENT_MARKERS = {
-    "balance_sheet": ("合并资产负债表", "资产负债表", "consolidated balance sheet", "consolidated balance sheets", "statement of financial position"),
+    "balance_sheet": ("合并资产负债表", "资产负债表", "consolidated balance sheet", "consolidated balance sheets", "consolidated statement of financial position", "statement of financial position"),
     "income_statement": ("合并利润表", "利润表", "consolidated income statement", "consolidated income statements", "statement of profit or loss"),
     "cash_flow": ("合并现金流量表", "现金流量表", "consolidated cash flow statement", "consolidated statement of cash flows", "consolidated statements of cash flows", "statement of cash flows"),
 }
@@ -438,6 +635,9 @@ def _scope_from_text(text: str, rules: FinancialRulesSnapshot | None = None) -> 
 def _manifest_for(filing: FilingDocument) -> FilingManifest | None:
     title = filing.primary_document or ""
     folded = title.casefold()
+    original_period_end = str(filing.period_end or "")
+    original_fiscal_period = str(filing.fiscal_period or "")
+    original_revision = str(filing.revision or "")
     # H1 must precede annual because some issuers use 年度报告 in a long title.
     if any(x in title for x in ("半年度报告", "中期报告")) or "interim report" in folded:
         period, form, end_suffix = "H1", "INTERIM_REPORT", "06-30"
@@ -462,10 +662,111 @@ def _manifest_for(filing: FilingDocument) -> FilingManifest | None:
     except (TypeError, ValueError):
         supplied_end = ""
     period_end = supplied_end or f"{year}-{end_suffix}"
+    identity = DisclosureIdentityResolver().resolve(
+        title=filing.primary_document,
+        filed_at=filing.filed_at,
+        provider_metadata={
+            "period_end": filing.period_end,
+            "fiscal_period": filing.fiscal_period,
+            "revision": filing.revision,
+        },
+    )
+    if identity.fiscal_period:
+        period = identity.fiscal_period
+    if identity.period_end and not identity.provisional:
+        period_end = identity.period_end
+    revision = identity.revision
+    # PRC A-share annual reports use the statutory calendar accounting year.
+    # When the official discovery record supplies 31 December for the same
+    # explicit report year in the title, those independent signals resolve the
+    # disclosure period before PDF/vision extraction starts.  Keep this rule
+    # market-scoped: HK/US and other non-calendar issuers must still prove their
+    # period from an explicit date in the source document.
+    title_year_match = re.search(
+        r"\b(20\d{2})\b|(?<!\d)(20\d{2})年", title,
+    )
+    title_year = (
+        next((group for group in title_year_match.groups() if group), "")
+        if title_year_match is not None else ""
+    )
+    filing_identity = str(filing.company_cik or "").upper()
+    calendar_year_a_share = (
+        identity.provisional
+        and period == "FY"
+        and supplied_end.endswith("-12-31")
+        and title_year == supplied_end[:4]
+        and (filing_identity == "CN_A" or filing_identity.startswith("CN_A:"))
+    )
+    if calendar_year_a_share:
+        period_end = supplied_end
+        # Revision describes the filing edition, not how period identity was
+        # established.  Do not make a normal annual report look amended.
+        revision = original_revision or identity.revision or "original"
+    elif identity.provisional:
+        period_end = ""
+        revision = "period_end_provisional"
+    supplied_filed = str(filing.filed_at or "")[:10]
+    supplied_period_end = str(filing.period_end or "")[:10]
+    if (
+        len(supplied_filed) == 10
+        and len(supplied_period_end) == 10
+        and supplied_period_end > supplied_filed
+    ):
+        # Discovery metadata can contain an announcement year or an
+        # unobserved 12/31 placeholder.  It is unsafe as a parser/compiler
+        # period until the statement itself supplies a date.
+        period_end = ""
+        revision = "period_end_provisional"
     return FilingManifest(
         filing.document_id, filing.accession_number, filing.source_url,
         filing.primary_document, form, period, period_end,
-        filing.revision, filing.supersedes_document_id, filing.content_hash,
+        revision, filing.supersedes_document_id, filing.content_hash,
+        original_period_end, original_fiscal_period, original_revision,
+    )
+
+
+def _manifest_from_observed_pages(
+    manifest: FilingManifest,
+    filing: FilingDocument,
+    page_texts: Sequence[str],
+) -> FilingManifest:
+    """Resolve a provisional metadata date from bounded statement page text.
+
+    Discovery is allowed to retain an annual-looking placeholder (for example
+    an H1 filing carrying ``12/31``).  The parser must not turn that placeholder
+    into a fact, but it can safely resolve it from dates observed on the
+    candidate pages.  Dates remain constrained by ``filed_at`` in the shared
+    resolver; absent a source-supported date the manifest stays provisional.
+    """
+    if manifest.period_end:
+        return manifest
+    observed: list[str] = []
+    for text in page_texts:
+        observed.extend(_date_tokens(text or ""))
+    if not observed:
+        return manifest
+    identity = DisclosureIdentityResolver().resolve(
+        title=filing.primary_document,
+        filed_at=filing.filed_at,
+        provider_metadata={
+            "period_end": "",
+            "fiscal_period": manifest.fiscal_period,
+            "revision": manifest.revision,
+        },
+        observed_statement_dates=tuple(observed),
+    )
+    if identity.period_end is None or identity.provisional:
+        return manifest
+    resolved_revision = (
+        "period_end_verified"
+        if manifest.revision == "period_end_provisional"
+        else manifest.revision
+    )
+    return replace(
+        manifest,
+        fiscal_period=identity.fiscal_period or manifest.fiscal_period,
+        period_end=identity.period_end,
+        revision=resolved_revision,
     )
 
 
@@ -666,7 +967,13 @@ def _period_start(manifest: FilingManifest) -> str | None:
     if manifest.fiscal_period == "FY":
         try:
             end = date.fromisoformat(manifest.period_end[:10])
-            previous = end.replace(year=end.year - 1)
+            try:
+                previous = end.replace(year=end.year - 1)
+            except ValueError:
+                # A leap-day year-end has no same-day predecessor; retaining
+                # the fiscal boundary at Feb 28 keeps the following period
+                # start deterministic rather than falling back to Jan 1.
+                previous = end.replace(year=end.year - 1, day=28)
             return (previous + timedelta(days=1)).isoformat()
         except ValueError:
             return f"{manifest.period_end[:4]}-01-01"
@@ -714,6 +1021,7 @@ class _PeriodColumn:
     right: float
     currency: str = ""
     unit_scale: float = 1.0
+    header: str = ""
 
 
 _ENGLISH_MONTHS = {
@@ -763,6 +1071,7 @@ def _period_columns(
     """Choose visual year columns before any one-year title/date row."""
     dual: list[tuple[int, float]] | None = None
     fallback: list[tuple[int, float]] | None = None
+    headers_by_year: dict[int, str] = {}
     all_text = " ".join(row.text for row in rows)
     global_scale, _ = _unit_scale(all_text, rules)
     unit_cells: list[tuple[float, str]] = []
@@ -780,10 +1089,13 @@ def _period_columns(
             effective_year = _effective_period_year(cell.text)
             if effective_year is not None:
                 by_year.setdefault(effective_year, (cell.x0 + cell.x1) / 2)
+                headers_by_year.setdefault(effective_year, cell.text.strip())
                 continue
             match = re.search(r"20\d{2}", cell.text)
             if match:
-                by_year.setdefault(int(match.group()), (cell.x0 + cell.x1) / 2)
+                year = int(match.group())
+                by_year.setdefault(year, (cell.x0 + cell.x1) / 2)
+                headers_by_year.setdefault(year, cell.text.strip())
         candidates = sorted(by_year.items(), key=lambda item: item[1])
         if len(candidates) >= 2 and dual is None:
             dual = candidates
@@ -888,6 +1200,7 @@ def _period_columns(
                 right,
                 currency,
                 global_scale if currency else 1.0,
+                headers_by_year.get(year, ""),
             )
         )
     return tuple(result)
@@ -1063,6 +1376,54 @@ def _continuation_compatible(context: PdfTableContext, rows: Sequence[PdfRowAST]
         return False
     for index in range(len(rows)):
         merged = _merge_visual_rows(rows, index, rules=rules)
+        if not any(_parse_number(cell.text) is not None for cell in merged.cells):
+            # Some statement renderers use a hanging indent for the final
+            # fragment of a wrapped label, so the ordinary same-column merge
+            # deliberately refuses it.  At the continuation gate, accept only
+            # a very small adjacent fragment when the combined label is a
+            # known financial concept and the fragment row itself carries a
+            # value in a known period column.  This admits split rows such as
+            # ``经营活动产生的现金流`` + ``量净额 <current> <prior>`` without
+            # turning narrative paragraphs or the next line item into a table
+            # continuation.
+            head = rows[index]
+            head_label = _row_label_text(head)
+            if head_label and not any(
+                _parse_number(cell.text) is not None for cell in head.cells
+            ):
+                for tail in rows[index + 1:index + 3]:
+                    if tail.top - head.bbox[3] > 6.5:
+                        break
+                    tail_label = _row_label_text(tail)
+                    if (
+                        not tail_label
+                        or len(tail_label) > 12
+                        or _known_label(tail_label, rules=rules)
+                    ):
+                        break
+                    joined = PdfRowAST(
+                        tuple((*head.cells, *tail.cells)),
+                        head.top,
+                        (
+                            min(head.bbox[0], tail.bbox[0]),
+                            min(head.bbox[1], tail.bbox[1]),
+                            max(head.bbox[2], tail.bbox[2]),
+                            max(head.bbox[3], tail.bbox[3]),
+                        ),
+                    )
+                    head_compact = _label_compact(head_label)
+                    combined_compact = _label_compact(_row_label_text(joined))
+                    extension_completes_label = any(
+                        _label_compact(label) in combined_compact
+                        and _label_compact(label) not in head_compact
+                        for labels in _labels_for_rules(rules).values()
+                        for label in labels
+                    )
+                    if extension_completes_label:
+                        merged = joined
+                        break
+                    if any(_parse_number(cell.text) is not None for cell in tail.cells):
+                        break
         if not _known_label(_row_label_text(merged), rules=rules):
             continue
         label_end = max(
@@ -1099,7 +1460,8 @@ def _page_sections(
     if _is_summary_page(page_text, rows_tuple, rules=rules):
         return (PdfPageSection(
             PdfTableContext("summary", "consolidated", scale, currency or default_currency,
-                            explicit, _period_columns(rows_tuple, default_currency, rules), page_number, 0),
+                            explicit, _period_columns(rows_tuple, default_currency, rules), page_number, 0,
+                            "explicit" if explicit else "unknown"),
             rows_tuple, True, False,
         ),)
 
@@ -1138,7 +1500,8 @@ def _page_sections(
                 sections.append(PdfPageSection(
                     PdfTableContext(previous.statement, previous.scope, previous.multiplier,
                                     previous.currency, previous.unit_explicit,
-                                    previous.periods, page_number, previous.inherited_pages + 1),
+                                    previous.periods, page_number, previous.inherited_pages + 1,
+                                    previous.unit_provenance),
                     prefix, False, True,
                 ))
         for position, (title_index, (statement, scope)) in enumerate(titles):
@@ -1163,12 +1526,16 @@ def _page_sections(
             if can_inherit_unit:
                 section_scale = previous.multiplier
                 section_currency = previous.currency or default_currency
+            section_unit_provenance = (
+                "inherited" if can_inherit_unit else "explicit" if explicit else "unknown"
+            )
             if not periods and previous and previous.statement == statement and previous.scope == scope:
                 periods = previous.periods
             sections.append(PdfPageSection(
                 PdfTableContext(statement, scope, section_scale, section_currency,
                                 explicit or can_inherit_unit, periods, page_number,
-                                previous.inherited_pages + 1 if can_inherit_unit else 0),
+                                previous.inherited_pages + 1 if can_inherit_unit else 0,
+                                section_unit_provenance),
                 section_rows, False, can_inherit_unit,
             ))
         return tuple(sections)
@@ -1183,10 +1550,11 @@ def _page_sections(
         inherited_scale = previous.multiplier if not explicit else scale
         inherited_currency = currency or previous.currency or default_currency
         inherited_periods = previous.periods or _period_columns(rows_tuple, default_currency, rules)
+        inherited_unit_provenance = "explicit" if explicit else "inherited"
         return (PdfPageSection(
             PdfTableContext(previous.statement, previous.scope, inherited_scale, inherited_currency,
                             previous.unit_explicit or explicit, inherited_periods, page_number,
-                            previous.inherited_pages + 1),
+                            previous.inherited_pages + 1, inherited_unit_provenance),
             rows_tuple, False, True,
         ),)
     return ()
@@ -1509,10 +1877,12 @@ def _vision_failed_pages(
             "separate financial", "separate statement", "separate accounts",
             "母公司", "单体", "个别财务报表", "个别报表",
         )
+        page_texts = [(page.extract_text() or "") for page in reader.pages]
+        mapped_statements = _toc_statement_page_map(page_texts)
         formal_starts: list[tuple[int, str, bool]] = []
-        for index, page in enumerate(reader.pages):
+        for index, page_text in enumerate(page_texts):
             found: tuple[str, bool] | None = None
-            lines = (page.extract_text() or "").splitlines()
+            lines = page_text.splitlines()
             for line_index, line in enumerate(lines):
                 normalized = re.sub(r"\s+", " ", line).strip().casefold()
                 statement = next(
@@ -1534,20 +1904,25 @@ def _vision_failed_pages(
                 break
             if found is not None:
                 formal_starts.append((index, found[0], found[1]))
-        starts: list[int] = [
-            index for index, statement, eligible in formal_starts
-            if statement in target and eligible
+        chosen: list[int] = [
+            page_number - 1
+            for statement in sorted(target)
+            for page_number in mapped_statements.get(statement, ())
         ]
-        chosen: list[int] = []
-        for start in starts:
-            for offset in range(3):
-                page_index = start + offset
-                if page_index >= len(reader.pages) or (
-                    offset and any(other > start and other <= page_index for other, _, _ in formal_starts)
-                ):
-                    break
-                if page_index not in chosen:
-                    chosen.append(page_index)
+        if not mapped_statements:
+            starts: list[int] = [
+                index for index, statement, eligible in formal_starts
+                if statement in target and eligible
+            ]
+            for start in starts:
+                for offset in range(3):
+                    page_index = start + offset
+                    if page_index >= len(reader.pages) or (
+                        offset and any(other > start and other <= page_index for other, _, _ in formal_starts)
+                    ):
+                        break
+                    if page_index not in chosen:
+                        chosen.append(page_index)
         selected: list[VisionPageRequest] = []
         total = 0
         for index in sorted(chosen):
@@ -1775,6 +2150,45 @@ def _parse_local_pdfs_bounded(
         }
 
     if process_isolated:
+        if engine._checkpoint_dir is not None and not hash_mismatches:
+            # Opt-in durable window recovery.  The default process scheduler
+            # remains unchanged; callers that provide a checkpoint directory
+            # get an ordered checkpoint boundary before compiler validation.
+            for item in uncached:
+                key, filing, manifest = item
+                try:
+                    facts, refs, window_diagnostics = engine.parse_local_pdf_resumable(
+                        company, filing, manifest,
+                        cancel_check=cancel_check,
+                        progress=(
+                            lambda current, total, status, filing=filing:
+                            _emit_ingestion_progress(
+                                progress, "filing-window", current, total, filing,
+                                status=status,
+                            )
+                        ) if progress is not None else None,
+                    )
+                    error = window_diagnostics[0] if window_diagnostics else None
+                except Exception as exc:
+                    facts, refs, error = [], [], f"pdf_window_failed:{type(exc).__name__}"
+                results[key] = (facts, refs, error or pre_errors.get(key))
+                if error is None and facts and refs:
+                    cache_key = cache_keys.get(key)
+                    if cache_key:
+                        engine._store_parse_cache(cache_key, facts, refs)
+                _emit_ingestion_progress(
+                    progress, "filing-parse", completed + 1, total, filing,
+                    status="failed" if error else "parsed", error_code=error or "",
+                )
+            _resolve_pdf_parse_flights(
+                flight_owners, flight_waiters, cache_keys, results, parse_timeout_seconds
+            )
+            return {
+                document_id: results[key]
+                for key, document_ids in duplicate_ids.items()
+                if key in results
+                for document_id in document_ids
+            }
         try:
             _parse_local_pdfs_isolated(
                 engine,
@@ -1938,12 +2352,15 @@ def _parse_pdf_process_worker_entry(
 
     try:
         index_error = None
+        index_diagnostic = None
         try:
-            indexed_pages = _candidate_financial_pages(filing.local_path, rules=rules)
+            indexed_pages, index_diagnostic = _candidate_financial_pages_with_diagnostic(
+                filing.local_path, rules=rules
+            )
         except Exception as exc:
             indexed_pages = None
             index_error = f"pdf_index_failed:{type(exc).__name__}"
-        result_queue.put(("filing-index", key, indexed_pages, index_error))
+        result_queue.put(("filing-index", key, indexed_pages, index_error, index_diagnostic))
         # A partial index is deliberately represented by None; the AST parser
         # then fails open to its full-document path for correctness.
         result_queue.put(("filing-result", _parse_pdf_process_worker(
@@ -2071,6 +2488,7 @@ def _parse_local_pdfs_isolated(
                 "deadline": time.monotonic() + timeout,
                 "item": item,
                 "indexed": False,
+                "index_diagnostic": None,
                 "started_at": time.monotonic(),
             }
             _emit_ingestion_progress(
@@ -2087,6 +2505,9 @@ def _parse_local_pdfs_isolated(
         finally:
             _close_pdf_result_queue(result_queue)
         _result_key, facts, refs, error = result
+        index_diagnostic = state.get("index_diagnostic")
+        if index_diagnostic:
+            error = f"{error};{index_diagnostic}" if error else index_diagnostic
         error = pre_errors.get(key) or error
         results[key] = (list(facts), list(refs), error)
         parsed += 1
@@ -2160,6 +2581,8 @@ def _parse_local_pdfs_isolated(
                     if kind == "filing-index":
                         if not state["indexed"]:
                             state["indexed"] = True
+                            if len(message) > 4 and message[4]:
+                                state["index_diagnostic"] = str(message[4])
                             indexed += 1
                             filing = state["item"][1]
                             _emit_ingestion_progress(
@@ -2277,11 +2700,102 @@ def _safe_pdf_worker_count(
     return bounded
 
 
+def _toc_statement_page_map(
+    page_texts: Sequence[str],
+    *,
+    rules: FinancialRulesSnapshot | None = None,
+) -> dict[str, tuple[int, ...]]:
+    """Resolve audited-statement print ranges to one-based PDF pages.
+
+    Image-only statements have no searchable title.  Some audited reports do,
+    however, provide an exact contents page followed by an audit report whose
+    printed page number establishes a stable offset.  We use that mapping only
+    when all three consolidated statements are present, the audit anchor is
+    independently confirmed on a nearby physical page, and every range is
+    small and inside the document.  This keeps scanned primary statements
+    eligible for vision fallback without admitting arbitrary blank pages.
+    """
+
+    page_count = len(page_texts)
+    range_pattern = re.compile(r"(\d{1,3})(?:\s*[-\u2013\u2014]\s*(\d{1,3}))?\s*$")
+    for toc_index, text in enumerate(page_texts):
+        compact = re.sub(r"\s+", "", text).casefold()
+        if not (
+            ("目录" in compact or "contents" in compact)
+            and ("页次" in compact or "pageno" in compact or "page" in compact)
+            and ("审计报告" in compact or "auditor" in compact)
+        ):
+            continue
+        print_ranges: dict[str, tuple[int, int]] = {}
+        audit_start: int | None = None
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            match = range_pattern.search(line)
+            if match is None:
+                continue
+            start = int(match.group(1))
+            end = int(match.group(2) or match.group(1))
+            if start < 1 or end < start or end - start > 8:
+                continue
+            label = line[:match.start()].strip()
+            folded = re.sub(r"\s+", "", label).casefold()
+            if "审计报告" in folded or "auditor" in folded:
+                audit_start = start
+                continue
+            context = _statement_context(label, rules)
+            if context is not None and context[1] == "consolidated":
+                print_ranges[context[0]] = (start, end)
+        if audit_start is None or set(print_ranges) != {
+            "income_statement", "balance_sheet", "cash_flow"
+        }:
+            continue
+
+        # The first nearby audit-report page must expose the same printed page
+        # number near its header; a TOC alone is not enough to establish an
+        # offset because annual-report and embedded-report numbering differ.
+        audit_physical: int | None = None
+        upper = min(page_count, toc_index + 13)
+        for physical_index in range(toc_index + 1, upper):
+            lines = [
+                re.sub(r"\s+", " ", item).strip()
+                for item in page_texts[physical_index].splitlines()
+                if item.strip()
+            ]
+            header = " ".join(lines[:8]).casefold()
+            printed_numbers = {
+                int(item) for item in lines[:4] if re.fullmatch(r"\d{1,3}", item)
+            }
+            if (
+                audit_start in printed_numbers
+                and ("审计报告" in header or "auditor" in header)
+            ):
+                audit_physical = physical_index + 1
+                break
+        if audit_physical is None:
+            continue
+        offset = audit_physical - audit_start
+        mapped: dict[str, tuple[int, ...]] = {}
+        for statement, (start, end) in print_ranges.items():
+            physical_pages = tuple(offset + number for number in range(start, end + 1))
+            if (
+                not physical_pages
+                or physical_pages[0] <= toc_index + 1
+                or physical_pages[-1] > page_count
+            ):
+                mapped = {}
+                break
+            mapped[statement] = physical_pages
+        if set(mapped) == {"income_statement", "balance_sheet", "cash_flow"}:
+            return mapped
+    return {}
+
+
 def _candidate_pages_from_text(
     page_texts: Sequence[str], *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
 ) -> frozenset[int] | None:
     """Convert one page-index text stream into the bounded candidate set."""
 
+    mapped_statements = _toc_statement_page_map(page_texts, rules=rules)
     starts: list[int] = []
     summary_pages: set[int] = set()
     statement_kinds: set[str] = set()
@@ -2301,7 +2815,8 @@ def _candidate_pages_from_text(
     # A partial index is unsafe: missing one statement can make the coordinate
     # parser report an apparently valid but incomplete filing. Returning None
     # deliberately fails open to the full-document parser.
-    if not starts or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
+    statement_kinds.update(mapped_statements)
+    if (not starts and not mapped_statements) or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
         return None
     selected: set[int] = set()
     page_count = len(page_texts)
@@ -2309,6 +2824,8 @@ def _candidate_pages_from_text(
         selected.update(
             range(start, min(page_count, start + max(0, continuation_pages)) + 1)
         )
+    for pages in mapped_statements.values():
+        selected.update(pages)
     selected.update(summary_pages)
     return frozenset(selected)
 
@@ -2325,8 +2842,9 @@ def _close_pdf_resource(resource: Any) -> None:
 
 
 def _candidate_financial_pages_pypdfium(
-    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
-) -> frozenset[int] | None:
+    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None,
+    return_diagnostics: bool = False,
+) -> frozenset[int] | tuple[frozenset[int] | None, str | None] | None:
     """Index page text through PDFium, closing page/text/document resources."""
 
     import pypdfium2 as pdfium
@@ -2346,19 +2864,89 @@ def _candidate_financial_pages_pypdfium(
                 _close_pdf_resource(page)
     finally:
         _close_pdf_resource(document)
-    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
+    indexed = _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
+    if return_diagnostics:
+        return indexed, _scanned_image_diagnostic(page_texts, rules=rules)
+    return indexed
 
 
 def _candidate_financial_pages_pypdf(
-    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
-) -> frozenset[int] | None:
+    path: str, *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None,
+    return_diagnostics: bool = False,
+) -> frozenset[int] | tuple[frozenset[int] | None, str | None] | None:
     """Compatibility indexer used when PDFium is unavailable or incomplete."""
 
     from pypdf import PdfReader
 
     reader = PdfReader(path)
     page_texts = [(page.extract_text() or "") for page in reader.pages]
-    return _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
+    indexed = _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
+    if return_diagnostics:
+        return indexed, _scanned_image_diagnostic(page_texts, rules=rules)
+    return indexed
+
+
+def _scanned_image_diagnostic(
+    page_texts: Sequence[str], *, rules: FinancialRulesSnapshot | None = None
+) -> str | None:
+    """Classify only clearly image-backed statement candidates.
+
+    An all-empty document with no independently anchored contents ranges is
+    deliberately unresolved.  It is not treated as a missing disclosure, and
+    no upload is authorized by this diagnostic alone.
+    """
+    if not page_texts:
+        return None
+    mapped = _toc_statement_page_map(page_texts, rules=rules)
+    if set(mapped) == {"income_statement", "balance_sheet", "cash_flow"}:
+        mapped_pages = {
+            page for pages in mapped.values() for page in pages
+        }
+        if mapped_pages and all(
+            not str(page_texts[page - 1] or "").strip()
+            for page in mapped_pages
+            if 0 < page <= len(page_texts)
+        ):
+            return "SCANNED_IMAGE_FILING_DETECTED"
+        return None
+    # Only an entirely textless document is eligible for the unresolved
+    # diagnostic.  Blank separator pages in an otherwise textual report do not
+    # become false scanned-filing alerts.
+    if not any(str(text or "").strip() for text in page_texts):
+        return "SCANNED_IMAGE_LAYOUT_UNRESOLVED"
+    return None
+
+
+def _candidate_financial_pages_with_diagnostic(
+    path: str, *, continuation_pages: int = 3,
+    rules: FinancialRulesSnapshot | None = None,
+) -> tuple[frozenset[int] | None, str | None]:
+    """Return the normal index plus a non-authorizing scan diagnostic."""
+    try:
+        indexed = _candidate_financial_pages_pypdfium(
+            path, continuation_pages=continuation_pages, rules=rules,
+            return_diagnostics=True,
+        )
+        if isinstance(indexed, tuple):
+            if indexed[0] is not None:
+                return indexed
+            # An incomplete PDFium text layer may still carry the useful scan
+            # classification; pypdf gets one compatibility attempt below.
+            pdfium_diagnostic = indexed[1]
+        else:
+            pdfium_diagnostic = None
+    except Exception:
+        pdfium_diagnostic = None
+    try:
+        indexed = _candidate_financial_pages_pypdf(
+            path, continuation_pages=continuation_pages, rules=rules,
+            return_diagnostics=True,
+        )
+        if isinstance(indexed, tuple):
+            return indexed[0], indexed[1] or pdfium_diagnostic
+        return indexed, pdfium_diagnostic
+    except Exception:
+        return None, pdfium_diagnostic
 
 
 def _candidate_financial_pages(path: str, *, continuation_pages: int = 3, rules: FinancialRulesSnapshot | None = None) -> frozenset[int] | None:
@@ -2370,20 +2958,31 @@ def _candidate_financial_pages(path: str, *, continuation_pages: int = 3, rules:
     continuation window and standalone ROE summary-page semantics.
     """
 
+    return _candidate_financial_pages_with_diagnostic(
+        path, continuation_pages=continuation_pages, rules=rules
+    )[0]
+
+
+def _pdf_page_count(path: str) -> int | None:
+    """Read only the document page count without extracting page text."""
+
     try:
-        indexed = _candidate_financial_pages_pypdfium(
-            path, continuation_pages=continuation_pages, rules=rules
-        )
-        if indexed is not None:
-            return indexed
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(path)
+        try:
+            return len(document)
+        finally:
+            close = getattr(document, "close", None)
+            if callable(close):
+                close()
     except Exception:
-        pass
-    try:
-        return _candidate_financial_pages_pypdf(
-            path, continuation_pages=continuation_pages, rules=rules
-        )
-    except Exception:
-        return None
+        try:
+            from pypdf import PdfReader
+
+            return len(PdfReader(path, strict=False).pages)
+        except Exception:
+            return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2394,6 +2993,65 @@ class FinancialCandidateCollection:
     batches_by_document: dict[str, tuple[Any, ...]]
     evidence: tuple[EvidenceRef, ...] = ()
     diagnostics: tuple[str, ...] = ()
+
+
+def _pdf_evidence_id_for_fact(fact_id: str) -> str | None:
+    """Return the explicit AST fact/evidence association, if one exists.
+
+    The AST intentionally prefixes fact identifiers with ``ingest:`` while
+    evidence identifiers use ``fact:``.  Keeping this relation in one named
+    seam avoids the old positional zip and avoids treating arbitrary strings
+    as evidence identifiers.
+    """
+    if fact_id.startswith("ingest:") and len(fact_id) > len("ingest:"):
+        return "fact:" + fact_id[len("ingest:"):]
+    return None
+
+
+def _shift_period_year(value: str | None, target_year: int) -> str | None:
+    """Shift a source-supported period boundary without changing its shape.
+
+    Comparative columns must use the filing's actual fiscal boundaries.  In
+    particular, a March year-end cannot be rewritten as a calendar-year
+    January start, and February 29 needs a deterministic non-leap fallback.
+    """
+    if not value or len(str(value)[:10]) < 10:
+        return None
+    try:
+        current = date.fromisoformat(str(value)[:10])
+        try:
+            shifted = current.replace(year=int(target_year))
+        except ValueError:
+            shifted = current.replace(year=int(target_year), day=28)
+        return shifted.isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _pair_pdf_facts_evidence(
+    facts: Sequence[FinancialFact], refs: Sequence[EvidenceRef],
+) -> tuple[tuple[tuple[FinancialFact, EvidenceRef], ...], tuple[str, ...]]:
+    """Pair AST facts with exactly one explicit evidence reference.
+
+    Missing or duplicate references are diagnostic-only and are deliberately
+    excluded from candidate provenance; an unpaired fact must never look
+    accepted merely because it happened to occupy the same list position.
+    """
+    refs_by_id: dict[str, list[EvidenceRef]] = {}
+    for ref in refs:
+        refs_by_id.setdefault(ref.evidence_id, []).append(ref)
+    paired: list[tuple[FinancialFact, EvidenceRef]] = []
+    diagnostics: list[str] = []
+    for fact in facts:
+        expected_id = _pdf_evidence_id_for_fact(fact.fact_id)
+        matches = refs_by_id.get(expected_id, []) if expected_id else []
+        if len(matches) == 1:
+            paired.append((fact, matches[0]))
+        elif len(matches) > 1:
+            diagnostics.append(f"pdf_evidence_ambiguous:{fact.fact_id}")
+        else:
+            diagnostics.append(f"pdf_evidence_missing:{fact.fact_id}")
+    return tuple(paired), tuple(diagnostics)
 
 
 class FinancialIngestionEngine:
@@ -2407,6 +3065,7 @@ class FinancialIngestionEngine:
         parse_timeout_seconds: float = 120.0,
         batch_timeout_seconds: float = 280.0,
         compatibility_rules: FinancialRulesSnapshot | None = None,
+        checkpoint_dir: str | Path | None = None,
     ) -> None:
         # The cache is deliberately optional so fixture/injected engines keep
         # their historical behavior. Production supplies a workspace-owned
@@ -2417,6 +3076,8 @@ class FinancialIngestionEngine:
         self._parse_timeout_seconds = max(0.1, float(parse_timeout_seconds))
         self._batch_timeout_seconds = max(0.1, min(280.0, float(batch_timeout_seconds)))
         self._compatibility_rules = compatibility_rules or FinancialRulesSnapshot.empty()
+        self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
+        self._last_pdf_context: PdfTableContext | None = None
 
     def with_compatibility_rules(
         self, rules: FinancialRulesSnapshot | None
@@ -2436,6 +3097,7 @@ class FinancialIngestionEngine:
             parse_timeout_seconds=self._parse_timeout_seconds,
             batch_timeout_seconds=self._batch_timeout_seconds,
             compatibility_rules=selected,
+            checkpoint_dir=self._checkpoint_dir,
         )
 
     @staticmethod
@@ -2539,6 +3201,116 @@ class FinancialIngestionEngine:
                 except OSError:
                     pass
 
+    def parse_local_pdf_resumable(
+        self,
+        company: Company,
+        filing: FilingDocument,
+        manifest: FilingManifest,
+        *,
+        candidate_pages: frozenset[int] | None = None,
+        window_size: int = 8,
+        cancel_check: Callable[[], bool] | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> tuple[list[FinancialFact], list[EvidenceRef], tuple[str, ...]]:
+        """Parse candidate pages through durable, content-addressed windows.
+
+        This is an opt-in recovery seam.  The ordinary isolated scheduler
+        remains the default and supplies hard process termination; callers
+        enabling ``checkpoint_dir`` gain per-window restart/resume without
+        changing compiler acceptance semantics.
+        """
+
+        from .financial_checkpoint import (
+            CheckpointKey,
+            WindowCheckpointStore,
+            plan_page_windows,
+            run_checkpointed_windows,
+        )
+
+        if not filing.local_path or not Path(filing.local_path).is_file():
+            return [], [], ("pdf_file_missing",)
+        try:
+            actual_hash = self._file_sha256(filing.local_path)
+        except OSError:
+            return [], [], ("pdf_file_unreadable",)
+        page_count = _pdf_page_count(filing.local_path)
+        selected_pages = candidate_pages
+        if selected_pages is None:
+            indexed_pages = _candidate_financial_pages(
+                filing.local_path, rules=self._compatibility_rules
+            )
+            if indexed_pages is None:
+                # ``None`` means the inexpensive index could not establish a
+                # complete statement-page map.  Fail open to the real document
+                # page range; silently treating this as an empty result loses
+                # every fact in reports whose text layer is incomplete.
+                if not page_count or page_count < 1:
+                    return [], [], ("pdf_candidate_pages_unavailable",)
+                selected_pages = frozenset(range(1, page_count + 1))
+            else:
+                selected_pages = indexed_pages
+        if not selected_pages:
+            return [], [], ("pdf_candidate_pages_unavailable",)
+        pages = frozenset(int(page) for page in selected_pages if int(page) > 0)
+        page_count = page_count or max(pages)
+        windows = plan_page_windows(page_count, pages, window_size=window_size)
+        store = WindowCheckpointStore(
+            self._checkpoint_dir or (Path(filing.local_path).parent / ".checkpoints")
+        )
+        key = CheckpointKey(
+            actual_hash,
+            _PDF_PARSER_VERSION,
+            self._compatibility_rules.semantic_fingerprint(),
+            identity_digest=hashlib.sha256(
+                "|".join(
+                    (
+                        company.security_id,
+                        company.market,
+                        company.reporting_currency,
+                        manifest.accession_number,
+                        manifest.period_end,
+                        manifest.fiscal_period,
+                        manifest.revision,
+                        manifest.source_url,
+                    )
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+        worker = _CheckpointPdfWindowWorker(
+            filing.local_path,
+            company,
+            filing,
+            manifest,
+            self._compatibility_rules,
+        )
+
+        checkpoints = run_checkpointed_windows(
+            store,
+            key,
+            windows,
+            worker,
+            max_retries=1,
+            cancel_check=cancel_check,
+            progress=progress,
+            timeout_seconds=self._parse_timeout_seconds,
+        )
+        facts: dict[str, FinancialFact] = {}
+        refs: dict[str, EvidenceRef] = {}
+        for checkpoint in checkpoints:
+            for fact in checkpoint.facts:
+                facts.setdefault(fact.fact_id, fact)
+            for ref in checkpoint.evidence:
+                refs.setdefault(ref.evidence_id, ref)
+        diagnostics = (
+            () if len(checkpoints) == len(windows) else ("pdf_window_incomplete",)
+        )
+        return (
+            sorted(facts.values(), key=lambda fact: (fact.source_page or 0, fact.fact_id)),
+            sorted(refs.values(), key=lambda ref: ref.evidence_id),
+            diagnostics,
+        )
+
     def collect_candidate_batches(
         self,
         company: Company,
@@ -2609,6 +3381,8 @@ class FinancialIngestionEngine:
                     fact.fact_id: ref for fact, ref in zip(sfacts, srefs)
                 }
                 for fact in sfacts:
+                    if fact.unit_provenance == "unknown" and fact.concept != "reported_roe":
+                        fact = replace(fact, unit_provenance="structured_normalized")
                     refs = (ref_by_fact[fact.fact_id],) if fact.fact_id in ref_by_fact else ()
                     structured_candidates.append(
                         FactCandidate(fact, refs, f"structured:{type(adapter).__name__}")
@@ -2624,15 +3398,57 @@ class FinancialIngestionEngine:
             )
             if pdf_error:
                 diagnostics.append(f"{filing.document_id}:{pdf_error}")
+            paired_pdf, pairing_diagnostics = _pair_pdf_facts_evidence(
+                pdf_facts, pdf_refs,
+            )
+            diagnostics.extend(
+                f"{filing.document_id}:{item}" for item in pairing_diagnostics
+            )
             pdf_candidates = tuple(
                 FactCandidate(
                     fact,
-                    ((ref,) if ref is not None else ()),
+                    (ref,),
                     "financial-ingestion-ast",
                 )
-                for fact, ref in zip(pdf_facts, pdf_refs)
+                for fact, ref in paired_pdf
             )
             pdf_batch = CandidateBatch(filing, pdf_candidates, tuple(pdf_refs))
+            # A provisional discovery identity is only an expected date.  Once
+            # an extractor supplies a source-supported statement date, promote
+            # the canonical filing/manifest together so the compiler does not
+            # reject the otherwise valid cohort merely because discovery had a
+            # placeholder (for example H1 with 12/31 metadata).
+            if not filing.period_end:
+                observed_dates = [
+                    candidate.fact.end_date
+                    for candidate in (*structured_candidates, *pdf_candidates)
+                    if candidate.fact.end_date
+                    and (candidate.fact.fiscal_period or filing.fiscal_period).upper()
+                    == (filing.fiscal_period or "FY").upper()
+                ]
+                observed_identity = DisclosureIdentityResolver().resolve(
+                    title=filing.primary_document,
+                    filed_at=filing.filed_at,
+                    provider_metadata={
+                        "period_end": "",
+                        "fiscal_period": filing.fiscal_period,
+                        "revision": "period_end_provisional",
+                    },
+                    observed_statement_dates=tuple(observed_dates),
+                )
+                if observed_identity.period_end and not observed_identity.provisional:
+                    filing.period_end = observed_identity.period_end
+                    filing.revision = "period_end_verified"
+                    resolved_manifest = replace(
+                        manifest_by_document[filing.document_id],
+                        period_end=filing.period_end,
+                        revision=filing.revision,
+                    )
+                    manifest_by_document[filing.document_id] = resolved_manifest
+                    manifests = [
+                        resolved_manifest if item.document_id == filing.document_id else item
+                        for item in manifests
+                    ]
             batches[filing.document_id] = (structured_batch, pdf_batch)
             all_evidence.extend(structured_refs)
             all_evidence.extend(pdf_refs)
@@ -2668,12 +3484,26 @@ class FinancialIngestionEngine:
         issues = list(compiled.diagnostics)
         for item in compiled.validations:
             issues.extend(item.issues)
+        # ``allow_ai`` describes the selected research cohort only.  The
+        # compatibility projection still exposes audit failures from other
+        # cohorts as warnings, so callers cannot mistake a partially
+        # quarantined ingestion for an entirely verified dataset.
+        has_rejected_group = any(
+            getattr(item.validation.status, "value", item.validation.status)
+            == ValidationStatus.REJECTED.value
+            for item in compiled.group_validations
+        )
+        has_warning_group = any(
+            getattr(item.validation.status, "value", item.validation.status)
+            == ValidationStatus.READY_WITH_WARNINGS.value
+            for item in compiled.group_validations
+        )
         status = (
-            ValidationStatus.VERIFIED
-            if compiled.allow_ai
+            ValidationStatus.REJECTED
+            if not compiled.resolved_facts
             else ValidationStatus.READY_WITH_WARNINGS
-            if compiled.resolved_facts
-            else ValidationStatus.REJECTED
+            if has_rejected_group or has_warning_group or not compiled.allow_ai
+            else ValidationStatus.VERIFIED
         )
         validation = FinancialValidation(
             status,
@@ -2801,6 +3631,14 @@ class FinancialIngestionEngine:
             ref = (evidence_map or {}).get(fact.fact_id)
             if fact.parser_version.startswith("financial-ingestion-ast") and (ref is None or ref.bbox is None):
                 issues.append("pdf_evidence_bbox_missing")
+            if (
+                fact.parser_version.startswith("financial-ingestion-ast")
+                and
+                fact.concept in required
+                and fact.concept not in {"reported_roe"}
+                and fact.unit_provenance == "unknown"
+            ):
+                issues.append("unit_provenance_missing")
             if fact.parser_version.startswith("vision-"):
                 if ref is None or not ref.content_hash or not ref.locator.startswith("page:") or str(fact.source_page or 0) != ref.locator.split(":", 1)[1] or ref.evidence_id != f"fact:{fact.fact_id}":
                     issues.append("vision_evidence_provenance_missing")
@@ -2847,16 +3685,30 @@ class FinancialIngestionEngine:
         candidate_pages: frozenset[int] | None = None,
         index_precomputed: bool = False,
         compatibility_rules: FinancialRulesSnapshot | None = None,
+        initial_context: dict[str, Any] | None = None,
     ):
         import pdfplumber
 
         facts: list[FinancialFact] = []
         refs: list[EvidenceRef] = []
-        previous: PdfTableContext | None = None
+        previous: PdfTableContext | None = _checkpoint_context_from_dict(initial_context)
+        self._last_pdf_context = previous
         rules = compatibility_rules or self._compatibility_rules
         if not index_precomputed:
             candidate_pages = _candidate_financial_pages(path, rules=rules)
         with pdfplumber.open(path) as pdf:
+            if not manifest.period_end:
+                observed_pages = []
+                for page_number, page in enumerate(pdf.pages, 1):
+                    if candidate_pages is not None and page_number not in candidate_pages:
+                        continue
+                    try:
+                        observed_pages.append(page.extract_text() or "")
+                    except Exception:
+                        observed_pages.append("")
+                manifest = _manifest_from_observed_pages(manifest, filing, observed_pages)
+                if not manifest.period_end:
+                    return [], []
             for page_number, page in enumerate(pdf.pages, 1):
                 if candidate_pages is not None and page_number not in candidate_pages:
                     continue
@@ -3078,6 +3930,13 @@ class FinancialIngestionEngine:
                                 if selected_column is not None and selected_column.currency
                                 else table_currency
                             )
+                            fact_unit_provenance = section.context.unit_provenance
+                            if (
+                                fact_unit_provenance == "unknown"
+                                and selected_column is not None
+                                and selected_column.currency
+                            ):
+                                fact_unit_provenance = "explicit"
                             value = float(parsed) * (1.0 if concept == "reported_roe" else fact_multiplier)
                             if concept == "reported_roe" and abs(value) > 1:
                                 value /= 100.0
@@ -3097,10 +3956,12 @@ class FinancialIngestionEngine:
                                 statement=statement, period_start=period_start,
                                 consolidated_scope=scope, currency=fact_currency or company.reporting_currency,
                                 unit_scale=1.0 if concept == "reported_roe" else fact_multiplier,
+                                unit_provenance=fact_unit_provenance,
                                 revision=manifest.revision,
-                                source_document=manifest.primary_document, source_page=page_number,
-                                source_bbox=merged_row.bbox,
-                                raw_text=merged_row.text, parser_version=_PDF_PARSER_VERSION,
+                                 source_document=manifest.primary_document, source_page=page_number,
+                                 source_bbox=merged_row.bbox,
+                                 source_column=(selected_column.header if selected_column is not None else ""),
+                                 raw_text=merged_row.text, parser_version=_PDF_PARSER_VERSION,
                                 validation_status=ValidationStatus.READY_WITH_WARNINGS.value,
                             )
                             ref = EvidenceRef(
@@ -3110,7 +3971,13 @@ class FinancialIngestionEngine:
                                 filing.content_hash, merged_row.bbox,
                             )
                             existing_index = next(
-                                (index for index, existing in enumerate(facts) if existing.concept == concept),
+                                (
+                                    index for index, existing in enumerate(facts)
+                                    if existing.concept == concept
+                                    and existing.fiscal_year == fact.fiscal_year
+                                    and existing.end_date == fact.end_date
+                                    and existing.usage_status == fact.usage_status
+                                ),
                                 None,
                             )
                             if existing_index is None:
@@ -3164,6 +4031,97 @@ class FinancialIngestionEngine:
                                     if abs(fact.value - target) < abs(existing.value - target):
                                         facts[existing_index] = fact
                                         refs[existing_index] = ref
+
+                            # Keep an issuer-provided comparison column as an
+                            # auditable hidden fact.  It belongs to the same
+                            # filing but has its own period and explicit
+                            # comparator usage, so it cannot replace the
+                            # current-period fact or masquerade as another
+                            # filing.  Only a like-for-like visual column is
+                            # eligible; ambiguous headers simply produce no
+                            # comparator candidate.
+                            if not summary_page and len(columns) > 1:
+                                target_year = int(manifest.period_end[:4])
+                                for comparison_column in columns:
+                                    if comparison_column.year in {0, target_year}:
+                                        continue
+                                    comparison_cell = _select_period_cell(
+                                        merged_row, label_end, columns, comparison_column.year
+                                    )
+                                    if comparison_cell is None:
+                                        continue
+                                    comparison_value = _parse_number(comparison_cell.text)
+                                    if comparison_value is None:
+                                        continue
+                                    if concept == "capital_expenditure":
+                                        comparison_value = abs(comparison_value)
+                                    comparison_end = _shift_period_year(
+                                        manifest.period_end, comparison_column.year
+                                    ) or ""
+                                    if not comparison_end:
+                                        continue
+                                    comparison_start = (
+                                        _shift_period_year(
+                                            _period_start(manifest),
+                                            comparison_column.year - (
+                                                int(manifest.period_end[:4])
+                                                - int((_period_start(manifest) or manifest.period_end)[:4])
+                                            ),
+                                        )
+                                        if statement in {"income_statement", "cash_flow"}
+                                        else None
+                                    )
+                                    comparison_center = (comparison_cell.x0 + comparison_cell.x1) / 2
+                                    comparison_multiplier = (
+                                        comparison_column.unit_scale
+                                        if comparison_column.currency else multiplier
+                                    )
+                                    comparison_currency = (
+                                        comparison_column.currency or table_currency
+                                        or company.reporting_currency
+                                    )
+                                    comparison_normalized = (
+                                        float(comparison_value)
+                                        * (1.0 if concept == "reported_roe" else comparison_multiplier)
+                                    )
+                                    comparison_identity = (
+                                        f"{filing.document_id}|{concept}|{page_number}|"
+                                        f"{merged_row.bbox}|{comparison_column.year}|{comparison_normalized}"
+                                    )
+                                    comparison_fact_id = hashlib.sha256(
+                                        comparison_identity.encode()
+                                    ).hexdigest()[:24]
+                                    comparison_fact = replace(
+                                        fact,
+                                        fact_id=f"ingest:{comparison_fact_id}",
+                                        value=comparison_normalized,
+                                        fiscal_year=comparison_column.year,
+                                        start_date=comparison_start,
+                                        end_date=comparison_end,
+                                        period_start=comparison_start,
+                                        usage_status="comparator",
+                                         source_column=comparison_column.header,
+                                         raw_text=f"{merged_row.text} [column:{comparison_column.year}]",
+                                    )
+                                    comparison_ref = replace(
+                                        ref,
+                                        evidence_id=f"fact:{comparison_fact_id}",
+                                        title=(
+                                            f"{manifest.form_type} {comparison_end} / {label} "
+                                            f"column:{comparison_column.year}"
+                                        ),
+                                        locator=f"page:{page_number}",
+                                        excerpt=comparison_fact.raw_text,
+                                    )
+                                    if not any(
+                                        existing.concept == concept
+                                        and existing.fiscal_year == comparison_fact.fiscal_year
+                                        and existing.end_date == comparison_fact.end_date
+                                        and existing.usage_status == "comparator"
+                                        for existing in facts
+                                    ):
+                                        facts.append(comparison_fact)
+                                        refs.append(comparison_ref)
                 # Only the last section can continue onto the next page.  A
                 # parent section therefore correctly replaces a consolidated
                 # context at a same-page boundary.
@@ -3171,6 +4129,7 @@ class FinancialIngestionEngine:
                     previous = sections[-1].context
                 else:
                     previous = None
+        self._last_pdf_context = previous
         return facts, refs
 
 
@@ -3220,6 +4179,11 @@ def parse_financial_pages(
     manifest = _manifest_for(filing)
     if manifest is None:
         return [], []
+    manifest = _manifest_from_observed_pages(
+        manifest, filing, tuple(raw_text for _page_number, raw_text in pages)
+    )
+    if not manifest.period_end:
+        return [], []
     facts: list[FinancialFact] = []
     evidence: list[EvidenceRef] = []
     for page_number, raw_text in pages:
@@ -3245,6 +4209,7 @@ def parse_financial_pages(
                 manifest.source_url, scope=scope, entity=company.name, market=company.market,
                 statement=statement, period_start=period_start, consolidated_scope=scope,
                 currency=currency_hint or company.reporting_currency, unit_scale=1.0 if concept == "reported_roe" else scale,
+                unit_provenance=("explicit" if _explicit_unit_info(raw_text, compatibility_rules)[2] else "unknown"),
                 source_document=manifest.primary_document, source_page=page_number,
                 raw_text=raw_text[:2000], parser_version=_PDF_PARSER_VERSION,
                 validation_status=ValidationStatus.READY_WITH_WARNINGS.value,

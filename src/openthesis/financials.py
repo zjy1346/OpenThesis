@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
@@ -31,6 +33,16 @@ _REVERSE_DCF_STATUS_TEXT: dict[str, tuple[str, str, str]] = {
         "行情與報告幣別不一致，無法可靠計算市場隱含增速。",
         "The quote and reporting currencies do not match, so implied growth cannot be calculated reliably.",
     ),
+    "valuation_unit_mismatch": (
+        "市场价值或自由现金流缺少可验证的金额单位，无法可靠计算市场隐含增速。",
+        "市場價值或自由現金流缺少可驗證的金額單位，無法可靠計算市場隱含增速。",
+        "The market value or free cash flow has no verifiable monetary unit, so implied growth cannot be calculated reliably.",
+    ),
+    "valuation_currency_mismatch": (
+        "市场价值与财报币种不一致，无法可靠计算市场隐含增速。",
+        "市場價值與財報幣別不一致，無法可靠計算市場隱含增速。",
+        "The market value and financial statements use different currencies, so implied growth cannot be calculated reliably.",
+    ),
     "not_applicable": (
         "当前公司类型不适用标准自由现金流反向 DCF。",
         "目前公司類型不適用標準自由現金流反向 DCF。",
@@ -49,6 +61,87 @@ _REVERSE_DCF_DISCLAIMER = (
     "該結果用於解釋市場隱含預期，不是目標價或交易建議。",
     "This result explains market-implied expectations; it is not a price target or trading recommendation.",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedMoney:
+    """A monetary amount with an explicit, one-time normalization contract.
+
+    ``value`` is the displayed/raw amount when created with :meth:`from_raw`
+    and is already in base currency when created with :meth:`from_normalized`.
+    Callers cannot silently infer a scale from a bare float at the valuation
+    boundary; the legacy float path remains supported as an already-normalized
+    compatibility value.
+    """
+
+    value: float
+    currency: str
+    unit_scale: float = 1.0
+    unit_provenance: str = "normalized"
+    source_id: str = ""
+    as_of: str = ""
+
+    @classmethod
+    def from_raw(
+        cls, value: float, currency: str, unit_scale: float,
+        unit_provenance: str = "declared",
+    ) -> "NormalizedMoney":
+        if unit_scale <= 0 or not unit_provenance or unit_provenance == "unknown":
+            raise ValueError("money_unit_provenance_required")
+        return cls(float(value), str(currency).upper(), float(unit_scale), unit_provenance)
+
+    @classmethod
+    def from_normalized(
+        cls, value: float, currency: str, *, source_id: str = "", as_of: str = ""
+    ) -> "NormalizedMoney":
+        return cls(float(value), str(currency).upper(), 1.0, "normalized", source_id, as_of)
+
+    @property
+    def normalized_value(self) -> float:
+        if self.unit_provenance == "normalized":
+            return float(self.value)
+        try:
+            return float(Decimal(str(self.value)) * Decimal(str(self.unit_scale)))
+        except (InvalidOperation, ValueError):
+            raise ValueError("money_value_invalid") from None
+
+
+def _coerce_money(value: object, *, fallback_currency: str = "") -> NormalizedMoney | None:
+    if isinstance(value, NormalizedMoney):
+        return value
+    if isinstance(value, dict):
+        try:
+            provenance = str(value.get("unit_provenance", value.get("provenance", "")))
+            scale = float(value.get("unit_scale", 1.0))
+            amount = float(value["value"])
+            currency = str(value.get("currency", fallback_currency))
+            if provenance == "normalized" or scale == 1.0:
+                if not provenance:
+                    provenance = "normalized"
+                return NormalizedMoney(
+                    amount, currency.upper(), scale, provenance,
+                    str(value.get("source_id", "")), str(value.get("as_of", "")),
+                )
+            return NormalizedMoney.from_raw(amount, currency, scale, provenance)
+        except (KeyError, TypeError, ValueError):
+            return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return NormalizedMoney.from_normalized(float(value), fallback_currency)
+    return None
+
+
+def _has_explicit_normalized_money(value: object) -> bool:
+    """Require an explicit normalized provenance marker at strict seams."""
+    if isinstance(value, NormalizedMoney):
+        return value.unit_provenance == "normalized" and value.unit_scale == 1.0
+    if not isinstance(value, dict):
+        return False
+    provenance = str(value.get("unit_provenance", value.get("provenance", ""))).strip().casefold()
+    try:
+        scale = float(value.get("unit_scale", 0))
+    except (TypeError, ValueError):
+        return False
+    return provenance == "normalized" and scale == 1.0
 
 
 def reverse_dcf_status_text(status: object, language: str = "zh-CN") -> str:
@@ -76,17 +169,19 @@ def latest_by_year(facts: list[dict[str, Any]]) -> dict[int, dict[str, float]]:
     """
 
     matrix: dict[int, dict[str, float]] = defaultdict(dict)
-    filed: dict[tuple[int, str], str] = {}
+    filed: dict[tuple[int, str], tuple[int, str, str]] = {}
     for fact in facts:
         if _period(fact.get("fiscal_period")) not in _ANNUAL_PERIODS:
             continue
         year = int(fact["fiscal_year"])
         concept = str(fact["concept"])
         key = (year, concept)
-        filing_date = str(fact["filed_at"])
-        if key not in filed or filing_date >= filed[key]:
+        filing_date = str(fact.get("filed_at", ""))
+        priority = 0 if str(fact.get("usage_status", "")).casefold() == "comparator" else 1
+        rank = (priority, filing_date, str(fact.get("fact_id", "")))
+        if key not in filed or rank >= filed[key]:
             matrix[year][concept] = float(fact["value"])
-            filed[key] = filing_date
+            filed[key] = rank
     return dict(sorted(matrix.items(), reverse=True))
 
 
@@ -94,7 +189,7 @@ def _latest_by_interim_period(
     facts: list[dict[str, Any]],
 ) -> tuple[dict[tuple[int, str], dict[str, float]], dict[tuple[int, str], str]]:
     matrix: dict[tuple[int, str], dict[str, float]] = defaultdict(dict)
-    filed: dict[tuple[int, str, str], str] = {}
+    filed: dict[tuple[int, str, str], tuple[int, str, str]] = {}
     period_ends: dict[tuple[int, str], str] = {}
     for fact in facts:
         period = _period(fact.get("fiscal_period"))
@@ -104,10 +199,12 @@ def _latest_by_interim_period(
         concept = str(fact["concept"])
         key = (year, period)
         filing_date = str(fact.get("filed_at", ""))
+        priority = 0 if str(fact.get("usage_status", "")).casefold() == "comparator" else 1
+        rank = (priority, filing_date, str(fact.get("fact_id", "")))
         concept_key = (year, period, concept)
-        if concept_key not in filed or filing_date >= filed[concept_key]:
+        if concept_key not in filed or rank >= filed[concept_key]:
             matrix[key][concept] = float(fact["value"])
-            filed[concept_key] = filing_date
+            filed[concept_key] = rank
         period_ends[key] = max(period_ends.get(key, ""), str(fact.get("end_date", "")))
     return dict(matrix), period_ends
 
@@ -182,6 +279,8 @@ def _annual_roe_details(
 def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     matrix = latest_by_year(facts)
     metadata: dict[int, tuple[str, str]] = {}
+    monetary_metadata: dict[tuple[int, str], tuple[str, str]] = {}
+    monetary_filed: dict[tuple[int, str], str] = {}
     for fact in facts:
         if _period(fact.get("fiscal_period")) not in _ANNUAL_PERIODS:
             continue
@@ -191,9 +290,28 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         filed_at = str(fact.get("filed_at", ""))
         period_end = str(fact.get("end_date", ""))
+        concept = str(fact.get("concept", ""))
         previous = metadata.get(year, ("", ""))
         metadata[year] = (max(previous[0], filed_at), max(previous[1], period_end))
-    years = sorted(matrix, reverse=True)
+        currency = str(fact.get("currency") or fact.get("unit") or "").upper()
+        provenance = str(fact.get("unit_provenance") or "")
+        money_key = (year, concept)
+        if (
+            currency and provenance and provenance != "unknown"
+            and filed_at >= monetary_filed.get(money_key, "")
+        ):
+            monetary_metadata[money_key] = (currency, provenance)
+            monetary_filed[money_key] = filed_at
+    visible_years = {
+        int(fact["fiscal_year"])
+        for fact in facts
+        if _period(fact.get("fiscal_period")) in _ANNUAL_PERIODS
+        and str(fact.get("usage_status", "")).casefold() != "comparator"
+        and str(fact.get("fiscal_year", "")).isdigit()
+    }
+    # Comparative columns remain available in ``matrix`` as a calculation
+    # baseline, but never become standalone report rows.
+    years = sorted((year for year in matrix if year in visible_years), reverse=True)
     results: list[dict[str, Any]] = []
     for index, year in enumerate(years):
         values = matrix[year]
@@ -212,6 +330,45 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if operating_cash_flow is not None and capex is not None
             else None
         )
+        comparison_records = [
+            fact for fact in facts
+            if str(fact.get("fiscal_period", "")).upper() in _ANNUAL_PERIODS
+            and fact.get("fiscal_year") == comparison_year
+        ] if comparison_year is not None else []
+        comparison_revenue = [
+            fact for fact in comparison_records if fact.get("concept") == "revenue"
+        ]
+        comparison_source = None
+        if comparison_revenue:
+            comparison_source = (
+                "same_filing_comparator"
+                if any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
+                else "independent_historical"
+            )
+        comparison_selected = (
+            [item for item in comparison_revenue
+             if str(item.get("usage_status", "")).casefold() == "comparator"]
+            if comparison_source == "same_filing_comparator"
+            else comparison_revenue
+        )
+        if comparison_selected:
+            previous = {
+                **previous,
+                **{
+                    str(item.get("concept")): float(item["value"])
+                    for item in comparison_selected
+                    if item.get("concept") and item.get("value") is not None
+                },
+            }
+        # Recompute ROE inputs after selecting an issuer-stated comparative
+        # column, while keeping that column out of visible rows.
+        roe_details = _annual_roe_details(values, previous)
+        restatement_available = bool(
+            comparison_revenue
+            and any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
+            and any(str(item.get("usage_status", "")).casefold() != "comparator" for item in comparison_revenue)
+            and len({str(item.get("value")) for item in comparison_revenue}) > 1
+        )
         results.append(
             {
                 "year": year,
@@ -227,10 +384,33 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if comparison_year is not None
                     else f"missing_{year - 1}"
                 ),
+                "comparison_source": comparison_source,
+                "comparison_basis": comparison_source,
+                "comparison_fact_ids": [
+                    str(item.get("fact_id")) for item in comparison_selected
+                    if item.get("fact_id")
+                ],
+                "restatement_available": restatement_available,
                 "operating_margin": safe_divide(operating_income, revenue),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": safe_divide(operating_cash_flow, net_income),
                 "free_cash_flow": free_cash_flow,
+                **(
+                    {
+                        "free_cash_flow_money": {
+                            "value": free_cash_flow,
+                            "currency": monetary_metadata[(year, "operating_cash_flow")][0],
+                            "unit_scale": 1.0,
+                            "unit_provenance": "normalized",
+                        }
+                    }
+                    if free_cash_flow is not None
+                    and (year, "operating_cash_flow") in monetary_metadata
+                    and (year, "capital_expenditure") in monetary_metadata
+                    and monetary_metadata[(year, "operating_cash_flow")][0]
+                    == monetary_metadata[(year, "capital_expenditure")][0]
+                    else {}
+                ),
                 "debt_to_assets": safe_divide(liabilities, assets),
                 **roe_details,
             }
@@ -246,8 +426,16 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
     """
 
     matrix, period_ends = _latest_by_interim_period(facts)
+    visible_keys = {
+        (int(fact["fiscal_year"]), _period(fact.get("fiscal_period")))
+        for fact in facts
+        if _period(fact.get("fiscal_period")) not in _ANNUAL_PERIODS
+        and str(fact.get("usage_status", "")).casefold() != "comparator"
+        and str(fact.get("fiscal_year", "")).isdigit()
+    }
+    # Keep comparator cohorts in the matrix as a calculation baseline only.
     keys = sorted(
-        matrix,
+        (key for key in matrix if key in visible_keys),
         key=lambda item: (item[0], _INTERIM_PERIOD_ORDER.get(item[1], 0), item[1]),
         reverse=True,
     )
@@ -264,6 +452,42 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
         liabilities = values.get("liabilities")
         equity = _equity_value(values)
         reported_roe = values.get("reported_roe")
+        comparison_records = [
+            fact for fact in facts
+            if fact.get("fiscal_year") == year - 1
+            and _period(fact.get("fiscal_period")) == period
+        ]
+        comparison_revenue = [
+            fact for fact in comparison_records if fact.get("concept") == "revenue"
+        ]
+        comparison_source = None
+        if comparison_revenue:
+            comparison_source = (
+                "same_filing_comparator"
+                if any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
+                else "independent_historical"
+            )
+        comparison_selected = (
+            [item for item in comparison_revenue
+             if str(item.get("usage_status", "")).casefold() == "comparator"]
+            if comparison_source == "same_filing_comparator"
+            else comparison_revenue
+        )
+        if comparison_selected:
+            previous = {
+                **previous,
+                **{
+                    str(item.get("concept")): float(item["value"])
+                    for item in comparison_selected
+                    if item.get("concept") and item.get("value") is not None
+                },
+            }
+        restatement_available = bool(
+            comparison_revenue
+            and any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
+            and any(str(item.get("usage_status", "")).casefold() != "comparator" for item in comparison_revenue)
+            and len({str(item.get("value")) for item in comparison_revenue}) > 1
+        )
         results.append(
             {
                 "year": year,
@@ -277,6 +501,13 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                     if previous
                     else "prior_period_unavailable"
                 ),
+                "comparison_source": comparison_source,
+                "comparison_basis": comparison_source,
+                "comparison_fact_ids": [
+                    str(item.get("fact_id")) for item in comparison_selected
+                    if item.get("fact_id")
+                ],
+                "restatement_available": restatement_available,
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
                 "operating_margin": safe_divide(operating_income, revenue),
@@ -407,7 +638,7 @@ def implied_fcf_growth(
 
 def reverse_dcf_analysis(
     metrics: list[dict[str, Any]],
-    market_cap: float,
+    market_cap: float | NormalizedMoney | dict[str, Any],
     discount_rate: float = 0.10,
     terminal_growth: float = 0.03,
     horizon_years: int = 5,
@@ -415,9 +646,32 @@ def reverse_dcf_analysis(
     market_as_of: str = "",
     currency: str = "",
     policy_version: str = "reverse-dcf-policy-v1",
+    strict: bool = False,
+    require_typed: bool | None = None,
 ) -> dict[str, Any]:
+    # ``strict`` is the semantic switch; ``require_typed`` is the explicit
+    # name used by the authoritative research boundary.  Keep both keyword
+    # spellings so compatibility callers can opt in without changing the
+    # legacy positional API.
+    strict_mode = bool(strict or require_typed)
     if not metrics:
         return {"status": "insufficient_data", "reason": "没有财务指标"}
+    market_money = _coerce_money(market_cap, fallback_currency=currency)
+    if strict_mode and not _has_explicit_normalized_money(market_cap):
+        return {
+            "status": "valuation_unit_mismatch",
+            "reason": "市场价值必须是带可验证归一化来源的金额",
+            "currency": currency,
+            "policy_version": policy_version,
+        }
+    if market_money is None or market_money.normalized_value <= 0:
+        return {
+            "status": "valuation_unit_mismatch",
+            "reason": "市场价值缺少可验证的金额单位或归一化来源",
+            "currency": currency,
+            "policy_version": policy_version,
+        }
+    market_currency = market_money.currency or str(currency or "").upper()
     # Keep only complete fiscal-year rows for the FCFE proxy.  Intermediate
     # Q1/H1/Q3 and YTD rows remain available to other analysis, but must not
     # be mistaken for a full-year base simply because they sort first.
@@ -432,8 +686,40 @@ def reverse_dcf_analysis(
         int(row.get("year") or 0),
     ), reverse=True)
     base_metric = eligible[0] if eligible else None
-    base_fcf = base_metric.get("free_cash_flow") if base_metric else None
-    if not isinstance(base_fcf, (int, float)) or base_fcf <= 0:
+    base_fcf_value = base_metric.get("free_cash_flow") if base_metric else None
+    base_money = _coerce_money(
+        base_metric.get("free_cash_flow_money") if base_metric else None,
+        fallback_currency=str(base_metric.get("free_cash_flow_currency", currency)) if base_metric else currency,
+    ) if base_metric and base_metric.get("free_cash_flow_money") is not None else None
+    if strict_mode and (
+        not _has_explicit_normalized_money(
+            base_metric.get("free_cash_flow_money") if base_metric else None
+        )
+        or
+        base_metric is None
+        or base_money is None
+        or base_money.unit_provenance != "normalized"
+        or base_money.unit_scale != 1.0
+    ):
+        return {
+            "status": "valuation_unit_mismatch",
+            "reason": "自由现金流必须来自已验证的归一化金额对象",
+            "currency": market_currency,
+            "policy_version": policy_version,
+        }
+    # A metric carrying a table scale but no explicit normalized-money object
+    # is ambiguous at this boundary.  Reject it instead of guessing whether
+    # the parser already applied the scale.
+    if base_metric and base_money is None and base_metric.get("free_cash_flow_unit_scale") not in (None, 1, 1.0):
+        return {
+            "status": "valuation_unit_mismatch",
+            "reason": "自由现金流同时携带裸值与未声明的归一化边界",
+            "currency": market_currency,
+            "policy_version": policy_version,
+        }
+    if base_money is None:
+        base_money = _coerce_money(base_fcf_value, fallback_currency=str(currency or market_currency))
+    if base_money is None or base_money.normalized_value <= 0:
         return {
             "status": "insufficient_data",
             "reason": "行情日之前没有正的 FCFE proxy，无法使用权益反向 DCF",
@@ -441,9 +727,18 @@ def reverse_dcf_analysis(
             "market_as_of": market_as_of,
             "policy_version": policy_version,
         }
+    base_fcf = base_money.normalized_value
+    normalized_market_cap = market_money.normalized_value
+    if base_money.currency and market_currency and base_money.currency.upper() != market_currency.upper():
+        return {
+            "status": "valuation_currency_mismatch",
+            "reason": "市场价值与自由现金流币种不一致",
+            "currency": market_currency,
+            "policy_version": policy_version,
+        }
     implied = implied_fcf_growth(
-        market_cap,
-        float(base_fcf),
+        normalized_market_cap,
+        base_fcf,
         discount_rate,
         terminal_growth,
         horizon_years,
@@ -452,7 +747,7 @@ def reverse_dcf_analysis(
         {
             "fcf_growth": growth,
             "equity_value": discounted_cash_flow_value(
-                float(base_fcf),
+                base_fcf,
                 growth,
                 discount_rate,
                 terminal_growth,
@@ -465,9 +760,9 @@ def reverse_dcf_analysis(
         "status": "ok" if implied is not None else "outside_search_range",
         # Keep market_cap as a wire-compatibility alias.  The semantic target
         # is equity market value, never enterprise value.
-        "market_cap": market_cap,
-        "equity_market_value": market_cap,
-        "base_free_cash_flow": float(base_fcf),
+        "market_cap": normalized_market_cap,
+        "equity_market_value": normalized_market_cap,
+        "base_free_cash_flow": base_fcf,
         "base_fcf_period": (
             f"{base_metric.get('year')} {base_metric.get('period')}".strip()
             if base_metric and base_metric.get("period") else str(base_metric.get("year", "")) if base_metric else ""
@@ -475,7 +770,9 @@ def reverse_dcf_analysis(
         "base_fcf_filed_at": str(base_metric.get("filed_at", "")) if base_metric else "",
         "cash_flow_basis": "FCFE proxy = operating cash flow - capital expenditure",
         "market_as_of": market_as_of,
-        "currency": currency,
+        "currency": market_currency,
+        "market_value_source_id": market_money.source_id,
+        "market_value_source_as_of": market_money.as_of,
         "policy_version": policy_version,
         "discount_rate": discount_rate,
         "terminal_growth": terminal_growth,
