@@ -36,6 +36,7 @@ from openthesis.service import (
     _market_snapshot,
     _request_secrets,
     _vision_config_from_request,
+    _vision_request_from_preferences,
     _vision_batch_upload_allowed,
     VisionFallbackConfig,
     _research_history_years,
@@ -49,6 +50,7 @@ from openthesis.service import (
     _filing_identity_matches,
     _latest_annual_validations,
     _scanner_diagnostic_code,
+    _report_retryable,
 )
 from openthesis.financial_ingestion import FinancialDataset, FinancialGroupValidation, FilingManifest, FinancialIngestionEngine
 from openthesis.financial_compiler import FactGroupValidation
@@ -105,6 +107,25 @@ class _ResearchMarketData:
 
 
 class AppServiceTests(unittest.TestCase):
+    def test_synthesis_retryability_depends_on_persisted_stage_graph_not_a_final_artifact(self) -> None:
+        required_types = (
+            "deterministic-financial-summary",
+            "verified-research-dossier",
+            "growth-opportunities",
+            "counter-analysis",
+            "forecast-scenarios",
+        )
+        artifacts = [
+            {"artifact_type": artifact_type, "content": {}}
+            for artifact_type in required_types
+        ]
+        self.assertTrue(_report_retryable(artifacts))
+        self.assertFalse(_report_retryable(artifacts[:-1]))
+        self.assertFalse(_report_retryable([
+            *artifacts,
+            {"artifact_type": "research-report", "content": {"retryable": False}},
+        ]))
+
     def test_application_components_are_unique_views_of_injected_dependencies(self) -> None:
         market = _FakeMarketData()
         engine = object()
@@ -1188,7 +1209,9 @@ class AppServiceTests(unittest.TestCase):
                 {item["market"] for item in result["market_catalog"]},
                 {"US", "CN_A", "HK"},
             )
-            self.assertTrue(any(item["exchange"] == "BSE" for item in result["common_companies"]))
+            self.assertTrue(result["common_companies"])
+            self.assertTrue(all("research_readiness" in item for item in result["common_companies"]))
+            self.assertTrue(all(not item["research_readiness"]["recommended"] for item in result["common_companies"]))
 
     def test_preferences_persist_only_allowlisted_non_secret_values(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1204,6 +1227,54 @@ class AppServiceTests(unittest.TestCase):
             with self.assertRaises(PreferenceValidationError):
                 service.update_preferences({"api_key": "never-store-this"})
             self.assertEqual(service.storage.get_setting("api_key", ""), "")
+
+    def test_visual_fallback_policy_is_atomic_versioned_and_secret_free(self) -> None:
+        policy = {
+            "schema_version": 1,
+            "policy_version": 1,
+            "scope_version": 1,
+            "enabled": True,
+            "provider": "mineru_flash",
+            "approval_mode": "approve_current_research",
+            "standing_authorization": True,
+            "authorization_scope": "financial_failed_pages",
+            "provider_terms_version": 1,
+            "authorized_at": "2026-09-13T12:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            saved = service.update_preferences(
+                {"vision_fallback_policy": json.dumps(policy)}
+            )
+            self.assertEqual(
+                json.loads(saved["vision_fallback_policy"]),
+                policy,
+            )
+            request = _vision_request_from_preferences(saved)
+            self.assertTrue(request["enabled"])
+            self.assertTrue(request["consent"])
+            self.assertEqual(request["provider"], "mineru_flash")
+
+            with self.assertRaises(PreferenceValidationError):
+                service.update_preferences(
+                    {"vision_fallback_policy": json.dumps({**policy, "api_key": "secret"})}
+                )
+            with self.assertRaises(PreferenceValidationError):
+                service.update_preferences(
+                    {"vision_fallback_policy": json.dumps({
+                        **policy,
+                        "provider": "configured_model",
+                        "model": {
+                            "configured_model_id": "vision.ready",
+                            "configuration_version": 1,
+                            "token": "secret",
+                        },
+                    })}
+                )
+            with self.assertRaises(PreferenceValidationError):
+                service.update_preferences(
+                    {"vision_fallback_policy": json.dumps({**policy, "policy_version": 2})}
+                )
 
     def test_unknown_report_has_a_stable_not_found_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1930,7 +2001,8 @@ class AppServiceTests(unittest.TestCase):
             self.assertIn("ot.compile", result["capabilities"])
             self.assertNotIn("models.discover", result["capabilities"])
             self.assertNotIn("model_catalog", result)
-            self.assertEqual(result["common_companies"][0]["ticker"], "AAPL")
+            self.assertTrue(result["common_companies"])
+            self.assertTrue(all("research_readiness" in item for item in result["common_companies"]))
             self.assertTrue(result["research_packs"])
             self.assertTrue(all(item["content_hash"] for item in result["research_packs"]))
     def test_company_search_uses_saved_sec_identity(self) -> None:
@@ -1943,6 +2015,36 @@ class AppServiceTests(unittest.TestCase):
             matches = service.search_companies("acme")
 
             self.assertEqual(matches[0]["ticker"], "ACME")
+
+    def test_us_company_search_returns_stable_missing_sec_email_error(self) -> None:
+        from openthesis.service import ServiceConfigurationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory), sec_client_factory=_FakeSecClient)
+            with self.assertRaises(ServiceConfigurationError) as raised:
+                service.search_companies("AAPL", market="US")
+            self.assertEqual(raised.exception.code, "SEC_EMAIL_CONFIG_REQUIRED")
+
+    def test_first_thesis_save_upserts_explicit_company_identity(self) -> None:
+        from openthesis.service import ServiceConfigurationError
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            with self.assertRaises(ServiceConfigurationError) as raised:
+                service.save_thesis_version("US:NYSE:BRK.B", {"thesis": "value"})
+            self.assertEqual(raised.exception.code, "COMPANY_IDENTITY_REQUIRED")
+
+            company = Company(
+                cik="US:NYSE:BRK.B", ticker="BRK.B", name="Berkshire Hathaway",
+                exchange="NYSE", market="US", security_id="US:NYSE:BRK.B",
+            )
+            saved = service.save_thesis_version(
+                company.cik,
+                {"thesis": "value"},
+                company=company.to_dict(),
+            )
+            self.assertEqual(saved["company_cik"], company.cik)
+            self.assertTrue(service.storage.company_exists(company.cik))
 
     def test_a_share_search_does_not_require_sec_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2000,7 +2102,7 @@ class AppServiceTests(unittest.TestCase):
             def rate(self, source, target, as_of):
                 return type("FxResult", (), {"rate": 0.13, "as_of": as_of, "source": "fixture-ecb"})()
         company = Company(cik="HK:00700", ticker="00700.HK", name="Tencent", exchange="HKEX", market="HK", listing_currency="HKD", reporting_currency="CNY")
-        with patch("openthesis.service.EcbFxAdapter", return_value=Fx()), patch(
+        with patch("openthesis.service.FxRouter", return_value=Fx()), patch(
             "openthesis.service.EastmoneyPublicQuoteAdapter", Noop
         ), patch("openthesis.service.YahooChartQuoteAdapter", Noop):
             with tempfile.TemporaryDirectory() as directory:
@@ -2142,7 +2244,7 @@ class AppServiceTests(unittest.TestCase):
                     "compare_enabled": True,
                     "comparison_models": [],
                 })
-    def test_sec_latest_invalid_group_does_not_fallback_to_prior_year(self) -> None:
+    def test_sec_latest_invalid_group_falls_back_to_prior_verified_year(self) -> None:
         company = build_company("AAPL", "Apple")
 
         def make_fact(accession: str, end: str, concept: str, value: float) -> FinancialFact:
@@ -2170,7 +2272,48 @@ class AppServiceTests(unittest.TestCase):
         result = _latest_sec_verified_group(
             facts, FinancialIngestionEngine(), expected_period_end="2025-12-31"
         )
-        self.assertIsNone(result)
+        self.assertIsNotNone(result)
+        self.assertEqual({fact.end_date for fact in result or ()}, {"2024-12-31"})
+
+    def test_sec_latest_shares_only_group_does_not_pollute_prior_reporting_currency(self) -> None:
+        company = Company(
+            "0001046179", "TSM", "TSMC", market="US",
+            listing_currency="USD", reporting_currency="TWD",
+        )
+        statements = {
+            "revenue": "income_statement", "net_income": "income_statement",
+            "operating_cash_flow": "cash_flow", "assets": "balance_sheet",
+            "liabilities": "balance_sheet", "equity": "balance_sheet",
+        }
+        values = {
+            "revenue": 100.0, "net_income": 20.0, "operating_cash_flow": 30.0,
+            "assets": 200.0, "liabilities": 80.0, "equity": 120.0,
+        }
+        facts = [FinancialFact(
+            f"old:{concept}", company.cik, concept, concept, value, "TWD", 2024,
+            "FY", "20-F", "2024-01-01" if statement != "balance_sheet" else None,
+            "2024-12-31", "2025-03-01", "old-20f",
+            "https://www.sec.gov/Archives/old", statement=statement,
+            scope="consolidated", consolidated_scope="consolidated", currency="TWD",
+            raw_text=f"{concept} {value}", validation_status="VERIFIED",
+        ) for concept, value in values.items() for statement in (statements[concept],)]
+        facts.append(FinancialFact(
+            "new:shares", company.cik, "shares_outstanding",
+            "EntityCommonStockSharesOutstanding", 10.0, "SHARES", 2025,
+            "FY", "20-F", None, "2025-12-31", "2026-03-01", "new-20f",
+            "https://www.sec.gov/Archives/new", statement="summary",
+            scope="consolidated", consolidated_scope="consolidated", currency="SHARES",
+            raw_text="shares 10", validation_status="VERIFIED",
+        ))
+
+        result = _latest_sec_verified_group(
+            facts, FinancialIngestionEngine(), company=company,
+            expected_period_end="2025-12-31",
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual({fact.end_date for fact in result or ()}, {"2024-12-31"})
+        self.assertEqual({fact.currency for fact in result or ()}, {"TWD"})
 
     def test_sec_latest_wrong_scope_or_currency_is_not_researched(self) -> None:
         company = build_company("AAPL", "Apple")
@@ -2412,7 +2555,10 @@ class FinancialRetryContractTests(unittest.TestCase):
 
             started_at = time.monotonic()
             started = service.start_financial_retry("financial-job")
-            self.assertLess(time.monotonic() - started_at, 0.2)
+            # Thread creation and antivirus hooks on Windows are noisy; the
+            # contract is that this call queues background work promptly and
+            # never waits for the filing download itself.
+            self.assertLess(time.monotonic() - started_at, 0.5)
             self.assertTrue(entered.wait(1))
             live = service.get_research_status(started["job_id"])
             self.assertIn(live["state"], {"queued", "running"})

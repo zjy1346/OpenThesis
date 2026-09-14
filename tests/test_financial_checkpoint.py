@@ -36,6 +36,11 @@ def _context_window_worker(window: PdfWindow, context: dict[str, object]):
     return (), (), {"last_page": window.pages[-1], "prior": context.get("last_page", 0)}
 
 
+def _large_result_window_worker(window: PdfWindow, context: dict[str, object]):
+    del window, context
+    return (), (), {"serialized_table_context": "x" * (512 * 1024)}
+
+
 class FinancialCheckpointTests(unittest.TestCase):
     def test_incomplete_candidate_index_fails_open_to_all_document_windows(self) -> None:
         """An incomplete fast index must not turn a real PDF into zero work."""
@@ -92,6 +97,21 @@ class FinancialCheckpointTests(unittest.TestCase):
                 timeout_seconds=0.1,
             )
         self.assertEqual(completed, ())
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_large_picklable_worker_result_is_drained_before_join(self) -> None:
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            completed = run_checkpointed_windows(
+                WindowCheckpointStore(directory),
+                CheckpointKey("large-result", "parser", "rules"),
+                (PdfWindow(0, (1,)),),
+                _large_result_window_worker,
+                max_retries=0,
+                timeout_seconds=1.0,
+            )
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(len(completed[0].context["serialized_table_context"]), 512 * 1024)
         self.assertLess(time.monotonic() - started, 3.0)
 
     def test_context_is_carried_only_from_successful_prior_window(self) -> None:
@@ -249,6 +269,60 @@ class FinancialCheckpointTests(unittest.TestCase):
             path = store.path_for(key, 0)
             path.write_text("not-json", encoding="utf-8")
             self.assertIsNone(store.load(key, 0))
+
+    def test_exhausted_same_input_skips_worker_and_requires_exact_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WindowCheckpointStore(Path(directory))
+            key = CheckpointKey("same-input", "parser-v1", "rules-v1")
+            store.save_exhausted(key, reason="ValueError: static parser failure", input_fingerprint="fp-1")
+            calls: list[int] = []
+            statuses: list[str] = []
+
+            def worker(window: PdfWindow):
+                calls.append(window.index)
+                return (), (), {}
+
+            skipped = run_checkpointed_windows(
+                store, key, (PdfWindow(0, (1,)),), worker,
+                input_fingerprint="fp-1", progress=lambda _current, _total, status: statuses.append(status),
+            )
+            self.assertEqual(skipped, ())
+            self.assertEqual(calls, [])
+            self.assertEqual(statuses, ["exhausted_same_input"])
+            # A changed input fingerprint must not inherit the old terminal state.
+            rerun = run_checkpointed_windows(
+                store, key, (PdfWindow(0, (1,)),), worker, input_fingerprint="fp-2",
+            )
+            self.assertEqual([item.window.index for item in rerun], [0])
+            self.assertEqual(calls, [0])
+
+    def test_only_explicit_deterministic_failure_is_marked_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            key = CheckpointKey("classify", "parser", "rules")
+            store = WindowCheckpointStore(Path(directory))
+
+            def deterministic(_window: PdfWindow):
+                raise ValueError("unsupported document shape")
+
+            run_checkpointed_windows(
+                store, key, (PdfWindow(0, (1,)),), deterministic,
+                max_retries=0, input_fingerprint=key.digest,
+                deterministic_failure=lambda error: isinstance(error, ValueError),
+            )
+            self.assertIsNotNone(store.load_exhausted(key, input_fingerprint=key.digest))
+
+            transient_key = CheckpointKey("transient", "parser", "rules")
+            transient_store = WindowCheckpointStore(Path(directory) / "transient")
+
+            def transient(_window: PdfWindow):
+                raise TimeoutError("network timeout")
+
+            run_checkpointed_windows(
+                transient_store, transient_key, (PdfWindow(0, (1,)),), transient,
+                max_retries=0, input_fingerprint=transient_key.digest,
+                deterministic_failure=lambda error: isinstance(error, ValueError),
+            )
+            self.assertIsNone(transient_store.load_exhausted(transient_key, input_fingerprint=transient_key.digest))
 
     def test_worker_restart_resumes_after_last_successful_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

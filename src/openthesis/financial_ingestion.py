@@ -27,7 +27,7 @@ import time
 import types
 
 
-_PDF_PARSER_VERSION = "financial-ingestion-ast-v6"
+_PDF_PARSER_VERSION = "financial-ingestion-ast-v7"
 _PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
 _PDF_CACHE_POLICY_VERSION = "parse-cache-v1"
 
@@ -46,6 +46,11 @@ _PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .disclosure_identity import DisclosureIdentityResolver, _date_tokens
 from .financial_compatibility import FinancialRulesSnapshot
+from .financial_taxonomy import (
+    FINANCIAL_LABEL_ALIASES,
+    capex_component_kind,
+    normalize_financial_label,
+)
 from .market_financials import FinancialValidation, ValidationStatus
 from .vision_financials import (
     VISION_MAX_PAGES,
@@ -553,18 +558,16 @@ _LABELS: dict[str, tuple[str, ...]] = {
         "equity attributable to equity holders of the company",
         "total equity attributable to the parent company",
         "total shareholders' equity attributable to the parent company",
+        "total equity attributable to shareholders of the company",
     ),
     "total_equity": ("所有者权益合计", "所有者权益（或股东权益）合计", "所有者权益（或股东权", "股东权益合计", "total equity", "total shareholders' equity"),
     "reported_roe": ("加权平均净资产收益率", "weighted average return on equity"),
     "profit_before_tax": ("利润总额", "profit before tax"),
     "profit_after_tax": ("净利润", "profit after tax", "net profit"),
-    "operating_income": ("Operating income", "Operating loss", "operating profit", "operating income/(loss)"),
-    "capital_expenditure": (
-        "purchases and prepayments of property, plant and equipment and intangible assets",
-        "purchases of property, plant and equipment and intangible assets",
-        "capital expenditure", "capital expenditures",
-    ),
-    "gross_profit": ("Gross profit", "gross profit/(loss)"),
+    "operating_income": FINANCIAL_LABEL_ALIASES["operating_income"],
+    "capital_expenditure": FINANCIAL_LABEL_ALIASES["capital_expenditure"],
+    "gross_profit": FINANCIAL_LABEL_ALIASES["gross_profit"],
+    "cost_of_revenue": FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
 }
 _STATEMENT_FOR = {
     "revenue": "income_statement", "net_income": "income_statement",
@@ -573,6 +576,7 @@ _STATEMENT_FOR = {
     "total_equity": "balance_sheet", "reported_roe": "summary",
     "profit_before_tax": "income_statement", "profit_after_tax": "income_statement",
     "operating_income": "income_statement", "gross_profit": "income_statement",
+    "cost_of_revenue": "income_statement",
     "capital_expenditure": "cash_flow",
 }
 _CORE = {"revenue", "net_income", "assets", "liabilities", "equity", "operating_cash_flow"}
@@ -1134,6 +1138,7 @@ def _period_columns(
     )
     split_semantic_header = (
         ("currentperiod" in header_text and "previousperiod" in header_text)
+        or ("closingbalance" in header_text and "openingbalance" in header_text)
         or ("balanceattheend" in header_text and "beginning" in header_text and "oftheperiod" in header_text)
         or (
             header_text.count("balanceatthe") >= 2
@@ -1587,7 +1592,60 @@ def _known_label(text: str, rules: FinancialRulesSnapshot | None = None) -> bool
 
 
 def _label_compact(text: str) -> str:
-    return re.sub(r"\s+", "", text).casefold().translate(str.maketrans({"’": "'", "‘": "'", "＇": "'"}))
+    return normalize_financial_label(text)
+
+
+def _merge_capex_facts(
+    existing: FinancialFact,
+    candidate: FinancialFact,
+) -> FinancialFact | None:
+    """Aggregate distinct capex components only when provenance is identical."""
+
+    existing_kind = capex_component_kind(existing.reported_concept)
+    candidate_kind = capex_component_kind(candidate.reported_concept)
+    if existing.reported_concept == "capital_expenditure_components":
+        existing_kind = "aggregate"
+    if candidate_kind == "total":
+        if existing_kind == "total" and _fact_rank(candidate) <= _fact_rank(existing):
+            return None
+        return candidate
+    if existing_kind in {"total", "aggregate"} or existing_kind == candidate_kind:
+        return None
+    same_context = (
+        existing.accession_number == candidate.accession_number
+        and existing.end_date == candidate.end_date
+        and existing.fiscal_period == candidate.fiscal_period
+        and existing.consolidated_scope == candidate.consolidated_scope
+        and existing.currency == candidate.currency
+        and existing.unit_scale == candidate.unit_scale
+        and existing.statement == candidate.statement == "cash_flow"
+        and existing.source_page == candidate.source_page
+    )
+    if not same_context:
+        return None
+    boxes = tuple(box for box in (existing.source_bbox, candidate.source_bbox) if box)
+    bbox = (
+        (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+        if boxes
+        else None
+    )
+    identity = (
+        f"{existing.accession_number}|capital_expenditure|{existing.end_date}|"
+        f"{existing.source_page}|{existing.fact_id}|{candidate.fact_id}"
+    )
+    return replace(
+        existing,
+        fact_id=f"ingest:{hashlib.sha256(identity.encode()).hexdigest()[:24]}",
+        reported_concept="capital_expenditure_components",
+        value=abs(existing.value) + abs(candidate.value),
+        source_bbox=bbox,
+        raw_text=f"{existing.raw_text}\n{candidate.raw_text}",
+    )
 
 
 def _net_income_candidate_allowed(compact: str) -> bool:
@@ -2154,32 +2212,69 @@ def _parse_local_pdfs_bounded(
             # Opt-in durable window recovery.  The default process scheduler
             # remains unchanged; callers that provide a checkpoint directory
             # get an ordered checkpoint boundary before compiler validation.
-            for item in uncached:
+            # Each document is an independent pipeline, so checkpoint mode is
+            # allowed to overlap documents.  Window order and table context
+            # remain strictly sequential inside parse_local_pdf_resumable.
+            def parse_checkpointed(
+                item: tuple[str, FilingDocument, FilingManifest],
+            ) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
                 key, filing, manifest = item
                 try:
                     facts, refs, window_diagnostics = engine.parse_local_pdf_resumable(
                         company, filing, manifest,
                         cancel_check=cancel_check,
-                        progress=(
-                            lambda current, total, status, filing=filing:
-                            _emit_ingestion_progress(
-                                progress, "filing-window", current, total, filing,
-                                status=status,
-                            )
-                        ) if progress is not None else None,
                     )
                     error = window_diagnostics[0] if window_diagnostics else None
                 except Exception as exc:
                     facts, refs, error = [], [], f"pdf_window_failed:{type(exc).__name__}"
-                results[key] = (facts, refs, error or pre_errors.get(key))
-                if error is None and facts and refs:
-                    cache_key = cache_keys.get(key)
-                    if cache_key:
-                        engine._store_parse_cache(cache_key, facts, refs)
-                _emit_ingestion_progress(
-                    progress, "filing-parse", completed + 1, total, filing,
-                    status="failed" if error else "parsed", error_code=error or "",
-                )
+                return key, facts, refs, error or pre_errors.get(key)
+
+            checkpoint_workers = max(1, min(workers, len(uncached)))
+            checkpoint_futures: dict[Any, tuple[str, FilingDocument, FilingManifest]] = {}
+            checkpoint_executor = ThreadPoolExecutor(
+                max_workers=checkpoint_workers,
+                thread_name_prefix="financial-checkpoint",
+            )
+            try:
+                for item in uncached:
+                    if cancel_check is not None and cancel_check():
+                        break
+                    checkpoint_futures[checkpoint_executor.submit(parse_checkpointed, item)] = item
+                while checkpoint_futures:
+                    done, _ = wait(tuple(checkpoint_futures), return_when=FIRST_COMPLETED)
+                    if cancel_check is not None and cancel_check():
+                        for pending in tuple(checkpoint_futures):
+                            if not pending.done():
+                                pending.cancel()
+                    for future in done:
+                        item = checkpoint_futures.pop(future)
+                        key, filing, _manifest = item
+                        if future.cancelled():
+                            results[key] = ([], [], "pdf_parse_cancelled")
+                            continue
+                        try:
+                            parsed_key, facts, refs, error = future.result()
+                        except Exception as exc:
+                            parsed_key, facts, refs, error = key, [], [], f"pdf_window_failed:{type(exc).__name__}"
+                        results[parsed_key] = (facts, refs, error)
+                        if error is None and facts and refs:
+                            cache_key = cache_keys.get(parsed_key)
+                            if cache_key:
+                                engine._store_parse_cache(cache_key, facts, refs)
+                # Progress is intentionally emitted in filing order, not
+                # completion order, so callers receive monotonic counters even
+                # when a later document finishes first.
+                for index, item in enumerate(uncached, start=1):
+                    key, filing, _manifest = item
+                    if key not in results:
+                        continue
+                    error = results[key][2]
+                    _emit_ingestion_progress(
+                        progress, "filing-parse", completed + index, total, filing,
+                        status="failed" if error else "parsed", error_code=error or "",
+                    )
+            finally:
+                checkpoint_executor.shutdown(wait=True, cancel_futures=True)
             _resolve_pdf_parse_flights(
                 flight_owners, flight_waiters, cache_keys, results, parse_timeout_seconds
             )
@@ -2698,6 +2793,22 @@ def _safe_pdf_worker_count(
     if largest_bytes > 64 * 1024 * 1024:
         return min(2, bounded)
     return bounded
+
+
+def _is_deterministic_pdf_window_failure(error: Exception) -> bool:
+    """Classify failures safe to short-circuit for an identical PDF input.
+
+    External/process lifecycle failures must remain retryable.  Parser and
+    document-shape failures are deterministic for the same content hash,
+    parser version, rules and identity digest and may be marked exhausted.
+    """
+    text = f"{type(error).__name__} {error}".casefold()
+    transient_markers = (
+        "timeout", "timed out", "network", "connection", "rate limit",
+        "too many request", "spawn", "process start", "worker exited",
+        "cancel", "resource temporarily", "broken pipe",
+    )
+    return not any(marker in text for marker in transient_markers)
 
 
 def _toc_statement_page_map(
@@ -3277,6 +3388,10 @@ class FinancialIngestionEngine:
             ).hexdigest(),
         )
 
+        exhausted = store.load_exhausted(key, input_fingerprint=key.digest)
+        if exhausted is not None:
+            return [], [], ("pdf_window_exhausted_same_input",)
+
         worker = _CheckpointPdfWindowWorker(
             filing.local_path,
             company,
@@ -3294,6 +3409,8 @@ class FinancialIngestionEngine:
             cancel_check=cancel_check,
             progress=progress,
             timeout_seconds=self._parse_timeout_seconds,
+            input_fingerprint=key.digest,
+            deterministic_failure=_is_deterministic_pdf_window_failure,
         )
         facts: dict[str, FinancialFact] = {}
         refs: dict[str, EvidenceRef] = {}
@@ -3484,19 +3601,23 @@ class FinancialIngestionEngine:
         issues = list(compiled.diagnostics)
         for item in compiled.validations:
             issues.extend(item.issues)
-        # ``allow_ai`` describes the selected research cohort only.  The
-        # compatibility projection still exposes audit failures from other
-        # cohorts as warnings, so callers cannot mistake a partially
-        # quarantined ingestion for an entirely verified dataset.
+        # Audit-only parent-company rows must not downgrade a complete
+        # consolidated research cohort. They remain visible in group
+        # diagnostics, while status follows the cohort that can enter research.
+        research_groups = tuple(
+            item for item in compiled.group_validations
+            if len(item.identity) > 3
+            and str(item.identity[3]).casefold() == "consolidated"
+        ) or tuple(compiled.group_validations)
         has_rejected_group = any(
             getattr(item.validation.status, "value", item.validation.status)
             == ValidationStatus.REJECTED.value
-            for item in compiled.group_validations
+            for item in research_groups
         )
         has_warning_group = any(
             getattr(item.validation.status, "value", item.validation.status)
             == ValidationStatus.READY_WITH_WARNINGS.value
-            for item in compiled.group_validations
+            for item in research_groups
         )
         status = (
             ValidationStatus.REJECTED
@@ -3733,6 +3854,19 @@ class FinancialIngestionEngine:
                     table_rows = section.rows
                     table = PdfTableAST(page_number, statement, scope, table_currency, multiplier, _period_headers(table_rows), table_rows)
                     columns = context.periods or _period_columns(table.rows, rules=rules)
+                    table_text = ' '.join(item.text for item in table.rows)
+                    # CAS English statements use Operating income for top-line
+                    # revenue, unlike US GAAP operating profit. Require the
+                    # paired numbered cost header in the same formal table.
+                    cas_topline = statement == 'income_statement' and bool(
+                        re.search(r'\bI\.\s*Operating income\b', table_text, re.I)
+                        and re.search(r'\bII\.\s*Operating cost\b', table_text, re.I)
+                    )
+                    section_labels = _labels_for_rules(rules)
+                    if cas_topline:
+                        section_labels = dict(section_labels)
+                        section_labels['revenue'] = (*section_labels['revenue'], 'operating income')
+                        section_labels['operating_income'] = tuple(label for label in section_labels['operating_income'] if label.casefold() != 'operating income')
                     summary_page = section.summary
                     revenue_totals = _revenue_group_total_rows(
                         table.rows, columns, int(manifest.period_end[:4])
@@ -3813,7 +3947,7 @@ class FinancialIngestionEngine:
                                     )
                                     compact = _row_label_text(merged_row)
                                     break
-                        for concept, labels in _labels_for_rules(rules).items():
+                        for concept, labels in section_labels.items():
                             if concept == "operating_cash_flow" and "现金流出小计" in compact:
                                 continue
                             if concept == "assets" and "资产合计" in compact and "资产总计" not in compact and any(prefix in compact for prefix in ("流动资产", "非流动资产")):
@@ -3863,7 +3997,13 @@ class FinancialIngestionEngine:
                                 label = "revenue"
                             if label is None and concept == "equity" and row.bbox in equity_totals:
                                 label = "equity attributable to equity holders of the company"
-                            if label is None or (not summary_page and statement != _STATEMENT_FOR[concept] and concept != "reported_roe"):
+                            # Summary labels such as 毛利率 contain 毛利.  Only
+                            # an explicitly reported ratio may be accepted from
+                            # a summary page; monetary facts require their
+                            # formal statement context.
+                            if summary_page and concept != "reported_roe":
+                                continue
+                            if label is None or (statement != _STATEMENT_FOR[concept] and concept != "reported_roe"):
                                 continue
                             if concept == "liabilities" and any(
                                 token in _label_compact(compact)
@@ -3891,7 +4031,14 @@ class FinancialIngestionEngine:
                             label_cell = next((cell for cell in label_cells if normalized_label in _label_compact(cell.text)), None)
                             if label_cell is not None and _label_compact(label_cell.text) != normalized_label:
                                 prefix = _label_compact(label_cell.text).split(normalized_label, 1)[0]
-                                if prefix and any("\u4e00" <= char <= "\u9fff" for char in prefix[-1:]):
+                                numbered_prefix = bool(re.fullmatch(
+                                    r"[一二三四五六七八九十百千万亿零〇0-9]+", prefix
+                                ))
+                                if (
+                                    prefix
+                                    and any("\u4e00" <= char <= "\u9fff" for char in prefix[-1:])
+                                    and not numbered_prefix
+                                ):
                                     continue
                             label_end = max(
                                 (
@@ -3983,6 +4130,20 @@ class FinancialIngestionEngine:
                             if existing_index is None:
                                 facts.append(fact)
                                 refs.append(ref)
+                            elif concept == "capital_expenditure":
+                                merged = _merge_capex_facts(facts[existing_index], fact)
+                                if merged is not None:
+                                    facts[existing_index] = merged
+                                    refs[existing_index] = replace(
+                                        ref,
+                                        evidence_id=f"fact:{merged.fact_id.removeprefix('ingest:')}",
+                                        title=(
+                                            f"{manifest.form_type} {manifest.period_end} / "
+                                            "capital_expenditure_components"
+                                        ),
+                                        excerpt=merged.raw_text,
+                                        bbox=merged.source_bbox,
+                                    )
                             elif _fact_rank(fact) > _fact_rank(facts[existing_index]):
                                 facts[existing_index] = fact
                                 refs[existing_index] = ref
@@ -4113,15 +4274,35 @@ class FinancialIngestionEngine:
                                         locator=f"page:{page_number}",
                                         excerpt=comparison_fact.raw_text,
                                     )
-                                    if not any(
-                                        existing.concept == concept
+                                    comparison_index = next((
+                                        position
+                                        for position, existing in enumerate(facts)
+                                        if existing.concept == concept
                                         and existing.fiscal_year == comparison_fact.fiscal_year
                                         and existing.end_date == comparison_fact.end_date
                                         and existing.usage_status == "comparator"
-                                        for existing in facts
-                                    ):
+                                    ), None)
+                                    if comparison_index is None:
                                         facts.append(comparison_fact)
                                         refs.append(comparison_ref)
+                                    elif concept == "capital_expenditure":
+                                        merged = _merge_capex_facts(
+                                            facts[comparison_index], comparison_fact
+                                        )
+                                        if merged is not None:
+                                            facts[comparison_index] = merged
+                                            refs[comparison_index] = replace(
+                                                comparison_ref,
+                                                evidence_id=(
+                                                    f"fact:{merged.fact_id.removeprefix('ingest:')}"
+                                                ),
+                                                title=(
+                                                    f"{manifest.form_type} {comparison_end} / "
+                                                    "capital_expenditure_components"
+                                                ),
+                                                excerpt=merged.raw_text,
+                                                bbox=merged.source_bbox,
+                                            )
                 # Only the last section can continue onto the next page.  A
                 # parent section therefore correctly replaces a consolidated
                 # context at a same-page boundary.

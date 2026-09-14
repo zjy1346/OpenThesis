@@ -1,4 +1,5 @@
 import threading
+import unittest
 import time
 import ssl
 from unittest.mock import patch
@@ -10,6 +11,8 @@ from tempfile import TemporaryDirectory
 from openthesis.domain import Company
 from openthesis.market_snapshot import (
     EcbFxAdapter,
+    FrankfurterFxAdapter,
+    FxRouter,
     ConfiguredQuoteAdapter,
     EastmoneyPublicQuoteAdapter,
     MemorySnapshotCache,
@@ -47,6 +50,78 @@ def test_symbol_mapping_covers_a_h_and_us() -> None:
     else:
         raise AssertionError("Yahoo must not map BSE to .SZ")
     assert map_symbol(bse, "configured").provider_symbol == "832982.BJ"
+
+
+def test_zero_price_is_rejected_before_source_conflict_or_valuation() -> None:
+    result = MarketSnapshotModule(
+        adapters=(FixtureAdapter("eastmoney-public", price=0, cap=1_000_000, currency="CNY"),),
+        clock=lambda: datetime(2026, 9, 8, tzinfo=timezone.utc),
+    ).capture(company("600519.SH", "CN_A", "CNY"))
+    assert result.status is SnapshotStatus.UNAVAILABLE
+
+
+def test_market_cap_conflicts_compare_only_matching_date_and_scope() -> None:
+    issuer = QuoteSnapshot("issuer", "fixture", "NYSE", 100, 1_000_000_000, "USD", "2026-09-07", "", market_cap_scope="issuer")
+    security = QuoteSnapshot("security", "fixture", "NYSE", 100, 100_000_000, "USD", "2026-09-07", "", market_cap_scope="security")
+    prior_day = QuoteSnapshot("prior", "fixture", "NYSE", 80, 1_000_000_000, "USD", "2026-09-06", "", market_cap_scope="issuer")
+    assert not market_snapshot._conflicts([issuer, security, prior_day], 0.05)
+
+
+def test_fx_router_covers_major_currencies_falls_back_and_caches() -> None:
+    class Missing:
+        name = "missing"
+        def __init__(self): self.calls = 0
+        def rate(self, source, target, as_of):
+            self.calls += 1
+            return None
+    class Working:
+        name = "working"
+        def __init__(self): self.calls = 0
+        def rate(self, source, target, as_of):
+            self.calls += 1
+            return market_snapshot.FxSnapshot(source, target, 1.7, as_of, self.name)
+    missing, working = Missing(), Working()
+    router = FxRouter((missing, working))
+    first = router.rate("AUD", "SGD", "2026-09-07")
+    second = router.rate("AUD", "SGD", "2026-09-07")
+    assert first is not None and first.rate == 1.7
+    assert second is first
+    assert missing.calls == working.calls == 1
+
+
+def test_fx_router_temporarily_skips_repeatedly_unhealthy_source() -> None:
+    class Missing:
+        name = "missing"
+        def __init__(self): self.calls = 0
+        def rate(self, source, target, as_of):
+            self.calls += 1
+            return None
+
+    missing = Missing()
+    router = FxRouter((missing,), clock=lambda: 100.0)
+    assert router.rate("USD", "CNY", "2026-09-07") is None
+    assert router.rate("USD", "CNY", "2026-09-08") is None
+    assert router.rate("USD", "CNY", "2026-09-09") is None
+    assert missing.calls == 2
+
+
+def test_frankfurter_fx_adapter_requires_matching_pair_and_bounded_date() -> None:
+    class Transport:
+        def get_json(self, url, *, timeout):
+            assert "rate/hkd/cny" in url
+            return {"date": "2026-09-07", "base": "HKD", "quote": "CNY", "rate": 0.91}
+
+    result = FrankfurterFxAdapter(Transport()).rate("HKD", "CNY", "2026-09-08")
+    assert result is not None
+    assert result.rate == 0.91
+    assert result.as_of == "2026-09-07"
+    assert result.source == "frankfurter-central-bank"
+
+    class WrongPair:
+        def get_json(self, url, *, timeout):
+            return {"date": "2026-09-07", "base": "USD", "quote": "CNY", "rate": 7.1}
+
+    assert FrankfurterFxAdapter(WrongPair()).rate("HKD", "CNY", "2026-09-08") is None
 
 
 def test_eastmoney_precision_is_contract_driven_for_a_h_us() -> None:
@@ -578,12 +653,12 @@ def test_automatic_cross_currency_quote_is_normalized_to_reporting_currency() ->
     assert result.equity_market_value == 13_000_000_000
 
 
-def test_ecb_fixture_adapter_accepts_normalized_payload() -> None:
+def test_ecb_fixture_adapter_rejects_unattributed_normalized_payload() -> None:
     class Transport:
         def get_json(self, url, *, timeout):
             return {"rate": 0.13}
     fx = EcbFxAdapter(Transport()).rate("HKD", "CNY", "2026-09-07")
-    assert fx is not None and fx.rate == 0.13
+    assert fx is None
 
 
 def test_ecb_cross_rate_uses_per_eur_legs_and_previous_workday() -> None:
@@ -591,7 +666,8 @@ def test_ecb_cross_rate_uses_per_eur_legs_and_previous_workday() -> None:
         def get_json(self, url, *, timeout):
             assert ".EUR.SP00.A" in url
             if "USD.EUR.SP00.A" in url:
-                return {"dataSets": [{"series": {"0": {"observations": {"0": [1.1]}}}}]}
+                return {"dataSets": [{"series": {"0": {"observations": {"0": [1.1]}}}}],
+                        "structure": {"dimensions": {"observation": [{"id": "TIME_PERIOD", "values": [{"id": "2026-09-04"}]}]}}}
             if "HKD.EUR.SP00.A" in url:
                 return "CURRENCY,TIME_PERIOD,OBS_VALUE\nHKD,2026-09-04,8.8\n"
             return {}
@@ -652,3 +728,8 @@ def test_counterargument_aliases_survive_canonical_projection() -> None:
     assert projected["strongest_counterarguments"] == ["Debt risk"]
     assert projected["unsupported_assumptions"] == ["Margin assumption"]
     assert projected["missing_evidence"] == ["Segment data"]
+
+
+def load_tests(loader, tests, pattern):
+    return unittest.TestSuite(unittest.FunctionTestCase(value) for name, value in globals().items()
+                              if name.startswith('test_') and callable(value))

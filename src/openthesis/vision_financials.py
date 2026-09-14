@@ -27,6 +27,7 @@ from .providers import ProviderError
 VISION_MAX_PAGES = 20
 VISION_MAX_BYTES = 10 * 1024 * 1024
 VISION_TASK_SCHEMA_VERSION = "vision-task-v1"
+MINERU_UPLOAD_PROTOCOL_VERSION = "oss-put-v2"
 
 
 def _vision_period_start(fiscal_period: str, period_end: str, statement: str) -> str | None:
@@ -358,7 +359,19 @@ class UrllibVisionTransport:
     def request(self, method: str, url: str, *, headers=None, body=None, timeout=60.0):
         if not str(url).startswith("https://"):
             raise VisionAdapterError("VISION_INSECURE_URL")
-        request = Request(url, data=body, headers=dict(headers or {}), method=method)
+        request_headers = dict(headers or {})
+        # urllib treats every body without an explicit content type as a form
+        # submission.  That implicit header changes the canonical request used
+        # by OSS/S3 pre-signed URLs and produces SignatureDoesNotMatch.  An
+        # empty Content-Type is intentional: it suppresses urllib's default
+        # without inventing a MIME value that was not part of the signature.
+        if (
+            method.upper() == "PUT"
+            and body is not None
+            and not any(str(key).casefold() == "content-type" for key in request_headers)
+        ):
+            request_headers["Content-Type"] = ""
+        request = Request(url, data=body, headers=request_headers, method=method)
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 payload = response.read(VISION_MAX_BYTES + 1)
@@ -614,7 +627,10 @@ class MineruFlashAdapter:
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
                 page_task_key = vision_task_key(
-                    "mineru_flash", filing.content_hash, (page,), namespace="page"
+                    f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}",
+                    filing.content_hash,
+                    (page,),
+                    namespace="page",
                 )
                 prior = self.journal.get_vision_task(page_task_key) if self.journal is not None else None
                 prior_status = str(prior.get("status") or "") if prior else ""

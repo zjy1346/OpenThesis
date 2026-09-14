@@ -78,17 +78,26 @@ describe("NewResearch configured models", () => {
     expect(COPY["zh-Hant"].marketSnapshotUnavailable).not.toContain("Market data");
   });
 
-  it("sends only configured-model references for research and vision", async () => {
+  it("uses the persisted vision policy as a per-run snapshot", async () => {
+    const policyBootstrap = {
+      ...bootstrap,
+      preferences: {
+        ...bootstrap.preferences,
+        vision_fallback_policy: JSON.stringify({
+          schema_version: 1, policy_version: 1, scope_version: 1,
+          enabled: true, provider: "configured_model", approval_mode: "review_each_plan",
+          standing_authorization: true, authorization_scope: "financial_failed_pages",
+          provider_terms_version: 1,
+          model: { configured_model_id: "vision-model", configuration_version: 2, role: "vision" },
+        }),
+      },
+    };
     const onSavePreferences = vi.fn().mockResolvedValue(bootstrap.preferences);
     const onStart = vi.fn().mockResolvedValue(undefined);
-    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={onSavePreferences} onStart={onStart} />);
+    render(<NewResearchView bootstrap={policyBootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={onSavePreferences} onStart={onStart} />);
 
     await screen.findByRole("combobox", { name: "Primary model" });
     fireEvent.click(screen.getByRole("button", { name: "700" }));
-    fireEvent.click(screen.getByText("Financial-page vision parsing"));
-    fireEvent.click(screen.getByLabelText("Enable vision fallback"));
-    fireEvent.change(screen.getByLabelText("Vision path"), { target: { value: "configured_model" } });
-    fireEvent.click(screen.getByLabelText(COPY.en.visionConsent));
     fireEvent.click(screen.getByRole("button", { name: "Start research" }));
 
     await waitFor(() => expect(onStart).toHaveBeenCalled());
@@ -100,9 +109,7 @@ describe("NewResearch configured models", () => {
     expect(JSON.stringify(request)).not.toMatch(/api_key|token|base_url|preset_id/i);
   });
 
-
-  it("offers the no-token MinerU Flash path without a configured vision model", async () => {
-    vi.mocked(listConfiguredModels).mockResolvedValue([configuredModels[0]]);
+  it("does not expose per-run vision controls when no persistent policy is enabled", async () => {
     const onStart = vi.fn().mockResolvedValue(undefined);
     render(<NewResearchView
       bootstrap={bootstrap}
@@ -113,26 +120,32 @@ describe("NewResearch configured models", () => {
     />);
 
     await screen.findByRole("combobox", { name: "Primary model" });
+    expect(screen.queryByLabelText("Enable vision fallback")).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Vision path" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "700" }));
-    fireEvent.click(screen.getByText("Financial-page vision parsing"));
-    fireEvent.click(screen.getByLabelText("Enable vision fallback"));
-    expect(screen.getByRole("option", { name: "MinerU Flash · Free · No registration" })).toBeVisible();
-    expect(screen.queryByLabelText(/API Key/i)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText(COPY.en.visionConsent));
     fireEvent.click(screen.getByRole("button", { name: "Start research" }));
 
     await waitFor(() => expect(onStart).toHaveBeenCalled());
     const request = onStart.mock.calls[0][0];
-    expect(request.vision_fallback).toMatchObject({ enabled: true, consent: true, provider: "mineru_flash", require_page_approval: true });
-    expect(request.vision_fallback.approval_mode).toBe("review_each_plan");
-    expect(request.vision_fallback.model).toBeUndefined();
+    expect(request.vision_fallback).toBeUndefined();
     expect(JSON.stringify(request)).not.toMatch(/api_key|token|base_url|preset_id/i);
   });
 
-  it("sends the one-click current-research approval mode explicitly", async () => {
+  it("requires renewed authorization when a persisted policy is stale", async () => {
+    const staleBootstrap = {
+      ...bootstrap,
+      preferences: {
+        ...bootstrap.preferences,
+        vision_fallback_policy: JSON.stringify({
+          schema_version: 1, policy_version: 0, scope_version: 1,
+          enabled: true, provider: "mineru_flash", approval_mode: "review_each_plan",
+          standing_authorization: true, authorization_scope: "financial_failed_pages", provider_terms_version: 1,
+        }),
+      },
+    };
     const onStart = vi.fn().mockResolvedValue(undefined);
     render(<NewResearchView
-      bootstrap={bootstrap}
+      bootstrap={staleBootstrap}
       copy={COPY.en}
       onOpenModelCenter={vi.fn()}
       onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)}
@@ -141,43 +154,9 @@ describe("NewResearch configured models", () => {
 
     await screen.findByRole("combobox", { name: "Primary model" });
     fireEvent.click(screen.getByRole("button", { name: "700" }));
-    fireEvent.click(screen.getByText("Financial-page vision parsing"));
-    fireEvent.click(screen.getByLabelText("Enable vision fallback"));
-    const each = screen.getByLabelText(COPY.en.visionApprovalEach) as HTMLInputElement;
-    const batch = screen.getByLabelText(COPY.en.visionApprovalResearch) as HTMLInputElement;
-    expect(each.checked).toBe(true);
-    expect(batch.checked).toBe(false);
-    fireEvent.click(batch);
-    expect(batch.checked).toBe(true);
-    expect(each.checked).toBe(false);
-    expect(screen.queryByText(/page-by-page|per-page/i)).not.toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText(COPY.en.visionConsent));
     fireEvent.click(screen.getByRole("button", { name: "Start research" }));
-
-    await waitFor(() => expect(onStart).toHaveBeenCalled());
-    expect(onStart.mock.calls[0][0].vision_fallback.approval_mode).toBe("approve_current_research");
-  });
-
-  it("resets batch approval to per-page review when vision fallback is disabled", async () => {
-    render(<NewResearchView
-      bootstrap={bootstrap}
-      copy={COPY.en}
-      onOpenModelCenter={vi.fn()}
-      onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)}
-      onStart={vi.fn()}
-    />);
-
-    await screen.findByRole("combobox", { name: "Primary model" });
-    fireEvent.click(screen.getByRole("button", { name: "700" }));
-    fireEvent.click(screen.getByText("Financial-page vision parsing"));
-    const enable = screen.getByLabelText("Enable vision fallback");
-    fireEvent.click(enable);
-    const batch = screen.getByLabelText(COPY.en.visionApprovalResearch) as HTMLInputElement;
-    fireEvent.click(batch);
-    fireEvent.click(enable);
-    fireEvent.click(enable);
-    expect((screen.getByLabelText(COPY.en.visionApprovalEach) as HTMLInputElement).checked).toBe(true);
-    expect((screen.getByLabelText(COPY.en.visionApprovalResearch) as HTMLInputElement).checked).toBe(false);
+    expect(onStart).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.visionMissing);
   });
   it("keeps editing available and links to Model Center when no tested model exists", async () => {
     vi.mocked(listConfiguredModels).mockResolvedValue([]);

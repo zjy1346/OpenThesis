@@ -251,11 +251,9 @@ export function useWorkbenchSession() {
     }
   };
 
-  const retrySynthesis = async () => {
-    const model = lastRequest.current?.model;
-    if (!report || !model) {
-      throw new Error("model session is unavailable");
-    }
+  const retrySynthesis = async (selectedModel?: ResearchRequest["model"]) => {
+    const model = selectedModel ?? lastRequest.current?.model;
+    if (!report) throw new Error("report is unavailable");
     setError(null);
     const next = await retryResearchSynthesis(report.run_id, model);
     setReport(next);

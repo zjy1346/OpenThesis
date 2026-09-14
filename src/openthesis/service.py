@@ -26,13 +26,14 @@ from .application_services import (
     ResearchOrchestrator,
 )
 from .demo import DEMO_COMPANY, demo_facts
-from .domain import Company, FilingDocument, FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso
+from .domain import Company, EvidenceRef, FilingDocument, FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso
 from .filing_parser import build_filing_evidence
+from .research_readiness import readiness, primary_market_alternative
 from .filing_selection import select_research_filings
 from .i18n import EN, ZH_HANT, normalize_language, resolve_system_language, resolve_ui_language, translate_error
 from .market_data import MarketDataError, MarketDataModule
 from .market_snapshot import (
-    EcbFxAdapter,
+    FxRouter,
     EastmoneyPublicQuoteAdapter,
     MarketSnapshotModule,
     ReverseDcfPolicy,
@@ -53,6 +54,7 @@ from .financial_compiler import (
     concepts_cover_profile,
 )
 from .financial_recognition import FinancialRecognitionCoordinator
+from .financial_evidence import FinancialEvidenceCoordinator, FinancialEvidenceRequest
 from .financial_recovery import FinancialRecoveryController, RecoveryState
 from .financials import deterministic_summary
 from .market_financials import FinancialValidation, ValidationStatus
@@ -107,11 +109,37 @@ PREFERENCE_DEFAULTS: dict[str, str] = {
     "sec_contact_profile": "personal",
     "sec_contact_email": "",
     "sec_user_agent": "",
+    # Atomic, non-secret visual fallback policy written by the desktop UI.
+    # Keeping the complete policy in one setting prevents a partially written
+    # provider/authorization pair from ever enabling uploads accidentally.
+    "vision_fallback_policy": "",
+    # Versioned, non-secret visual fallback policy.  A standing authorization
+    # is always explicit and can be revoked independently of provider/model
+    # selection.  Legacy per-run consent is never promoted into these keys.
+    "vision_policy_version": "1",
+    "vision_enabled": "false",
+    "vision_provider": "mineru_flash",
+    "vision_configured_model_id": "",
+    "vision_configuration_version": "1",
+    "vision_approval_mode": "review_each_plan",
+    "vision_standing_authorization": "false",
+    "vision_authorized_provider": "",
+    "vision_authorized_scope": "failed_financial_statement_pages",
+    "vision_authorized_policy_version": "",
+    "vision_authorized_at": "",
 }
 
 
 class PreferenceValidationError(ValueError):
     """Raised when a caller attempts to persist an unsupported preference."""
+
+
+class ServiceConfigurationError(RuntimeError):
+    """A user-fixable configuration gap with a stable public error code."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 class _ResearchDataUnavailable(RuntimeError):
@@ -331,7 +359,7 @@ class AppService:
                     )
             self._market_snapshot = MarketSnapshotModule(
                 adapters=snapshot_adapters,
-                cache=StorageSnapshotCache(self.storage), fx_adapter=EcbFxAdapter()
+                cache=StorageSnapshotCache(self.storage), fx_adapter=FxRouter()
             )
         self._disclosure_service = DisclosureService(self._market_data, self._market_snapshot)
         self._financial_ingestion = financial_ingestion_engine or FinancialIngestionEngine(
@@ -341,6 +369,7 @@ class AppService:
         self._financial_recognition = FinancialRecognitionCoordinator(
             self._financial_ingestion
         )
+        self._financial_evidence = FinancialEvidenceCoordinator(self._recognition_for)
         self._financial_recovery = FinancialRecoveryController(
             self.storage, app_version=self.app_version
         )
@@ -368,6 +397,105 @@ class AppService:
     ) -> FinancialRecognitionCoordinator:
         """Compatibility alias; ownership lives in :class:`FinancialPipeline`."""
         return self._financial_pipeline.recognition_for(company, filings)
+
+    def _financial_recognition_capabilities(
+        self,
+        company: Company,
+        filings: Sequence[FilingDocument],
+        *,
+        job: _ResearchJob | None = None,
+    ) -> tuple[tuple[Any, ...], VisionFinancialSourceAdapter | None, VisionFallbackConfig | None]:
+        """Resolve current structured and visual adapters for every entry path.
+
+        Historical run payloads are audit records, not authorization.  Manual
+        and automatic retries therefore re-read the current settings policy so
+        revocation takes effect immediately.
+        """
+
+        preferences = self.preferences()
+        structured_sources: tuple[Any, ...] = ()
+        sec_mapping = SEC_HK_ISSUERS.get(company.ticker.upper())
+        sec_email = str(preferences.get("sec_contact_email", "")).strip()
+        if sec_mapping and "@" in sec_email and " " not in sec_email:
+            try:
+                client = self._sec_client_factory(
+                    build_sec_user_agent(
+                        _normalize_sec_profile(preferences["sec_contact_profile"]),
+                        sec_email,
+                    ),
+                    self.storage.data_dir / "sec-cache",
+                )
+                structured_sources = (SecFinancialSourceAdapter(client),)
+            except Exception:
+                structured_sources = ()
+
+        config = _vision_config_from_request(
+            _vision_request_from_preferences(preferences)
+        )
+        if config is None or not config.enabled:
+            return structured_sources, None, config
+        filing_hashes = frozenset(
+            str(item.content_hash) for item in filings if str(item.content_hash or "")
+        )
+        approval_ledger: dict[str, tuple[str, int, int]] = {}
+
+        def approve_upload(summary: dict[str, Any]) -> bool:
+            if config.approval_mode == "review_each_plan":
+                if job is None:
+                    return False
+                safe_summary = {
+                    key: summary.get(key)
+                    for key in (
+                        "plan_id", "provider", "pages", "total_bytes",
+                        "source_document", "filing_hash", "document_hashes",
+                        "max_pages", "max_bytes",
+                    )
+                    if key in summary
+                }
+                with self._jobs_lock:
+                    if job.cancel_event.is_set() or job.state not in {"queued", "running"}:
+                        return False
+                    job.vision_approval_event.clear()
+                    job.vision_approval = None
+                    job.vision_approval_pending = True
+                    job.vision_upload_preview = safe_summary
+                    job.stage = "vision-approval"
+                    job.message = _ui_message(
+                        job.ui_language,
+                        "Review failed financial pages before upload",
+                        "上传前请审核本地识别失败的财务表页",
+                        "上傳前請審核本地辨識失敗的財務表頁",
+                    )
+                while not job.vision_approval_event.wait(0.1):
+                    if job.cancel_event.is_set():
+                        with self._jobs_lock:
+                            job.vision_approval_pending = False
+                        return False
+                with self._jobs_lock:
+                    approved = bool(job.vision_approval)
+                    job.vision_approval_pending = False
+                    job.vision_upload_preview = None
+                if not approved or job.cancel_event.is_set():
+                    return False
+            return _vision_batch_upload_allowed(
+                summary,
+                config,
+                filing_hashes,
+                job_active=job is None or job.state in {"queued", "running"},
+                cancelled=bool(job and job.cancel_event.is_set()),
+                approved_plans=approval_ledger,
+            )
+
+        config = replace(config, approve_upload=approve_upload)
+        config.validate()
+        adapter = self._vision_adapter_factory(config)
+        if isinstance(adapter, MineruFlashAdapter):
+            adapter.journal = self.storage
+        return (
+            structured_sources,
+            VisionTaskCoordinator(adapter, journal=self.storage, max_workers=2),
+            config,
+        )
 
     def hello(self) -> dict[str, Any]:
         return {
@@ -447,14 +575,45 @@ class AppService:
                 value = normalize_language(value)
             if key == "research_market":
                 value = normalize_market(value).value
+            if key in {"vision_enabled", "vision_standing_authorization"} and value not in {"true", "false"}:
+                raise PreferenceValidationError(f"{key} must be true or false")
+            if key in {"vision_policy_version", "vision_configuration_version"}:
+                try:
+                    value = str(max(1, int(value)))
+                except (TypeError, ValueError) as exc:
+                    raise PreferenceValidationError(f"{key} must be a positive integer") from exc
+            if key in {"vision_provider", "vision_authorized_provider"} and value not in {"", "mineru_flash", "configured_model"}:
+                raise PreferenceValidationError(f"{key} is unsupported")
+            if key == "vision_approval_mode" and value not in {"review_each_plan", "approve_current_research"}:
+                raise PreferenceValidationError("vision_approval_mode is unsupported")
+            if key == "vision_authorized_scope" and value not in {"failed_financial_statement_pages"}:
+                raise PreferenceValidationError("vision authorization scope is unsupported")
+            if key == "vision_configured_model_id" and (
+                len(value) > 128
+                or any(not (character.isalnum() or character in "_.-") for character in value)
+            ):
+                raise PreferenceValidationError("vision configured model id is invalid")
+            if key == "vision_fallback_policy":
+                _parse_persisted_vision_policy(value, strict=True)
             self.storage.set_setting(key, value)
         return self.preferences()
 
     def common_companies(self) -> list[dict[str, Any]]:
         return [
-            company.to_dict()
+            self._company_search_result(company)
             for company in (*COMMON_COMPANIES, *COMMON_MARKET_COMPANIES)
         ]
+
+    def _company_readiness(self, company: Company) -> dict[str, Any]:
+        key = _financial_storage_key(company.to_dict())
+        return readiness(company, self.storage.get_validation_groups(key))
+
+    def _company_search_result(self, company: Company) -> dict[str, Any]:
+        status = self._company_readiness(company)
+        alternative = primary_market_alternative(company, COMMON_MARKET_COMPANIES)
+        if not status['recommended'] and alternative is not None:
+            status['alternative'] = alternative.to_dict()
+        return {**company.to_dict(), 'research_readiness': status}
 
     def market_catalog(self) -> list[dict[str, Any]]:
         return [
@@ -604,7 +763,7 @@ class AppService:
         bounded_limit = min(50, max(1, int(limit)))
         if selected_market != Market.US:
             return [
-                company.to_dict()
+                self._company_search_result(company)
                 for company in self._disclosure_service.resolve(
                     normalized,
                     selected_market,
@@ -613,7 +772,10 @@ class AppService:
             ]
         preferences = self.preferences()
         profile = _normalize_sec_profile(preferences["sec_contact_profile"])
-        user_agent = build_sec_user_agent(profile, preferences["sec_contact_email"])
+        try:
+            user_agent = build_sec_user_agent(profile, preferences["sec_contact_email"])
+        except ValueError as exc:
+            raise ServiceConfigurationError("SEC_EMAIL_CONFIG_REQUIRED") from exc
         client = self._sec_client_factory(
             user_agent, self.storage.data_dir / "sec-cache"
         )
@@ -665,19 +827,54 @@ class AppService:
         thesis = self.storage.get_thesis_version(thesis_version_id)
         if thesis is None:
             raise KeyError("thesis version not found")
+        sources = []
+        if thesis.get('run_id'):
+            for artifact in self.storage.get_artifacts(thesis['run_id']):
+                if artifact['artifact_type'] == 'deterministic-financial-summary':
+                    sources = artifact.get('content', {}).get('evidence', [])
+                    break
+        thesis['sources'] = sources
         return thesis
 
     def save_thesis_version(
-        self, company_cik: str, content: dict[str, Any]
+        self,
+        company_cik: str,
+        content: dict[str, Any],
+        *,
+        base_thesis_version_id: str | None = None,
+        company: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not company_cik.strip() or not isinstance(content, dict):
             raise ValueError("thesis content is invalid")
-        return self.storage.save_thesis_version(
-            company_cik.strip(),
+        run_id = None
+        company_cik = company_cik.strip()
+        if base_thesis_version_id is not None:
+            base = self.storage.get_thesis_version(base_thesis_version_id)
+            if base is None or base['company_cik'] != company_cik:
+                raise ValueError('thesis base must belong to the same company')
+            run_id = base.get('run_id')
+            content = {**content, '_parent_thesis_version_id': base_thesis_version_id}
+        if not self.storage.company_exists(company_cik):
+            if not isinstance(company, dict):
+                raise ServiceConfigurationError("COMPANY_IDENTITY_REQUIRED")
+            allowed = set(Company.__dataclass_fields__)
+            try:
+                identity = Company(**{
+                    key: value for key, value in company.items() if key in allowed
+                })
+            except (TypeError, ValueError) as exc:
+                raise ServiceConfigurationError("COMPANY_IDENTITY_INVALID") from exc
+            if identity.cik != company_cik:
+                raise ServiceConfigurationError("COMPANY_IDENTITY_MISMATCH")
+            self.storage.save_company(identity)
+        saved = self.storage.save_thesis_version(
+            company_cik,
             content,
+            run_id=run_id,
             created_by="user",
             created_at=utc_now_iso(),
         )
+        return self.get_thesis(saved['thesis_version_id'])
 
     def get_report(
         self,
@@ -718,6 +915,7 @@ class AppService:
                 "data_snapshot": payload.get("data_snapshot", {}),
             },
             "retryable_synthesis": _report_retryable(artifacts),
+            "synthesis_error_code": _synthesis_error_code(artifacts),
             "retryable_growth": _growth_retryable(artifacts),
             "financial_status": financial_status,
             "markdown": self._report_service.markdown(
@@ -837,6 +1035,7 @@ class AppService:
         self, run_id: str, *, force: bool = False,
         progress: Callable[[str, int, int], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        _vision_job: _ResearchJob | None = None,
     ) -> dict[str, Any]:
         """Refresh official financial evidence without constructing a model provider.
 
@@ -877,6 +1076,7 @@ class AppService:
                 errors.extend(self._retry_market_financials(
                     company, payload, force=force, trace=retry_trace,
                     progress=progress, cancel_check=cancel_check, run_id=run_id,
+                    vision_job=_vision_job,
                 ))
         except ResearchCancelled:
             raise
@@ -1051,6 +1251,7 @@ class AppService:
             report = self.retry_financials(
                 run_id, force=force, progress=update,
                 cancel_check=job.cancel_event.is_set,
+                _vision_job=job,
             )
             retry = report.get("financial_retry", {})
             operation_status = str(retry.get("status", "failed"))
@@ -1313,12 +1514,16 @@ class AppService:
         progress: Callable[[str, int, int], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         run_id: str = "",
+        vision_job: _ResearchJob | None = None,
     ) -> list[str]:
         progress = progress or (lambda _stage, _current, _total: None)
         cancel_check = cancel_check or (lambda: False)
         if cancel_check():
             raise ResearchCancelled()
         adapter = self._disclosure_service.adapter_for(company)
+        language_setter = getattr(adapter, "set_preferred_language", None)
+        if callable(language_setter):
+            language_setter(str(payload.get("report_language") or "zh-Hant"))
         configuration = payload.get("research_configuration", {})
         history_years = _research_history_years({
             "evidence_policy": {
@@ -1543,7 +1748,8 @@ class AppService:
                 accepted_facts,
                 quarantined,
                 canonical_groups,
-                evidence + list(build_filing_evidence([filing])),
+                evidence + [EvidenceRef(**item) for item in build_filing_evidence([filing])
+                            if item.get('kind') != 'material_gap'],
                 audit_only_facts,
             )
             incomplete = production_dataset and (
@@ -1585,12 +1791,20 @@ class AppService:
                 raise ResearchCancelled()
             progress("filing-parse", 0, len(parse_targets))
             try:
-                outcome = self._recognition_for(company, parse_targets).recognize(
+                structured_sources, vision_adapter, vision_config = (
+                    self._financial_recognition_capabilities(
+                        company, parse_targets, job=vision_job
+                    )
+                )
+                outcome = self._financial_evidence.execute(FinancialEvidenceRequest(
                     company,
-                    parse_targets,
+                    tuple(parse_targets),
+                    structured_sources=structured_sources,
+                    vision_fallback=vision_adapter,
+                    vision_config=vision_config,
                     cancel_check=cancel_check,
                     progress=progress,
-                )
+                ))
             except Exception as exc:
                 errors.extend(
                     f"{filing.accession_number}:parse:{type(exc).__name__}"
@@ -1821,7 +2035,7 @@ class AppService:
         return errors
 
     def retry_research_synthesis(
-        self, run_id: str, model: dict[str, Any]
+        self, run_id: str, model: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         stored = self.storage.get_run(run_id)
         if stored is None:
@@ -1830,7 +2044,8 @@ class AppService:
         company_payload = payload.get("company")
         if not isinstance(company_payload, dict):
             raise ValueError("saved company is invalid")
-        config = _model_config_from_request(model)
+        model_reference = model if isinstance(model, dict) and model else payload.get("model_configuration")
+        config = _model_config_from_request(model_reference)
         if not config.enabled:
             raise ValueError("an enabled model is required")
         company = Company(**company_payload)
@@ -2224,7 +2439,19 @@ class AppService:
                 }
             filing_evidence: list[dict[str, Any]] = []
             financial_profile: FinancialProfile | None = None
-            vision_config = _vision_config_from_request(request.get("vision_fallback"))
+            # Settings is the sole current authorization source.  A historical
+            # or legacy request payload may be retained for audit, but cannot
+            # reactivate cloud page uploads after the user revoked the policy.
+            legacy_vision_request = request.get("vision_fallback")
+            if (
+                isinstance(legacy_vision_request, dict)
+                and bool(legacy_vision_request.get("enabled"))
+                and not bool(_vision_policy_snapshot(preferences).get("enabled"))
+            ):
+                raise _ResearchDataUnavailable("VISION_CONSENT_REQUIRED")
+            vision_request = _vision_request_from_preferences(preferences)
+            vision_config = _vision_config_from_request(vision_request)
+            vision_policy = _vision_policy_snapshot(preferences)
             vision_adapter: VisionFinancialSourceAdapter | None = None
             if vision_config is not None and vision_config.enabled:
                 if vision_config.require_page_approval:
@@ -2529,6 +2756,9 @@ class AppService:
                     self.storage.save_facts(list(latest_sec))
             else:
                 adapter = self._disclosure_service.adapter_for(company)
+                language_setter = getattr(adapter, "set_preferred_language", None)
+                if callable(language_setter):
+                    language_setter(report_language)
                 market_label = _ui_message(ui_language, "A/H-share", "A/港股", "A/港股")
                 self._update_job(
                     job,
@@ -2659,9 +2889,9 @@ class AppService:
                         structured_sources = ()
                 if hasattr(self._financial_ingestion, "collect_candidate_batches"):
                     try:
-                        outcome = self._recognition_for(company, research_reports).recognize(
+                        outcome = self._financial_evidence.execute(FinancialEvidenceRequest(
                             company,
-                            research_reports,
+                            tuple(research_reports),
                             structured_sources=structured_sources,
                             vision_fallback=vision_adapter,
                             vision_config=vision_config,
@@ -2669,7 +2899,7 @@ class AppService:
                             progress=lambda stage, current, total, detail=None: self._ingestion_progress(
                                 job, stage, current, total, detail
                             ),
-                        )
+                        ))
                         dataset = outcome.dataset
                     except VisionAdapterError as exc:
                         if job.cancel_event.is_set() or exc.code == "VISION_CANCELLED":
@@ -2729,6 +2959,9 @@ class AppService:
                     percent=29,
                 )
                 filing_evidence.extend(item.to_dict() for item in dataset.evidence)
+                # Canonical financial cells cannot substitute for the official
+                # business / MD&A / risk body required by qualitative roles.
+                filing_evidence.extend(build_filing_evidence(research_reports))
                 manifest_by_document = {item.document_id: item for item in dataset.manifest}
                 for filing in research_reports:
                     manifest = manifest_by_document.get(filing.document_id)
@@ -2874,6 +3107,7 @@ class AppService:
                 valuation_inputs,
                 market_snapshot,
                 valuation_policy,
+                vision_policy,
                 policy_source=(
                     "manual_override"
                     if isinstance(request.get("valuation"), dict)
@@ -3578,27 +3812,91 @@ def _latest_sec_verified_group(
             first.fiscal_period or "FY", first.end_date, first.filed_at,
             first.source_document or accession, first.source_url,
         ))
-    if expected_period_end:
-        filings = [item for item in filings if item.period_end == expected_period_end]
-        if not filings:
-            return None
-    canonical = FinancialFactCompiler().compile_facts(
-        subject,
+    # Probe the requested/latest filing first, then walk backwards to the
+    # latest complete FY. A malformed newly archived filing must not erase a
+    # previously verified annual baseline.
+    ordered = sorted(
         filings,
-        [fact for fact in facts if any(item.accession_number == fact.accession_number for item in filings)],
-        reporting_currency=first.currency,
+        key=lambda item: (
+            item.period_end == expected_period_end if expected_period_end else False,
+            item.period_end,
+            item.filed_at,
+        ),
+        reverse=True,
     )
-    if not canonical.allow_ai or not canonical.research_facts:
-        return None
-    return tuple(canonical.research_facts)
+    for filing in ordered:
+        group_facts = [
+            fact for fact in facts
+            if fact.accession_number == filing.accession_number
+        ]
+        monetary_currencies = {
+            str(fact.currency or fact.unit).upper()
+            for fact in group_facts
+            if str(fact.currency or fact.unit).upper()
+            not in {"", "SHARE", "SHARES", "UNIT", "UNITS", "PURE", "PERCENT"}
+        }
+        subject_currency = str(subject.reporting_currency or "").upper()
+        if subject_currency in monetary_currencies:
+            reporting_currency = subject_currency
+        elif len(monetary_currencies) == 1:
+            reporting_currency = next(iter(monetary_currencies))
+        else:
+            # A shares-only or mixed-currency archive is not a financial
+            # baseline.  Let the ordered loop continue to the prior complete
+            # FY instead of leaking a unit from another accession.
+            continue
+        canonical = FinancialFactCompiler().compile_facts(
+            subject,
+            [filing],
+            group_facts,
+            reporting_currency=reporting_currency,
+        )
+        if canonical.allow_ai and canonical.research_facts:
+            return tuple(canonical.research_facts)
+    return None
 
 
 def _report_retryable(artifacts: list[dict[str, Any]]) -> bool:
+    required_stage_types = {
+        "deterministic-financial-summary",
+        "verified-research-dossier",
+        "growth-opportunities",
+        "counter-analysis",
+        "forecast-scenarios",
+    }
+    available_stage_types = {
+        str(item.get("artifact_type"))
+        for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("content"), dict)
+    }
+    stages_complete = required_stage_types.issubset(available_stage_types)
     final = next(
         (item for item in reversed(artifacts) if item.get("artifact_type") == "research-report"),
         None,
     )
-    return bool(final and final.get("content", {}).get("retryable"))
+    if final is None:
+        return stages_complete
+    return bool(stages_complete and final.get("content", {}).get("retryable"))
+
+
+def _synthesis_error_code(artifacts: list[dict[str, Any]]) -> str:
+    final = next(
+        (item for item in reversed(artifacts) if item.get("artifact_type") == "research-report"),
+        None,
+    )
+    content = final.get("content", {}) if isinstance(final, dict) else {}
+    if not isinstance(content, dict) or content.get("mode") != "synthesis-incomplete":
+        return ""
+    diagnostics = content.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    provider_code = str(diagnostics.get("provider_error_code") or "")
+    if provider_code:
+        return provider_code[:80]
+    if diagnostics.get("parse_error_class") == "context_budget_exceeded":
+        return "MODEL_CONTEXT_CAPACITY"
+    if diagnostics.get("parse_error_class") == "provider_error":
+        return "MODEL_PROVIDER_ERROR"
+    return "MODEL_RESPONSE_INVALID"
 
 
 def _growth_retryable(artifacts: list[dict[str, Any]]) -> bool:
@@ -3854,6 +4152,177 @@ def _vision_config_from_request(value: Any) -> VisionFallbackConfig | None:
         require_page_approval=True,
         approval_mode=approval_mode,
     )
+
+
+def _parse_persisted_vision_policy(
+    raw_value: str,
+    *,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    """Parse the atomic visual policy without accepting secrets or stale consent."""
+
+    if not raw_value:
+        return None
+    try:
+        value = json.loads(raw_value)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        if strict:
+            raise PreferenceValidationError("vision fallback policy must be valid JSON") from exc
+        return None
+    if not isinstance(value, dict):
+        if strict:
+            raise PreferenceValidationError("vision fallback policy must be an object")
+        return None
+    forbidden = {"api_key", "apikey", "token", "secret", "endpoint", "base_url"}
+
+    def contains_forbidden(item: Any) -> bool:
+        if isinstance(item, dict):
+            return any(
+                str(key).casefold() in forbidden or contains_forbidden(child)
+                for key, child in item.items()
+            )
+        if isinstance(item, list):
+            return any(contains_forbidden(child) for child in item)
+        return False
+
+    if contains_forbidden(value):
+        if strict:
+            raise PreferenceValidationError("vision fallback policy must not contain secrets")
+        return None
+    valid = bool(
+        value.get("schema_version") == 1
+        and value.get("policy_version") == 1
+        and value.get("scope_version") == 1
+        and value.get("provider_terms_version") == 1
+        and value.get("provider") in {"mineru_flash", "configured_model"}
+        and value.get("approval_mode")
+        in {"review_each_plan", "approve_current_research"}
+        and value.get("authorization_scope") == "financial_failed_pages"
+    )
+    model = value.get("model")
+    if value.get("provider") == "configured_model":
+        model_id = model.get("configured_model_id") if isinstance(model, dict) else None
+        valid = bool(
+            valid
+            and isinstance(model, dict)
+            and isinstance(model_id, str)
+            and model_id
+            and len(model_id) <= 128
+            and all(character.isalnum() or character in "_.-" for character in model_id)
+            and isinstance(model.get("configuration_version"), int)
+            and not isinstance(model.get("configuration_version"), bool)
+            and model.get("configuration_version") >= 1
+        )
+    normalized = {
+        "schema_version": 1,
+        "policy_version": 1,
+        "scope_version": 1,
+        "provider_terms_version": 1,
+        "enabled": value.get("enabled") is True,
+        "provider": value.get("provider")
+        if value.get("provider") in {"mineru_flash", "configured_model"}
+        else "mineru_flash",
+        "configured_model_id": str(model.get("configured_model_id", ""))
+        if isinstance(model, dict)
+        else "",
+        "configuration_version": int(model.get("configuration_version", 1))
+        if isinstance(model, dict)
+        and isinstance(model.get("configuration_version", 1), int)
+        else 1,
+        "approval_mode": value.get("approval_mode")
+        if value.get("approval_mode")
+        in {"review_each_plan", "approve_current_research"}
+        else "review_each_plan",
+        "authorization": {
+            "valid": bool(
+                valid
+                and value.get("enabled") is True
+                and value.get("standing_authorization") is True
+                and isinstance(value.get("authorized_at"), str)
+                and value.get("authorized_at")
+            ),
+            "scope": "financial_failed_pages",
+            "policy_version": "1",
+            "confirmed_at": str(value.get("authorized_at", "")),
+        },
+    }
+    if strict and not valid:
+        raise PreferenceValidationError("vision fallback policy is unsupported or stale")
+    return normalized
+
+
+def _vision_policy_snapshot(preferences: dict[str, str]) -> dict[str, Any]:
+    """Return a non-secret immutable policy snapshot for one research run."""
+
+    atomic = _parse_persisted_vision_policy(
+        str(preferences.get("vision_fallback_policy", ""))
+    )
+    if atomic is not None:
+        return atomic
+
+    provider = str(preferences.get("vision_provider", "mineru_flash"))
+    policy_version = str(preferences.get("vision_policy_version", "1"))
+    standing = str(preferences.get("vision_standing_authorization", "false")) == "true"
+    authorization_valid = bool(
+        standing
+        and preferences.get("vision_authorized_provider", "") == provider
+        and preferences.get("vision_authorized_scope", "")
+        == "failed_financial_statement_pages"
+        and preferences.get("vision_authorized_policy_version", "") == policy_version
+        and preferences.get("vision_authorized_at", "")
+    )
+    try:
+        schema_version = max(1, int(policy_version or "1"))
+    except (TypeError, ValueError):
+        schema_version = 1
+        authorization_valid = False
+    try:
+        configuration_version = max(
+            1, int(preferences.get("vision_configuration_version", "1") or "1")
+        )
+    except (TypeError, ValueError):
+        configuration_version = 1
+        authorization_valid = False
+    return {
+        "schema_version": schema_version,
+        "enabled": str(preferences.get("vision_enabled", "false")) == "true",
+        "provider": provider,
+        "configured_model_id": str(preferences.get("vision_configured_model_id", "")),
+        "configuration_version": configuration_version,
+        "approval_mode": str(
+            preferences.get("vision_approval_mode", "review_each_plan")
+        ),
+        "authorization": {
+            "valid": authorization_valid,
+            "scope": "failed_financial_statement_pages",
+            "policy_version": policy_version,
+            "confirmed_at": str(preferences.get("vision_authorized_at", "")),
+        },
+    }
+
+
+def _vision_request_from_preferences(preferences: dict[str, str]) -> dict[str, Any]:
+    """Build the current request view; revoked authorization always wins."""
+
+    snapshot = _vision_policy_snapshot(preferences)
+    if not snapshot["enabled"]:
+        return {"enabled": False}
+    provider = str(snapshot["provider"])
+    request: dict[str, Any] = {
+        "enabled": True,
+        "provider": provider,
+        "consent": bool(snapshot["authorization"]["valid"]),
+        "require_page_approval": True,
+        "approval_mode": str(snapshot["approval_mode"]),
+        "language": "auto",
+    }
+    if provider == "configured_model":
+        request["model"] = {
+            "configured_model_id": str(snapshot["configured_model_id"]),
+            "configuration_version": int(snapshot["configuration_version"]),
+            "role": "vision",
+        }
+    return request
 
 
 def _vision_batch_upload_allowed(
@@ -4359,6 +4828,7 @@ def _build_research_snapshot(
     valuation_inputs: dict[str, Any] | None,
     market_snapshot: dict[str, Any] | None,
     valuation_policy: ReverseDcfPolicy | None = None,
+    vision_policy: dict[str, Any] | None = None,
     policy_source: str = "policy_default",
 ) -> dict[str, Any]:
     return {
@@ -4392,6 +4862,7 @@ def _build_research_snapshot(
             "research_pack_version": pack.version,
             "research_pack_content_identity": pack.content_hash,
             "annual_history_years": int(annual_history_years),
+            "vision_policy": dict(vision_policy or {}),
         },
     }
 

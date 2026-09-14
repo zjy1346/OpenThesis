@@ -4,8 +4,10 @@ import tempfile
 import unittest
 import json
 import urllib.parse
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
 from openthesis.download_safety import store_immutable_payload
 from openthesis.market_data import (
@@ -14,12 +16,15 @@ from openthesis.market_data import (
     MarketDataError,
     MarketDataModule,
     OfficialDisclosureHttpClient,
+    _ValidatedRedirectHandler,
     _classify_report,
     _hkex_filings_from_json,
     _hkex_filings_from_text,
     _hkex_json_rows,
 )
 from openthesis.markets import Exchange, Market
+from openthesis.markets import build_company
+from openthesis.filing_selection import select_research_filings
 
 
 class _Transport:
@@ -109,6 +114,40 @@ class _HkexJsonTransport(_Transport):
 
 
 class MarketDataAdapterTests(unittest.TestCase):
+    def test_hkex_resolve_folds_simplified_and_traditional_and_excludes_derivatives(self) -> None:
+        class CatalogueTransport(_Transport):
+            def get_json(self, url: str):
+                if "activestock" in url:
+                    return [
+                        {"i": 1000304996, "c": "13019", "n": "騰訊國君購B", "s": 7729},
+                        {"i": 1000030033, "c": "03033", "n": "騰訊主題ETF", "s": 7730},
+                        {"i": 1000000700, "c": "00700", "n": "騰訊控股", "s": 700},
+                    ]
+                return super().get_json(url)
+
+        matches = HkexNewsAdapter(CatalogueTransport()).resolve("腾讯")
+
+        self.assertEqual([item.ticker for item in matches], ["00700.HK"])
+        self.assertEqual(matches[0].name, "騰訊控股")
+
+    def test_cninfo_normalizes_fullwidth_st_query_but_preserves_official_name(self) -> None:
+        class StTransport(_Transport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.query = ""
+
+            def post_form(self, url: str, fields: dict[str, str]):
+                if "topSearch" in url:
+                    self.query = fields["keyWord"]
+                    return [{"code": "600001", "zwjc": "*ST测试", "orgId": "st-1"}]
+                return super().post_form(url, fields)
+
+        transport = StTransport()
+        company = CnInfoAdapter(transport).resolve("＊ＳＴ测试")[0]
+
+        self.assertEqual(transport.query, "ST测试")
+        self.assertEqual(company.name, "*ST测试")
+
     def test_cninfo_one_quarter_alias_maps_to_q1_period_end(self) -> None:
         self.assertEqual(_classify_report("宁德时代2026年一季度报告"), ("QUARTERLY_REPORT", "Q1"))
         self.assertEqual(_classify_report("宁德时代2026年1季度报告"), ("QUARTERLY_REPORT", "Q1"))
@@ -190,7 +229,8 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertTrue(transport.search_urls)
         query = urllib.parse.parse_qs(urllib.parse.urlparse(transport.search_urls[0]).query)
         self.assertEqual(query["rowRange"], ["100"])
-        self.assertEqual(query["title"], ["Annual Report"])
+        self.assertEqual(query["title"], ["年度報告"])
+        self.assertEqual(query["lang"], ["C"])
         for key in ("stockId", "fromDate", "toDate", "documentType", "sortByOptions", "lang"):
             self.assertIn(key, query)
         self.assertRegex(query["fromDate"][0], r"^20\d{6}$")
@@ -198,6 +238,38 @@ class MarketDataAdapterTests(unittest.TestCase):
         self.assertTrue(query["fromDate"][0].endswith("0101"))
         self.assertNotIn("/", query["fromDate"][0] + query["toDate"][0])
         self.assertNotIn("titlesearch.xhtml", transport.search_urls[0])
+
+    def test_hkex_prefers_chinese_report_and_deduplicates_english_twin(self) -> None:
+        class BilingualTransport(_Transport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.languages: list[str] = []
+
+            def get_json(self, url: str):
+                if "titleSearchServlet.do" not in url:
+                    return super().get_json(url)
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                language = query["lang"][0]
+                title = query["title"][0]
+                self.languages.append(language)
+                if title not in {"年度報告", "Annual Report"}:
+                    return {"result": []}
+                suffix = "c" if language == "C" else "e"
+                report_title = "2025 年度報告" if language == "C" else "2025 Annual Report"
+                return {"result": [{
+                    "DATE_TIME": "28/03/2026 12:00",
+                    "TITLE": report_title,
+                    "FILE_LINK": f"/listedco/listconews/sehk/2026/0328/annual-2025-{suffix}.pdf",
+                }]}
+
+        transport = BilingualTransport()
+        adapter = HkexNewsAdapter(transport, preferred_language="zh-Hant")
+        company = adapter.resolve("00700")[0]
+        filings = adapter.list_financial_filings(company, limit=1)
+        annuals = [item for item in filings if item.form_type == "ANNUAL_REPORT"]
+        self.assertEqual(len(annuals), 1)
+        self.assertIn("年度報告", annuals[0].primary_document)
+        self.assertEqual(transport.languages[0], "C")
 
     def test_hkex_discovery_keeps_n_plus_one_annual_comparator(self) -> None:
         adapter = HkexNewsAdapter(_HkexJsonTransport())
@@ -257,6 +329,37 @@ class MarketDataAdapterTests(unittest.TestCase):
             "Interim Report 2024",
         ])
         self.assertEqual([item.period_end for item in filings], ["2024-12-31", "2023-12-31", "2024-06-30"])
+
+    def test_hkex_interim_results_announcement_is_provisional_then_formal_report_wins(self) -> None:
+        company = build_company("00700.HK", "Tencent")
+        candidates = _hkex_filings_from_json(company, [
+            {
+                "DATE_TIME": "14/08/2026 07:00",
+                "TITLE": "Interim Results for the six months ended 30 June 2026",
+                "FILE_LINK": "/listedco/listconews/sehk/2026/0814/results.pdf",
+            },
+            {
+                "DATE_TIME": "20/09/2026 07:00",
+                "TITLE": "Interim Report 2026",
+                "FILE_LINK": "/listedco/listconews/sehk/2026/0920/report.pdf",
+            },
+        ])
+        announcement = next(item for item in candidates if "Results" in item.primary_document)
+        self.assertEqual(announcement.period_end, "2026-06-30")
+        self.assertEqual(announcement.revision, "provisional_results_announcement")
+        selected = select_research_filings(candidates, annual_limit=5).documents
+        h1 = [item for item in selected if item.fiscal_period == "H1"]
+        self.assertEqual(len(h1), 1)
+        self.assertIn("Interim Report", h1[0].primary_document)
+
+    def test_hkex_non_calendar_interim_uses_actual_title_period_end(self) -> None:
+        company = build_company("00005.HK", "HSBC")
+        filing = _hkex_filings_from_json(company, [{
+            "DATE_TIME": "15/11/2026 07:00",
+            "TITLE": "Interim Results for the six months ended 30 September 2026",
+            "FILE_LINK": "/listedco/listconews/sehk/2026/1115/results.pdf",
+        }])[0]
+        self.assertEqual(filing.period_end, "2026-09-30")
 
     def test_hkex_json_source_failure_falls_back_to_html(self) -> None:
         class BrokenJsonTransport(_Transport):
@@ -546,6 +649,109 @@ class MarketDataAdapterTests(unittest.TestCase):
                 client.download("https://static.cninfo.com.cn/unsafe.pdf", target)
             self.assertEqual(raised.exception.code, "FILING_CONTENT_UNSAFE")
             self.assertFalse(target.exists())
+
+    def test_official_download_streams_and_retries_transient_failure(self) -> None:
+        class Response(BytesIO):
+            headers = {"Content-Length": "35"}
+
+            def geturl(self) -> str:
+                return "https://static.cninfo.com.cn/annual.pdf"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = OfficialDisclosureHttpClient(maximum_attempts=2)
+        payload = b"%PDF-1.7\nstreamed filing data\n%%EOF"
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            client, "_open_once",
+            side_effect=[URLError("temporary"), Response(payload)],
+        ) as opened, patch("openthesis.market_data.time.sleep"):
+            saved = client.download(
+                "https://static.cninfo.com.cn/annual.pdf",
+                Path(directory) / "annual.pdf",
+            )
+            self.assertEqual(saved.read_bytes(), payload)
+            self.assertEqual(opened.call_count, 2)
+
+    def test_official_download_rejects_declared_oversize_before_read(self) -> None:
+        class OversizeResponse(BytesIO):
+            headers = {"Content-Length": "150000001"}
+            reads = 0
+
+            def read(self, *args, **kwargs):
+                self.reads += 1
+                return super().read(*args, **kwargs)
+
+            def geturl(self) -> str:
+                return "https://static.cninfo.com.cn/oversize.pdf"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        client = OfficialDisclosureHttpClient()
+        response = OversizeResponse(b"should not be read")
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            client, "_open_once", return_value=response
+        ):
+            with self.assertRaises(MarketDataError) as raised:
+                client.download(
+                    "https://static.cninfo.com.cn/oversize.pdf",
+                    Path(directory) / "oversize.pdf",
+                )
+            self.assertEqual(raised.exception.code, "FILING_CONTENT_UNSAFE")
+            self.assertEqual(response.reads, 0)
+
+    def test_redirect_target_is_validated_before_following(self) -> None:
+        checked: list[str] = []
+
+        def validate(url: str) -> None:
+            checked.append(url)
+            if "evil.test" in url:
+                raise MarketDataError("unsafe redirect")
+
+        handler = _ValidatedRedirectHandler(validate)
+        request = urllib.request.Request("https://static.cninfo.com.cn/report.pdf")
+        with self.assertRaises(MarketDataError):
+            handler.redirect_request(
+                request, None, 302, "Found", {}, "https://evil.test/report.pdf"
+            )
+        self.assertEqual(checked, ["https://evil.test/report.pdf"])
+
+    def test_official_subdomains_are_allowed_but_lookalikes_are_rejected(self) -> None:
+        OfficialDisclosureHttpClient._validate_url(
+            "https://cdn.static.cninfo.com.cn/report.pdf"
+        )
+        with self.assertRaises(MarketDataError):
+            OfficialDisclosureHttpClient._validate_url(
+                "https://cninfo.com.cn.evil.test/report.pdf"
+            )
+
+    def test_exact_official_host_allows_tun_fake_ip_without_opening_subdomain_bypass(self) -> None:
+        fake_ip = [(2, 1, 6, "", ("198.18.0.7", 443))]
+        with patch("socket.getaddrinfo", return_value=fake_ip):
+            OfficialDisclosureHttpClient._validate_network_target(
+                "https://static.cninfo.com.cn/report.pdf"
+            )
+            with self.assertRaises(MarketDataError):
+                OfficialDisclosureHttpClient._validate_network_target(
+                    "https://cdn.static.cninfo.com.cn/report.pdf"
+                )
+
+    def test_exact_official_host_still_rejects_real_private_and_loopback_addresses(self) -> None:
+        for address in ("127.0.0.1", "10.0.0.8", "172.16.0.2", "192.168.1.2", "169.254.1.2"):
+            with self.subTest(address=address), patch(
+                "socket.getaddrinfo", return_value=[(2, 1, 6, "", (address, 443))]
+            ):
+                with self.assertRaises(MarketDataError):
+                    OfficialDisclosureHttpClient._validate_network_target(
+                        "https://static.cninfo.com.cn/report.pdf"
+                    )
 
     def test_failed_atomic_publish_cleans_temp_and_preserves_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

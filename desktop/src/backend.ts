@@ -196,9 +196,9 @@ export function deleteResearchRun(runId: string): Promise<{ run_id: string; dele
 
 export function retryResearchSynthesis(
   runId: string,
-  model: ModelSelection,
+  model?: ModelSelection,
 ): Promise<ResearchReport> {
-  return request("research.retry_synthesis", { run_id: runId, model });
+  return request("research.retry_synthesis", { run_id: runId, ...(model ? { model } : {}) });
 }
 
 export function retryResearchGrowth(
@@ -273,7 +273,9 @@ export function getThesis(thesisVersionId: string): Promise<ThesisVersion> {
 export function saveThesis(
   companyCik: string,
   content: Record<string, unknown>,
+  baseThesisVersionId?: string,
+  company?: Company,
 ): Promise<ThesisVersion> {
-  return request("thesis.save", { company_cik: companyCik, content });
+  return request("thesis.save", { company_cik: companyCik, content, ...(company ? { company } : {}), ...(baseThesisVersionId ? { base_thesis_version_id: baseThesisVersionId } : {}) });
 }
 

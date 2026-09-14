@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Iterable
 
 from .domain import Company
+from .text_normalization import canonical_search_text
 
 
 class Market(StrEnum):
@@ -95,6 +96,44 @@ _FINANCIAL_KEYWORDS = (
     "insurance",
     "securities",
     "brokerage",
+    "financial services",
+    "asset management",
+    "wealth management",
+    "credit union",
+    "資產管理",
+    "金融服務",
+    "金融服务",
+)
+
+# Names are a fallback only when an adapter cannot supply an authoritative
+# industry code.  Keep distinctive institution aliases separate from broad
+# business keywords so unrelated names such as "Ping An Healthcare" are not
+# routed to the financial model merely because they share a parent brand.
+_FINANCIAL_ENTITY_ALIASES = (
+    "中国平安",
+    "中國平安",
+    "中国人寿",
+    "中國人壽",
+    "中国太保",
+    "中國太保",
+    "jpmorgan chase",
+    "goldman sachs",
+    "morgan stanley",
+    "berkshire hathaway",
+)
+
+_FINANCIAL_SECURITY_IDENTIFIERS = frozenset({
+    "601318.SH", "02318.HK",  # Ping An
+    "601628.SH", "02628.HK",  # China Life
+    "601601.SH", "02601.HK",  # China Pacific Insurance
+    "JPM", "GS", "MS", "BRK.A", "BRK.B",
+})
+
+_FINANCIAL_INDUSTRY_CODE_PATTERNS = (
+    re.compile(r"^(?:GICS:?)?40(?:\d{0,6})$"),
+    re.compile(r"^(?:CSRC:?)?J(?:6[6-9]|7[0-1])(?:\d*)$"),
+    re.compile(r"^(?:SIC:?)?6[0-7]\d{2}$"),
+    re.compile(r"^(?:NAICS:?)?52\d{4}$"),
 )
 
 
@@ -123,10 +162,25 @@ def market_profile(value: str | Market) -> MarketProfile:
     return MARKET_PROFILES[normalize_market(value)]
 
 
-def industry_support(name: str = "", industry: str = "") -> IndustrySupport:
-    searchable = f"{name} {industry}".casefold()
-    if any(keyword.casefold() in searchable for keyword in _FINANCIAL_KEYWORDS):
+def industry_support(
+    name: str = "", industry: str = "", *, identifier: str = "",
+) -> IndustrySupport:
+    normalized_industry_code = re.sub(r"[\s._-]", "", industry.upper())
+    if any(pattern.fullmatch(normalized_industry_code) for pattern in _FINANCIAL_INDUSTRY_CODE_PATTERNS):
         return IndustrySupport.FINANCIAL_BETA
+    if identifier.strip().upper() in _FINANCIAL_SECURITY_IDENTIFIERS:
+        return IndustrySupport.FINANCIAL_BETA
+    searchable = f"{name} {industry}".casefold()
+    chinese_searchable = canonical_search_text(searchable)
+    if any(canonical_search_text(alias.casefold()) in chinese_searchable for alias in _FINANCIAL_ENTITY_ALIASES):
+        return IndustrySupport.FINANCIAL_BETA
+    for keyword in _FINANCIAL_KEYWORDS:
+        folded = keyword.casefold()
+        if any("\u4e00" <= character <= "\u9fff" for character in folded):
+            if canonical_search_text(folded) in chinese_searchable:
+                return IndustrySupport.FINANCIAL_BETA
+        elif re.search(rf"(?<![a-z]){re.escape(folded)}(?![a-z])", searchable):
+            return IndustrySupport.FINANCIAL_BETA
     return IndustrySupport.STANDARD
 
 
@@ -134,6 +188,13 @@ def normalize_symbol(symbol: str, market: str | Market | None = None) -> tuple[s
     raw = symbol.strip().upper().replace(" ", "")
     if not raw:
         raise ValueError("security symbol is required")
+
+    requested = normalize_market(market) if market else None
+    prefixed_a_share = re.fullmatch(r"(SH|SZ|BJ)(\d{6})", raw)
+    if prefixed_a_share and requested in {None, Market.CN_A}:
+        prefix, code = prefixed_a_share.groups()
+        exchange = {"SH": Exchange.SSE, "SZ": Exchange.SZSE, "BJ": Exchange.BSE}[prefix]
+        return _format_symbol(code, exchange), exchange, Market.CN_A
 
     suffixes = {
         ".SH": (Exchange.SSE, Market.CN_A),
@@ -147,14 +208,17 @@ def normalize_symbol(symbol: str, market: str | Market | None = None) -> tuple[s
             code = raw[: -len(suffix)]
             return _format_symbol(code, exchange), exchange, resolved_market
 
-    requested = normalize_market(market) if market else None
     if requested == Market.HK or (requested is None and re.fullmatch(r"\d{4,5}", raw)):
         return _format_symbol(raw, Exchange.HKEX), Exchange.HKEX, Market.HK
     if requested == Market.CN_A or (requested is None and re.fullmatch(r"\d{6}", raw)):
         exchange = infer_a_share_exchange(raw)
         return _format_symbol(raw, exchange), exchange, Market.CN_A
-    if requested in {None, Market.US} and re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", raw):
-        return raw, Exchange.NASDAQ, Market.US
+    if requested in {None, Market.US}:
+        share_class = re.fullmatch(r"([A-Z][A-Z0-9]{0,9})[/-]([A-Z])", raw)
+        if share_class:
+            raw = f"{share_class.group(1)}.{share_class.group(2)}"
+        if re.fullmatch(r"[A-Z][A-Z0-9.-]{0,14}", raw):
+            return raw, Exchange.NASDAQ, Market.US
     raise ValueError("security symbol does not match the selected market")
 
 
@@ -184,7 +248,7 @@ def build_company(
     profile = MARKET_PROFILES[resolved_market]
     security_id = f"{resolved_market.value}:{exchange.value}:{normalized_symbol}"
     standard = accounting_standard.strip().upper() or profile.default_accounting_standard.value
-    support = industry_support(name, industry)
+    support = industry_support(name, industry, identifier=normalized_symbol)
     return Company(
         cik=security_id,
         ticker=normalized_symbol,

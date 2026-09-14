@@ -6,7 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 
-CURRENT_DERIVED_VERSION = "financial-facts-v2"
+CURRENT_DERIVED_VERSION = "financial-facts-v3"
 
 
 def utc_now_iso() -> str:

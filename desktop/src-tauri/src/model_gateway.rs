@@ -1020,11 +1020,23 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             .chars()
             .take(MAX_PROVIDER_ERROR_CHARS)
             .collect::<String>();
+        let lowered_detail = detail.to_ascii_lowercase();
+        let context_capacity = [
+            "context_length_exceeded",
+            "maximum context length",
+            "context window",
+            "too many tokens",
+            "prompt is too long",
+            "input is too long",
+        ]
+        .iter()
+        .any(|marker| lowered_detail.contains(marker));
         let code = match status.as_u16() {
             401 | 403 => "MODEL_UNAUTHORIZED",
             408 => "MODEL_TIMEOUT",
             429 => "MODEL_RATE_LIMITED",
             value if value >= 500 => "MODEL_PROVIDER_UNAVAILABLE",
+            _ if context_capacity => "MODEL_CONTEXT_CAPACITY",
             _ => "MODEL_HTTP_ERROR",
         };
         let retryable =
@@ -1339,6 +1351,23 @@ mod tests {
         assert_eq!(error.code, "MODEL_UNAUTHORIZED");
         assert!(!error.message.contains("gateway-secret"));
         assert!(error.message.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn provider_context_capacity_is_classified_without_exposing_request_text() {
+        let endpoint = one_response_server(
+            "400 Bad Request",
+            r#"{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}"#,
+        );
+        let (center, model_id) = configured_custom(endpoint, Some("gateway-secret"));
+        let error = ModelGateway::new(center)
+            .generate(&model_id, "private system prompt", "private user prompt", true)
+            .unwrap_err();
+        assert_eq!(error.code, "MODEL_CONTEXT_CAPACITY");
+        assert!(!error.retryable);
+        assert!(!error.message.contains("private system prompt"));
+        assert!(!error.message.contains("private user prompt"));
+        assert!(!error.message.contains("gateway-secret"));
     }
 
     #[test]

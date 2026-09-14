@@ -203,6 +203,11 @@ def _document_authority(filing: FilingDocument) -> int:
             rank += 30
         if "摘要" in title or "summary" in title:
             rank -= 40
+    if company_id.startswith("hk:") or company_id.startswith("hkex:"):
+        if "interim report" in title or "中期報告" in title or "中期报告" in title:
+            rank += 30
+        if "interim result" in title or "中期業績" in title or "中期业绩" in title:
+            rank += 10
     return rank
 
 
@@ -217,6 +222,7 @@ def _revision_rank(filing: FilingDocument) -> tuple[int, int, str]:
         # they are provenance statuses, not corrected-document revisions.
         "period_end_provisional",
         "period_end_verified",
+        "provisional_results_announcement",
     } else 0
     if any(token in title for token in ("更正", "修订", "revision", "restated", "corrigendum")):
         revision = max(revision, 1)

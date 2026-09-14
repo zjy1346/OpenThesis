@@ -81,7 +81,7 @@ class DisclosureIdentityTests(unittest.TestCase):
         self.assertEqual(fact.extraction_status, "unresolved")
         self.assertEqual(fact.usage_status, "audit_only")
         self.assertEqual(fact.provenance_status, "unresolved")
-        self.assertEqual(fact.derived_version, "financial-facts-v2")
+        self.assertEqual(fact.derived_version, "financial-facts-v3")
 
 
 if __name__ == "__main__":

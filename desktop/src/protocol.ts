@@ -70,7 +70,7 @@ export type BackendParams = {
   "ot.suggest": { draft: OtDraft; selected_path: string; instruction: string; model: ModelReference };
   "thesis.list": EmptyParams;
   "thesis.get": { thesis_version_id: string };
-  "thesis.save": { company_cik: string; content: Record<string, unknown> };
+  "thesis.save": { company_cik: string; content: Record<string, unknown>; company?: Company; base_thesis_version_id?: string };
   "research.list": EmptyParams;
   "research.delete": { run_id: string };
   "research.get_report": {
@@ -87,7 +87,7 @@ export type BackendParams = {
   "research.start_financial_retry": { run_id: string };
   "research.start_financial_rebuild": { run_id: string; confirmed: boolean };
   "research.rebuild_financials": { run_id: string; confirmed: boolean };
-  "research.retry_synthesis": { run_id: string; model: ModelSelection };
+    "research.retry_synthesis": { run_id: string; model?: ModelSelection };
   "research.status": { job_id: string };
   "research.cancel": { job_id: string };
   "research.vision_decision": { job_id: string; approved: boolean };

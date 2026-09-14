@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.2.1",
+    [string]$Version = "2.7.3",
     [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis",
     [ValidateSet("unsigned-test", "authenticode-required")]
     [string]$SignatureMode = "unsigned-test"
@@ -65,6 +65,16 @@ try {
         $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/python*.dll"
     })) {
         throw "Portable ZIP is missing the sidecar Python runtime."
+    }
+    if (-not ($entries | Where-Object {
+        $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/VCRUNTIME*.dll"
+    })) {
+        throw "Portable ZIP is missing the VCRUNTIME runtime."
+    }
+    if ($entries | Where-Object {
+        $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/VCRUNTIME*.bin"
+    }) {
+        throw "Portable ZIP contains a Tauri-only VCRUNTIME staging name."
     }
 } finally {
     $archive.Dispose()

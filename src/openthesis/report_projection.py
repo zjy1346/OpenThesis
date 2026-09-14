@@ -42,6 +42,7 @@ _REPORT_FIELDS = frozenset(
         "evidence_grade", "supporting_evidence_count", "contradicting_evidence_count",
         "opportunities",
         "strongest_counterarguments", "unsupported_assumptions", "missing_evidence",
+        "risk_flags", "benign_explanations", "follow_up_questions",
     }
 )
 
@@ -183,8 +184,8 @@ _TYPED_SECTION_FIELDS = {
     "executive_summary": {"summary", "text", "analysis", "conclusion"},
     "claims": {"text", "conclusion", "argument", "kind", "confidence", "title"},
     "business_model": {"summary", "analysis", "conclusion", "possible_moats", "risks", "unknowns", "strengths", "concerns"},
-    "financial_quality": {"summary", "analysis", "conclusion", "financial_analysis", "accounting_risk", "strengths", "concerns", "risks", "unknowns"},
-    "balance_sheet": {"summary", "analysis", "conclusion", "strengths", "concerns", "risks", "unknowns", "assets", "liabilities", "equity", "total_equity"},
+    "financial_quality": {"summary", "analysis", "conclusion", "financial_analysis", "accounting_risk", "strengths", "concerns", "risks", "unknowns", "risk_flags", "benign_explanations", "follow_up_questions"},
+    "balance_sheet": {"summary", "analysis", "conclusion", "strengths", "concerns", "risks", "unknowns", "risk_flags", "benign_explanations", "follow_up_questions", "assets", "liabilities", "equity", "total_equity"},
     "competitive_position": {"summary", "analysis", "conclusion", "possible_moats", "strengths", "concerns", "risks", "unknowns"},
     "counterarguments": {"title", "counterargument", "argument", "text", "severity", "confidence", "strongest_counterarguments", "unsupported_assumptions", "missing_evidence", "claims"},
     "invalidation_conditions": {"title", "condition", "text", "trigger", "confidence"},
@@ -379,6 +380,7 @@ def normalize_report_sections(value: Any, language: str) -> dict[str, Any]:
         for alias, canonical in aliases.items():
             if counter.get(canonical) in (None, "", [], {}) and counter.get(alias) not in (None, "", [], {}):
                 counter[canonical] = counter[alias]
+            counter.pop(alias, None)
         report["counterarguments"] = counter
     locale = normalize_language(language)
     missing = (

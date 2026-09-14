@@ -13,6 +13,30 @@ from openthesis.filing_parser import (
 
 
 class FilingParserTests(unittest.TestCase):
+    def test_sec_registered_public_accounting_firm_heading_is_audit_evidence(self) -> None:
+        external = """<html><body><h1>Report of Independent Registered Public Accounting Firm</h1>
+        <p>We have audited the accompanying consolidated balance sheets and the
+        related consolidated statements of operations, stockholders' equity and
+        cash flows. In our opinion, the financial statements present fairly, in
+        all material respects, the financial position of the company.</p></body></html>"""
+        management = """<html><body><h1>Management's Report on Internal Control</h1>
+        <p>Management is responsible for establishing and maintaining adequate
+        internal control over financial reporting. Management assessed the
+        effectiveness of those controls using the applicable framework.</p></body></html>"""
+        with tempfile.TemporaryDirectory() as directory:
+            topics = []
+            for name, content in (("external", external), ("management", management)):
+                path = Path(directory) / f"{name}.html"
+                path.write_text(content, encoding="utf-8")
+                filing = FilingDocument(
+                    f"test:{name}", "0001", name, "10-K", "FY",
+                    "2025-12-31", "2026-02-01", path.name,
+                    f"https://example.test/{path.name}", local_path=str(path),
+                )
+                topics.append({ref.title.split(" · ")[-1] for ref in extract_topic_evidence(filing)})
+            self.assertIn("audit", topics[0])
+            self.assertNotIn("audit", topics[1])
+
     def test_extracts_structured_topic_evidence(self) -> None:
         html = """
         <html><body>

@@ -243,6 +243,22 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("2025 财年收入增长缺少 2024 财年已验证收入", report)
         self.assertIn("净资产收益率无法计算：缺少权益数据", report)
 
+    def test_financial_table_renders_growth_semantics_instead_of_a_dash(self) -> None:
+        artifacts = sample_artifacts()
+        metric = artifacts[0]["content"]["metrics"][0]
+        metric.update({
+            "net_income_growth": None,
+            "net_income_growth_status": "turnaround",
+            "return_on_equity": None,
+            "return_on_equity_gap": "non_positive_equity",
+        })
+
+        report = render_research_html("run-growth-semantics", artifacts, "zh-CN")
+
+        self.assertIn("净利润增长", report)
+        self.assertIn("扭亏为盈", report)
+        self.assertIn("净资产收益率无法计算：权益为零或负数，不适用", report)
+
     def test_traditional_chinese_report_declares_language(self) -> None:
         report = render_research_html("run-hant", sample_artifacts(), "zh-Hant")
         self.assertIn('<html lang="zh-Hant">', report)

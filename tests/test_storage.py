@@ -16,6 +16,42 @@ from openthesis.markets import build_company
 
 
 class StorageTests(unittest.TestCase):
+    def test_connections_enable_concurrency_pragmas_and_rollback_failed_transactions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            with storage.connect() as db:
+                self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0].casefold(), "wal")
+                self.assertGreaterEqual(db.execute("PRAGMA busy_timeout").fetchone()[0], 5_000)
+                self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                db.execute("CREATE TABLE rollback_probe(value TEXT)")
+            with self.assertRaisesRegex(RuntimeError, "rollback"):
+                with storage.connect() as db:
+                    db.execute("INSERT INTO rollback_probe(value) VALUES('must-not-persist')")
+                    raise RuntimeError("rollback")
+            with storage.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM rollback_probe").fetchone()[0], 0)
+
+    def test_parser_upgrade_keeps_v2_facts_auditable_but_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("parser-upgrade", "UPGRADE", reporting_currency="CNY")
+            storage.save_company(company)
+            fact = self._fact(company.security_id)
+            validation = FinancialValidation(ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (fact,), ())
+            group = FinancialGroupValidation(("acc-rich", "2025-12-31", "FY", "consolidated", "CNY"), validation)
+            storage.replace_financial_ingestion(company.security_id, ["acc-rich"], [fact], [], [group], [])
+            with storage.connect() as db:
+                db.execute("UPDATE financial_facts SET derived_version = 'financial-facts-v2'")
+                db.execute("UPDATE financial_validation_groups SET derived_version = 'financial-facts-v2'")
+                db.execute("UPDATE metadata SET value = ? WHERE key = 'derived_pipeline_contract'", (json.dumps({"parser": "financial-ingestion-ast-v6", "facts": "financial-facts-v2"}),))
+            restarted = Storage(Path(directory))
+            self.assertEqual(restarted.get_facts(company.security_id), [])
+            self.assertEqual(restarted.get_validation_groups(company.security_id), [])
+            self.assertEqual(len(restarted.get_facts_audit(company.security_id)), 1)
+            self.assertEqual(len(restarted.get_validation_groups_audit(company.security_id)), 1)
+            with restarted.connect() as db:
+                self.assertEqual(db.execute("SELECT value FROM metadata WHERE key = 'derived_rebuild_required'").fetchone()[0], "1")
+
     def _fact(self, company_cik: str, status: str = "VERIFIED") -> FinancialFact:
         return FinancialFact(
             fact_id="rich-fact",
@@ -65,7 +101,7 @@ class StorageTests(unittest.TestCase):
             groups = storage.get_validation_groups(company.security_id)
             self.assertEqual(groups[0]["status"], "VERIFIED")
             self.assertEqual(groups[0]["covered_concepts"], ["revenue"])
-            self.assertEqual(groups[0]["derived_version"], "financial-facts-v2")
+            self.assertEqual(groups[0]["derived_version"], "financial-facts-v3")
             self.assertEqual(storage.get_validation_groups_audit(company.security_id), groups)
 
     def test_unit_provenance_roundtrips_and_unknown_stays_fail_closed(self) -> None:

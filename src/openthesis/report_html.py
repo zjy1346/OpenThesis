@@ -4,6 +4,7 @@ import html
 from typing import Any
 
 from .financials import (
+    format_growth,
     format_money,
     format_percent,
     reverse_dcf_disclaimer,
@@ -357,6 +358,14 @@ def _annual_metric_gap_note(rows: list[object], language: str) -> str:
                 if language == ZH_HANT
                 else "净资产收益率无法计算：缺少净利润数据"
             )
+        elif roe_gap == "non_positive_equity":
+            messages.append(
+                "Return on equity cannot be calculated: equity is zero or negative, so ROE is not applicable."
+                if language == EN
+                else "淨資產報酬率無法計算：權益為零或負數，不適用"
+                if language == ZH_HANT
+                else "净资产收益率无法计算：权益为零或负数，不适用"
+            )
     if not messages:
         return ""
     return (
@@ -463,7 +472,10 @@ def _financial_section(
     columns = [("year", "Fiscal year", "财年"), ("revenue", "Revenue", "营业收入"), ("revenue_growth", "Revenue growth", "收入增长")]
     if has_operating_margin:
         columns.append(("operating_margin", "Operating margin", "营业利润率"))
-    columns.extend([("net_income", "Net income", "净利润"), ("operating_cash_flow", "Operating cash flow", "经营现金流")])
+    columns.extend([
+        ("net_income", "Net income", "净利润"),
+        ("operating_cash_flow", "Operating cash flow", "经营现金流"),
+    ])
     if has_free_cash_flow:
         columns.append(("free_cash_flow", "Free cash flow", "自由现金流"))
     headers = tuple(column[1] if english else column[2] for column in columns)
@@ -482,6 +494,8 @@ def _financial_section(
                 values.append(str(value if value is not None else "—"))
             elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
                 values.append(format_money(value, currency))
+            elif key.endswith("_growth"):
+                values.append(format_growth(value, row.get(f"{key}_status"), language))
             else:
                 values.append(format_percent(value))
         table += "<tr>" + "".join(
@@ -489,6 +503,37 @@ def _financial_section(
             for value in values
         ) + "</tr>"
     table += "</tbody></table>"
+    detail_rows = [
+        (
+            _pick(language, "毛利率", "Gross margin"),
+            format_percent(latest.get("gross_margin")),
+            latest.get("gross_margin") is not None,
+        ),
+        (
+            _pick(language, "营业利润增长", "Operating income growth"),
+            format_growth(latest.get("operating_income_growth"), latest.get("operating_income_growth_status"), language),
+            "operating_income_growth_status" in latest,
+        ),
+        (
+            _pick(language, "净利润增长", "Net income growth"),
+            format_growth(latest.get("net_income_growth"), latest.get("net_income_growth_status"), language),
+            "net_income_growth_status" in latest,
+        ),
+        (
+            _pick(language, "经营现金流增长", "Operating cash-flow growth"),
+            format_growth(latest.get("operating_cash_flow_growth"), latest.get("operating_cash_flow_growth_status"), language),
+            "operating_cash_flow_growth_status" in latest,
+        ),
+    ]
+    visible_detail_rows = [(label, value) for label, value, visible in detail_rows if visible]
+    detail_html = (
+        '<div class="callout"><strong>'
+        + _escape(_pick(language, "增长与质量指标", "Growth and Quality Metrics"))
+        + '</strong><ul class="list">'
+        + "".join(f"<li>{_escape(label)}：{_escape(value)}</li>" for label, value in visible_detail_rows)
+        + "</ul></div>"
+        if visible_detail_rows else ""
+    )
     missing_count = sum(
         1
         for row in rows[:5]
@@ -570,7 +615,7 @@ def _financial_section(
         )
     return _section(
         _pick(language, "确定性财务概览", "Deterministic Financial Overview"),
-        coverage_html + snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + metric_gap_note + note,
+        coverage_html + snapshot_note + beta_note + continuity_note + interim_html + kpi_html + table + detail_html + metric_gap_note + note,
         section_id="financials",
     )
 

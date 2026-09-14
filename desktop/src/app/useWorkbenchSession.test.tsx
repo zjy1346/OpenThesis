@@ -5,6 +5,7 @@ import {
   bootstrapBackend,
   getResearchReport,
   getResearchStatus,
+  retryResearchSynthesis,
   startResearchFinancialRetry,
 } from "../backend";
 import { useWorkbenchSession } from "./useWorkbenchSession";
@@ -143,5 +144,16 @@ describe("useWorkbenchSession financial jobs", () => {
     expect(getResearchReport).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(result.current.report?.markdown).toBe("partial refreshed report"));
     expect(result.current.report?.financial_retry?.status).toBe("partial");
+  });
+
+  it("retries synthesis from history without an in-memory research request", async () => {
+    vi.mocked(retryResearchSynthesis).mockResolvedValue(report("retried synthesis"));
+    const { result } = renderHook(() => useWorkbenchSession());
+    await waitFor(() => expect(result.current.report?.markdown).toBe("initial report"));
+
+    await act(async () => { await result.current.retrySynthesis(); });
+
+    expect(retryResearchSynthesis).toHaveBeenCalledWith("run-1", undefined);
+    expect(result.current.report?.markdown).toBe("retried synthesis");
   });
 });

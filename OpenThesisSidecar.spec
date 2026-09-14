@@ -16,13 +16,17 @@ cryptography_datas, cryptography_binaries, cryptography_hiddenimports = collect_
 # dependency explicitly so a local build cannot silently fall back to a Python
 # bundle that lacks the operating-system certificate bridge.
 truststore_datas, truststore_binaries, truststore_hiddenimports = collect_all("truststore")
+# OpenCC loads its conversion dictionaries at runtime.  They must travel with
+# the sidecar or simplified/traditional canonicalization fails only after the
+# desktop package leaves the development checkout.
+opencc_datas, opencc_binaries, opencc_hiddenimports = collect_all("opencc")
 
 a = Analysis(
     [str(project_root / "sidecar_launcher.py")],
     pathex=[str(project_root / "src")],
-    binaries=cryptography_binaries + truststore_binaries,
-    datas=cryptography_datas + truststore_datas + [(str(resources), "openthesis/resources")],
-    hiddenimports=cryptography_hiddenimports + truststore_hiddenimports,
+    binaries=cryptography_binaries + truststore_binaries + opencc_binaries,
+    datas=cryptography_datas + truststore_datas + opencc_datas + [(str(resources), "openthesis/resources")],
+    hiddenimports=cryptography_hiddenimports + truststore_hiddenimports + opencc_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

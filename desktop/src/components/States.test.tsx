@@ -150,4 +150,28 @@ describe("ResearchProgress", () => {
     );
     expect(screen.queryByLabelText("Estimated remaining")).not.toBeInTheDocument();
   });
+
+  it("replaces a divergent filing ETA with a stalled deep-parsing explanation", () => {
+    render(
+      <ResearchProgress
+        language="en"
+        job={{
+          job_id: "stalled-filing",
+          state: "running",
+          message: "",
+          percent: 47,
+          run_id: null,
+          stage: "filing-parse",
+          stage_current: 1,
+          stage_total: 10,
+          elapsed_seconds: 765,
+          stage_elapsed_seconds: 765,
+        }}
+        labels={{ cancel: "Cancel", cancelling: "Stopping", agents: "Agents", running: "Running", retrying: "Retrying", queued: "Queued", completed: "Done", cancelled: "Cancelled", failed: "Failed", unknown: "Waiting" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText("Estimated remaining")).not.toBeInTheDocument();
+    expect(screen.getByText(/Deep parsing is still active/)).toBeInTheDocument();
+  });
 });

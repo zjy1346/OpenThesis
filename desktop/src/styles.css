@@ -159,6 +159,7 @@ button { color: inherit; }
 @starting-style { .research-waiting-copy { opacity: 0; } }
 .research-remaining { grid-column: 1; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 12px; border: 1px solid #dfe9e2; border-radius: 8px; background: rgba(255,255,255,.7); color: #65726b; font-size: 11px; }
 .research-remaining strong { color: #38644e; font-variant-numeric: tabular-nums; }
+.research-stalled { grid-column: 1; padding: 8px 12px; border: 1px solid #eadbb9; border-radius: 8px; background: rgba(255, 249, 235, .78); color: #775d2d; font-size: 11px; line-height: 1.55; }
 .vision-approval-card { grid-column: 1 / -1; display: grid; gap: 7px; padding: 14px; border: 1px solid #c8d9ef; border-radius: 12px; background: #f4f8ff; color: #29415d; }
 .vision-approval-card code { width: fit-content; padding: 3px 6px; border-radius: 5px; background: #e7eef8; font-size: 11px; }
 .vision-approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
@@ -248,6 +249,14 @@ button { color: inherit; }
 .financial-recovery-diagnostics code { margin-left: 4px; padding: 2px 5px; border-radius: 4px; background: #fff4e8; font-size: 11px; overflow-wrap: anywhere; }
 .financial-health-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .financial-health .report-rebuild-button { border-color: var(--line-strong); color: var(--ink-soft); background: transparent; }
+.synthesis-capacity-recovery { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 14px; padding: 13px; border: 1px solid #efd6bf; border-radius: 12px; background: #fff8f0; color: #5f452d; font-size: 12px; }
+.synthesis-capacity-recovery strong { display: block; color: #412f20; font-size: 13px; }
+.synthesis-capacity-recovery p { max-width: 760px; margin: 4px 0 0; line-height: 1.5; }
+.synthesis-capacity-actions { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.synthesis-capacity-actions label { font-weight: 600; }
+.synthesis-capacity-actions select { min-width: 220px; min-height: 34px; border: 1px solid var(--line-strong); border-radius: 9px; background: #fff; color: var(--ink); padding: 0 30px 0 10px; }
+.synthesis-capacity-actions .report-retry-button { min-height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid #cba982; border-radius: 9px; background: #fff; color: #704821; cursor: pointer; }
+.synthesis-capacity-actions .report-retry-button:disabled { cursor: default; opacity: .45; }
 .financial-rebuild-advanced { max-width: 280px; padding: 8px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; }
 .financial-rebuild-advanced[open] { border-color: #e7d5c2; background: rgba(255, 255, 255, .72); }
 .financial-rebuild-advanced summary { cursor: pointer; color: var(--ink-muted); font-size: 11px; font-weight: 650; text-align: right; }
@@ -437,8 +446,6 @@ button { color: inherit; }
 .thesis-list span, .thesis-list small { overflow: hidden; color: var(--ink-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .thesis-editor { min-width: 0; display: flex; flex-direction: column; }
 .thesis-editor label { margin-bottom: 8px; color: #536059; font-size: 12px; font-weight: 650; }
-.thesis-editor textarea { width: 100%; min-height: 430px; flex: 1; resize: vertical; padding: 16px; border: 1px solid #d7dcd7; border-radius: 13px; background: #fbfcfa; color: #29332d; font-family: "Cascadia Code", monospace; font-size: 12px; line-height: 1.6; outline: none; }
-.thesis-editor textarea:focus { border-color: #609679; box-shadow: 0 0 0 3px rgba(63, 132, 94, .10); }
 .thesis-editor .primary-button { align-self: flex-start; }
 .thesis-editor .settings-message { color: #377354; font-size: 12px; }
 
@@ -455,6 +462,8 @@ button { color: inherit; }
   .report-meta { display: grid; }
   .report-toolbar { justify-self: start; }
   .financial-health { align-items: flex-start; flex-direction: column; }
+  .synthesis-capacity-recovery { align-items: flex-start; flex-direction: column; }
+  .synthesis-capacity-actions { justify-content: flex-start; width: 100%; }
   .report-context span + span::before { display: none; }
   .report-markdown { font-size: 15px; overflow-x: auto; }
   .history-view, .help-view { padding: 22px 18px; }

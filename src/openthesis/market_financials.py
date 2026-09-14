@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import date, timedelta
 from dataclasses import dataclass
 from enum import StrEnum
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .financial_taxonomy import FINANCIAL_LABEL_ALIASES, capex_component_kind
 
 
 class FinancialExtractionError(RuntimeError):
@@ -109,12 +111,7 @@ CONCEPT_PATTERNS: tuple[ConceptPattern, ...] = (
     ),
     ConceptPattern(
         "capital_expenditure",
-        (
-            "购建固定资产、无形资产和其他长期资产支付的现金",
-            "购建固定资产、无形资产及其他长期资产支付的现金",
-            "purchase of property, plant and equipment",
-            "capital expenditure",
-        ),
+        FINANCIAL_LABEL_ALIASES["capital_expenditure"],
     ),
     ConceptPattern(
         "net_income",
@@ -130,8 +127,10 @@ CONCEPT_PATTERNS: tuple[ConceptPattern, ...] = (
     ),
     ConceptPattern(
         "operating_income",
-        ("营业利润", "经营利润", "operating profit", "profit from operations"),
+        FINANCIAL_LABEL_ALIASES["operating_income"],
     ),
+    ConceptPattern("gross_profit", FINANCIAL_LABEL_ALIASES["gross_profit"]),
+    ConceptPattern("cost_of_revenue", FINANCIAL_LABEL_ALIASES["cost_of_revenue"]),
     ConceptPattern(
         "revenue",
         ("营业收入", "收入合计", "營業收入", "收入總額", "revenue", "turnover"),
@@ -185,10 +184,12 @@ _TOPIC_LABELS: dict[str, tuple[str, ...]] = {
 # the parser usable with UTF-8 official PDFs.
 _CANONICAL_LABELS: dict[str, tuple[str, ...]] = {
     "revenue": ("营业收入", "营业总收入", "营业额", "收入", "revenue", "turnover"),
-    "operating_income": ("营业利润", "经营利润", "operating profit", "profit from operations"),
+    "operating_income": FINANCIAL_LABEL_ALIASES["operating_income"],
+    "gross_profit": FINANCIAL_LABEL_ALIASES["gross_profit"],
+    "cost_of_revenue": FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
     "net_income": ("净利润", "归属于上市公司股东的净利润", "归属于母公司股东的净利润", "profit attributable to owners of the company", "net income"),
     "operating_cash_flow": ("经营活动产生的现金流量净额", "经营活动现金流量净额", "net cash generated from operating activities", "net cash flows from operating activities"),
-    "capital_expenditure": ("购建固定资产、无形资产和其他长期资产支付的现金", "资本性支出", "capital expenditure", "purchase of property, plant and equipment"),
+    "capital_expenditure": FINANCIAL_LABEL_ALIASES["capital_expenditure"],
     "assets": ("资产总计", "资产总额", "total assets"),
     "liabilities": ("负债合计", "负债总额", "total liabilities"),
     "equity": ("归属于母公司所有者权益合计", "归属于上市公司股东的所有者权益", "equity attributable to owners of the company"),
@@ -199,6 +200,40 @@ _CANONICAL_LABELS: dict[str, tuple[str, ...]] = {
 
 def _labels_for(definition: ConceptPattern) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*definition.labels, *_CANONICAL_LABELS.get(definition.concept, ()))))
+
+
+def _select_capex_candidate(options: list[_Candidate]) -> _Candidate:
+    totals = [item for item in options if capex_component_kind(item.label) == "total"]
+    if totals:
+        return max(totals, key=lambda item: (item.score, item.page_number))
+    by_page: dict[int, dict[str, _Candidate]] = {}
+    for item in options:
+        kind = capex_component_kind(item.label)
+        current = by_page.setdefault(item.page_number, {}).get(kind)
+        if current is None or item.score > current.score:
+            by_page[item.page_number][kind] = item
+    aggregates = [
+        _Candidate(
+            "capital_expenditure",
+            "capital_expenditure_components",
+            abs(parts["ppe"].value) + abs(parts["intangibles"].value),
+            page,
+            f"{parts['ppe'].excerpt}\n{parts['intangibles'].excerpt}",
+            max(parts["ppe"].score, parts["intangibles"].score) + 1,
+            parts["ppe"].unit_multiplier,
+            parts["ppe"].statement,
+            parts["ppe"].scope,
+        )
+        for page, parts in by_page.items()
+        if {"ppe", "intangibles"} <= set(parts)
+        and parts["ppe"].unit_multiplier == parts["intangibles"].unit_multiplier
+        and parts["ppe"].statement == parts["intangibles"].statement
+        and parts["ppe"].scope == parts["intangibles"].scope
+    ]
+    return max(
+        aggregates or options,
+        key=lambda item: (item.score, item.page_number),
+    )
 
 
 _STATEMENT_TITLES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -338,7 +373,39 @@ def _parse_financial_pages_legacy(
     for definition in CONCEPT_PATTERNS:
         if not candidates[definition.concept]:
             continue
-        candidate = max(candidates[definition.concept], key=lambda item: (item.score, item.page_number))
+        options = candidates[definition.concept]
+        candidate = max(options, key=lambda item: (item.score, item.page_number))
+        if definition.concept == "capital_expenditure":
+            totals = [item for item in options if capex_component_kind(item.label) == "total"]
+            if totals:
+                candidate = max(totals, key=lambda item: (item.score, item.page_number))
+            else:
+                by_page: dict[int, dict[str, _Candidate]] = {}
+                for item in options:
+                    kind = capex_component_kind(item.label)
+                    current = by_page.setdefault(item.page_number, {}).get(kind)
+                    if current is None or item.score > current.score:
+                        by_page[item.page_number][kind] = item
+                aggregates = [
+                    _Candidate(
+                        "capital_expenditure",
+                        "capital_expenditure_components",
+                        abs(parts["ppe"].value) + abs(parts["intangibles"].value),
+                        page,
+                        f"{parts['ppe'].excerpt}\n{parts['intangibles'].excerpt}",
+                        max(parts["ppe"].score, parts["intangibles"].score) + 1,
+                        parts["ppe"].unit_multiplier,
+                        parts["ppe"].statement,
+                        parts["ppe"].scope,
+                    )
+                    for page, parts in by_page.items()
+                    if {"ppe", "intangibles"} <= set(parts)
+                    and parts["ppe"].unit_multiplier == parts["intangibles"].unit_multiplier
+                    and parts["ppe"].statement == parts["intangibles"].statement
+                    and parts["ppe"].scope == parts["intangibles"].scope
+                ]
+                if aggregates:
+                    candidate = max(aggregates, key=lambda item: (item.score, item.page_number))
         # Mentions in narrative prose are not deterministic table facts. Accept
         # only an exact row label or a candidate anchored to a financial table.
         if candidate.score < 40:
@@ -381,7 +448,7 @@ def _parse_financial_pages_legacy(
 
 
 def _normalize_text(value: str) -> str:
-    value = value.replace("\u00a0", " ").replace("，", ",")
+    value = unicodedata.normalize("NFKC", value).replace("\u00a0", " ").replace("，", ",")
     return "\n".join(line.strip() for line in value.splitlines() if line.strip())
 
 
@@ -796,7 +863,11 @@ def parse_financial_pages(
     for definition in CONCEPT_PATTERNS:
         if not candidates[definition.concept]:
             continue
-        candidate = max(candidates[definition.concept], key=lambda item: (item.score, item.page_number))
+        candidate = (
+            _select_capex_candidate(candidates[definition.concept])
+            if definition.concept == "capital_expenditure"
+            else max(candidates[definition.concept], key=lambda item: (item.score, item.page_number))
+        )
         identity = f"{filing.document_id}|{candidate.concept}|{fiscal_year}|{candidate.page_number}|{candidate.value}"
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
         fact = FinancialFact(

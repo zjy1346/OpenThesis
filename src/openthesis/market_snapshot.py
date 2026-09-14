@@ -8,6 +8,9 @@ provider payloads are never persisted or sent to a model.
 from __future__ import annotations
 
 import json
+import csv
+import io
+import math
 import re
 import ssl
 import threading
@@ -26,6 +29,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only before install
     truststore = None  # type: ignore[assignment]
 
+from . import __version__
 from .domain import Company
 from .markets import Exchange, Market, normalize_market
 
@@ -269,7 +273,7 @@ class StdlibJsonTransport:
     def get_json(self, url: str, *, timeout: float, headers: Mapping[str, str] | None = None) -> Any:
         request_headers = {
             "Accept": "application/json",
-            "User-Agent": "OpenThesis/2.6.1",
+            "User-Agent": f"OpenThesis/{__version__}",
         }
         request_headers.update(dict(headers or {}))
         request = urllib.request.Request(url, headers=request_headers)
@@ -286,7 +290,7 @@ class StdlibTextTransport:
         "Accept": "text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
         "Referer": "https://gu.qq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
+        "User-Agent": f"Mozilla/5.0 OpenThesis/{__version__}",
     }
 
     def get_text(self, url: str, *, timeout: float, headers: Mapping[str, str] | None = None) -> str:
@@ -430,7 +434,7 @@ class NasdaqPublicQuoteAdapter:
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.nasdaq.com",
         "Referer": "https://www.nasdaq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
+        "User-Agent": f"Mozilla/5.0 OpenThesis/{__version__}",
     }
 
     def __init__(self, transport: JsonTransport | Callable[..., Any] | None = None):
@@ -515,7 +519,7 @@ class TencentPublicQuoteAdapter:
         "Accept": "text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
         "Referer": "https://gu.qq.com/",
-        "User-Agent": "Mozilla/5.0 OpenThesis/2.6.1",
+        "User-Agent": f"Mozilla/5.0 OpenThesis/{__version__}",
     }
 
     def __init__(self, transport: TextTransport | Callable[..., Any] | None = None):
@@ -635,40 +639,192 @@ class EcbFxAdapter:
     def __init__(self, transport: JsonTransport | Callable[..., Any] | None = None, *, timeout_seconds: float = 4.0):
         self.transport = transport or StdlibJsonTransport()
         self.timeout_seconds = max(0.5, min(10.0, float(timeout_seconds)))
+        self._cache: dict[tuple[str, str], tuple[float, dict[date, float]]] = {}
+        self._lock = threading.RLock()
 
     def rate(self, from_currency: str, to_currency: str, as_of: str) -> FxSnapshot | None:
         src, dst = from_currency.upper(), to_currency.upper()
         if src == dst:
             return FxSnapshot(src, dst, 1.0, as_of, self.name)
-        requested = date.fromisoformat(as_of)
-        start = requested - timedelta(days=7)
-        src_rate, src_day, src_direct = self._leg(src, start, requested)
-        if src_direct is not None:
-            return FxSnapshot(src, dst, src_direct, as_of, self.name)
-        dst_rate, dst_day, dst_direct = self._leg(dst, start, requested)
-        if src_rate is None or dst_rate is None:
+        supported = {'HKD', 'USD', 'CNY', 'EUR', 'JPY', 'GBP', 'CAD', 'SGD', 'AUD', 'CHF'}
+        if src not in supported or dst not in supported:
             return None
-        effective = min(day for day in (src_day, dst_day) if day is not None)
-        return FxSnapshot(src, dst, dst_rate / src_rate, effective.isoformat(), self.name)
+        try:
+            requested = date.fromisoformat(as_of)
+        except ValueError:
+            return None
+        start = requested - timedelta(days=7)
+        # Never divide rates observed on different dates or fabricate a date
+        # from the requested range. Both legs must attest the same day.
+        src_rates = self._leg(src, start, requested)
+        dst_rates = self._leg(dst, start, requested)
+        common = src_rates.keys() & dst_rates.keys()
+        if not common:
+            return None
+        effective = max(common)
+        return FxSnapshot(src, dst, dst_rates[effective] / src_rates[effective], effective.isoformat(), self.name)
 
-    def _leg(self, currency: str, start: date, end: date) -> tuple[float | None, date | None, float | None]:
+    def _leg(self, currency: str, start: date, end: date) -> dict[date, float]:
         if currency == "EUR":
-            return 1.0, end if end.weekday() < 5 else end - timedelta(days=end.weekday() - 4), None
+            return {start + timedelta(days=i): 1.0 for i in range((end - start).days + 1)}
+        cache_key = (currency, end.isoformat())
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and time.monotonic() - cached[0] < 3600:
+                return dict(cached[1])
         key = f"{currency}.EUR.SP00.A"
         query = urllib.parse.urlencode({"startPeriod": start.isoformat(), "endPeriod": end.isoformat(), "format": "jsondata"})
         url = self._URL + key + "?" + query
         try:
             payload = _transport_payload(self.transport, url, timeout=self.timeout_seconds)
         except Exception:
-            return None, None, None
-        direct = _ecb_observation(payload)
-        if isinstance(payload, dict) and any(key in payload for key in ("rate", "value")):
-            return None, None, direct
-        fallback_day = end
-        while fallback_day.weekday() >= 5:
-            fallback_day -= timedelta(days=1)
-        value, observed = _ecb_observation_with_date(payload, fallback_day)
-        return value, observed, None
+            return {}
+        observations = {day: value for day, value in _dated_ecb_observations(payload).items()
+                        if start <= day <= end}
+        if observations:
+            with self._lock:
+                if len(self._cache) >= 64:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[cache_key] = (time.monotonic(), observations)
+        return dict(observations)
+
+
+class FrankfurterFxAdapter:
+    """Keyless historical FX backed by central-bank and official sources."""
+
+    name = "frankfurter-central-bank"
+    _BASE = "https://api.frankfurter.dev/v2/rate/"
+    _SUPPORTED = frozenset({
+        "HKD", "USD", "CNY", "EUR", "JPY", "GBP", "CAD", "SGD", "AUD", "CHF",
+    })
+
+    def __init__(
+        self,
+        transport: JsonTransport | Callable[..., Any] | None = None,
+        *,
+        timeout_seconds: float = 2.5,
+    ):
+        self.transport = transport or StdlibJsonTransport()
+        self.timeout_seconds = max(0.5, min(8.0, float(timeout_seconds)))
+
+    def rate(self, from_currency: str, to_currency: str, as_of: str) -> FxSnapshot | None:
+        source, target = from_currency.upper(), to_currency.upper()
+        if source == target:
+            return FxSnapshot(source, target, 1.0, as_of, self.name)
+        if source not in self._SUPPORTED or target not in self._SUPPORTED:
+            return None
+        try:
+            requested = date.fromisoformat(as_of)
+        except ValueError:
+            return None
+        url = (
+            self._BASE + urllib.parse.quote(source.lower(), safe="") + "/"
+            + urllib.parse.quote(target.lower(), safe="") + "?"
+            + urllib.parse.urlencode({"date": requested.isoformat()})
+        )
+        try:
+            payload = _transport_payload(self.transport, url, timeout=self.timeout_seconds)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            observed = date.fromisoformat(str(payload.get("date") or ""))
+            rate = float(payload.get("rate"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            str(payload.get("base") or "").upper() != source
+            or str(payload.get("quote") or "").upper() != target
+            or observed > requested
+            or (requested - observed).days > 7
+            or not math.isfinite(rate)
+            or rate <= 0
+        ):
+            return None
+        return FxSnapshot(source, target, rate, observed.isoformat(), self.name)
+
+
+class FxRouter:
+    """Bounded no-key FX source router with provenance-preserving caching."""
+
+    def __init__(
+        self,
+        adapters: tuple[FxAdapter, ...] | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.adapters = adapters or (FrankfurterFxAdapter(), EcbFxAdapter())
+        self._cache: dict[tuple[str, str, str], FxSnapshot] = {}
+        self._lock = threading.RLock()
+        self._clock = clock
+        self._failures: dict[str, int] = {}
+        self._open_until: dict[str, float] = {}
+
+    def rate(self, from_currency: str, to_currency: str, as_of: str) -> FxSnapshot | None:
+        source, target = from_currency.upper(), to_currency.upper()
+        key = (source, target, as_of)
+        with self._lock:
+            cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        for adapter in self.adapters:
+            adapter_name = str(getattr(adapter, "name", type(adapter).__name__))
+            with self._lock:
+                if self._open_until.get(adapter_name, 0.0) > self._clock():
+                    continue
+            try:
+                result = adapter.rate(source, target, as_of)
+            except Exception:
+                result = None
+            if (
+                result is None
+                or result.from_currency != source
+                or result.to_currency != target
+                or not result.source
+                or not math.isfinite(result.rate)
+                or result.rate <= 0
+            ):
+                with self._lock:
+                    failures = self._failures.get(adapter_name, 0) + 1
+                    self._failures[adapter_name] = failures
+                    if failures >= 2:
+                        self._open_until[adapter_name] = self._clock() + 30.0
+                continue
+            with self._lock:
+                self._failures.pop(adapter_name, None)
+                self._open_until.pop(adapter_name, None)
+                if len(self._cache) >= 256:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[key] = result
+            return result
+        return None
+
+
+def _dated_ecb_observations(payload: Any) -> dict[date, float]:
+    rows: list[tuple[Any, Any]] = []
+    if isinstance(payload, str):
+        rows = [(row.get('TIME_PERIOD'), row.get('OBS_VALUE')) for row in csv.DictReader(io.StringIO(payload))]
+    elif isinstance(payload, dict):
+        dimensions = payload.get('structure', {}).get('dimensions', {}).get('observation', [])
+        time_dimension = next((item for item in dimensions if item.get('id') == 'TIME_PERIOD'), {})
+        values = time_dimension.get('values', [])
+        for dataset in payload.get('dataSets', []):
+            for series in dataset.get('series', {}).values():
+                for index, observation in series.get('observations', {}).items():
+                    try:
+                        rows.append((values[int(index)]['id'], observation[0]))
+                    except (ValueError, IndexError, KeyError, TypeError):
+                        continue
+    result: dict[date, float] = {}
+    for day, raw in rows:
+        try:
+            observed, value = date.fromisoformat(str(day)), float(raw)
+        except (ValueError, TypeError):
+            continue
+        if math.isfinite(value) and value > 0:
+            result[observed] = value
+    return result
 
 
 @dataclass
@@ -686,7 +842,7 @@ class MarketSnapshotModule:
             NasdaqPublicQuoteAdapter(),
             YahooChartQuoteAdapter(),
         ) if adapters is None else adapters
-        self.fx_adapter = fx_adapter
+        self.fx_adapter = fx_adapter or FxRouter()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._cache_port = cache or MemorySnapshotCache()
         self._inflight: dict[str, _Flight] = {}
@@ -841,7 +997,15 @@ class MarketSnapshotModule:
                     provider=quote.provider, source_id=quote.source_id, retrieved_at=quote.retrieved_at,
                     warnings=all_warnings, policy_version=policy.version,
                     quote_currency=quote.currency, valuation_currency=report_currency)
-            fx = self.fx_adapter.rate(quote.currency, report_currency, quote.as_of) if self.fx_adapter else None
+            try:
+                fx = self.fx_adapter.rate(quote.currency, report_currency, quote.as_of) if self.fx_adapter else None
+            except Exception:
+                fx = None
+            if fx is not None and (not math.isfinite(fx.rate) or fx.rate <= 0
+                    or not fx.source or not _is_fresh(fx.as_of, date.fromisoformat(quote.as_of), policy.max_quote_age_days)
+                    or getattr(fx, 'from_currency', quote.currency) != quote.currency
+                    or getattr(fx, 'to_currency', report_currency) != report_currency):
+                fx = None
             if fx is None or value is None:
                 return MarketSnapshotOutcome(status=SnapshotStatus.UNAVAILABLE, issuer_id=company.issuer_id, security_id=company.security_id,
                     symbol=quote.symbol, exchange=quote.exchange, price=quote.price, market_cap=value,
@@ -882,7 +1046,10 @@ def _manual_quote(company: Company, value: dict[str, Any], now: datetime) -> Quo
 
 
 def _validate_quote(quote: QuoteSnapshot, company: Company) -> None:
-    if quote.price is not None and quote.price < 0 or quote.market_cap is not None and quote.market_cap <= 0:
+    if (
+        quote.price is not None and quote.price <= 0
+        or quote.market_cap is not None and quote.market_cap <= 0
+    ):
         raise ValueError("QUOTE_VALUE_INVALID")
     if len(quote.currency) != 3 or not quote.currency.isalpha():
         raise ValueError("QUOTE_CURRENCY_INVALID")
@@ -913,11 +1080,19 @@ def _conflicts(quotes: list[QuoteSnapshot], tolerance: float) -> bool:
     currencies = {q.currency for q in quotes}
     if len(currencies) > 1:
         return True
-    prices = [q.price for q in quotes if q.price is not None]
-    if len(prices) > 1 and min(prices) > 0 and (max(prices) - min(prices)) / min(prices) > tolerance:
-        return True
-    caps = [q.market_cap for q in quotes if q.market_cap is not None]
-    return len(caps) > 1 and min(caps) > 0 and (max(caps) - min(caps)) / min(caps) > tolerance
+    price_groups: dict[tuple[str, str], list[float]] = {}
+    cap_groups: dict[tuple[str, str, str], list[float]] = {}
+    for quote in quotes:
+        if quote.price is not None:
+            price_groups.setdefault((quote.currency, quote.as_of), []).append(quote.price)
+        if quote.market_cap is not None:
+            cap_groups.setdefault(
+                (quote.currency, quote.as_of, quote.market_cap_scope), []
+            ).append(quote.market_cap)
+    for values in (*price_groups.values(), *cap_groups.values()):
+        if len(values) > 1 and min(values) > 0 and (max(values) - min(values)) / min(values) > tolerance:
+            return True
+    return False
 
 
 def _is_fresh(as_of: str, today: date, max_age: int) -> bool:
@@ -935,7 +1110,7 @@ def _number(value: Any, *, scale: float = 1.0) -> float | None:
         number = float(value) / scale
     except (TypeError, ValueError):
         return None
-    return number if number >= 0 else None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def _nested_dict(value: Any, *keys: str) -> dict[str, Any]:
@@ -1059,99 +1234,6 @@ def _transport_payload(transport: Any, url: str, *, timeout: float) -> Any:
         return text_method(url, timeout=timeout)
     return transport(url, timeout=timeout)
 
-
-def _ecb_observation(payload: Any) -> float | None:
-    """Extract the observation value from SDMX JSON or CSV only."""
-    if isinstance(payload, bytes):
-        payload = payload.decode("utf-8", errors="replace")
-    if isinstance(payload, str):
-        lines = [line.strip() for line in payload.splitlines() if line.strip()]
-        if not lines:
-            return None
-        headers = [part.strip().lower() for part in lines[0].split(",")]
-        value_index = next((i for i, name in enumerate(headers) if name in {"obs_value", "value", "rate"}), None)
-        if value_index is None:
-            return None
-        for line in reversed(lines[1:]):
-            columns = [part.strip() for part in line.split(",")]
-            if value_index < len(columns):
-                value = _number(columns[value_index])
-                if value is not None and value > 0:
-                    return value
-        return None
-    if not isinstance(payload, dict):
-        return None
-    # Tiny fixture/normalised form.
-    for key in ("rate", "value", "OBS_VALUE"):
-        value = _number(payload.get(key))
-        if value is not None and value > 0:
-            return value
-    data_sets = payload.get("dataSets")
-    if isinstance(data_sets, list) and data_sets:
-        dataset = data_sets[0]
-        series = dataset.get("series", {}) if isinstance(dataset, dict) else {}
-        if isinstance(series, dict):
-            for item in series.values():
-                observations = item.get("observations", {}) if isinstance(item, dict) else {}
-                if isinstance(observations, dict):
-                    for observation in observations.values():
-                        candidate = observation[0] if isinstance(observation, list) and observation else observation
-                        value = _number(candidate)
-                        if value is not None and value > 0:
-                            return value
-    data = payload.get("data")
-    if isinstance(data, list):
-        for row in reversed(data):
-            if isinstance(row, dict):
-                value = _number(row.get("OBS_VALUE") or row.get("value"))
-                if value is not None and value > 0:
-                    return value
-    return None
-
-
-def _ecb_observation_with_date(payload: Any, fallback: date) -> tuple[float | None, date | None]:
-    if isinstance(payload, str):
-        lines = [line.strip() for line in payload.splitlines() if line.strip()]
-        if len(lines) < 2:
-            return None, None
-        headers = [part.strip().lower() for part in lines[0].split(",")]
-        value_index = next((i for i, name in enumerate(headers) if name in {"obs_value", "value", "rate"}), None)
-        date_index = next((i for i, name in enumerate(headers) if name in {"time_period", "date", "observation_date"}), None)
-        if value_index is None:
-            return None, None
-        for line in reversed(lines[1:]):
-            columns = [part.strip() for part in line.split(",")]
-            value = _number(columns[value_index]) if value_index < len(columns) else None
-            if value is not None and value > 0:
-                observed = _date_text(columns[date_index]) if date_index is not None and date_index < len(columns) else fallback.isoformat()
-                return value, date.fromisoformat(observed) if observed else fallback
-        return None, None
-    if isinstance(payload, dict):
-        data_sets = payload.get("dataSets")
-        structure = payload.get("structure", {})
-        dimensions = structure.get("dimensions", {}).get("observation", []) if isinstance(structure, dict) else []
-        time_values = dimensions[0].get("values", []) if dimensions and isinstance(dimensions[0], dict) else []
-        if isinstance(data_sets, list) and data_sets:
-            series = data_sets[0].get("series", {}) if isinstance(data_sets[0], dict) else {}
-            if isinstance(series, dict):
-                for item in series.values():
-                    observations = item.get("observations", {}) if isinstance(item, dict) else {}
-                    if isinstance(observations, dict):
-                        candidates = []
-                        for index, observation in observations.items():
-                            candidate = observation[0] if isinstance(observation, list) and observation else observation
-                            value = _number(candidate)
-                            if value is not None and value > 0:
-                                observed = fallback
-                                try:
-                                    observed = date.fromisoformat(str(time_values[int(index)]["id"] if isinstance(time_values[int(index)], dict) else time_values[int(index)]))
-                                except (IndexError, KeyError, TypeError, ValueError):
-                                    pass
-                                candidates.append((observed, value))
-                        if candidates:
-                            observed, value = max(candidates, key=lambda item: item[0])
-                            return value, observed
-    return _ecb_observation(payload), fallback
 
 
 def _now() -> str:

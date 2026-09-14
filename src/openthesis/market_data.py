@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import html as html_lib
 import json
+import ipaddress
 import re
+import socket
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -13,7 +16,11 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 
 from .domain import Company, FilingDocument
-from .download_safety import UnsafeDisclosurePayload, store_immutable_payload
+from .download_safety import (
+    UnsafeDisclosurePayload,
+    store_immutable_payload,
+    store_immutable_stream,
+)
 from .filing_selection import select_research_filings
 from .markets import (
     COMMON_MARKET_COMPANIES,
@@ -23,6 +30,7 @@ from .markets import (
     normalize_market,
     search_companies,
 )
+from .text_normalization import canonical_search_text, normalize_company_query
 
 
 class MarketDataError(RuntimeError):
@@ -31,6 +39,18 @@ class MarketDataError(RuntimeError):
     def __init__(self, message: str, *, code: str = "FILING_FETCH_FAILED"):
         super().__init__(message)
         self.code = code
+
+
+class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject an unsafe redirect before urllib sends the next request."""
+
+    def __init__(self, validator: Callable[[str], None]):
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class HttpTransport(Protocol):
@@ -50,10 +70,18 @@ class OfficialDisclosureHttpClient:
         "www1.hkexnews.hk",
         "www.hkexnews.hk",
     }
+    _ALLOWED_HOST_SUFFIXES = (".cninfo.com.cn", ".hkexnews.hk")
 
-    def __init__(self, *, timeout_seconds: int = 30, maximum_bytes: int = 50_000_000):
+    def __init__(
+        self,
+        *,
+        timeout_seconds: int = 30,
+        maximum_bytes: int = 150_000_000,
+        maximum_attempts: int = 3,
+    ):
         self.timeout_seconds = max(5, min(120, int(timeout_seconds)))
-        self.maximum_bytes = max(1_000_000, min(100_000_000, int(maximum_bytes)))
+        self.maximum_bytes = max(1_000_000, min(150_000_000, int(maximum_bytes)))
+        self.maximum_attempts = max(1, min(5, int(maximum_attempts)))
 
     def get_json(self, url: str) -> Any:
         return json.loads(self._request(url).decode("utf-8-sig"))
@@ -74,17 +102,43 @@ class OfficialDisclosureHttpClient:
     def get_text(self, url: str) -> str:
         return self._request(url).decode("utf-8", errors="replace")
 
-    def download(self, url: str, target: Path) -> Path:
-        payload = self._request(url)
+    def download(
+        self,
+        url: str,
+        target: Path,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Path:
         try:
-            return store_immutable_payload(
-                target,
-                payload,
-                maximum_bytes=self.maximum_bytes,
-                require_pdf=target.suffix.lower() == ".pdf",
-            )
+            # Tests and embedders may supply an in-memory request seam.  The
+            # production path below always streams and therefore never holds
+            # a 100+ MB report in RAM.
+            if "_request" in self.__dict__:
+                return store_immutable_payload(
+                    target,
+                    self._request(url),
+                    maximum_bytes=self.maximum_bytes,
+                    require_pdf=target.suffix.lower() == ".pdf",
+                )
+            request = self._build_request(url)
+            with self._open_with_retry(request, cancel_check=cancel_check) as response:
+                self._validate_url(response.geturl())
+                declared = response.headers.get("Content-Length")
+                if declared and int(declared) > self.maximum_bytes:
+                    raise UnsafeDisclosurePayload("disclosure payload exceeds the size limit")
+                return store_immutable_stream(
+                    target,
+                    response,
+                    maximum_bytes=self.maximum_bytes,
+                    require_pdf=target.suffix.lower() == ".pdf",
+                    cancel_check=cancel_check,
+                )
         except UnsafeDisclosurePayload as exc:
             raise MarketDataError("official disclosure failed safety validation", code="FILING_CONTENT_UNSAFE") from exc
+        except InterruptedError as exc:
+            raise MarketDataError("official disclosure download was cancelled", code="FILING_DOWNLOAD_CANCELLED") from exc
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            raise MarketDataError("official disclosure source is unavailable", code="FILING_FETCH_FAILED") from exc
 
     def _request(
         self,
@@ -93,6 +147,24 @@ class OfficialDisclosureHttpClient:
         data: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> bytes:
+        request = self._build_request(url, data=data, headers=headers)
+        try:
+            with self._open_with_retry(request) as response:
+                self._validate_url(response.geturl())
+                payload = response.read(self.maximum_bytes + 1)
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
+            raise MarketDataError("official disclosure source is unavailable") from exc
+        if len(payload) > self.maximum_bytes:
+            raise MarketDataError("official disclosure document exceeds the size limit")
+        return payload
+
+    def _build_request(
+        self,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> urllib.request.Request:
         self._validate_url(url)
         request_headers = {
             "Accept": "application/json,text/html,application/pdf;q=0.9,*/*;q=0.5",
@@ -100,21 +172,75 @@ class OfficialDisclosureHttpClient:
             "Referer": "https://www.cninfo.com.cn/" if "cninfo" in url else "https://www1.hkexnews.hk/",
             **(headers or {}),
         }
-        request = urllib.request.Request(url, data=data, headers=request_headers)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+        return urllib.request.Request(url, data=data, headers=request_headers)
+
+    def _open_with_retry(
+        self,
+        request: urllib.request.Request,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> Any:
+        last_error: BaseException | None = None
+        for attempt in range(self.maximum_attempts):
+            if cancel_check is not None and cancel_check():
+                raise InterruptedError("disclosure download cancelled")
+            try:
+                response = self._open_once(request)
                 self._validate_url(response.geturl())
-                payload = response.read(self.maximum_bytes + 1)
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-            raise MarketDataError("official disclosure source is unavailable") from exc
-        if len(payload) > self.maximum_bytes:
-            raise MarketDataError("official disclosure document exceeds the size limit")
-        return payload
+                return response
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
+                    raise
+            except (URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+            if attempt + 1 < self.maximum_attempts:
+                delay = min(4.0, 0.5 * (2**attempt))
+                if cancel_check is not None and cancel_check():
+                    raise InterruptedError("disclosure download cancelled")
+                time.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+    def _open_once(self, request: urllib.request.Request) -> Any:
+        self._validate_network_target(request.full_url)
+        opener = urllib.request.build_opener(
+            _ValidatedRedirectHandler(self._validate_network_target)
+        )
+        return opener.open(request, timeout=self.timeout_seconds)
+
+    @classmethod
+    def _validate_network_target(cls, url: str) -> None:
+        cls._validate_url(url)
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        }
+        if not addresses:
+            raise MarketDataError("disclosure source resolved to an unsafe network target")
+        fake_ip_network = ipaddress.ip_network("198.18.0.0/15")
+        for address in addresses:
+            resolved = ipaddress.ip_address(address)
+            # Clash/Surge TUN modes intentionally resolve public destinations
+            # into RFC 2544 benchmark addresses.  Permit that representation
+            # only for the four exact built-in official hosts; wildcard
+            # subdomains and every user-controlled/lookalike host retain the
+            # ordinary globally-routable requirement.
+            if resolved in fake_ip_network and host in cls._ALLOWED_HOSTS:
+                continue
+            if not resolved.is_global:
+                raise MarketDataError("disclosure source resolved to an unsafe network target")
 
     @classmethod
     def _validate_url(cls, url: str) -> None:
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "https" or (parsed.hostname or "").lower() not in cls._ALLOWED_HOSTS:
+        host = (parsed.hostname or "").lower()
+        allowed = host in cls._ALLOWED_HOSTS or any(
+            host.endswith(suffix) and host != suffix[1:]
+            for suffix in cls._ALLOWED_HOST_SUFFIXES
+        )
+        if parsed.scheme != "https" or not allowed or parsed.username or parsed.password:
             raise MarketDataError("unsupported disclosure source URL")
 
 
@@ -147,7 +273,7 @@ class CnInfoAdapter:
         self._stock_rows: list[dict[str, str]] | None = None
 
     def resolve(self, query: str, *, limit: int = 15) -> list[Company]:
-        normalized = query.strip()
+        normalized = normalize_company_query(query)
         if not normalized:
             raise ValueError("company query is required")
         try:
@@ -375,25 +501,43 @@ class HkexNewsAdapter:
     market = Market.HK
     _STOCK_LIST_URL = "https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json"
 
-    def __init__(self, transport: HttpTransport | None = None):
+    def __init__(
+        self,
+        transport: HttpTransport | None = None,
+        *,
+        preferred_language: str = "zh-Hant",
+    ):
         self.transport = transport or OfficialDisclosureHttpClient()
         self._stock_rows: list[dict[str, str]] | None = None
+        self.preferred_language = preferred_language
+
+    def set_preferred_language(self, language: str) -> None:
+        self.preferred_language = str(language or "zh-Hant")
 
     def resolve(self, query: str, *, limit: int = 15) -> list[Company]:
-        needle = query.strip().casefold()
+        needle = canonical_search_text(query)
         if not needle:
             raise ValueError("company query is required")
         try:
             rows = self._stocks()
         except MarketDataError:
             return search_companies(query, market=Market.HK, limit=limit)
-        matches = [row for row in rows if needle in row["code"].casefold() or needle in row["name"].casefold()]
+        matches = [
+            row for row in rows
+            if needle in canonical_search_text(row["code"])
+            or needle in row["search_text"]
+        ]
         return [self._company(row) for row in matches[: max(1, limit)]] or search_companies(
             query, market=Market.HK, limit=limit
         )
 
     def list_financial_filings(self, company: Company, *, limit: int = 5) -> list[FilingDocument]:
         code = company.ticker[:5]
+        language_order = (
+            ("E", "C")
+            if self.preferred_language.strip().lower().startswith("en")
+            else ("C", "E")
+        )
         prefix_url = "https://www1.hkexnews.hk/search/prefix.do?" + urllib.parse.urlencode(
             {
                 "callback": "openthesis",
@@ -413,17 +557,30 @@ class HkexNewsAdapter:
         # earnings releases cannot crowd annual/interim reports out of the
         # source page.  The old HTML page remains a conservative fallback for
         # deployments where the servlet is unavailable.
-        titles = ("Annual Report", "Interim Report", "Quarterly Report", "Half-Year Report")
+        title_filters = {
+            "E": (
+                "Annual Report", "Interim Report", "Interim Results",
+                "Quarterly Report", "Half-Year Report",
+            ),
+            "C": (
+                "年度報告", "中期報告", "中期業績", "中期业绩",
+                "季度報告", "半年度報告",
+            ),
+        }
         discovered: list[FilingDocument] = []
         json_successes = 0
         json_failures = 0
         explicit_empty = 0
         annual_count = 0
-        for title_filter in titles:
+        for language, title_filter in (
+            (language, title)
+            for language in language_order
+            for title in title_filters[language]
+        ):
             # Once the requested annual history is present, do not fetch more
             # annual pages; periodic filters are still queried for a current
             # year without an annual filing.
-            if title_filter == "Annual Report" and annual_count >= max(1, limit) + 1:
+            if title_filter in {"Annual Report", "年度報告"} and annual_count >= max(1, limit) + 1:
                 continue
             now = datetime.now(timezone.utc)
             from_date = f"{max(2000, now.year - 10):04d}0101"
@@ -442,7 +599,7 @@ class HkexNewsAdapter:
                 "t2Gcode": "-2",
                 "t2code": "-2",
                 "rowRange": "100",
-                "lang": "E",
+                "lang": language,
             }
             search_url = "https://www1.hkexnews.hk/search/titleSearchServlet.do?" + urllib.parse.urlencode(query)
             try:
@@ -478,7 +635,7 @@ class HkexNewsAdapter:
 
         # Compatibility fallback for older HKEX deployments or malformed JSON.
         search_url = "https://www1.hkexnews.hk/search/titlesearch.xhtml?" + urllib.parse.urlencode(
-            {"category": "0", "lang": "EN", "market": "SEHK", "stockId": stock_id}
+            {"category": "0", "lang": language_order[0], "market": "SEHK", "stockId": stock_id}
         )
         text = self.transport.get_text(search_url)
         filings = list(select_research_filings(_hkex_filings_from_text(company, text, limit=30), annual_limit=limit).documents)
@@ -508,10 +665,22 @@ class HkexNewsAdapter:
         rows: list[dict[str, str]] = []
         for item in _find_dict_rows(payload):
             code = _first_text(item, "code", "stockCode", "stock_code", "c").zfill(5)
-            name = _first_text(item, "name", "stockName", "stock_name", "cName", "n")
+            if not _hkex_is_researchable_equity(item):
+                continue
+            names = [
+                _first_text(item, key)
+                for key in ("name", "stockName", "stock_name", "cName", "n", "eName", "englishName", "chineseName")
+            ]
+            names = list(dict.fromkeys(name for name in names if name))
+            name = names[0] if names else ""
             stock_id = _first_text(item, "stockId", "stock_id", "id", "s")
             if re.fullmatch(r"\d{5}", code) and name and stock_id:
-                rows.append({"code": code, "name": name, "stock_id": stock_id})
+                rows.append({
+                    "code": code,
+                    "name": name,
+                    "stock_id": stock_id,
+                    "search_text": " ".join(canonical_search_text(value) for value in names),
+                })
         if not rows:
             raise MarketDataError("HKEX company catalogue returned no usable records")
         self._stock_rows = rows
@@ -522,7 +691,7 @@ class HkexNewsAdapter:
         symbol = f"{row['code']}.HK"
         known = next((item for item in COMMON_MARKET_COMPANIES if item.ticker == symbol), None)
         if known is not None:
-            return Company(**known.to_dict())
+            return Company(**{**known.to_dict(), "name": row["name"]})
         return build_company(
             symbol,
             row["name"],
@@ -579,6 +748,54 @@ def _first_text(item: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _hkex_is_researchable_equity(item: dict[str, Any]) -> bool:
+    """Accept researchable issuers from both typed and real HKEX catalogue rows."""
+    code = _first_text(item, "code", "stockCode", "stock_code", "c")
+    name = _first_text(
+        item, "name", "stockName", "stock_name", "cName", "n",
+        "eName", "englishName", "chineseName",
+    )
+    folded_name = canonical_search_text(name).casefold()
+    non_company_markers = (
+        "warrant", "cbbc", "call warrant", "put warrant", "derivative",
+        "etf", "exchange traded fund", "債券", "债券", "票據", "票据",
+        "基金", "認購", "认购", "認沽", "认沽", "權證", "权证",
+        "牛熊證", "牛熊证",
+    )
+    if any(marker in folded_name for marker in non_company_markers):
+        return False
+    if re.search(r"(?:購|购|沽|牛|熊)[a-z]?$", folded_name):
+        return False
+
+    value = _first_text(
+        item,
+        "securityType",
+        "security_type",
+        "instrumentType",
+        "instrument_type",
+        "productType",
+        "type",
+        "category",
+    ).casefold()
+    rejected = ("warrant", "cbbc", "derivative", "bond", "debt", "etf", "fund", "權證", "权证", "牛熊證", "牛熊证")
+    if any(marker in value for marker in rejected):
+        return False
+    accepted = ("equity", "stock", "ordinary", "share", "股份", "股票")
+    if value:
+        return any(marker in value for marker in accepted)
+
+    # The production ``activestock_sehk_c.json`` payload only exposes i/c/n/s
+    # and provides no securityType.  HKEX allocates listed-company/GEM equity
+    # counters below 10000; warrants, CBBCs and other leveraged products use
+    # higher counter ranges.  Keep the range as a positive eligibility gate,
+    # while the name exclusions above remove exchange-traded funds and debt
+    # products that also use low counters.
+    if not re.fullmatch(r"\d{1,5}", code):
+        return False
+    numeric_code = int(code)
+    return 1 <= numeric_code < 10_000
+
+
 def _timestamp_to_iso(value: Any) -> str:
     try:
         number = float(value)
@@ -600,27 +817,33 @@ def _optional_nonnegative_int(value: Any) -> int | None:
 
 
 def _report_period_end(year: int, fiscal_period: str, filed_at: str, title: str = "") -> str:
-    if fiscal_period == "FY":
-        explicit = re.search(
-            r"(?:year\s+ended|year\s+ending|for\s+the\s+year\s+ended)\s+"
-            r"(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
-            title,
-            flags=re.IGNORECASE,
-        )
-        if explicit:
-            day, month_name, explicit_year = explicit.groups()
-            month = datetime.strptime(month_name[:3], "%b").month
-            return f"{int(explicit_year):04d}-{month:02d}-{int(day):02d}"
-        chinese = re.search(r"截至\s*(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", title)
-        if chinese:
-            explicit_year, month, day = chinese.groups()
-            return f"{int(explicit_year):04d}-{int(month):02d}-{int(day):02d}"
+    explicit = re.search(
+        r"(?:(?:for\s+the\s+)?(?:year|six\s+months?|half[- ]year|period)\s+"
+        r"(?:ended|ending)|interim\s+results?\s+for\s+the\s+(?:six\s+months?\s+)?ended)\s+"
+        r"(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(20\d{2})",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if explicit:
+        day, month_name, explicit_year = explicit.groups()
+        month = datetime.strptime(month_name[:3], "%b").month
+        return f"{int(explicit_year):04d}-{month:02d}-{int(day):02d}"
+    chinese = re.search(r"截至\s*(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", title)
+    if chinese:
+        explicit_year, month, day = chinese.groups()
+        return f"{int(explicit_year):04d}-{int(month):02d}-{int(day):02d}"
     suffix = {"FY": "12-31", "H1": "06-30", "Q1": "03-31", "Q3": "09-30"}.get(fiscal_period)
     return f"{year:04d}-{suffix}" if suffix else filed_at[:10]
 
 
 def _report_period_revision(fiscal_period: str, title: str) -> str:
     """Mark annual dates without a title-level month/day as provisional."""
+    if fiscal_period == "H1" and (
+        "interim result" in title.casefold()
+        or "中期業績" in title
+        or "中期业绩" in title
+    ):
+        return "provisional_results_announcement"
     if fiscal_period != "FY":
         return "original"
     explicit = re.search(
@@ -661,7 +884,9 @@ def _is_explicit_empty_hkex_result(text: str) -> bool:
 
 def _classify_report(title: str) -> tuple[str, str]:
     lowered = title.casefold()
-    if "半年度报告" in title or "中期报告" in title or "interim report" in lowered or "half-year report" in lowered:
+    if any(token in title for token in (
+        "半年度报告", "半年度報告", "中期报告", "中期報告", "中期业绩", "中期業績",
+    )) or "interim report" in lowered or "interim result" in lowered or "half-year report" in lowered:
         return "INTERIM_REPORT", "H1"
     if "招股说明书" in title or "prospectus" in lowered:
         return "PROSPECTUS", "IPO"
@@ -675,9 +900,9 @@ def _classify_report(title: str) -> tuple[str, str]:
         return "QUARTERLY_REPORT", "Q1"
     if re.search(r"\b(?:third|3rd) quarter(?:ly)?(?:\s+financial)?\s+report\b", lowered):
         return "QUARTERLY_REPORT", "Q3"
-    if "年度报告" in title or "年报" in title or "annual report" in lowered:
+    if any(token in title for token in ("年度报告", "年度報告", "年报", "年報")) or "annual report" in lowered:
         return "ANNUAL_REPORT", "FY"
-    if "季度报告" in title or "quarterly report" in lowered:
+    if "季度报告" in title or "季度報告" in title or "quarterly report" in lowered:
         return "QUARTERLY_REPORT", "Q"
     return "", ""
 
@@ -740,10 +965,15 @@ def _hkex_date_time(value: Any, fallback_year: int | None = None) -> str:
 
 
 def _dedupe_hkex_filings(filings: list[FilingDocument]) -> list[FilingDocument]:
-    seen: set[str] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     result: list[FilingDocument] = []
     for filing in filings:
-        key = filing.source_url.casefold()
+        key = (
+            filing.form_type,
+            filing.fiscal_period,
+            filing.period_end,
+            filing.revision,
+        )
         if key in seen:
             continue
         seen.add(key)
