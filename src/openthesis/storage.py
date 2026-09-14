@@ -27,7 +27,7 @@ SCHEMA_VERSION = 11
 DERIVED_PIPELINE_CONTRACT = {
     "version": "financial-derived-pipeline-v1",
     "disclosure_identity": "disclosure-identity-v1",
-    "parser": "financial-ingestion-ast-v6",
+    "parser": "financial-ingestion-ast-v7",
     "rules": "financial-rules-v1",
     "facts": CURRENT_DERIVED_VERSION,
     "validation": "financial-validation-v1",
@@ -48,17 +48,25 @@ class Storage:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.db_path)
+        connection = sqlite3.connect(self.db_path, timeout=5.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
             connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
     def _initialize(self) -> None:
         with self.connect() as db:
+            # WAL is a persistent database setting. Configure it once at
+            # initialization rather than renegotiating it on every worker
+            # connection; per-connection busy_timeout is set in ``connect``.
+            db.execute("PRAGMA journal_mode = WAL")
             # Read the prior contract before migration.  A changed/missing
             # contract plus legacy derived rows requires a future rebuild;
             # startup itself must never pretend that rebuild completed.
@@ -500,6 +508,14 @@ class Storage:
                     for filing in filings
                 ],
             )
+
+    def company_exists(self, company_cik: str) -> bool:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT 1 FROM companies WHERE cik = ?",
+                (company_cik,),
+            ).fetchone()
+        return row is not None
 
     def get_filings(self, company_cik: str) -> list[FilingDocument]:
         """Return stored official filings in deterministic newest-first order."""

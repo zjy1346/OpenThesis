@@ -10,6 +10,7 @@ from openthesis.financial_ingestion import FinancialGroupValidation
 from openthesis.financial_recovery import (
     FinancialRecoveryController,
     RecoveryState,
+    financial_input_fingerprint,
 )
 from openthesis.markets import build_company
 from openthesis.market_financials import FinancialValidation, ValidationStatus
@@ -17,6 +18,44 @@ from openthesis.storage import Storage
 
 
 class FinancialRecoveryControllerTests(unittest.TestCase):
+    def test_input_fingerprint_is_stable_and_changes_with_parser_inputs(self) -> None:
+        company = build_company("300000.SZ", "Fingerprint Company")
+        first = FilingDocument(
+            "doc-a", company.security_id, "acc-a", "ANNUAL_REPORT", "FY",
+            "2025-12-31", "2026-03-01", "a.pdf", "https://example.test/a",
+            content_hash="ABC123",
+        )
+        second = FilingDocument(
+            "doc-b", company.security_id, "acc-b", "ANNUAL_REPORT", "FY",
+            "2024-12-31", "2025-03-01", "b.pdf", "https://example.test/b",
+            content_hash="DEF456",
+        )
+        one = financial_input_fingerprint(
+            company, [first, second], parser_version="parser-v1", rules_version="rules-v1",
+        )
+        reordered = financial_input_fingerprint(
+            company, [second, first], parser_version="parser-v1", rules_version="rules-v1",
+        )
+        changed = financial_input_fingerprint(
+            company, [first, second], parser_version="parser-v2", rules_version="rules-v1",
+        )
+        self.assertEqual(one, reordered)
+        self.assertNotEqual(one, changed)
+
+    def test_retry_decision_exhausts_deterministic_input_but_cools_transient_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = FinancialRecoveryController(Storage(Path(directory)))
+            deterministic = controller.retry_decision("input-static", "FILING_DATA_QUALITY_FAILED")
+            self.assertEqual(deterministic.state, RecoveryState.EXHAUSTED_SAME_INPUT)
+            self.assertFalse(deterministic.allowed)
+            transient = controller.retry_decision(
+                "input-network", "FILING_FETCH_FAILED", now=100.0, cooldown_seconds=30,
+            )
+            self.assertEqual(transient.state, RecoveryState.RETRYABLE_EXTERNAL_FAILURE)
+            self.assertFalse(transient.allowed)
+            self.assertEqual(transient.retry_after_seconds, 30.0)
+            self.assertFalse(controller.retry_available("input-network", now=129.0))
+            self.assertTrue(controller.retry_available("input-network", now=130.0))
     def test_discovery_error_uses_complete_local_snapshot_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

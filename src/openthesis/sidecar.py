@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from .paths import default_data_dir
-from .service import AppService, PreferenceValidationError, _FinancialReportRefreshError
+from .service import (
+    AppService,
+    PreferenceValidationError,
+    ServiceConfigurationError,
+    _FinancialReportRefreshError,
+)
 
 
 class JsonLineServer:
@@ -36,6 +41,8 @@ class JsonLineServer:
             result = self.dispatch(request)
         except PreferenceValidationError:
             return _error(request_id, -32602, "invalid preferences")
+        except ServiceConfigurationError as exc:
+            return _error(request_id, -32010, exc.code)
         except (TypeError, ValueError):
             return _error(request_id, -32602, "invalid parameters")
         except KeyError as exc:
@@ -109,7 +116,15 @@ class JsonLineServer:
             content = params.get("content")
             if not isinstance(company_cik, str) or not isinstance(content, dict):
                 raise ValueError("thesis content is required")
-            return self.service.save_thesis_version(company_cik, content)
+            company = params.get("company")
+            if company is not None and not isinstance(company, dict):
+                raise ValueError("company identity must be an object")
+            return self.service.save_thesis_version(
+                company_cik,
+                content,
+                base_thesis_version_id=params.get("base_thesis_version_id"),
+                company=company,
+            )
         if method == "research.list":
             return self.service.list_research_runs(limit=params.get("limit", 50))
         if method == "research.delete":
@@ -147,8 +162,10 @@ class JsonLineServer:
         if method == "research.retry_synthesis":
             run_id = params.get("run_id")
             model = params.get("model")
-            if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
-                raise ValueError("run_id and model are required")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            if model is not None and not isinstance(model, dict):
+                raise ValueError("model must be an object")
             return self.service.retry_research_synthesis(run_id, model)
         if method == "research.retry_growth":
             run_id = params.get("run_id")

@@ -58,13 +58,24 @@ class SecClientTests(unittest.TestCase):
 
     def test_company_search_and_annual_filing_mapping(self) -> None:
         tickers = {
-            "0": {"cik_str": 1234, "ticker": "TEST", "title": "Test Systems Inc."},
-            "1": {"cik_str": 9999, "ticker": "OTHER", "title": "Other Corp."},
+            "fields": ["cik", "name", "ticker", "exchange"],
+            "data": [
+                [1234, "Test Systems Inc.", "TEST", "Nasdaq"],
+                [9999, "Other Corp.", "OTHER", "NYSE"],
+            ],
         }
         with patch.object(self.client, "_get_json", return_value=tickers):
             matches = self.client.search_companies("test")
         self.assertEqual(matches[0].cik, "0000001234")
         self.assertEqual(matches[0].ticker, "TEST")
+        self.assertEqual(matches[0].exchange, "NASDAQ")
+
+        with patch.object(self.client, "_get_json", return_value={
+            "fields": ["cik", "name", "ticker", "exchange"],
+            "data": [[1067983, "Berkshire Hathaway Inc.", "BRK-B", "NYSE"]],
+        }):
+            share_class = self.client.search_companies("BRK/B")[0]
+        self.assertEqual((share_class.ticker, share_class.exchange), ("BRK.B", "NYSE"))
 
         submissions = {
             "filings": {
@@ -83,6 +94,22 @@ class SecClientTests(unittest.TestCase):
         self.assertEqual(len(filings), 2)
         self.assertEqual(filings[0].form_type, "10-K")
         self.assertIn("annual25.htm", filings[0].source_url)
+
+    def test_company_search_supports_exact_chinese_alias_and_bounded_typo(self) -> None:
+        tickers = {
+            "fields": ["cik", "name", "ticker", "exchange"],
+            "data": [
+                [320193, "Apple Inc.", "AAPL", "Nasdaq"],
+                [1045810, "NVIDIA Corporation", "NVDA", "Nasdaq"],
+                [789019, "Microsoft Corporation", "MSFT", "Nasdaq"],
+            ],
+        }
+        with patch.object(self.client, "_get_json", return_value=tickers):
+            self.assertEqual(self.client.search_companies("苹果")[0].ticker, "AAPL")
+            self.assertEqual(self.client.search_companies("nvida")[0].ticker, "NVDA")
+            self.assertEqual(self.client.search_companies("msftx")[0].ticker, "MSFT")
+            self.assertEqual(self.client.search_companies("aple")[0].ticker, "AAPL")
+            self.assertEqual(self.client.search_companies("meta"), [])
 
     def test_company_facts_normalization(self) -> None:
         payload = {
@@ -131,6 +158,7 @@ class SecClientTests(unittest.TestCase):
         self.assertEqual(by_concept["revenue"].value, 1000)
         self.assertEqual(by_concept["net_income"].value, 120)
         self.assertEqual(by_concept["revenue"].fiscal_year, 2025)
+        self.assertEqual(by_concept["revenue"].unit_provenance, "structured_normalized")
 
     def test_alternate_xbrl_concept_fills_missing_years(self) -> None:
         def row(year: int, value: int) -> dict[str, object]:
@@ -221,6 +249,7 @@ class SecClientTests(unittest.TestCase):
         self.assertIn("LiabilitiesAndStockholdersEquity - StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", liabilities[0].reported_concept)
         self.assertIn("inputs: LiabilitiesAndStockholdersEquity=100, StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest=45", liabilities[0].raw_text)
         self.assertEqual(liabilities[0].statement, "balance_sheet")
+        self.assertEqual(liabilities[0].unit_provenance, "structured_normalized")
 
     def test_companyfacts_does_not_guess_liabilities_from_parent_equity(self) -> None:
         def row(value: int) -> dict[str, object]:
@@ -238,6 +267,55 @@ class SecClientTests(unittest.TestCase):
         with patch.object(self.client, "_get_json", return_value=payload):
             facts = self.client.get_company_facts(company)
         self.assertFalse([fact for fact in facts if fact.concept == "liabilities"])
+
+    def test_companyfacts_derives_liabilities_for_multi_year_issuer_without_nci_evidence(self) -> None:
+        def row(value: int, year: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": year, "fp": "FY", "form": "10-K",
+                "start": None, "end": f"{year}-12-31", "filed": f"{year + 1}-02-01",
+                "accn": f"0001-{year}-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {
+                "units": {"USD": [row(100 + year, year) for year in (2023, 2024, 2025)]}
+            },
+            "StockholdersEquity": {
+                "units": {"USD": [row(40 + year, year) for year in (2023, 2024, 2025)]}
+            },
+        }, "dei": {}}}
+        company = Company(cik="0001018724", ticker="AMZN", name="Amazon", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = [fact for fact in facts if fact.concept == "liabilities"]
+        self.assertEqual(len(liabilities), 3)
+        self.assertEqual({fact.value for fact in liabilities}, {60.0})
+        self.assertTrue(all("no reported NCI" in fact.reported_concept for fact in liabilities))
+
+    def test_companyfacts_does_not_apply_no_nci_history_path_when_any_nci_is_reported(self) -> None:
+        def row(value: int, year: int) -> dict[str, object]:
+            return {
+                "val": value, "fy": year, "fp": "FY", "form": "10-K",
+                "start": None, "end": f"{year}-12-31", "filed": f"{year + 1}-02-01",
+                "accn": f"0001-{year}-001",
+            }
+
+        payload = {"facts": {"us-gaap": {
+            "LiabilitiesAndStockholdersEquity": {
+                "units": {"USD": [row(100, year) for year in (2024, 2025)]}
+            },
+            "StockholdersEquity": {
+                "units": {"USD": [row(40, year) for year in (2024, 2025)]}
+            },
+            "MinorityInterestInConsolidatedEntity": {
+                "units": {"USD": [row(5, 2025)]}
+            },
+        }, "dei": {}}}
+        company = Company(cik="0000001234", ticker="NCI", name="NCI issuer", reporting_currency="USD")
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+        liabilities = [fact for fact in facts if fact.concept == "liabilities"]
+        self.assertEqual([(fact.fiscal_year, fact.value) for fact in liabilities], [(2025, 55.0)])
 
     def test_companyfacts_derives_ko_style_nine_years_with_cross_validation(self) -> None:
         def row(value: int, year: int) -> dict[str, object]:
@@ -386,6 +464,32 @@ class SecClientTests(unittest.TestCase):
         self.assertEqual(by_concept["revenue"].currency, "USD")
         self.assertIn("ifrs-full", by_concept["revenue"].raw_text)
         self.assertEqual(by_concept["revenue"].parser_version, "sec-companyfacts-v2")
+
+    def test_ifrs_companyfacts_maps_operating_profit_and_capex_taxonomy_concepts(self) -> None:
+        def row(value: float) -> dict[str, object]:
+            return {
+                "val": value, "fy": 2025, "fp": "FY", "form": "20-F",
+                "start": "2025-01-01", "end": "2025-12-31", "filed": "2026-02-20",
+                "accn": "0001-26-001",
+            }
+
+        payload = {"facts": {"ifrs-full": {
+            "ProfitLossFromOperatingActivities": {"units": {"USD": [row(12_000)]}},
+            "PurchaseOfPropertyPlantAndEquipment": {"units": {"USD": [row(3_000)]}},
+        }, "dei": {}}}
+        company = Company(
+            cik="0001089113", ticker="IFRS", name="IFRS issuer",
+            reporting_currency="USD", accounting_standard="IFRS",
+        )
+
+        with patch.object(self.client, "_get_json", return_value=payload):
+            facts = self.client.get_company_facts(company)
+
+        by_concept = {fact.concept: fact for fact in facts}
+        self.assertEqual(by_concept["operating_income"].reported_concept, "ProfitLossFromOperatingActivities")
+        self.assertEqual(by_concept["operating_income"].statement, "income_statement")
+        self.assertEqual(by_concept["capital_expenditure"].reported_concept, "PurchaseOfPropertyPlantAndEquipment")
+        self.assertEqual(by_concept["capital_expenditure"].statement, "cash_flow")
 
     def test_structured_adapter_remaps_period_and_keeps_sec_evidence(self) -> None:
         class FakeClient:

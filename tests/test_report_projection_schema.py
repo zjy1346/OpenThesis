@@ -41,6 +41,28 @@ def _artifacts() -> list[dict[str, object]]:
 
 
 class ReportProjectionSchemaTests(unittest.TestCase):
+    def test_nontechnical_financial_sections_keep_public_accounting_risk_fields(self) -> None:
+        payload = {
+            "financial_quality": {
+                "summary": "质量摘要",
+                "risk_flags": ["应收账款增长快于收入"],
+                "benign_explanations": ["季节性备货"],
+                "follow_up_questions": ["回款是否在下一季度恢复？"],
+            },
+            "balance_sheet": {
+                "summary": "资产负债表摘要",
+                "risk_flags": ["短债增加"],
+                "benign_explanations": ["在手现金充足"],
+                "follow_up_questions": ["债务期限结构如何？"],
+            },
+        }
+
+        projected = project_report_value(payload, include_technical=False)
+
+        for section in ("financial_quality", "balance_sheet"):
+            self.assertIn("risk_flags", projected[section])
+            self.assertIn("benign_explanations", projected[section])
+            self.assertIn("follow_up_questions", projected[section])
     def test_three_locales_render_the_same_canonical_claims_without_protocol_leaks(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",

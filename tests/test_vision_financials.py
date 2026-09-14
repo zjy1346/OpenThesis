@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import unittest
+from urllib.request import AbstractHTTPHandler, Request
 
 from pypdf import PdfWriter
 
@@ -15,10 +16,12 @@ from openthesis.vision_financials import (
     MineruFlashAdapter,
     VisionHttpResponse,
     VisionFallbackConfig,
+    MINERU_UPLOAD_PROTOCOL_VERSION,
     VisionExtractionResult,
     VisionPageRequest,
     VisionUploadPlan,
     VisionTaskCoordinator,
+    UrllibVisionTransport,
     vision_task_key,
     default_pdf_to_png,
     parse_vision_json,
@@ -166,6 +169,44 @@ class BoundedVisionAdapter:
 
 
 class VisionFinancialTests(unittest.TestCase):
+    def test_presigned_put_suppresses_urllib_form_content_type(self):
+        request = Request(
+            "https://upload.example/signed",
+            data=b"%PDF",
+            headers={"Content-Type": ""},
+            method="PUT",
+        )
+        handler = AbstractHTTPHandler()
+        handler.parent = type("Parent", (), {"addheaders": []})()
+        prepared = handler.do_request_(request)
+        self.assertNotEqual(
+            prepared.get_header("Content-type"),
+            "application/x-www-form-urlencoded",
+        )
+
+        class Response:
+            status = 200
+            headers = {}
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def read(self, _limit): return b""
+
+        class Opener:
+            def __init__(self): self.request = None
+            def open(self, request, timeout):
+                handler = AbstractHTTPHandler()
+                handler.parent = type("Parent", (), {"addheaders": []})()
+                self.request = handler.do_request_(request)
+                return Response()
+
+        transport = UrllibVisionTransport()
+        opener = Opener()
+        transport._opener = opener
+        transport.request("PUT", "https://upload.example/signed", body=b"%PDF")
+        self.assertNotEqual(
+            opener.request.get_header("Content-type"),
+            "application/x-www-form-urlencoded",
+        )
     def test_upload_plan_is_deterministic_sorted_deduplicated_and_safe(self):
         pages = (_page(132, b"same"), _page(130, b"one"), _page(131, b"same"), _page(130, b"one"))
         plan = VisionUploadPlan(
@@ -548,7 +589,7 @@ class VisionFinancialTests(unittest.TestCase):
         journal = MemoryVisionJournal()
         page = _page()
         key = vision_task_key(
-            "mineru_flash", _filing().content_hash, (page,), namespace="page"
+            f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}", _filing().content_hash, (page,), namespace="page"
         )
         journal.save_vision_task(
             key, company_cik=_filing().company_cik, document_id=_filing().document_id,
@@ -567,7 +608,7 @@ class VisionFinancialTests(unittest.TestCase):
             "mineru_flash", _filing().content_hash, (page,), namespace="batch"
         )
         per_page = vision_task_key(
-            "mineru_flash", _filing().content_hash, (page,), namespace="page"
+            f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}", _filing().content_hash, (page,), namespace="page"
         )
         self.assertNotEqual(batch, per_page)
 
@@ -576,7 +617,7 @@ class VisionFinancialTests(unittest.TestCase):
         journal = MemoryVisionJournal()
         page = _page()
         key = vision_task_key(
-            "mineru_flash", _filing().content_hash, (page,), namespace="page"
+            f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}", _filing().content_hash, (page,), namespace="page"
         )
         journal.save_vision_task(
             key, company_cik=_filing().company_cik,
@@ -594,6 +635,41 @@ class VisionFinancialTests(unittest.TestCase):
         self.assertEqual(transport.calls, [])
         self.assertEqual(journal.rows[key]["status"], "created")
         self.assertEqual(journal.rows[key]["remote_task_id"], "created-only")
+
+    def test_mineru_transport_upgrade_does_not_reuse_failed_legacy_upload(self):
+        journal = MemoryVisionJournal()
+        page = _page()
+        legacy_key = vision_task_key(
+            "mineru_flash", _filing().content_hash, (page,), namespace="page"
+        )
+        journal.save_vision_task(
+            legacy_key, company_cik=_filing().company_cik,
+            document_id=_filing().document_id, provider="mineru_flash",
+            page_hashes=[page.content_hash], page_numbers=[page.original_page],
+            status="created", remote_task_id="legacy-broken-upload",
+        )
+        transport = QueueVisionTransport(
+            VisionHttpResponse(200, json.dumps({
+                "code": 0,
+                "data": {"task_id": "task-v2", "file_url": "https://upload.example/page"},
+            }).encode()),
+            VisionHttpResponse(200),
+            VisionHttpResponse(200, json.dumps({
+                "state": "done", "data": {"markdown_url": "https://download.example/result.md"},
+            }).encode()),
+            VisionHttpResponse(200, b"Unit: RMB million\nRevenue 1"),
+        )
+
+        result = MineruFlashAdapter(
+            transport, sleep=lambda _: None, journal=journal
+        ).extract(
+            _company(), _filing(), [page],
+            _config(provider="mineru_flash", configured_model_id=""),
+        )
+
+        self.assertIsNone(result.error_code)
+        self.assertEqual([call["method"] for call in transport.calls], ["POST", "PUT", "GET", "GET"])
+        self.assertIn(legacy_key, journal.rows)
 
     def test_uncertain_mineru_upload_failure_remains_created(self):
         transport = QueueVisionTransport(
@@ -617,7 +693,7 @@ class VisionFinancialTests(unittest.TestCase):
         )
         self.assertEqual(result.error_code, "VISION_HTTP_ERROR")
         key = vision_task_key(
-            "mineru_flash", _filing().content_hash, (page,), namespace="page"
+            f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}", _filing().content_hash, (page,), namespace="page"
         )
         self.assertEqual(journal.rows[key]["status"], "created")
         self.assertEqual(journal.rows[key]["remote_task_id"], "upload-uncertain")

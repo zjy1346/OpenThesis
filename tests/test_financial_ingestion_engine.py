@@ -466,6 +466,75 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             for item in filings:
                 self.assertTrue(Path(item.local_path + ".done").is_file())
 
+    def test_checkpointed_uncached_filing_progress_is_strictly_monotonic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for index in range(3):
+                path = Path(directory) / f"checkpoint-{index}.pdf"
+                path.write_bytes(f"fixture-{index}".encode())
+                filing = _filing(f"checkpoint-{index}", path=str(path))
+                filing.content_hash = ""
+                filings.append(filing)
+            events: list[tuple] = []
+            engine = FinancialIngestionEngine(checkpoint_dir=Path(directory) / "checkpoints")
+            with patch.object(
+                FinancialIngestionEngine,
+                "parse_local_pdf_resumable",
+                return_value=([], [], ()),
+            ):
+                _parse_local_pdfs_bounded(
+                    engine,
+                    _company(),
+                    filings,
+                    {item.document_id: _manifest_for(item) for item in filings},
+                    progress=lambda *event: events.append(event),
+                )
+            filing_progress = [event[1:3] for event in events if event[0] == "filing-parse"]
+            self.assertEqual(filing_progress, [(1, 3), (2, 3), (3, 3)])
+
+    def test_checkpointed_documents_overlap_but_emit_results_in_filing_order(self) -> None:
+        """Checkpoint windows stay serial per document while documents overlap."""
+        with tempfile.TemporaryDirectory() as directory:
+            filings = []
+            for index in range(2):
+                path = Path(directory) / f"parallel-checkpoint-{index}.pdf"
+                path.write_bytes(f"fixture-{index}".encode())
+                filing = _filing(f"parallel-checkpoint-{index}", path=str(path))
+                filing.content_hash = ""
+                filings.append(filing)
+            barrier = threading.Barrier(2)
+            lock = threading.Lock()
+            active = 0
+            peak = 0
+
+            def resumable(_company, _filing, _manifest, **_kwargs):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    barrier.wait(timeout=3)
+                    time.sleep(0.02)
+                    return [], [], ()
+                finally:
+                    with lock:
+                        active -= 1
+
+            events: list[tuple] = []
+            engine = FinancialIngestionEngine(
+                checkpoint_dir=Path(directory) / "checkpoints", max_workers=2,
+            )
+            with patch.object(FinancialIngestionEngine, "parse_local_pdf_resumable", side_effect=resumable):
+                result = _parse_local_pdfs_bounded(
+                    engine, _company(), filings,
+                    {item.document_id: _manifest_for(item) for item in filings},
+                    progress=lambda *event: events.append(event),
+                )
+            self.assertEqual(set(result), {item.document_id for item in filings})
+            self.assertGreaterEqual(peak, 2)
+            filing_progress = [event[1:3] for event in events if event[0] == "filing-parse"]
+            self.assertEqual(filing_progress, [(1, 2), (2, 2)])
+
     def test_isolated_scheduler_timeout_and_cancel_terminate_report_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             slow_path = Path(directory) / "slow.pdf"

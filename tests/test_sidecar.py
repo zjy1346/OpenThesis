@@ -13,6 +13,34 @@ from openthesis.sidecar import JsonLineServer
 
 
 class JsonLineServerTests(unittest.TestCase):
+    def test_missing_sec_email_is_a_structured_user_fixable_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            JsonLineServer(AppService(Path(directory))).serve(
+                io.StringIO(json.dumps({
+                    "jsonrpc": "2.0", "id": 9, "method": "company.search",
+                    "params": {"query": "AAPL", "market": "US"},
+                }) + "\n"),
+                output,
+            )
+            response = json.loads(output.getvalue())
+            self.assertEqual(response["error"]["code"], -32010)
+            self.assertEqual(response["error"]["message"], "SEC_EMAIL_CONFIG_REQUIRED")
+
+    def test_thesis_save_without_known_company_returns_identity_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            JsonLineServer(AppService(Path(directory))).serve(
+                io.StringIO(json.dumps({
+                    "jsonrpc": "2.0", "id": 10, "method": "thesis.save",
+                    "params": {"company_cik": "missing", "content": {"thesis": "x"}},
+                }) + "\n"),
+                output,
+            )
+            response = json.loads(output.getvalue())
+            self.assertEqual(response["error"]["code"], -32010)
+            self.assertEqual(response["error"]["message"], "COMPANY_IDENTITY_REQUIRED")
+
     def test_financial_diagnostics_requires_run_id_and_calls_service(self) -> None:
         class Service:
             def financial_diagnostics(self, run_id: str):

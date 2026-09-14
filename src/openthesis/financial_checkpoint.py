@@ -16,7 +16,6 @@ import os
 import pickle
 import inspect
 from pathlib import Path
-import queue
 import tempfile
 import time
 from typing import Any, Callable, Iterable, Sequence
@@ -25,6 +24,7 @@ from .domain import EvidenceRef, FinancialFact
 
 
 CHECKPOINT_SCHEMA_VERSION = "financial-window-checkpoint-v1"
+EXHAUSTED_SCHEMA_VERSION = "financial-window-exhausted-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +89,64 @@ class WindowCheckpointStore:
 
     def path_for(self, key: CheckpointKey, window_index: int) -> Path:
         return self.directory / f"{key.digest}-{int(window_index):06d}.json"
+
+    def exhausted_path(self, key: CheckpointKey) -> Path:
+        """Return the deterministic-failure marker for one exact input."""
+        return self.directory / f"{key.digest}-exhausted.json"
+
+    def save_exhausted(
+        self, key: CheckpointKey, *, reason: str, input_fingerprint: str | None = None,
+    ) -> None:
+        """Atomically remember a deterministic failure, never a transient one."""
+        payload = {
+            "schema_version": EXHAUSTED_SCHEMA_VERSION,
+            "key_digest": key.digest,
+            "input_fingerprint": input_fingerprint or key.digest,
+            "reason": str(reason)[:240],
+        }
+        destination = self.exhausted_path(key)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=f".{destination.stem}-",
+                suffix=".tmp", dir=self.directory, delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def load_exhausted(
+        self, key: CheckpointKey, *, input_fingerprint: str | None = None,
+    ) -> dict[str, str] | None:
+        """Load a marker only when it belongs to the exact current input."""
+        try:
+            payload = json.loads(self.exhausted_path(key).read_text(encoding="utf-8"))
+            expected = input_fingerprint or key.digest
+            if (
+                payload.get("schema_version") != EXHAUSTED_SCHEMA_VERSION
+                or payload.get("key_digest") != key.digest
+                or payload.get("input_fingerprint") != expected
+            ):
+                return None
+            reason = payload.get("reason")
+            return {"reason": str(reason)[:240]} if reason else {"reason": "deterministic_failure"}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def clear_exhausted(self, key: CheckpointKey) -> None:
+        try:
+            self.exhausted_path(key).unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def save(self, checkpoint: WindowCheckpoint) -> None:
         payload = checkpoint.payload()
@@ -203,6 +261,8 @@ def run_checkpointed_windows(
     cancel_check: Callable[[], bool] | None = None,
     progress: Callable[[int, int, str], None] | None = None,
     timeout_seconds: float | None = None,
+    input_fingerprint: str | None = None,
+    deterministic_failure: Callable[[Exception], bool] | None = None,
 ) -> tuple[WindowCheckpoint, ...]:
     """Resume successful windows and retry only failed windows deterministically.
 
@@ -213,6 +273,11 @@ def run_checkpointed_windows(
     """
 
     ordered = tuple(sorted(windows, key=lambda item: item.index))
+    exhausted = store.load_exhausted(key, input_fingerprint=input_fingerprint) if input_fingerprint else None
+    if exhausted is not None:
+        if progress is not None:
+            progress(0, len(ordered), "exhausted_same_input")
+        return ()
     results: list[WindowCheckpoint] = []
     current_context: dict[str, Any] = {}
     retry_limit = max(0, int(max_retries))
@@ -248,6 +313,12 @@ def run_checkpointed_windows(
             except Exception as exc:
                 last_error = exc
         if last_error is not None:
+            if deterministic_failure is not None and deterministic_failure(last_error):
+                store.save_exhausted(
+                    key,
+                    reason=f"{type(last_error).__name__}",
+                    input_fingerprint=input_fingerprint or key.digest,
+                )
             if progress is not None:
                 progress(position, len(ordered), "failed")
             # Later windows may depend on the table context at this boundary.
@@ -268,13 +339,18 @@ def _worker_accepts_context(worker: Callable[..., Any]) -> bool:
 
 def _checkpoint_worker_entry(
     worker: Callable[[PdfWindow], Any], window: PdfWindow,
-    context: dict[str, Any], result_queue: Any,
+    context: dict[str, Any], result_sender: Any,
 ) -> None:
     try:
         result = worker(window, context) if _worker_accepts_context(worker) else worker(window)
-        result_queue.put(("result", result))
+        result_sender.send(("result", result))
     except BaseException as exc:
-        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+        try:
+            result_sender.send(("error", f"{type(exc).__name__}: {exc}"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        result_sender.close()
 
 
 def _invoke_worker(
@@ -298,28 +374,59 @@ def _invoke_worker(
     except (pickle.PickleError, TypeError, AttributeError):
         return worker(window, dict(context or {})) if _worker_accepts_context(worker) else worker(window)
     mp_context = mp.get_context("spawn")
-    result_queue = mp_context.Queue(maxsize=1)
+    # A Queue uses a feeder thread in the child.  Waiting for that process to
+    # exit before reading can deadlock when a real table payload exceeds the
+    # Windows pipe buffer: the feeder waits for a reader while the parent
+    # waits for the feeder.  A one-way Pipe lets the parent drain the payload
+    # while the worker is still alive and keeps the timeout/cancel boundary.
+    result_receiver, result_sender = mp_context.Pipe(duplex=False)
     process = None
     try:
         process = mp_context.Process(
             target=_checkpoint_worker_entry,
-            args=(worker, window, dict(context or {}), result_queue),
+            args=(worker, window, dict(context or {}), result_sender),
             name=f"financial-window-{window.index}",
         )
         process.daemon = True
-        process.start()
+        try:
+            process.start()
+        except (OSError, RuntimeError):
+            # Resource-constrained hosts (and frozen Windows launchers with a
+            # temporarily unavailable spawn context) still need a quality-
+            # preserving path.  Run the same worker synchronously instead of
+            # returning an apparently parsed-but-empty window.  The caller's
+            # normal compiler/quality gate remains in force.
+            result_sender.close()
+            result_receiver.close()
+            return worker(window, dict(context or {})) if _worker_accepts_context(worker) else worker(window)
+        result_sender.close()
         deadline = time.monotonic() + max(0.01, float(timeout_seconds))
-        while process.is_alive():
+        kind: str | None = None
+        value: Any = None
+        while kind is None:
             if cancel_check is not None and cancel_check():
                 raise CancelledError(f"window {window.index} cancelled")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"window {window.index} exceeded timeout")
-            process.join(min(0.05, remaining))
-        try:
-            kind, value = result_queue.get(timeout=0.2)
-        except queue.Empty:
-            raise RuntimeError("window worker exited without a result")
+            wait_for = min(0.05, remaining)
+            if result_receiver.poll(wait_for):
+                try:
+                    kind, value = result_receiver.recv()
+                except EOFError as exc:
+                    raise RuntimeError("window worker exited without a result") from exc
+                break
+            if not process.is_alive():
+                if result_receiver.poll(0.2):
+                    try:
+                        kind, value = result_receiver.recv()
+                    except EOFError as exc:
+                        raise RuntimeError("window worker exited without a result") from exc
+                    break
+                raise RuntimeError("window worker exited without a result")
+        process.join(1.0)
+        if process.is_alive():
+            raise RuntimeError("window worker did not exit after returning a result")
         if kind == "error":
             raise RuntimeError(str(value))
         return value
@@ -331,5 +438,5 @@ def _invoke_worker(
                 process.join(1.0)
             except (AssertionError, OSError):
                 pass
-        result_queue.close()
-        result_queue.join_thread()
+        result_sender.close()
+        result_receiver.close()

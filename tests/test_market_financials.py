@@ -44,6 +44,44 @@ class MarketFinancialNormalizationTests(unittest.TestCase):
         self.assertEqual(by_concept["operating_income"], -12_500_000_000)
         self.assertEqual(by_concept["capital_expenditure"], 76_800_000_000)
 
+    def test_hk_slash_capex_components_are_aggregated_once(self) -> None:
+        company = build_company("00700.HK", "Tencent")
+        filing = _filing(company.security_id)
+        facts, evidence = parse_financial_pages(
+            [
+                (
+                    139,
+                    "Consolidated statement of cash flows\nHK$ million\n"
+                    "Purchase of/prepayments for property, plant and equipment, "
+                    "construction in progress 12,500\n"
+                    "Purchase of/prepayments for intangible assets 800",
+                )
+            ],
+            filing,
+            company,
+        )
+        capex = next(item for item in facts if item.concept == "capital_expenditure")
+        self.assertEqual(capex.value, 13_300_000_000)
+        self.assertEqual(capex.reported_concept, "capital_expenditure_components")
+        self.assertTrue(any(item.locator == "page:139" for item in evidence))
+
+    def test_simplified_and_traditional_financial_labels_share_taxonomy(self) -> None:
+        company = build_company("002594.SZ", "比亚迪")
+        facts, _ = parse_financial_pages(
+            [
+                (
+                    144,
+                    "合并利润表\n单位:千元\n营业收入 803,964,958\n"
+                    "營業利潤 40,000,000\n毛利潤 150,000,000",
+                )
+            ],
+            _filing(company.security_id),
+            company,
+        )
+        values = {item.concept: item.value for item in facts}
+        self.assertEqual(values["operating_income"], 40_000_000_000)
+        self.assertEqual(values["gross_profit"], 150_000_000_000)
+
     def test_unknown_lines_are_not_invented(self) -> None:
         company = build_company("832982.BJ", "Jinbo")
         facts, evidence = parse_financial_pages(

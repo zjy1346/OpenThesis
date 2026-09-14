@@ -2,13 +2,14 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { COPY } from "../../i18n";
-import { exportFinancialDiagnostics, getFinancialDiagnostics } from "../../backend";
+import { exportFinancialDiagnostics, getFinancialDiagnostics, listConfiguredModels } from "../../backend";
 import { stripReportPreamble } from "./ReportWorkspace";
 import { ReportWorkspace } from "./ReportWorkspace";
 
 vi.mock("../../backend", () => ({
   getResearchReport: vi.fn(), exportResearchReport: vi.fn(),
   getFinancialDiagnostics: vi.fn(), exportFinancialDiagnostics: vi.fn(),
+  listConfiguredModels: vi.fn(),
 }));
 
 describe("report presentation", () => {
@@ -52,6 +53,20 @@ describe("report presentation", () => {
     expect(screen.queryByText(COPY.en.partialReport)).not.toBeInTheDocument();
     expect(screen.getAllByRole("status")).toHaveLength(1);
     resolveRetry?.();
+  });
+
+  it("offers a tested larger-context model only after an explicit capacity failure", async () => {
+    vi.mocked(listConfiguredModels).mockResolvedValue([
+      { configured_model_id: "current", connection_id: "c1", model_id: "small", alias: "Small", free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null, enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null, context_window_hint: 32_000, temperature: null, timeout_seconds: 120, configuration_version: 1 },
+      { configured_model_id: "large", connection_id: "c2", model_id: "large", alias: "Large context", free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null, enabled: true, capabilities: ["text_chat", "structured_json"], health_status: "ready", last_discovered_at: null, context_window_hint: 200_000, temperature: null, timeout_seconds: 120, configuration_version: 4 },
+    ]);
+    const retry = vi.fn(async () => undefined);
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en", retryable_synthesis: true, synthesis_error_code: "MODEL_CONTEXT_CAPACITY", reproducibility: { model_configuration: { configured_model_id: "current" }, research_configuration: {}, data_snapshot: {} }, markdown: "# Report", html: "" }} copy={COPY.en} onRetrySynthesis={retry} />);
+
+    expect(await screen.findByRole("combobox", { name: COPY.en.synthesisCapacityModel })).toHaveValue("large");
+    expect(screen.queryByRole("button", { name: COPY.en.retrySynthesis })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.synthesisCapacityRetry }));
+    await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", configuration_version: 4, role: "primary" }));
   });
 
   it("retries only the growth stage from an empty growth report", async () => {

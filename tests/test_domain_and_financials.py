@@ -13,10 +13,129 @@ from openthesis.financials import (
     reverse_dcf_analysis,
     reverse_dcf_status_text,
     deterministic_summary,
+    growth_rate,
 )
 
 
 class FinancialMetricTests(unittest.TestCase):
+    def test_gross_profit_is_derived_from_same_period_revenue_and_cost(self) -> None:
+        metrics = calculate_metrics(
+            [
+                {
+                    "concept": "revenue", "value": 120.0, "fiscal_year": 2025,
+                    "fiscal_period": "FY", "filed_at": "2026-03-01",
+                    "end_date": "2025-12-31", "usage_status": "canonical_research",
+                },
+                {
+                    "concept": "cost_of_revenue", "value": 72.0, "fiscal_year": 2025,
+                    "fiscal_period": "FY", "filed_at": "2026-03-01",
+                    "end_date": "2025-12-31", "usage_status": "canonical_research",
+                },
+            ]
+        )[0]
+        self.assertEqual(metrics["gross_margin"], 0.4)
+        self.assertEqual(metrics["gross_profit_basis"], "revenue_minus_cost_of_revenue")
+    def test_growth_rate_does_not_emit_misleading_percentages_across_loss_boundaries(self) -> None:
+        self.assertIsNone(growth_rate(-50.0, 100.0))
+        self.assertIsNone(growth_rate(50.0, -100.0))
+        self.assertIsNone(growth_rate(-50.0, -100.0))
+        self.assertIsNone(growth_rate(-150.0, -100.0))
+        self.assertIsNone(growth_rate(50.0, 0.0))
+        self.assertAlmostEqual(growth_rate(120.0, 100.0) or 0.0, 0.2)
+
+    def test_metric_growth_statuses_and_extended_growth_metrics_are_explicit(self) -> None:
+        facts = []
+        values = {
+            2024: {"revenue": 100.0, "gross_profit": 40.0, "operating_income": -10.0, "net_income": -20.0, "operating_cash_flow": -30.0, "equity": 50.0},
+            2025: {"revenue": 120.0, "gross_profit": 54.0, "operating_income": 5.0, "net_income": -10.0, "operating_cash_flow": 15.0, "equity": -20.0},
+        }
+        for year, concepts in values.items():
+            for concept, value in concepts.items():
+                facts.append({
+                    "fact_id": f"{year}-{concept}", "concept": concept, "value": value,
+                    "fiscal_year": year, "fiscal_period": "FY", "filed_at": f"{year + 1}-03-01",
+                })
+
+        latest = calculate_metrics(facts)[0]
+
+        self.assertAlmostEqual(latest["gross_margin"], 0.45)
+        self.assertAlmostEqual(latest["revenue_growth"], 0.2)
+        self.assertEqual(latest["revenue_growth_status"], "rate")
+        self.assertIsNone(latest["operating_income_growth"])
+        self.assertEqual(latest["operating_income_growth_status"], "turnaround")
+        self.assertIsNone(latest["net_income_growth"])
+        self.assertEqual(latest["net_income_growth_status"], "loss_narrowed")
+        self.assertIsNone(latest["operating_cash_flow_growth"])
+        self.assertEqual(latest["operating_cash_flow_growth_status"], "turnaround")
+        self.assertIsNone(latest["return_on_equity"])
+        self.assertEqual(latest["return_on_equity_gap"], "non_positive_equity")
+
+    def test_all_same_filing_comparators_drive_extended_growth_metrics(self) -> None:
+        facts = []
+        for concept, value in {
+            "revenue": 120.0,
+            "operating_income": 12.0,
+            "net_income": 6.0,
+            "operating_cash_flow": 18.0,
+        }.items():
+            facts.append({
+                "fact_id": f"current-{concept}", "concept": concept, "value": value,
+                "fiscal_year": 2025, "fiscal_period": "FY", "filed_at": "2026-03-01",
+                "usage_status": "canonical_research",
+            })
+            facts.append({
+                "fact_id": f"standalone-{concept}", "concept": concept, "value": value / 3,
+                "fiscal_year": 2024, "fiscal_period": "FY", "filed_at": "2025-03-01",
+                "usage_status": "canonical_research",
+            })
+            facts.append({
+                "fact_id": f"comparator-{concept}", "concept": concept, "value": value / 2,
+                "fiscal_year": 2024, "fiscal_period": "FY", "filed_at": "2026-03-01",
+                "usage_status": "comparator",
+            })
+
+        latest = calculate_metrics(facts)[0]
+
+        self.assertAlmostEqual(latest["revenue_growth"], 1.0)
+        self.assertAlmostEqual(latest["operating_income_growth"], 1.0)
+        self.assertAlmostEqual(latest["net_income_growth"], 1.0)
+        self.assertAlmostEqual(latest["operating_cash_flow_growth"], 1.0)
+        self.assertCountEqual(
+            latest["comparison_fact_ids"],
+            [
+                "comparator-revenue", "comparator-operating_income",
+                "comparator-net_income", "comparator-operating_cash_flow",
+            ],
+        )
+
+    def test_summary_renders_loss_transition_and_non_positive_equity_reason(self) -> None:
+        summary = deterministic_summary(
+            "示例",
+            [{
+                "year": 2025, "revenue": 10.0, "revenue_growth": 0.1,
+                "net_income": 1.0, "net_income_growth": None,
+                "net_income_growth_status": "turnaround",
+                "operating_cash_flow": 2.0, "return_on_equity": None,
+                "return_on_equity_gap": "non_positive_equity",
+            }],
+            "zh-CN", "CNY",
+        )
+        self.assertIn("扭亏为盈", summary)
+        self.assertIn("权益为零或负数，不适用", summary)
+
+    def test_reverse_dcf_invalid_parameters_return_a_structured_result(self) -> None:
+        metrics = [{"year": 2025, "period": "FY", "free_cash_flow": 100.0}]
+        for kwargs in (
+            {"discount_rate": 0.03, "terminal_growth": 0.03},
+            {"discount_rate": float("nan")},
+            {"terminal_growth": float("inf")},
+            {"horizon_years": 0},
+        ):
+            with self.subTest(kwargs=kwargs):
+                result = reverse_dcf_analysis(metrics, 1_000.0, **kwargs)
+                self.assertEqual(result["status"], "invalid_parameters")
+                self.assertTrue(result["invalid_fields"])
+
     def test_traditional_deterministic_summary_uses_traditional_labels(self) -> None:
         summary = deterministic_summary("示例", [{"year": 2025, "revenue": 10.0, "revenue_growth": None, "net_income": 1.0, "operating_cash_flow": 2.0}], "zh-Hant", "CNY")
         self.assertIn("\u71df\u696d\u6536\u5165", summary)

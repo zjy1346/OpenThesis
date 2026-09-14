@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import math
 from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
@@ -47,6 +48,11 @@ _REVERSE_DCF_STATUS_TEXT: dict[str, tuple[str, str, str]] = {
         "当前公司类型不适用标准自由现金流反向 DCF。",
         "目前公司類型不適用標準自由現金流反向 DCF。",
         "Standard free-cash-flow reverse DCF is not applicable to this company type.",
+    ),
+    "invalid_parameters": (
+        "估值参数无效，请检查折现率、永续增长率与预测年限。",
+        "估值參數無效，請檢查折現率、永續增長率與預測年限。",
+        "The valuation parameters are invalid; check the discount rate, terminal growth, and forecast horizon.",
     ),
 }
 
@@ -216,9 +222,100 @@ def safe_divide(numerator: float | None, denominator: float | None) -> float | N
 
 
 def growth_rate(current: float | None, previous: float | None) -> float | None:
-    if current is None or previous in (None, 0):
+    if current is None or previous is None or previous <= 0 or current < 0:
         return None
     return current / previous - 1
+
+
+def growth_status(current: float | None, previous: float | None) -> str:
+    """Describe comparison semantics without inventing percentages for losses."""
+    if current is None or previous is None:
+        return "comparison_unavailable"
+    if previous == 0:
+        return "zero_base"
+    if previous > 0 and current < 0:
+        return "turned_to_loss"
+    if previous < 0 and current >= 0:
+        return "turnaround"
+    if previous < 0 and current < 0:
+        if abs(current) < abs(previous):
+            return "loss_narrowed"
+        if abs(current) > abs(previous):
+            return "loss_widened"
+        return "loss_unchanged"
+    return "rate"
+
+
+_GROWTH_STATUS_TEXT: dict[str, tuple[str, str, str]] = {
+    "turned_to_loss": ("转为亏损", "轉為虧損", "Turned to loss"),
+    "turnaround": ("扭亏为盈", "轉虧為盈", "Turned profitable"),
+    "loss_narrowed": ("亏损收窄", "虧損收窄", "Loss narrowed"),
+    "loss_widened": ("亏损扩大", "虧損擴大", "Loss widened"),
+    "loss_unchanged": ("亏损持平", "虧損持平", "Loss unchanged"),
+    "zero_base": ("基数为零，不适用", "基數為零，不適用", "Not meaningful on a zero base"),
+    "comparison_unavailable": ("缺少可比数据", "缺少可比資料", "Comparable data unavailable"),
+}
+
+
+def format_growth(value: float | None, status: object, language: str = "zh-CN") -> str:
+    """Render a growth comparison without turning loss transitions into rates."""
+    if value is not None:
+        return format_percent(value)
+    locale = normalize_language(language)
+    index = 2 if locale == EN else 1 if locale == ZH_HANT else 0
+    return _GROWTH_STATUS_TEXT.get(str(status), ("—", "—", "—"))[index]
+
+
+def _comparison_baseline(
+    previous: dict[str, float], records: list[dict[str, Any]],
+) -> tuple[dict[str, float], list[dict[str, Any]], str | None, bool]:
+    """Prefer issuer-stated comparators independently for every concept.
+
+    A later filing can restate revenue, profit and cash-flow rows together.  A
+    revenue-only override produces internally inconsistent growth metrics, so
+    selection happens per concept and keeps every selected fact id auditable.
+    """
+    by_concept: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fact in records:
+        concept = str(fact.get("concept") or "")
+        if concept and fact.get("value") is not None:
+            by_concept[concept].append(fact)
+    selected: list[dict[str, Any]] = []
+    has_comparator = False
+    restatement_available = False
+    for concept, candidates in by_concept.items():
+        comparators = [
+            item for item in candidates
+            if str(item.get("usage_status", "")).casefold() == "comparator"
+        ]
+        preferred = comparators or [
+            item for item in candidates
+            if str(item.get("usage_status", "")).casefold() != "comparator"
+        ]
+        if not preferred:
+            continue
+        chosen = max(
+            preferred,
+            key=lambda item: (str(item.get("filed_at", "")), str(item.get("fact_id", ""))),
+        )
+        selected.append(chosen)
+        if comparators:
+            has_comparator = True
+            standalone = [item for item in candidates if item not in comparators]
+            restatement_available = restatement_available or bool(
+                standalone
+                and any(float(item["value"]) != float(chosen["value"]) for item in standalone)
+            )
+    baseline = {
+        **previous,
+        **{str(item["concept"]): float(item["value"]) for item in selected},
+    }
+    source = (
+        "same_filing_comparator" if has_comparator
+        else "independent_historical" if selected
+        else None
+    )
+    return baseline, selected, source, restatement_available
 
 
 def _equity_value(values: dict[str, float]) -> float | None:
@@ -239,7 +336,16 @@ def _annual_roe_details(
         "opening_equity": opening_equity,
         "closing_equity": closing_equity,
     }
-    if reported_roe is not None:
+    average_equity = (
+        (opening_equity + closing_equity) / 2
+        if opening_equity is not None and closing_equity is not None
+        else None
+    )
+    if closing_equity is not None and closing_equity <= 0:
+        gap = "non_positive_equity"
+    elif average_equity is not None and average_equity <= 0:
+        gap = "non_positive_equity"
+    elif reported_roe is not None:
         return {
             "return_on_equity": reported_roe,
             "return_on_equity_basis": "reported_weighted_average",
@@ -247,13 +353,13 @@ def _annual_roe_details(
             "return_on_equity_inputs": inputs,
             "return_on_equity_gap": None,
         }
-    if net_income is None:
+    elif net_income is None:
         gap = "missing_net_income"
     elif closing_equity in (None, 0):
         gap = "missing_equity"
-    elif opening_equity not in (None, 0) and (opening_equity + closing_equity) != 0:
+    elif opening_equity not in (None, 0):
         return {
-            "return_on_equity": net_income / ((opening_equity + closing_equity) / 2),
+            "return_on_equity": net_income / average_equity,
             "return_on_equity_basis": "average_equity",
             "return_on_equity_formula": "net_income / average(opening_equity, closing_equity)",
             "return_on_equity_inputs": inputs,
@@ -318,6 +424,16 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         comparison_year = year - 1 if year - 1 in matrix else None
         previous = matrix.get(comparison_year, {}) if comparison_year is not None else {}
         revenue = values.get("revenue")
+        gross_profit = values.get("gross_profit")
+        cost_of_revenue = values.get("cost_of_revenue")
+        if (
+            gross_profit is None
+            and revenue is not None
+            and revenue >= 0
+            and cost_of_revenue is not None
+            and cost_of_revenue >= 0
+        ):
+            gross_profit = revenue - cost_of_revenue
         operating_income = values.get("operating_income")
         net_income = values.get("net_income")
         operating_cash_flow = values.get("operating_cash_flow")
@@ -335,40 +451,12 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if str(fact.get("fiscal_period", "")).upper() in _ANNUAL_PERIODS
             and fact.get("fiscal_year") == comparison_year
         ] if comparison_year is not None else []
-        comparison_revenue = [
-            fact for fact in comparison_records if fact.get("concept") == "revenue"
-        ]
-        comparison_source = None
-        if comparison_revenue:
-            comparison_source = (
-                "same_filing_comparator"
-                if any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
-                else "independent_historical"
-            )
-        comparison_selected = (
-            [item for item in comparison_revenue
-             if str(item.get("usage_status", "")).casefold() == "comparator"]
-            if comparison_source == "same_filing_comparator"
-            else comparison_revenue
+        previous, comparison_selected, comparison_source, restatement_available = (
+            _comparison_baseline(previous, comparison_records)
         )
-        if comparison_selected:
-            previous = {
-                **previous,
-                **{
-                    str(item.get("concept")): float(item["value"])
-                    for item in comparison_selected
-                    if item.get("concept") and item.get("value") is not None
-                },
-            }
         # Recompute ROE inputs after selecting an issuer-stated comparative
         # column, while keeping that column out of visible rows.
         roe_details = _annual_roe_details(values, previous)
-        restatement_available = bool(
-            comparison_revenue
-            and any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
-            and any(str(item.get("usage_status", "")).casefold() != "comparator" for item in comparison_revenue)
-            and len({str(item.get("value")) for item in comparison_revenue}) > 1
-        )
         results.append(
             {
                 "year": year,
@@ -376,6 +464,7 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "period_end": metadata.get(year, ("", ""))[1],
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
+                "revenue_growth_status": growth_status(revenue, previous.get("revenue")),
                 "comparison_year": comparison_year,
                 "comparison_gap": (
                     None
@@ -392,6 +481,20 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ],
                 "restatement_available": restatement_available,
                 "operating_margin": safe_divide(operating_income, revenue),
+                "gross_margin": safe_divide(gross_profit, revenue),
+                "gross_profit_basis": (
+                    "reported"
+                    if values.get("gross_profit") is not None
+                    else "revenue_minus_cost_of_revenue"
+                    if gross_profit is not None
+                    else None
+                ),
+                "operating_income_growth": growth_rate(operating_income, previous.get("operating_income")),
+                "operating_income_growth_status": growth_status(operating_income, previous.get("operating_income")),
+                "net_income_growth": growth_rate(net_income, previous.get("net_income")),
+                "net_income_growth_status": growth_status(net_income, previous.get("net_income")),
+                "operating_cash_flow_growth": growth_rate(operating_cash_flow, previous.get("operating_cash_flow")),
+                "operating_cash_flow_growth_status": growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": safe_divide(operating_cash_flow, net_income),
                 "free_cash_flow": free_cash_flow,
@@ -457,36 +560,8 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
             if fact.get("fiscal_year") == year - 1
             and _period(fact.get("fiscal_period")) == period
         ]
-        comparison_revenue = [
-            fact for fact in comparison_records if fact.get("concept") == "revenue"
-        ]
-        comparison_source = None
-        if comparison_revenue:
-            comparison_source = (
-                "same_filing_comparator"
-                if any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
-                else "independent_historical"
-            )
-        comparison_selected = (
-            [item for item in comparison_revenue
-             if str(item.get("usage_status", "")).casefold() == "comparator"]
-            if comparison_source == "same_filing_comparator"
-            else comparison_revenue
-        )
-        if comparison_selected:
-            previous = {
-                **previous,
-                **{
-                    str(item.get("concept")): float(item["value"])
-                    for item in comparison_selected
-                    if item.get("concept") and item.get("value") is not None
-                },
-            }
-        restatement_available = bool(
-            comparison_revenue
-            and any(str(item.get("usage_status", "")).casefold() == "comparator" for item in comparison_revenue)
-            and any(str(item.get("usage_status", "")).casefold() != "comparator" for item in comparison_revenue)
-            and len({str(item.get("value")) for item in comparison_revenue}) > 1
+        previous, comparison_selected, comparison_source, restatement_available = (
+            _comparison_baseline(previous, comparison_records)
         )
         results.append(
             {
@@ -510,6 +585,13 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 "restatement_available": restatement_available,
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
+                "revenue_growth_status": growth_status(revenue, previous.get("revenue")),
+                "operating_income_growth": growth_rate(operating_income, previous.get("operating_income")),
+                "operating_income_growth_status": growth_status(operating_income, previous.get("operating_income")),
+                "net_income_growth": growth_rate(net_income, previous.get("net_income")),
+                "net_income_growth_status": growth_status(net_income, previous.get("net_income")),
+                "operating_cash_flow_growth": growth_rate(operating_cash_flow, previous.get("operating_cash_flow")),
+                "operating_cash_flow_growth_status": growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
                 "operating_margin": safe_divide(operating_income, revenue),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": safe_divide(operating_cash_flow, net_income),
@@ -570,6 +652,11 @@ def _format_roe(metric: dict[str, Any], language: str) -> str:
             "en": "equity data is missing",
             "zh-CN": "缺少权益数据",
             "zh-Hant": "缺少權益資料",
+        },
+        "non_positive_equity": {
+            "en": "equity is zero or negative; not applicable",
+            "zh-CN": "权益为零或负数，不适用",
+            "zh-Hant": "權益為零或負數，不適用",
         },
     }
     reason = reasons.get(gap, {}).get(language, "")
@@ -654,6 +741,29 @@ def reverse_dcf_analysis(
     # spellings so compatibility callers can opt in without changing the
     # legacy positional API.
     strict_mode = bool(strict or require_typed)
+    invalid_fields: list[str] = []
+    numeric_parameters = {
+        "discount_rate": discount_rate,
+        "terminal_growth": terminal_growth,
+    }
+    for name, value in numeric_parameters.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            invalid_fields.append(name)
+    if (
+        isinstance(horizon_years, bool)
+        or not isinstance(horizon_years, int)
+        or horizon_years < 1
+    ):
+        invalid_fields.append("horizon_years")
+    if not invalid_fields and float(discount_rate) <= float(terminal_growth):
+        invalid_fields.extend(("discount_rate", "terminal_growth"))
+    if invalid_fields:
+        return {
+            "status": "invalid_parameters",
+            "reason": "invalid_reverse_dcf_parameters",
+            "invalid_fields": list(dict.fromkeys(invalid_fields)),
+            "policy_version": policy_version,
+        }
     if not metrics:
         return {"status": "insufficient_data", "reason": "没有财务指标"}
     market_money = _coerce_money(market_cap, fallback_currency=currency)
@@ -849,11 +959,30 @@ def deterministic_summary(
                 values.append(str(value))
             elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
                 values.append(format_money(value, currency))
+            elif key.endswith("_growth"):
+                values.append(format_growth(value, row.get(f"{key}_status"), language))
             else:
                 values.append(format_percent(value))
         lines.append("| " + " | ".join(values) + " |")
 
     latest = metrics[0]
+    metric_details = (
+        [
+            ("Gross margin", "毛利率", "毛利率", format_percent(latest.get("gross_margin"))),
+            ("Operating income growth", "營業利潤增長", "营业利润增长", format_growth(latest.get("operating_income_growth"), latest.get("operating_income_growth_status"), language)),
+            ("Net income growth", "淨利潤增長", "净利润增长", format_growth(latest.get("net_income_growth"), latest.get("net_income_growth_status"), language)),
+            ("Operating cash-flow growth", "經營現金流增長", "经营现金流增长", format_growth(latest.get("operating_cash_flow_growth"), latest.get("operating_cash_flow_growth_status"), language)),
+        ]
+    )
+    visible_details = [
+        item for item in metric_details
+        if item[3] != "—" or item[0] == "Gross margin" and latest.get("gross_margin") is not None
+    ]
+    if visible_details:
+        lines.extend(["", "## " + ("Growth and Quality Metrics" if english else "成長與品質指標" if traditional else "增长与质量指标"), ""])
+        for en_label, hant_label, zh_label, value in visible_details:
+            label = en_label if english else hant_label if traditional else zh_label
+            lines.append(f"- {label}: {value}" if english else f"- {label}：{value}")
     if english:
         lines.extend([
             "",

@@ -9,6 +9,8 @@ targets, and returning an explicit terminal state for callers and the UI.
 from __future__ import annotations
 
 import hashlib
+import json
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -28,6 +30,7 @@ class RecoveryState(StrEnum):
     NEEDS_CONSENT = "needs_consent"
     NEEDS_CONFIGURATION = "needs_configuration"
     RETRYABLE_EXTERNAL_FAILURE = "retryable_external_failure"
+    EXHAUSTED_SAME_INPUT = "exhausted_same_input"
     BLOCKED_INTEGRITY = "blocked_integrity"
     CANCELLED = "cancelled"
 
@@ -36,6 +39,78 @@ CORE_FINANCIAL_FIELDS = (
     "revenue", "net_income", "operating_cash_flow",
     "assets", "liabilities", "equity",
 )
+
+_DETERMINISTIC_FAILURE_CODES = frozenset({
+    "FILING_LOCAL_PARSE_FAILED", "FILING_RULE_UNSUPPORTED",
+    "FILING_DATA_QUALITY_FAILED", "FILING_CONTENT_INTEGRITY_FAILED",
+})
+_TRANSIENT_FAILURE_CODES = frozenset({
+    "FILING_FETCH_FAILED", "FILING_DISCOVERY_FAILED", "FILING_DOWNLOAD_FAILED",
+    "VISION_EXTERNAL_FAILED", "VISION_NETWORK_ERROR", "VISION_TIMEOUT",
+    "VISION_RATE_LIMITED",
+})
+
+
+def financial_input_fingerprint(
+    company: Company,
+    filings: Sequence[FilingDocument],
+    *,
+    parser_version: str = "",
+    rules_version: str = "",
+    structured_source_fingerprint: str = "",
+    vision_policy_fingerprint: str = "",
+) -> str:
+    """Build a stable, secret-free identity for one recovery input.
+
+    The fingerprint includes document bytes (when a content hash is known),
+    parser/rules identities and external-source policy.  It deliberately does
+    not include credentials or raw provider responses.
+    """
+    documents = []
+    for filing in filings:
+        documents.append({
+            "document_id": str(filing.document_id),
+            "accession_number": str(filing.accession_number),
+            "content_hash": str(filing.content_hash or "").casefold(),
+            "period_end": str(filing.period_end),
+            "fiscal_period": str(filing.fiscal_period),
+            "revision": str(filing.revision),
+        })
+    material = {
+        "company": str(company.security_id or company.cik),
+        "market": str(company.market),
+        "exchange": str(company.exchange),
+        "reporting_currency": str(company.reporting_currency),
+        "parser_version": str(parser_version),
+        "rules_version": str(rules_version),
+        "structured_source_fingerprint": str(structured_source_fingerprint),
+        "vision_policy_fingerprint": str(vision_policy_fingerprint),
+        "documents": sorted(documents, key=lambda item: (item["accession_number"], item["document_id"])),
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def is_deterministic_recovery_error(error_code: str) -> bool:
+    return str(error_code or "").strip().upper() in _DETERMINISTIC_FAILURE_CODES
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryRetryDecision:
+    state: RecoveryState
+    allowed: bool
+    attempt: int
+    input_fingerprint: str
+    retry_after_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.value,
+            "allowed": self.allowed,
+            "attempt": self.attempt,
+            "input_fingerprint": self.input_fingerprint,
+            "retry_after_seconds": self.retry_after_seconds,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +125,7 @@ class RecoveryOutcome:
     missing_periods: tuple[str, ...] = ()
     failed_fields: tuple[str, ...] = ()
     failed_accessions: tuple[str, ...] = ()
+    input_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +138,7 @@ class RecoveryOutcome:
             "missing_periods": list(self.missing_periods),
             "failed_fields": list(self.failed_fields),
             "failed_accessions": list(self.failed_accessions),
+            "input_fingerprint": self.input_fingerprint,
         }
 
 
@@ -77,6 +154,86 @@ class FinancialRecoveryController:
     def __init__(self, storage: Storage, *, app_version: str = __version__):
         self.storage = storage
         self.compatibility_packs = CompatibilityPackRegistry(storage.data_dir, app_version)
+        self._retry_attempts: dict[str, tuple[int, float, str]] = {}
+
+    def input_fingerprint(
+        self,
+        company: Company,
+        filings: Sequence[FilingDocument],
+        *,
+        parser_version: str = "",
+        rules_version: str = "",
+        structured_source_fingerprint: str = "",
+        vision_policy_fingerprint: str = "",
+    ) -> str:
+        return financial_input_fingerprint(
+            company,
+            filings,
+            parser_version=parser_version,
+            rules_version=rules_version,
+            structured_source_fingerprint=structured_source_fingerprint,
+            vision_policy_fingerprint=vision_policy_fingerprint,
+        )
+
+    def retry_decision(
+        self,
+        input_fingerprint: str,
+        error_code: str,
+        *,
+        now: float | None = None,
+        max_transient_attempts: int = 2,
+        cooldown_seconds: float = 30.0,
+    ) -> RecoveryRetryDecision:
+        """Record one failure and decide whether the exact input may retry.
+
+        Deterministic failures become terminal immediately.  Transient
+        failures remain retryable only after a bounded cooldown and attempt
+        budget; they are never persisted as deterministic exhaustion.
+        """
+        fingerprint = str(input_fingerprint).strip()
+        if not fingerprint:
+            raise ValueError("input_fingerprint is required")
+        current = time.monotonic() if now is None else float(now)
+        normalized = self.classify_error(error_code)
+        previous_attempt, next_at, previous_code = self._retry_attempts.get(fingerprint, (0, 0.0, ""))
+        attempt = previous_attempt + 1
+        if is_deterministic_recovery_error(normalized):
+            self._retry_attempts[fingerprint] = (attempt, float("inf"), normalized)
+            return RecoveryRetryDecision(RecoveryState.EXHAUSTED_SAME_INPUT, False, attempt, fingerprint)
+        if normalized in _TRANSIENT_FAILURE_CODES:
+            if previous_code != normalized:
+                attempt = 1
+            next_at = max(next_at, current)
+            if attempt > max(1, int(max_transient_attempts)):
+                self._retry_attempts[fingerprint] = (attempt, next_at, normalized)
+                return RecoveryRetryDecision(RecoveryState.RETRYABLE_EXTERNAL_FAILURE, False, attempt, fingerprint, max(0.0, next_at - current))
+            next_at = current + max(0.0, float(cooldown_seconds))
+            self._retry_attempts[fingerprint] = (attempt, next_at, normalized)
+            return RecoveryRetryDecision(RecoveryState.RETRYABLE_EXTERNAL_FAILURE, current >= next_at, attempt, fingerprint, max(0.0, next_at - current))
+        self._retry_attempts[fingerprint] = (attempt, float("inf"), normalized)
+        return RecoveryRetryDecision(RecoveryState.EXHAUSTED_SAME_INPUT, False, attempt, fingerprint)
+
+    def clear_retry_state(self, input_fingerprint: str) -> None:
+        self._retry_attempts.pop(str(input_fingerprint), None)
+
+    def retry_available(
+        self,
+        input_fingerprint: str,
+        *,
+        now: float | None = None,
+        max_transient_attempts: int = 2,
+    ) -> bool:
+        """Check whether a previously recorded transient failure may retry."""
+        record = self._retry_attempts.get(str(input_fingerprint).strip())
+        if record is None:
+            return False
+        attempts, next_at, error_code = record
+        if error_code not in _TRANSIENT_FAILURE_CODES:
+            return False
+        if attempts >= max(1, int(max_transient_attempts)):
+            return False
+        current = time.monotonic() if now is None else float(now)
+        return current >= next_at
 
     def compatibility_summary(
         self, market: str, report_type: str

@@ -17,7 +17,7 @@ $cargoTarget = if ($env:CARGO_TARGET_DIR) {
 } else {
     "D:\OpenThesisToolchain\cargo-target\openthesis"
 }
-$version = "2.6.1"
+$version = "2.7.3"
 
 $pythonPaths = @((Join-Path $projectRoot "src"))
 if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
@@ -26,6 +26,9 @@ if (Test-Path -LiteralPath (Join-Path $buildTools "PyInstaller")) {
 $env:PYTHONPATH = $pythonPaths -join [IO.Path]::PathSeparator
 $env:CARGO_TARGET_DIR = $cargoTarget
 New-Item -ItemType Directory -Path $resourceRoot -Force | Out-Null
+if (Test-Path -LiteralPath $sidecarBundle) {
+    Remove-Item -LiteralPath $sidecarBundle -Recurse -Force
+}
 
 Push-Location $projectRoot
 try {
@@ -39,6 +42,15 @@ try {
     $sidecarExecutable = Join-Path $sidecarBundle "openthesis-sidecar.exe"
     if (-not (Test-Path -LiteralPath $sidecarExecutable -PathType Leaf)) {
         throw "Expected sidecar executable was not created: $sidecarExecutable"
+    }
+    $sidecarRuntimeFiles = @(Get-ChildItem -LiteralPath (Join-Path $sidecarBundle "_internal") -File |
+        Where-Object { $_.Name -match '^(VCRUNTIME|MSVCP).*\.dll$' })
+    if ($sidecarRuntimeFiles.Count -eq 0) {
+        throw "Expected sidecar MSVC runtime files were not created."
+    }
+    foreach ($sidecarRuntimeFile in $sidecarRuntimeFiles) {
+        $sidecarRuntimeStaged = Join-Path $sidecarRuntimeFile.DirectoryName "$($sidecarRuntimeFile.BaseName).bin"
+        Move-Item -LiteralPath $sidecarRuntimeFile.FullName -Destination $sidecarRuntimeStaged
     }
 
     & (Join-Path $PSScriptRoot "desktop.ps1") portable
@@ -68,6 +80,15 @@ try {
     }
     Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $portableRoot "OpenThesis.exe")
     Copy-Item -Path (Join-Path $sidecarBundle "*") -Destination $portableSidecar -Recurse
+    $portableRuntimeFiles = @(Get-ChildItem -LiteralPath (Join-Path $portableSidecar "_internal") -File |
+        Where-Object { $_.Name -match '^(VCRUNTIME|MSVCP).*\.bin$' })
+    if ($portableRuntimeFiles.Count -eq 0) {
+        throw "Portable sidecar MSVC runtime staging files are missing."
+    }
+    foreach ($portableRuntimeFile in $portableRuntimeFiles) {
+        $portableRuntime = Join-Path $portableRuntimeFile.DirectoryName "$($portableRuntimeFile.BaseName).dll"
+        Move-Item -LiteralPath $portableRuntimeFile.FullName -Destination $portableRuntime
+    }
     # PyInstaller hooks may copy third-party package SBOM directories containing
     # public maintainer contact metadata. They are not required at runtime and
     # would weaken the release archive's strict no-email privacy invariant.

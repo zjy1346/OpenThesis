@@ -30,6 +30,7 @@ from .i18n import EN, OUTPUT_LANGUAGE_INSTRUCTIONS, UI_HANT, ZH_HANT, normalize_
 from .packs import ResearchPack
 from .providers import ModelConfig, ModelProvider, ProviderError
 from .storage import Storage
+from .research_materials import route_materials, insufficient_material_result
 
 
 ProgressCallback = Callable[[str, int], None]
@@ -173,7 +174,7 @@ def _agent_prompt_bundle(
             "task_instructions": role_prompt,
             "output_language": report_language,
             "output_language_instruction": language_instruction,
-            "research_context": json.loads(context_json),
+            "research_context": route_materials(json.loads(context_json), agent_id),
             "prior_artifacts": prior_artifacts,
             "required_claim_shape": {
                 "text": "string",
@@ -270,6 +271,9 @@ def verify_agent_output(
 ) -> dict[str, Any]:
     english = normalize_language(language) == EN
     issues: list[str] = []
+    material_gate = output.get('_material_adequacy')
+    if isinstance(material_gate, dict) and material_gate.get('status') == 'insufficient':
+        issues.append('Required official material is missing' if english else '缺少必要的官方披露材料')
     claims = output.get("claims", [])
     if claims is not None and not isinstance(claims, list):
         issues.append("claims must be an array" if english else "claims 必须是数组")
@@ -1323,11 +1327,15 @@ def _response_diagnostics(payload: Any) -> dict[str, Any]:
         content_length = int(meta.get("content_length") or 0)
     except (TypeError, ValueError):
         content_length = 0
-    return {
+    diagnostics = {
         "finish_reason": meta.get("finish_reason"),
         "content_length": content_length,
         "parse_error_class": parse_error_class,
     }
+    if parse_error_class == "provider_error":
+        diagnostics["provider_error_code"] = str(payload.get("_provider_error_code") or "MODEL_ERROR")
+        diagnostics["provider_retryable"] = bool(payload.get("_provider_retryable"))
+    return diagnostics
 
 
 class ResearchWorkflow:
@@ -1378,54 +1386,38 @@ class ResearchWorkflow:
         skeptic: dict[str, Any],
         forecast: dict[str, Any],
     ) -> dict[str, Any]:
-        """Run exactly one synthesis call, or fail before provider access.
+        """Submit the complete canonical synthesis context exactly once.
 
-        The final synthesis must see one complete canonical context.  Splitting
-        sections and asking the model to merge them changes the evidence graph
-        and is therefore not a lossless fallback.  If the complete provider
-        envelope cannot fit, callers must render deterministic staged output.
+        Local byte/token estimates are diagnostics only.  Provider tokenizers,
+        server-side prompt framing and context limits differ, so a conservative
+        local estimate must never reject a request the selected provider can
+        accept.  Capacity is classified from the provider's explicit response
+        or an incomplete length-truncated response after this one attempt.
         """
-        capability = provider_context_capability(self.provider)
         projected = _synthesis_prior_artifacts(dossier, growth, skeptic, forecast)
         context_json = context.compact_json()
-        role_prompt = self.pack.prompt("prompts/research-synthesizer.md")
-        required_bytes = _agent_input_size(
-            "research-synthesizer",
-            role_prompt,
-            self.report_language,
-            context_json,
-            projected,
-        )
-        # Without an exact provider tokenizer, count each UTF-8 byte as one
-        # conservative token.  A provider may opt into an explicit byte limit.
-        available_bytes = (
-            capability.explicit_max_input_bytes
-            if capability.explicit_max_input_bytes is not None
-            else max(
-                1,
-                capability.max_input_tokens
-                - capability.reserved_output_tokens
-                - capability.reserved_repair_tokens,
-            )
-        )
-        counting_mode = (
-            "explicit_max_input_bytes"
-            if capability.explicit_max_input_bytes is not None
-            else "conservative_utf8_byte_upper_bound"
-        )
-        if required_bytes > available_bytes:
-            raise SynthesisContextLimitError(
-                [{"name": "complete", "bytes": required_bytes}],
-                available_bytes,
-                required_bytes=required_bytes,
-                counting_mode=counting_mode,
-            )
-        return self._run_agent(
+        result = self._run_agent(
             "research-synthesizer",
             "prompts/research-synthesizer.md",
             context_json,
             projected,
+            enforce_local_budget=False,
         )
+        meta = result.get("_response_meta") if isinstance(result, dict) else None
+        finish_reason = str(meta.get("finish_reason") or "").casefold() if isinstance(meta, dict) else ""
+        if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
+            missing_sections = {
+                key for key in _REQUIRED_SYNTHESIS_SECTIONS
+                if result.get(key) in (None, "", [])
+            }
+            if missing_sections:
+                raise SynthesisContextLimitError(
+                    [{"name": "complete", "bytes": len(context_json.encode("utf-8"))}],
+                    0,
+                    required_bytes=len(context_json.encode("utf-8")),
+                    counting_mode="provider_finish_reason",
+                )
+        return result
 
     def _bounded_synthesis_merge(
         self,
@@ -2278,7 +2270,7 @@ class ResearchWorkflow:
                 evidence_records,
                 self.report_language,
             )
-            if (
+            if growth_raw.get('_response_error') != 'insufficient_material' and (
                 not growth_validation.passed
                 or not growth_gate["passed"]
                 or not growth.get("opportunities")
@@ -2372,6 +2364,22 @@ class ResearchWorkflow:
                     "_context_available_bytes": exc.available_bytes,
                     "_context_counting_mode": exc.counting_mode,
                 }
+            except ProviderError as exc:
+                # A final-only provider failure is recoverable from the five
+                # persisted prerequisite stages. Never issue an implicit
+                # repair/model retry here because that would consume tokens
+                # without a user action.
+                synthesis = {
+                    "claims": [],
+                    "_response_error": (
+                        "context_budget_exceeded"
+                        if exc.code == "MODEL_CONTEXT_CAPACITY"
+                        else "provider_error"
+                    ),
+                    "_provider_error_code": exc.code,
+                    "_provider_retryable": exc.retryable,
+                    "_context_counting_mode": "provider_error_code",
+                }
             context_budget_exceeded = (
                 synthesis.get("_response_error") == "context_budget_exceeded"
             )
@@ -2380,87 +2388,44 @@ class ResearchWorkflow:
             )
             report_payload: dict[str, Any] = synthesis
             report_mode = "synthesized"
-            if context_budget_exceeded:
-                report_mode = "staged-fallback"
+            if synthesis.get('_response_error') == 'insufficient_material':
+                report_mode = 'staged-fallback'
                 report_payload = self._build_staged_fallback(
                     stage_results, growth, skeptic, forecast, context.metrics
                 )
-                report_payload.update(
-                    {
-                        "research_complete": True,
-                        "cross_section_synthesis_status": "not_completed_context_capacity",
-                        "context_budget": {
-                            "required_bytes": synthesis.get("_context_required_bytes"),
-                            "available_bytes": synthesis.get("_context_available_bytes"),
-                            "counting_mode": synthesis.get("_context_counting_mode"),
-                        },
-                    }
-                )
-            repair_diagnostics: dict[str, Any] | None = None
-            if not verification["passed"] and synthesis.get("_response_error") != "context_budget_exceeded":
-                # A malformed final payload gets exactly one bounded repair
-                # call.  The prior agents are already persisted and are never
-                # rerun; authentication, rate-limit and provider exceptions
-                # remain terminal rather than becoming hidden retries.
-                repair_input = _synthesis_repair_input(
-                    synthesis, verification, dossier, growth, skeptic, forecast
-                )
-                try:
-                    repaired = self._run_agent(
-                        "research-synthesizer-repair",
-                        "prompts/research-synthesizer-section-repair.md",
-                        context.compact_json(),
-                        repair_input,
-                    )
-                except ProviderError:
-                    # Authentication, rate-limit, and quota failures are not
-                    # retried. Preserve completed stages as a partial report
-                    # instead of turning a final-only failure into FAILED.
-                    repair_diagnostics = _response_diagnostics(
-                        {"_response_error": "provider_error"}
-                    )
-                    verification["issues"].append(
-                        "Final synthesis repair was unavailable; completed stages were preserved."
-                    )
-                else:
-                    repair_fields = list(repair_input.get("repair_sections", []))
-                    patches = _section_patch_from_output(repaired, repair_fields)
-                    merged = dict(synthesis) if isinstance(synthesis, dict) else {}
-                    merged.update(patches)
-                    repaired_verification = validate_research_synthesis(
-                        merged, available, self.report_language, evidence_records
-                    )
-                    repair_diagnostics = _response_diagnostics(repaired)
-                    if not repaired_verification["passed"] and not repair_diagnostics.get("parse_error_class"):
-                        repair_diagnostics["parse_error_class"] = "invalid_schema"
-                    if repaired_verification["passed"]:
-                        synthesis = merged
-                        verification = repaired_verification
-                        report_payload = merged
-                    else:
-                        verification["issues"].extend(
-                            issue for issue in repaired_verification["issues"]
-                            if issue not in verification["issues"]
-                        )
-                report_mode = "staged-fallback"
-                if not verification["passed"]:
-                    report_payload = self._build_staged_fallback(
-                        stage_results, growth, skeptic, forecast, context.metrics
-                    )
-                    if synthesis.get("_response_error") == "context_budget_exceeded":
-                        report_payload.update(
-                            {
-                                "research_complete": True,
-                                "cross_section_synthesis_status": "not_completed_context_capacity",
-                                "context_budget": {
-                                    "required_bytes": synthesis.get("_context_required_bytes"),
-                                    "available_bytes": synthesis.get("_context_available_bytes"),
-                                    "counting_mode": synthesis.get("_context_counting_mode"),
-                                },
-                            }
-                        )
-                else:
-                    report_mode = "synthesized"
+                report_payload['unresolved_questions'] = list(synthesis.get('unresolved_questions', []))
+                report_payload['_material_adequacy'] = synthesis.get('_material_adequacy', {})
+            if context_budget_exceeded:
+                report_mode = "synthesis-incomplete"
+                report_payload = {
+                    "research_complete": False,
+                    "claims": [],
+                    "cross_section_synthesis_status": "not_completed_context_capacity",
+                    "context_budget": {
+                        "required_bytes": synthesis.get("_context_required_bytes"),
+                        "available_bytes": synthesis.get("_context_available_bytes"),
+                        "counting_mode": synthesis.get("_context_counting_mode"),
+                    },
+                }
+            if synthesis.get("_response_error") == "provider_error":
+                report_mode = "synthesis-incomplete"
+                report_payload = {
+                    "research_complete": False,
+                    "claims": [],
+                    "cross_section_synthesis_status": "not_completed_provider_error",
+                    "provider_error_code": synthesis.get("_provider_error_code"),
+                    "provider_retryable": synthesis.get("_provider_retryable"),
+                }
+            if not verification["passed"] and synthesis.get("_response_error") not in {"context_budget_exceeded", "insufficient_material", "provider_error"}:
+                # Do not spend a hidden second model call repairing malformed
+                # synthesis.  Preserve every prerequisite artifact and expose
+                # an explicit retryable state for a user-selected next attempt.
+                report_mode = "synthesis-incomplete"
+                report_payload = {
+                    "research_complete": False,
+                    "claims": [],
+                    "cross_section_synthesis_status": "not_completed_invalid_output",
+                }
             diagnostics = _response_diagnostics(synthesis)
             if synthesis.get("_response_error") == "context_budget_exceeded":
                 diagnostics.update(
@@ -2470,13 +2435,6 @@ class ResearchWorkflow:
                         "counting_mode": synthesis.get("_context_counting_mode"),
                     }
                 )
-            if repair_diagnostics is not None:
-                diagnostics = {
-                    **diagnostics,
-                    "initial": diagnostics,
-                    "repair": repair_diagnostics,
-                    **repair_diagnostics,
-                }
             synthesis_lineage = _synthesis_lineage(
                 synthesis, verification, report_payload, dossier, growth, skeptic, forecast
             )
@@ -2590,12 +2548,31 @@ class ResearchWorkflow:
         growth = growth_artifact["content"]
         skeptic = skeptic_artifact["content"]
         forecast = forecast_artifact["content"]
-        synthesis = self._run_agent(
-            "research-synthesizer",
-            "prompts/research-synthesizer.md",
-            context.compact_json(),
-            _synthesis_prior_artifacts(dossier, growth, skeptic, forecast),
-        )
+        try:
+            synthesis = self._run_synthesis_with_budget(
+                context, dossier, growth, skeptic, forecast
+            )
+        except SynthesisContextLimitError as exc:
+            synthesis = {
+                "claims": [],
+                "_response_error": "context_budget_exceeded",
+                "_context_sections": exc.sections,
+                "_context_required_bytes": exc.required_bytes,
+                "_context_available_bytes": exc.available_bytes,
+                "_context_counting_mode": exc.counting_mode,
+            }
+        except ProviderError as exc:
+            synthesis = {
+                "claims": [],
+                "_response_error": (
+                    "context_budget_exceeded"
+                    if exc.code == "MODEL_CONTEXT_CAPACITY"
+                    else "provider_error"
+                ),
+                "_provider_error_code": exc.code,
+                "_provider_retryable": exc.retryable,
+                "_context_counting_mode": "provider_error_code",
+            }
         available = {
             str(item.get("evidence_id"))
             for item in evidence
@@ -2613,10 +2590,19 @@ class ResearchWorkflow:
             report_payload = synthesis
             mode = "synthesized"
         else:
-            previous_report = _latest_artifact(artifacts, "research-report")
-            previous_content = previous_report.get("content", {}) if previous_report else {}
-            report_payload = previous_content.get("report", {})
-            mode = "staged-fallback"
+            capacity = synthesis.get("_response_error") == "context_budget_exceeded"
+            report_payload = {
+                "research_complete": False,
+                "claims": [],
+                "cross_section_synthesis_status": (
+                    "not_completed_context_capacity"
+                    if capacity
+                    else "not_completed_provider_error"
+                    if synthesis.get("_response_error") == "provider_error"
+                    else "not_completed_invalid_output"
+                ),
+            }
+            mode = "synthesis-incomplete"
         synthesis_lineage = _synthesis_lineage(
             synthesis, verification, report_payload, dossier, growth, skeptic, forecast
         )
@@ -2779,10 +2765,15 @@ class ResearchWorkflow:
         prompt_path: str,
         context_json: str,
         prior_artifacts: dict[str, Any],
+        *,
+        enforce_local_budget: bool = True,
     ) -> dict[str, Any]:
         self._check_cancelled()
         if self.provider is None:
             raise RuntimeError("model provider is not configured")
+        gate = route_materials(json.loads(context_json), agent_id)["material_adequacy"]
+        if gate["status"] == "insufficient":
+            return insufficient_material_result(gate, self.report_language)
         role_prompt = self.pack.prompt(prompt_path)
         system_prompt, user_prompt = _agent_prompt_bundle(
             agent_id,
@@ -2793,7 +2784,7 @@ class ResearchWorkflow:
         )
         input_size = len(system_prompt.encode("utf-8")) + len(user_prompt.encode("utf-8"))
         capability = provider_context_capability(self.provider)
-        if input_size > capability.max_input_bytes:
+        if enforce_local_budget and input_size > capability.max_input_bytes:
             raise SynthesisContextLimitError(
                 [{"name": agent_id, "bytes": input_size}],
                 capability.max_input_bytes,
@@ -2808,6 +2799,7 @@ class ResearchWorkflow:
             self._check_cancelled()
             raise
         self._check_cancelled()
+        result["_material_adequacy"] = gate
         return result
 
     def _save(

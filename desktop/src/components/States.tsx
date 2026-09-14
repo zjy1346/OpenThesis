@@ -12,15 +12,32 @@ import {
 
 type RemainingRange = { lower: number; upper: number };
 
-function estimateRemainingRange(job: ResearchJob, elapsed: number): RemainingRange | null {
+function isFilingProgressStalled(job: ResearchJob): boolean {
+  if (!["filing-parse", "filing-window"].includes(job.stage ?? "")) return false;
+  const stageElapsed = Number(job.stage_elapsed_seconds ?? 0);
+  const current = Math.max(0, Number(job.stage_current ?? 0));
+  const total = Math.max(0, Number(job.stage_total ?? 0));
+  if (!Number.isFinite(stageElapsed) || !Number.isFinite(current) || !Number.isFinite(total)) return false;
+  if (total <= 1 || current >= total) return false;
+  // A document can legitimately take longer than its neighbours.  Stop
+  // extrapolating only after three minutes per reported position; the timer
+  // remains visible and the next completed filing restores an evidence-based
+  // range automatically.
+  return stageElapsed >= Math.max(180, Math.max(1, current) * 180);
+}
+
+function estimateRemainingRange(job: ResearchJob, elapsed: number, stalled = false): RemainingRange | null {
   if (job.state !== "running" || job.vision_approval_pending || job.stage === "vision-approval") return null;
+  if (stalled) return null;
   const safeElapsed = Math.max(0, Number.isFinite(elapsed) ? elapsed : 0);
   if (safeElapsed <= 0) return null;
   const current = Number(job.stage_current);
   const total = Number(job.stage_total);
   let remaining: number | null = null;
   if (Number.isFinite(current) && Number.isFinite(total) && current > 0 && total > current) {
+    const terminalStatuses = new Set(["cache-hit", "validated", "parsed", "blocked", "failed", "cancelled"]);
     const samples = Object.values(job.filing_states ?? {})
+      .filter((item) => terminalStatuses.has(item.status))
       .map((item) => Number(item.elapsed_seconds ?? 0))
       .filter((value) => Number.isFinite(value) && value > 0);
     const perItem = samples.length > 0
@@ -165,10 +182,16 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
     job.stage_total ?? undefined,
   );
   const waitingMessage = waitingMessageAt(language, elapsed, job.job_id);
-  const remaining = estimateRemainingRange(job, elapsed);
+  const progressStalled = isFilingProgressStalled(job);
+  const remaining = estimateRemainingRange(job, elapsed, progressStalled);
   const remainingLabel = language === "en"
     ? "Estimated remaining"
     : language === "zh-Hant" ? "預計剩餘範圍" : "预计剩余范围";
+  const stalledCopy = language === "en"
+    ? "Deep parsing is still active. The remaining-time range will return after the next filing completes."
+    : language === "zh-Hant"
+      ? "仍在深度解析財報。下一份財報完成後，系統會重新估算剩餘時間。"
+      : "仍在深度解析财报。下一份财报完成后，系统会重新估算剩余时间。";
   const externalStage = ["filing-download", "vision-approval", "vision-processing", "comparison"].includes(stage ?? "");
   const sinceBackend = Math.max(0, elapsed - backendElapsed);
   const activeElapsed = Math.max(0, Math.floor((job.engine_active_seconds ?? backendElapsed) + (externalStage ? 0 : sinceBackend)));
@@ -222,6 +245,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
         <span>{remainingLabel}</span>
         <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
       </div>}
+      {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
       {filingStates.length > 0 && <div className="filing-progress-list" aria-label={language === "en" ? "Filing progress" : language === "zh-Hant" ? "財報進度" : "财报进度"}>
         {filingStates.map((filing) => <div className="filing-progress-row" key={filing.filing_id} data-status={filing.status}>
           <span>{filing.label}</span>

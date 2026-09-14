@@ -315,9 +315,9 @@ pub(crate) fn backend_request(
 
 fn backend_command(app: &AppHandle) -> Result<Command, String> {
     if let Ok(explicit_path) = std::env::var("OPENTHESIS_SIDECAR_PATH") {
-        return Ok(Command::new(validate_explicit_sidecar_path(Some(
-            &explicit_path,
-        ))?));
+        let sidecar_path = validate_explicit_sidecar_path(Some(&explicit_path))?;
+        prepare_sidecar_runtime(&sidecar_path)?;
+        return Ok(Command::new(sidecar_path));
     }
 
     if cfg!(debug_assertions) {
@@ -352,7 +352,49 @@ fn backend_command(app: &AppHandle) -> Result<Command, String> {
         .find(|path| path.is_file())
         .or_else(|| candidates.first())
         .ok_or_else(|| "desktop resource directory is unavailable".to_string())?;
+    prepare_sidecar_runtime(sidecar_path)?;
     Ok(Command::new(sidecar_path))
+}
+
+fn prepare_sidecar_runtime(sidecar_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let internal_dir = sidecar_path
+            .parent()
+            .ok_or_else(|| "sidecar directory is unavailable".to_string())?
+            .join("_internal");
+        if internal_dir.is_dir() {
+            for entry in std::fs::read_dir(&internal_dir)
+                .map_err(|error| format!("sidecar runtime directory could not be read: {error}"))?
+            {
+                let entry = entry
+                    .map_err(|error| format!("sidecar runtime entry could not be read: {error}"))?;
+                let staged_runtime = entry.path();
+                if staged_runtime.extension().and_then(|value| value.to_str()) != Some("bin")
+                    || !staged_runtime
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| {
+                            value.starts_with("VCRUNTIME") || value.starts_with("MSVCP")
+                        })
+                {
+                    continue;
+                }
+                let runtime = staged_runtime.with_extension("dll");
+                if !runtime.exists() {
+                    std::fs::rename(&staged_runtime, &runtime).map_err(|error| {
+                        format!(
+                            "sidecar runtime could not be restored from {} to {}: {error}",
+                            staged_runtime.display(),
+                            runtime.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    let _ = sidecar_path;
+    Ok(())
 }
 
 fn validate_explicit_sidecar_path(value: Option<&str>) -> Result<PathBuf, String> {
@@ -411,9 +453,11 @@ fn sidecar_candidates(
 #[cfg(test)]
 mod tests {
     use super::{
-        sidecar_candidates, startup_failure_from_backend, validate_debug_python,
-        validate_explicit_sidecar_path, validate_hello_result, BackendError,
+        prepare_sidecar_runtime, sidecar_candidates, startup_failure_from_backend,
+        validate_debug_python, validate_explicit_sidecar_path, validate_hello_result,
+        BackendError,
     };
+    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -462,6 +506,38 @@ mod tests {
             validate_explicit_sidecar_path(missing.to_str()).unwrap_err(),
             "explicit sidecar path is unavailable"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_windows_runtime_is_restored_before_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let internal = root.path().join("_internal");
+        fs::create_dir_all(&internal).unwrap();
+        let staged = internal.join("VCRUNTIME140.bin");
+        let runtime = internal.join("VCRUNTIME140.dll");
+        fs::write(&staged, b"runtime").unwrap();
+
+        prepare_sidecar_runtime(&root.path().join("openthesis-sidecar.exe")).unwrap();
+
+        assert!(!staged.exists());
+        assert_eq!(fs::read(runtime).unwrap(), b"runtime");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_msvc_runtime_is_restored_before_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let internal = root.path().join("_internal");
+        fs::create_dir_all(&internal).unwrap();
+        let staged = internal.join("MSVCP140.bin");
+        let runtime = internal.join("MSVCP140.dll");
+        fs::write(&staged, b"runtime").unwrap();
+
+        prepare_sidecar_runtime(&root.path().join("openthesis-sidecar.exe")).unwrap();
+
+        assert!(!staged.exists());
+        assert_eq!(fs::read(runtime).unwrap(), b"runtime");
     }
 
     #[test]

@@ -242,11 +242,11 @@ describe("report-first workbench", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
-    expect(updatePreferences).toHaveBeenCalledWith({
+    expect(updatePreferences).toHaveBeenCalledWith(expect.objectContaining({
       ui_language: "en",
       ui_language_mode: "manual",
       report_language: "zh-CN",
-    });
+    }));
   });
 
   it("loads the report when a research job completes", async () => {

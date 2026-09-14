@@ -34,6 +34,18 @@ from openthesis.growth import normalize_growth_output
 from openthesis.storage import Storage
 
 
+def _disclosure_fixture():
+    """Actual role-material preconditions for provider/orchestration tests."""
+    return [{'evidence_id': f'filing:{topic}', 'document_id': 'demo-annual',
+             'source_url': 'https://example.test/annual', 'title': f'Annual · {topic}',
+             'excerpt': text} for topic, text in (
+                 ('business', 'The company sells equipment to industrial customers.'),
+                 ('management_discussion', 'Management plans new products and capacity investment.'),
+                 ('risk_factors', 'Customer concentration and refinancing expose the business to risk.'),
+                 ('audit', 'Independent auditor reports an unqualified opinion on the consolidated statements.'),
+             )]
+
+
 def _valid_growth_output() -> dict[str, object]:
     return {
         "opportunities": [
@@ -54,6 +66,49 @@ def _valid_growth_output() -> dict[str, object]:
 
 
 class DeterministicWorkflowTests(unittest.TestCase):
+    def test_primary_synthesis_provider_error_preserves_stages_without_hidden_token_retry(self) -> None:
+        class FinalUnavailableProvider:
+            def __init__(self) -> None:
+                self.calls: dict[str, int] = {}
+
+            def test_connection(self) -> str:
+                return "ok"
+
+            def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
+                agent = str(json.loads(user_prompt).get("agent", ""))
+                self.calls[agent] = self.calls.get(agent, 0) + 1
+                if agent == "growth-opportunity-analyst":
+                    return _valid_growth_output()
+                if agent == "research-synthesizer":
+                    raise ProviderError("provider unavailable", retryable=True, code="MODEL_HTTP_503")
+                if agent == "research-synthesizer-repair":
+                    raise AssertionError("provider failures must not trigger a hidden token-consuming repair")
+                return {"analysis": "stage", "claims": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            storage.save_company(DEMO_COMPANY)
+            provider = FinalUnavailableProvider()
+            workflow = ResearchWorkflow(
+                storage,
+                builtin_pack(),
+                provider,
+                ModelConfig(configured_model_id="test.fake", role="primary"),
+            )
+
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
+
+            self.assertEqual(run.status, RunStatus.PARTIAL)
+            self.assertEqual(provider.calls["research-synthesizer"], 1)
+            self.assertNotIn("research-synthesizer-repair", provider.calls)
+            report = next(
+                item for item in reversed(storage.get_artifacts(run.run_id))
+                if item["artifact_type"] == "research-report"
+            )
+            self.assertEqual(report["content"]["mode"], "synthesis-incomplete")
+            self.assertTrue(report["content"]["retryable"])
+            self.assertEqual(report["content"]["diagnostics"]["provider_error_code"], "MODEL_HTTP_503")
+
     def test_growth_lineage_records_cap_and_retained_counts(self) -> None:
         template = _valid_growth_output()["opportunities"][0]
         output = {"opportunities": [
@@ -208,7 +263,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
     def test_skeptical_input_contains_all_canonical_evidence_and_claim_graph(self) -> None:
         evidence = [{"evidence_id": f"fact:{index}"} for index in range(41)]
         dossier = {"trusted_channels": {"verified_facts": [{"text": "Revenue", "evidence_ids": ["fact:40"]}]}}
-        context = ResearchContext(DEMO_COMPANY, [], [], [], evidence)
+        context = ResearchContext(DEMO_COMPANY, [], [], [], evidence + _disclosure_fixture())
         payload = _skeptical_prior_artifacts(context, dossier, {})
         encoded = json.dumps(payload, ensure_ascii=False)
         self.assertIn("fact:40", encoded)
@@ -571,7 +626,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertIn(claim["text"], serialized)
         self.assertTrue(all(len(json.dumps(part, ensure_ascii=False).encode("utf-8")) <= capability.max_input_bytes for part in parts))
 
-    def test_oversized_synthesis_rejects_before_provider_call(self) -> None:
+    def test_local_size_estimate_never_blocks_first_complete_provider_call(self) -> None:
         class RecordingProvider:
             context_window_tokens = 8_000
 
@@ -590,19 +645,68 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 provider,
                 ModelConfig(configured_model_id="test.fake", role="primary"),
             )
-            context = ResearchContext(DEMO_COMPANY, [], [], [], [])
-            with self.assertRaises(SynthesisContextLimitError) as error:
-                workflow._run_synthesis_with_budget(
-                    context,
-                    {"analyses": {"financial_quality": ["Q" * 2_000 for _ in range(5)]}},
-                    {"opportunities": ["G" * 2_000 for _ in range(5)]},
-                    {"strongest_counterarguments": ["R" * 2_000 for _ in range(5)]},
-                    {"scenarios": [{"name": "base"}]},
-                )
-            self.assertEqual(provider.payload_sizes, [])
-            self.assertGreater(error.exception.required_bytes, error.exception.available_bytes)
+            context = ResearchContext(
+                DEMO_COMPANY,
+                [],
+                [],
+                [],
+                [
+                    {"evidence_id": "fact:test", "kind": "financial_fact"},
+                    *_disclosure_fixture(),
+                ],
+            )
+            result = workflow._run_synthesis_with_budget(
+                context,
+                {"analyses": {"financial_quality": ["Q" * 2_000 for _ in range(5)]}},
+                {"opportunities": ["G" * 2_000 for _ in range(5)]},
+                {"strongest_counterarguments": ["R" * 2_000 for _ in range(5)]},
+                {"scenarios": [{"name": "base"}]},
+            )
+            self.assertEqual(len(provider.payload_sizes), 1)
+            self.assertGreater(provider.payload_sizes[0], 8_000)
+            self.assertTrue(result["claims"])
 
-    def test_run_context_capacity_saves_complete_staged_fallback_without_final_call(self) -> None:
+    def test_length_finish_reason_is_capacity_only_when_required_sections_are_missing(self) -> None:
+        complete = {
+            key: (["ok"] if key in {
+                "growth_opportunities", "counterarguments", "scenarios",
+                "invalidation_conditions", "leading_indicators", "unresolved_questions",
+            } else [] if key == "claims" else "ok")
+            for key in (
+                "executive_summary", "business_model", "financial_quality",
+                "balance_sheet", "competitive_position", "growth_opportunities",
+                "counterarguments", "scenarios", "thesis", "invalidation_conditions",
+                "leading_indicators", "unresolved_questions", "claims",
+            )
+        }
+        complete["claims"] = [{"text": "supported conclusion", "kind": "inference", "evidence_ids": []}]
+
+        class LengthProvider:
+            def __init__(self, payload): self.payload = payload; self.calls = 0
+            def generate(self, *_args, **_kwargs):
+                self.calls += 1
+                return {**self.payload, "_response_meta": {"finish_reason": "length"}}
+
+        context = ResearchContext(
+            DEMO_COMPANY, [], [], [],
+            [{"evidence_id": "fact:test", "kind": "financial_fact"}, *_disclosure_fixture()],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            provider = LengthProvider(complete)
+            workflow = ResearchWorkflow(
+                Storage(Path(directory)), builtin_pack(), provider,
+                ModelConfig(configured_model_id="test.length", role="primary"),
+            )
+            result = workflow._run_synthesis_with_budget(context, {}, {}, {}, {})
+            self.assertEqual(result["executive_summary"], "ok")
+            self.assertEqual(provider.calls, 1)
+
+            provider.payload = {"executive_summary": "truncated"}
+            with self.assertRaises(SynthesisContextLimitError):
+                workflow._run_synthesis_with_budget(context, {}, {}, {}, {})
+            self.assertEqual(provider.calls, 2)
+
+    def test_run_context_capacity_preserves_stages_without_fake_complete_report(self) -> None:
         class CapacityProvider:
             context_window_tokens = 100_000
 
@@ -613,12 +717,13 @@ class DeterministicWorkflowTests(unittest.TestCase):
             def generate(self, _system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> dict[str, object]:
                 agent = str(json.loads(user_prompt).get("agent", ""))
                 self.calls.append(agent)
-                if len(self.calls) == 6:
-                    # Make only the final synthesis envelope too small.  All
-                    # preceding stage calls retain their normal capability.
-                    self.max_input_bytes = 1
                 if agent == "growth-opportunity-analyst":
                     return _valid_growth_output()
+                if agent == "research-synthesizer":
+                    raise ProviderError(
+                        "provider rejected complete context",
+                        code="MODEL_CONTEXT_CAPACITY",
+                    )
                 return {
                     "analysis": f"preserved {agent}",
                     "claims": [{
@@ -640,31 +745,24 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 ModelConfig(configured_model_id="test.capacity", role="primary"),
                 parallel_agents=False,
             )
-            run = workflow.run(DEMO_COMPANY, demo_facts())
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
             report = next(
                 item for item in storage.get_artifacts(run.run_id)
                 if item["artifact_type"] == "research-report"
             )
             content = report["content"]
-            self.assertEqual(content["mode"], "staged-fallback")
-            self.assertEqual(provider.calls.count("research-synthesizer"), 0)
+            self.assertEqual(content["mode"], "synthesis-incomplete")
+            self.assertEqual(provider.calls.count("research-synthesizer"), 1)
             self.assertEqual(
                 content["report"]["cross_section_synthesis_status"],
                 "not_completed_context_capacity",
             )
-            self.assertTrue(content["report"]["research_complete"])
-            self.assertGreater(
-                content["report"]["context_budget"]["required_bytes"],
-                content["report"]["context_budget"]["available_bytes"],
+            self.assertFalse(content["report"]["research_complete"])
+            self.assertEqual(
+                content["report"]["context_budget"]["counting_mode"],
+                "provider_error_code",
             )
-            self.assertTrue(content["report"]["context_budget"]["counting_mode"])
-            required = {
-                "executive_summary", "business_model", "financial_quality",
-                "balance_sheet", "competitive_position", "growth_opportunities",
-                "counterarguments", "scenarios", "thesis", "claims",
-            }
-            self.assertTrue(required.issubset(content["report"]))
-            self.assertTrue(content["report"]["financial_quality"])
+            self.assertNotIn("executive_summary", content["report"])
 
     def test_compiled_custom_ot_executes_its_own_dependency_graph(self) -> None:
         class OtProvider:
@@ -722,7 +820,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 parallel_agents=True,
             )
 
-            run = workflow.run(DEMO_COMPANY, demo_facts())
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
 
             self.assertEqual(run.status, RunStatus.COMPLETED)
             self.assertEqual(provider.calls, ["company-analysis", "verification"])
@@ -813,7 +911,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 report_language="en",
             )
 
-            run = workflow.run(DEMO_COMPANY, demo_facts())
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
             self.assertEqual(provider.growth_calls, 2, "initial run gets one bounded growth retry")
             before = {agent: provider.calls.count(agent) for agent in set(provider.calls)}
 
@@ -851,7 +949,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             storage.save_facts([FinancialFact(**item) for item in facts])
             config = ModelConfig()
             workflow = ResearchWorkflow(storage, builtin_pack(), None, config)
-            run = workflow.run(DEMO_COMPANY, facts)
+            run = workflow.run(DEMO_COMPANY, facts, filing_evidence=_disclosure_fixture())
             self.assertEqual(run.status, RunStatus.PARTIAL)
             artifacts = storage.get_artifacts(run.run_id)
             self.assertEqual(len(artifacts), 2)
@@ -993,6 +1091,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             run = workflow.run(
                 DEMO_COMPANY,
                 facts,
+                filing_evidence=_disclosure_fixture(),
                 progress=lambda message, percent: progress.append((message, percent)),
             )
             self.assertEqual(run.status, RunStatus.COMPLETED)
@@ -1030,10 +1129,9 @@ class DeterministicWorkflowTests(unittest.TestCase):
                         "structured_output_valid": False,
                         "_response_error": "empty_content",
                     }
-                # The workflow gets one bounded repair attempt (call 8), which
-                # is deliberately still malformed; the explicit retry seam
-                # below succeeds on call 9.
-                if self.count == 9:
+                # No hidden repair is issued. The explicit retry below is the
+                # next and only synthesis call, and succeeds on call 8.
+                if self.count == 8:
                     return {
                         "executive_summary": "Recovered synthesis.",
                         "business_model": "Business model.",
@@ -1077,7 +1175,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 ModelConfig(configured_model_id="test.fake", role="primary"),
             )
 
-            run = workflow.run(DEMO_COMPANY, demo_facts())
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
 
             self.assertEqual(run.status, RunStatus.PARTIAL)
             report = next(
@@ -1085,36 +1183,22 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 for item in storage.get_artifacts(run.run_id)
                 if item["artifact_type"] == "research-report"
             )
-            self.assertEqual(report["content"]["mode"], "staged-fallback")
+            self.assertEqual(report["content"]["mode"], "synthesis-incomplete")
             self.assertTrue(report["content"]["retryable"])
-            self.assertEqual(report["content"]["diagnostics"]["initial"]["parse_error_class"], "empty_content")
-            self.assertEqual(report["content"]["diagnostics"]["repair"]["parse_error_class"], "invalid_schema")
+            self.assertEqual(report["content"]["diagnostics"]["parse_error_class"], "empty_content")
             self.assertNotIn("prompt", report["content"]["diagnostics"])
             fallback = report["content"]["report"]
-            required = {
-                "executive_summary", "business_model", "financial_quality",
-                "balance_sheet", "competitive_position", "growth_opportunities", "counterarguments",
-                "scenarios", "thesis", "invalidation_conditions",
-                "leading_indicators", "unresolved_questions", "claims",
-            }
-            self.assertTrue(required.issubset(fallback))
-            # Claims without a cited, verified record are intentionally kept
-            # out of the staged report rather than promoted as facts.
+            self.assertFalse(fallback["research_complete"])
             self.assertFalse(fallback["claims"])
-            self.assertNotIn("claims", fallback["business_model"])
             self.assertEqual(storage.list_thesis_versions(DEMO_COMPANY.cik), [])
-            self.assertEqual(provider.count, 8, "run performs one bounded final repair call")
-            repair_system_prompt = provider.system_prompts[7]
-            self.assertIn("section_patches", repair_system_prompt)
-            self.assertNotIn("return one complete report", repair_system_prompt.casefold())
-            self.assertIn("only", repair_system_prompt.casefold())
+            self.assertEqual(provider.count, 7, "run performs exactly one final synthesis call")
 
             retried = workflow.retry_synthesis(
                 run,
                 storage.get_artifacts(run.run_id),
                 demo_facts(),
             )
-            self.assertEqual(provider.count, 9, "bounded repair plus retry must make two final-only calls")
+            self.assertEqual(provider.count, 8, "explicit retry performs one final-only call")
             self.assertEqual(retried.status, RunStatus.COMPLETED)
             retried_report = next(
                 item
@@ -1124,7 +1208,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             self.assertEqual(retried_report["content"]["mode"], "synthesized")
             self.assertFalse(retried_report["content"]["retryable"])
 
-    def test_repair_provider_error_keeps_completed_stages_partial(self) -> None:
+    def test_invalid_synthesis_does_not_trigger_hidden_repair(self) -> None:
         class RepairUnavailableProvider:
             def __init__(self) -> None:
                 self.count = 0
@@ -1138,8 +1222,6 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     return _valid_growth_output()
                 if self.count == 7:
                     return {"narrative": "malformed", "structured_output_valid": False, "_response_error": "invalid_json"}
-                if self.count == 8:
-                    raise ProviderError("rate limited", retryable=False)
                 return {"analysis": "stage", "claims": []}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1152,12 +1234,12 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 provider,
                 ModelConfig(configured_model_id="test.fake", role="primary"),
             )
-            run = workflow.run(DEMO_COMPANY, demo_facts())
+            run = workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
             self.assertEqual(run.status, RunStatus.PARTIAL)
-            self.assertEqual(provider.count, 8)
+            self.assertEqual(provider.count, 7)
             report = next(item for item in storage.get_artifacts(run.run_id) if item["artifact_type"] == "research-report")
-            self.assertEqual(report["content"]["diagnostics"]["parse_error_class"], "provider_error")
-            self.assertEqual(report["content"]["diagnostics"]["repair"]["parse_error_class"], "provider_error")
+            self.assertEqual(report["content"]["mode"], "synthesis-incomplete")
+            self.assertEqual(report["content"]["diagnostics"]["parse_error_class"], "invalid_json")
 
     def test_failed_provider_persists_failed_run(self) -> None:
         class FailingProvider:
@@ -1178,7 +1260,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 storage, builtin_pack(), FailingProvider(), config
             )
             with self.assertRaisesRegex(RuntimeError, "intentional provider failure"):
-                workflow.run(DEMO_COMPANY, facts)
+                workflow.run(DEMO_COMPANY, facts, filing_evidence=_disclosure_fixture())
             runs = storage.list_runs()
             self.assertEqual(runs[0]["status"], RunStatus.FAILED.value)
 
@@ -1214,10 +1296,11 @@ class DeterministicWorkflowTests(unittest.TestCase):
             run = workflow.run(
                 DEMO_COMPANY,
                 demo_facts(),
+                filing_evidence=_disclosure_fixture(),
                 progress=lambda message, _percent: progress.append(message),
             )
             self.assertEqual(run.report_language, "en")
-            self.assertEqual(len(provider.calls), 8)
+            self.assertEqual(len(provider.calls), 7)
             for system_prompt, user_prompt in provider.calls:
                 self.assertIn(
                     "Write every natural-language value in English",
@@ -1265,10 +1348,11 @@ class DeterministicWorkflowTests(unittest.TestCase):
             run = workflow.run(
                 DEMO_COMPANY,
                 demo_facts(),
+                filing_evidence=_disclosure_fixture(),
                 progress=lambda message, _percent: progress.append(message),
             )
             self.assertEqual(run.report_language, "zh-Hant")
-            self.assertEqual(len(provider.calls), 8)
+            self.assertEqual(len(provider.calls), 7)
             for system_prompt, user_prompt in provider.calls:
                 self.assertIn(
                     "Write every natural-language value in Traditional Chinese",
@@ -1320,7 +1404,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                     ModelConfig(configured_model_id="test.fake", role="primary"),
                     parallel_agents=parallel,
                 )
-                workflow.run(DEMO_COMPANY, demo_facts())
+                workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
                 return provider.maximum
 
         self.assertEqual(run_with(False), 1)
@@ -1390,6 +1474,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
             run = workflow.run(
                 DEMO_COMPANY,
                 demo_facts(),
+                filing_evidence=_disclosure_fixture(),
                 progress=lambda message, percent: progress.append((message, percent)),
             )
 
@@ -1426,7 +1511,7 @@ class DeterministicWorkflowTests(unittest.TestCase):
                 cancel_check=lambda: True,
             )
             with self.assertRaises(ResearchCancelled) as caught:
-                workflow.run(DEMO_COMPANY, demo_facts())
+                workflow.run(DEMO_COMPANY, demo_facts(), filing_evidence=_disclosure_fixture())
             self.assertTrue(caught.exception.run_id)
             self.assertEqual(provider.count, 0)
             self.assertEqual(

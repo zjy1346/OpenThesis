@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Building2, ExternalLink } from "lucide-react";
+import { MarketReadiness, FxDetails } from './MarketReadiness';
 
 import {
   installResearchPack,
@@ -18,6 +19,7 @@ import type {
   ResearchPackSummary,
   ResearchRequest,
 } from "../../types";
+import { parseVisionFallbackPolicy, visionFallbackSelectionFromPolicy } from "../../types";
 
 type ResearchCopy = {
   setupTitle: string;
@@ -86,33 +88,24 @@ type ResearchCopy = {
   endpoint: string;
   apiKey: string;
   refreshFailed: string;
-  visionFallback: string;
-  visionFallbackTitle: string;
-  visionFallbackBody: string;
-  visionEnable: string;
-  visionConsent: string;
-  visionProvider: string;
-  visionLiteHint: string;
-  visionPrecisionHint: string;
-  visionCustomHint: string;
-  visionToken: string;
-  visionEndpoint: string;
-  visionModel: string;
-  visionApiKey: string;
-  visionTimeout: string;
   visionMissing: string;
-  visionApprovalMode: string;
+  visionSettingsTitle?: string;
+  visionSettingsSummary?: string;
+  visionSettingsDisabled?: string;
+  openVisionSettings?: string;
+  visionMineru: string;
+  visionConfiguredModel: string;
   visionApprovalEach: string;
   visionApprovalResearch: string;
-  visionApprovalScope: string;
 };
 
 const SEC_DEVELOPER_DOCS = "https://www.sec.gov/search-filings/edgar-application-programming-interfaces";
 
-export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePreferences, onStart }: {
+export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisionSettings, onSavePreferences, onStart }: {
   bootstrap: BootstrapResult;
   copy: ResearchCopy;
   onOpenModelCenter: () => void;
+  onOpenVisionSettings?: () => void;
   onSavePreferences: (value: Partial<Preferences>) => Promise<Preferences>;
   onStart: (request: ResearchRequest) => Promise<void>;
 }) {
@@ -144,25 +137,17 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
   const [marketAsOf, setMarketAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [discountRate, setDiscountRate] = useState("10");
   const [terminalGrowth, setTerminalGrowth] = useState("3");
-  const [visionEnabled, setVisionEnabled] = useState(false);
-  const [visionSource, setVisionSource] = useState<"mineru_flash" | "configured_model">("mineru_flash");
-  const [visionConsent, setVisionConsent] = useState(false);
-  const [visionApprovalMode, setVisionApprovalMode] = useState<"review_each_plan" | "approve_current_research">("review_each_plan");
-  const [visionModelId, setVisionModelId] = useState("");
   const marketCatalog = bootstrap.market_catalog ?? [
     { market: "US" as const, label_zh: "美股", label_en: "US equities", exchanges: ["NASDAQ", "NYSE"], default_currency: "USD", requires_sec_identity: true, disclosure_home: SEC_DEVELOPER_DOCS },
   ];
   const marketProfile = marketCatalog.find((item) => item.market === market);
   const requiresSecIdentity = marketProfile?.requires_sec_identity ?? market === "US";
+  const visionPolicy = parseVisionFallbackPolicy(bootstrap.preferences.vision_fallback_policy);
+  const visionFallback = visionFallbackSelectionFromPolicy(visionPolicy, market === "CN_A" ? "ch" : "en");
   const usableModels = useMemo(
     () => configuredModels.filter((model) => model.enabled && model.health_status === "ready"),
     [configuredModels],
   );
-  const visionModels = useMemo(
-    () => usableModels.filter((model) => model.capabilities.includes("vision")),
-    [usableModels],
-  );
-
   useEffect(() => {
     let cancelled = false;
     void listConfiguredModels()
@@ -171,8 +156,6 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
         setConfiguredModels(items);
         const usable = items.filter((model) => model.enabled && model.health_status === "ready");
         setPrimaryModelId((current) => current || usable[0]?.configured_model_id || "");
-        const vision = usable.find((model) => model.capabilities.includes("vision"));
-        setVisionModelId((current) => current || vision?.configured_model_id || "");
       })
       .catch((reason) => {
         if (!cancelled) setModelLoadError(reason instanceof Error ? reason.message : copy.coreUnavailable);
@@ -188,6 +171,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
     }
     let cancelled = false;
     setMarketPreviewLoading(true);
+    setMarketPreview(null);
     const timer = window.setTimeout(() => {
       void captureMarketSnapshot(selected)
         .then((snapshot) => {
@@ -258,30 +242,9 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
           .map((id) => modelReference(id, "comparison"))
           .filter((item): item is ModelReference => Boolean(item))
       : [];
-    let visionFallback: ResearchRequest["vision_fallback"];
-    if (visionEnabled) {
-      if (!visionConsent) {
-        setSearchError(copy.visionMissing);
-        return;
-      }
-      if (visionSource === "configured_model") {
-        const vision = modelReference(visionModelId, "vision");
-        if (!vision) {
-          setSearchError(copy.visionMissing);
-          return;
-        }
-        visionFallback = {
-          enabled: true, consent: true, provider: "configured_model", model: vision,
-          require_page_approval: true, approval_mode: visionApprovalMode,
-          language: market === "CN_A" ? "ch" : "en",
-        };
-      } else {
-        visionFallback = {
-          enabled: true, consent: true, provider: "mineru_flash",
-          require_page_approval: true, approval_mode: visionApprovalMode,
-          language: market === "CN_A" ? "ch" : "en",
-        };
-      }
+    if (visionPolicy.enabled && !visionFallback) {
+      setSearchError(copy.visionMissing);
+      return;
     }
     await onSavePreferences({
       sec_contact_profile: profile,
@@ -384,11 +347,18 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
           <div className="company-chips">{bootstrap.common_companies.filter((company) => (company.market ?? "US") === market).map((company) => <button key={company.security_id || company.cik} type="button" data-selected={selected?.cik === company.cik || undefined} onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}>{company.ticker}</button>)}</div>
           {results.length > 0 && <div className="company-results">{results.map((company) => <button key={company.security_id || company.cik} type="button" onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}><Building2 size={16} /><span><strong>{company.ticker}</strong>{company.name}</span></button>)}</div>}
           {selected && <div className="selected-company"><Building2 size={18} /><span><strong>{selected.ticker}</strong>{selected.name}</span></div>}
+          {selected && <MarketReadiness company={selected} language={bootstrap.preferences.ui_language} onSwitch={(company) => {
+            chooseMarket(company.market || 'CN_A');
+            setSelected(company);
+            setQuery(company.ticker);
+            setMarketCurrency(company.listing_currency || 'CNY');
+          }} />}
           {selected && <p className="provider-hint" data-testid="market-snapshot-preview">
             {marketPreviewLoading ? copy.marketSnapshotLoading : marketPreview
               ? `${({ VERIFIED: copy.marketSnapshotVerified, STALE: copy.marketSnapshotStale, MANUAL: copy.marketSnapshotManual, CONFLICT: copy.marketSnapshotConflict, UNAVAILABLE: copy.marketSnapshotUnavailable } as const)[marketPreview.status]}${marketPreview.as_of ? ` · ${marketPreview.as_of}` : ""}${marketPreview.quote_currency || marketPreview.currency ? ` · ${marketPreview.quote_currency || marketPreview.currency}` : ""}`
               : copy.marketSnapshotUnavailable}
           </p>}
+          <FxDetails snapshot={marketPreview} language={bootstrap.preferences.ui_language} />
           {selected?.industry_support === "financial_beta" && <p className="provider-hint">{copy.financeBeta}</p>}
           {searchError && <p className="inline-error" role="alert">{searchError}</p>}
         </section>
@@ -433,37 +403,20 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onSavePref
           </div>
           <label className="pack-import">{copy.importPack}<input type="file" accept=".ot" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
-          <details className="advanced-settings"><summary>{copy.visionFallbackTitle}</summary>
-            <p className="field-caption">{copy.visionFallbackBody}</p>
-            <label className="check-row"><input type="checkbox" checked={visionEnabled} onChange={(event) => { setVisionEnabled(event.target.checked); if (!event.target.checked) { setVisionConsent(false); setVisionApprovalMode("review_each_plan"); } }} />{copy.visionEnable}</label>
-            {visionEnabled && <div className="vision-source-panel">
-              <label className="configured-model-picker" htmlFor="vision-source">
-                <span>{copy.visionProvider}</span>
-                <select id="vision-source" value={visionSource} onChange={(event) => setVisionSource(event.target.value as "mineru_flash" | "configured_model")}>
-                  <option value="mineru_flash">{copy.visionToken}</option>
-                  <option value="configured_model" disabled={!visionModels.length}>{copy.visionModel}</option>
-                </select>
-              </label>
-              <p className="field-caption">{visionSource === "mineru_flash" ? copy.visionLiteHint : copy.visionPrecisionHint}</p>
-              {visionSource === "configured_model" && (visionModels.length
-                ? <ConfiguredModelPicker id="vision-configured-model" label={copy.visionModel} models={visionModels} value={visionModelId} onChange={setVisionModelId} />
-                : <div className="model-picker-empty"><p>{copy.modelsEmpty}</p><button className="secondary-button" type="button" onClick={onOpenModelCenter}>{copy.modelCenter}</button></div>)}
-              <p className="field-caption">{copy.visionCustomHint}</p>
-              <fieldset className="vision-approval-mode" aria-describedby="vision-approval-scope">
-                <legend>{copy.visionApprovalMode}</legend>
-                <label className={`vision-approval-option ${visionApprovalMode === "review_each_plan" ? "active" : ""}`}>
-                  <input type="radio" name="vision-approval-mode" value="review_each_plan" checked={visionApprovalMode === "review_each_plan"} onChange={() => setVisionApprovalMode("review_each_plan")} />
-                  <span>{copy.visionApprovalEach}</span>
-                </label>
-                <label className={`vision-approval-option ${visionApprovalMode === "approve_current_research" ? "active" : ""}`}>
-                  <input type="radio" name="vision-approval-mode" value="approve_current_research" checked={visionApprovalMode === "approve_current_research"} onChange={() => setVisionApprovalMode("approve_current_research")} />
-                  <span>{copy.visionApprovalResearch}</span>
-                </label>
-                <p id="vision-approval-scope" className="field-caption">{copy.visionApprovalScope}</p>
-              </fieldset>
-              <label className="vision-consent check-row"><input type="checkbox" checked={visionConsent} onChange={(event) => setVisionConsent(event.target.checked)} />{copy.visionConsent}</label>
-            </div>}
-          </details>
+          <section className="vision-policy-summary" data-testid="vision-policy-summary">
+            <h4>{copy.visionSettingsTitle ?? "Vision fallback"}</h4>
+            <p className="field-caption">{copy.visionSettingsSummary ?? "The persistent visual fallback is managed in Settings and snapshotted for this research run."}</p>
+            <p className="provider-hint">{visionPolicy.enabled && visionFallback
+              ? `${visionPolicy.provider === "mineru_flash"
+                ? (copy.visionMineru ?? "MinerU Flash")
+                : (usableModels.find((item) => item.configured_model_id === visionPolicy.model?.configured_model_id)?.alias
+                  ?? copy.visionConfiguredModel
+                  ?? "Configured vision model")} · ${visionPolicy.approval_mode === "review_each_plan"
+                    ? copy.visionApprovalEach
+                    : copy.visionApprovalResearch}`
+              : visionPolicy.enabled ? copy.visionMissing : (copy.visionSettingsDisabled ?? "Vision fallback is disabled")}</p>
+            {onOpenVisionSettings && <button className="secondary-button" type="button" onClick={onOpenVisionSettings}>{copy.openVisionSettings ?? "Open vision settings"}</button>}
+          </section>
           <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
             <label>{copy.manualPrice}<input inputMode="decimal" value={marketPrice} onChange={(event) => setMarketPrice(event.target.value)} /></label>
             <label>{copy.manualCurrency}<select value={marketCurrency} onChange={(event) => setMarketCurrency(event.target.value)}>{[marketProfile?.default_currency, selected?.listing_currency, selected?.reporting_currency, "USD", "CNY", "HKD"].filter((item, index, all): item is string => Boolean(item) && all.indexOf(item) === index).map((currency) => <option key={currency} value={currency}>{currency}</option>)}</select></label>

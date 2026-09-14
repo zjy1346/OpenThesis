@@ -9,6 +9,8 @@ export type Preferences = {
   sidebar_collapsed: string;
   parallel_agents: string;
   research_market?: Market;
+  /** Serialized VisionFallbackPolicy returned by the settings store. */
+  vision_fallback_policy?: string;
   [key: string]: string | undefined;
 };
 
@@ -26,6 +28,12 @@ export type Company = {
   industry?: string;
   industry_support?: "standard" | "financial_beta";
   source_url?: string;
+  research_readiness?: {
+    recommended: boolean;
+    consecutive_years: number;
+    reason: string;
+    alternative?: Company;
+  };
 };
 
 export type Market = "US" | "CN_A" | "HK";
@@ -199,6 +207,99 @@ export type VisionFallbackSelection = {
   approval_mode: "review_each_plan" | "approve_current_research";
 };
 
+/**
+ * Persisted, user-controlled policy for the financial-page visual fallback.
+ *
+ * This is deliberately separate from VisionFallbackSelection: the latter is
+ * a per-run immutable snapshot, while this policy is a revocable setting.
+ * Keeping the versions in the payload lets the core require fresh consent
+ * when provider terms or the authorization scope changes.
+ */
+export type VisionFallbackPolicy = {
+  schema_version: 1;
+  policy_version: 1;
+  scope_version: 1;
+  enabled: boolean;
+  provider: "mineru_flash" | "configured_model";
+  model?: ModelReference;
+  approval_mode: "review_each_plan" | "approve_current_research";
+  standing_authorization: boolean;
+  authorization_scope: "financial_failed_pages";
+  provider_terms_version: 1;
+  authorized_at?: string;
+  revoked_at?: string;
+};
+
+export const VISION_FALLBACK_POLICY_VERSION = 1 as const;
+export const VISION_FALLBACK_SCOPE_VERSION = 1 as const;
+export const VISION_FALLBACK_PROVIDER_TERMS_VERSION = 1 as const;
+
+export function defaultVisionFallbackPolicy(): VisionFallbackPolicy {
+  return {
+    schema_version: VISION_FALLBACK_POLICY_VERSION,
+    policy_version: VISION_FALLBACK_POLICY_VERSION,
+    scope_version: VISION_FALLBACK_SCOPE_VERSION,
+    enabled: false,
+    provider: "mineru_flash",
+    approval_mode: "review_each_plan",
+    standing_authorization: false,
+    authorization_scope: "financial_failed_pages",
+    provider_terms_version: VISION_FALLBACK_PROVIDER_TERMS_VERSION,
+  };
+}
+
+/** Parse only the persisted policy; old per-run consent is never migrated. */
+export function parseVisionFallbackPolicy(value: string | undefined): VisionFallbackPolicy {
+  const fallback = defaultVisionFallbackPolicy();
+  if (!value) return fallback;
+  try {
+    const parsed = JSON.parse(value) as Partial<VisionFallbackPolicy>;
+    if (parsed.schema_version !== VISION_FALLBACK_POLICY_VERSION
+      || parsed.policy_version !== VISION_FALLBACK_POLICY_VERSION
+      || parsed.scope_version !== VISION_FALLBACK_SCOPE_VERSION
+      || parsed.provider_terms_version !== VISION_FALLBACK_PROVIDER_TERMS_VERSION
+      || (parsed.provider !== "mineru_flash" && parsed.provider !== "configured_model")
+      || (parsed.approval_mode !== "review_each_plan" && parsed.approval_mode !== "approve_current_research")
+      || parsed.authorization_scope !== "financial_failed_pages") {
+      return { ...fallback, enabled: parsed.enabled === true, provider: parsed.provider === "configured_model" ? "configured_model" : "mineru_flash" };
+    }
+    return {
+      ...fallback,
+      ...parsed,
+      standing_authorization: parsed.standing_authorization === true,
+      enabled: parsed.enabled === true,
+      ...(parsed.provider === "configured_model" && parsed.model ? { model: parsed.model } : {}),
+    } as VisionFallbackPolicy;
+  } catch {
+    return fallback;
+  }
+}
+
+export function isCurrentVisionFallbackPolicy(policy: VisionFallbackPolicy): boolean {
+  return policy.schema_version === VISION_FALLBACK_POLICY_VERSION
+    && policy.policy_version === VISION_FALLBACK_POLICY_VERSION
+    && policy.scope_version === VISION_FALLBACK_SCOPE_VERSION
+    && policy.provider_terms_version === VISION_FALLBACK_PROVIDER_TERMS_VERSION;
+}
+
+/** Convert the current policy to an immutable per-run request snapshot. */
+export function visionFallbackSelectionFromPolicy(
+  policy: VisionFallbackPolicy,
+  language: "auto" | "ch" | "en",
+): VisionFallbackSelection | undefined {
+  if (!policy.enabled || !policy.standing_authorization || !isCurrentVisionFallbackPolicy(policy)) return undefined;
+  if (policy.provider === "configured_model" && !policy.model) return undefined;
+  return {
+    enabled: true,
+    consent: true,
+    provider: policy.provider,
+    ...(policy.model ? { model: policy.model } : {}),
+    language,
+    require_page_approval: true,
+    approval_mode: policy.approval_mode,
+  };
+}
+
 export type ResearchRequest = {
   mode: "demo" | "company";
   company?: Company;
@@ -235,6 +336,10 @@ export type MarketSnapshotPreview = {
   provider?: string;
   cache?: string;
   error_code?: string;
+  fx_rate?: number | null;
+  fx_as_of?: string;
+  fx_source?: string;
+  warnings?: string[];
 };
 
 export type ResearchRunSummary = {
@@ -326,6 +431,7 @@ export type ResearchReport = {
   industry_support?: "standard" | "financial_beta";
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
+  synthesis_error_code?: string;
   retryable_growth?: boolean;
   financial_retry?: FinancialRetryResult;
   financial_report_refresh?: {
@@ -438,6 +544,7 @@ export type ThesisVersion = {
   run_id: string | null;
   version: number;
   content: Record<string, unknown>;
+  sources?: Array<Record<string, unknown>>;
   created_at: string;
   created_by: string;
   ticker: string;

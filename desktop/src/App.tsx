@@ -200,6 +200,9 @@ export default function App() {
         {error && <div className="error-banner" role="alert" data-tone={error.kind === "research-failed" && error.code === "NO_FILINGS_AVAILABLE" ? "notice" : undefined}>
           <span>{error.kind === "report-unavailable" ? copy.reportUnavailable : (error.detail ?? copy.coreUnavailable)}</span>
           <div className="error-actions">
+            {error.kind === "research-failed" && error.code?.startsWith("VISION_") && (
+              <button type="button" onClick={() => setActiveView("settings")}>{copy.openVisionSettings}</button>
+            )}
             {canRetry && <button type="button" onClick={() => void retryResearch()}>{error.kind === "research-failed" ? copy.retryFetch : copy.retry}</button>}
             {error.kind === "research-failed" && error.disclosureUrl && <button type="button" onClick={() => void openFailedDisclosure()}><ExternalLink size={14} />{copy.officialDisclosure}</button>}
           </div>
@@ -246,12 +249,12 @@ export default function App() {
           ) : activeView === "ot-studio" ? (
             <OtStudioView language={language} onOpenModelCenter={() => setActiveView("models")} />
           ) : activeView === "new-research" && bootstrap ? (
-            <NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={() => setActiveView("models")} onSavePreferences={savePreferences} onStart={startNewResearch} />
+            <NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={() => setActiveView("models")} onOpenVisionSettings={() => setActiveView("settings")} onSavePreferences={savePreferences} onStart={startNewResearch} />
           ) : activeView === "history" && bootstrap ? (
             <HistoryView runs={bootstrap.recent_runs} language={language} copy={copy}
               onRefresh={refreshBootstrap} onSelect={openRun} onDelete={removeRun} />
           ) : activeView === "theses" && bootstrap ? (
-            <ThesisView copy={copy} />
+            <ThesisView copy={copy} language={language} />
           ) : activeView === "help" && bootstrap ? (
             <HelpView language={language} copy={copy} />
           ) : activeView === "about" && bootstrap ? (
