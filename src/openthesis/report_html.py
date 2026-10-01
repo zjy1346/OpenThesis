@@ -4,6 +4,8 @@ import html
 from typing import Any
 
 from .financials import (
+    cash_conversion_definition,
+    format_cash_conversion,
     format_growth,
     format_money,
     format_percent,
@@ -18,7 +20,22 @@ from .growth import (
     scenario_label,
 )
 from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
-from .report_projection import normalize_report_sections, project_report_value, report_display_value, report_field_label
+from .report_projection import (
+    claim_body_text,
+    claim_text_format_notice,
+    format_report_semantic_value,
+    normalize_report_sections,
+    project_report_value,
+    report_display_value,
+    report_field_label,
+    report_identity_title,
+)
+from .report_readiness import (
+    no_final_report_notice,
+    readiness_for_report_artifact,
+    report_readiness_notice,
+)
+from .report_revisions import resolve_report_artifact
 from .reporting import (
     ARTIFACT_LABELS,
     SECTION_LABELS_EN,
@@ -250,6 +267,7 @@ def _document(title: str, body: str, language: str = "zh-CN") -> str:
     html_lang = "zh-Hant" if normalize_language(language) == ZH_HANT else "en" if normalize_language(language) == EN else "zh-CN"
     return (
         f"<!DOCTYPE html><html lang=\"{html_lang}\"><head><meta charset=\"utf-8\">"
+        f"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"<title>{_escape(title)}</title><style>{REPORT_CSS}</style></head>"
         f"<body><div class=\"page\">{body}</div></body></html>"
     )
@@ -505,6 +523,16 @@ def _financial_section(
     table += "</tbody></table>"
     detail_rows = [
         (
+            _pick(language, "现金利润转化率", "Cash conversion"),
+            format_cash_conversion(latest, language),
+            "cash_conversion_status" in latest,
+        ),
+        (
+            _pick(language, "计算口径", "Definition"),
+            cash_conversion_definition(latest, language),
+            "cash_conversion_status" in latest,
+        ),
+        (
             _pick(language, "毛利率", "Gross margin"),
             format_percent(latest.get("gross_margin")),
             latest.get("gross_margin") is not None,
@@ -530,7 +558,10 @@ def _financial_section(
         '<div class="callout"><strong>'
         + _escape(_pick(language, "增长与质量指标", "Growth and Quality Metrics"))
         + '</strong><ul class="list">'
-        + "".join(f"<li>{_escape(label)}：{_escape(value)}</li>" for label, value in visible_detail_rows)
+        + "".join(
+            f"<li>{_escape(label)}{': ' if english else '：'}{_escape(value)}</li>"
+            for label, value in visible_detail_rows
+        )
         + "</ul></div>"
         if visible_detail_rows else ""
     )
@@ -970,11 +1001,31 @@ def _normalized_confidence(value: object) -> float | None:
 
 def _claims_section(value: object, language: str) -> str:
     claims = value if isinstance(value, list) else []
-    normalized: list[dict[str, Any]] = [item for item in claims if isinstance(item, dict)]
+    normalized: list[dict[str, Any]] = []
+    malformed_count = 0
+    for item in claims:
+        if not isinstance(item, dict):
+            continue
+        raw_text = item.get("text")
+        if raw_text in (None, "", [], ()):
+            raw_text = item.get("conclusion") or item.get("argument")
+        text, malformed = claim_body_text(raw_text)
+        malformed = malformed or bool(item.get("text_format_warning"))
+        malformed_count += int(malformed)
+        if text:
+            normalized.append({**item, "text": text})
     if not normalized:
+        warning = (
+            '<div class="callout callout-warning">'
+            + _escape(claim_text_format_notice(language) + f" ({malformed_count})")
+            + "</div>"
+            if malformed_count
+            else ""
+        )
+        body = warning if malformed_count else _render_generic(value, language)
         return _section(
             _pick(language, "主要结论", "Key Conclusions"),
-            _render_generic(value, language),
+            body,
             section_id="claims",
         )
     grouped: dict[float | None, list[dict[str, Any]]] = {}
@@ -982,6 +1033,12 @@ def _claims_section(value: object, language: str) -> str:
         confidence = _normalized_confidence(claim.get("confidence"))
         grouped.setdefault(confidence, []).append(claim)
     group_html: list[str] = []
+    if malformed_count:
+        group_html.append(
+            '<div class="callout callout-warning">'
+            + _escape(claim_text_format_notice(language) + f" ({malformed_count})")
+            + "</div>"
+        )
     for confidence in sorted(
         grouped,
         key=lambda item: (item is None, 0.0 if item is None else -item),
@@ -994,10 +1051,17 @@ def _claims_section(value: object, language: str) -> str:
         for claim in items:
             text = claim.get("text") or claim.get("conclusion") or claim.get("argument") or ""
             kind = report_display_value(str(claim.get("kind", "inference")), language)
+            evidence_count = claim.get("evidence_count")
+            evidence_note = (
+                f'<div class="meta">{_escape(_pick(language, f"{evidence_count} 条有效引用", f"{evidence_count} valid references"))}</div>'
+                if isinstance(evidence_count, int) and evidence_count > 0
+                else ""
+            )
             cards.append(
                 '<div class="claim-card">'
                 f'<span class="badge">{_escape(kind)}</span>'
                 f"{_paragraphs(text)}"
+                f"{evidence_note}"
                 "</div>"
             )
         group_html.append(
@@ -1013,20 +1077,30 @@ def _claims_section(value: object, language: str) -> str:
     )
 
 
-def _render_generic(value: object, language: str, level: int = 0) -> str:
+def _render_generic(
+    value: object,
+    language: str,
+    level: int = 0,
+    field_name: str | None = None,
+) -> str:
     if value is None:
         return f"<span class=\"muted\">{_escape(_pick(language, '证据不足或尚未提供。', 'Insufficient evidence or not provided.'))}</span>"
+    semantic_value = format_report_semantic_value(value, field_name)
+    if semantic_value is not None:
+        return _escape(semantic_value)
     if isinstance(value, str):
         return _paragraphs(report_display_value(value, language))
     if isinstance(value, bool):
         return _escape(_pick(language, "是" if value else "否", "Yes" if value else "No"))
     if isinstance(value, (int, float)):
-        return _escape(value)
+        if isinstance(value, float):
+            return _escape(f"{value:,.4f}".rstrip("0").rstrip("."))
+        return _escape(f"{value:,}")
     if isinstance(value, list):
         if not value:
             return f"<span class=\"muted\">{_escape(_pick(language, '暂无。', 'None.'))}</span>"
         return "<ul class=\"list\">" + "".join(
-            f"<li>{_render_generic(item, language, level + 1)}</li>"
+            f"<li>{_render_generic(item, language, level + 1, field_name)}</li>"
             for item in value
         ) + "</ul>"
     if isinstance(value, dict):
@@ -1037,9 +1111,9 @@ def _render_generic(value: object, language: str, level: int = 0) -> str:
             label = report_field_label(key, language)
             parts.append(
                 f"<div class=\"label\">{_escape(label)}</div>"
-                f"{_render_generic(item, language, level + 1)}"
+                f"{_render_generic(item, language, level + 1, str(key))}"
             )
-        return "".join(parts)
+        return "".join(parts) or f"<span class=\"muted\">{_escape(_pick(language, '暂无可显示内容。', 'No displayable content.'))}</span>"
     return _escape(value)
 
 
@@ -1061,73 +1135,92 @@ def _report_sections(
     for key, title in labels.items():
         if key not in display_report:
             continue
-        if key == "business_model":
-            parts.append(
-                _business_model_section(
-                    project_report_value(
-                        display_report[key],
-                        include_technical=include_technical,
-                        section=key,
-                        available_evidence=available_evidence,
-                    ),
-                    language,
-                )
-            )
-            continue
-        if key == "claims":
-            parts.append(
-                _claims_section(
-                    project_report_value(
-                        display_report[key],
-                        include_technical=include_technical,
-                        section=key,
-                        available_evidence=available_evidence,
-                    ),
-                    language,
-                )
-            )
-            continue
-        if key == "growth_opportunities":
-            projected = project_report_value(
-                display_report[key],
-                include_technical=include_technical,
-                section=key,
-                available_evidence=available_evidence,
-            )
-            if not growth_opportunities_from_value(projected, language):
+        try:
+            if key == "business_model":
                 parts.append(
-                    _section(
-                        title,
-                        _render_generic(projected, language),
-                        section_id="growth",
+                    _business_model_section(
+                        project_report_value(
+                            display_report[key],
+                            include_technical=include_technical,
+                            section=key,
+                            available_evidence=available_evidence,
+                        ),
+                        language,
+                    )
+                )
+                continue
+            if key == "claims":
+                parts.append(
+                    _claims_section(
+                        project_report_value(
+                            display_report[key],
+                            include_technical=include_technical,
+                            section=key,
+                            available_evidence=available_evidence,
+                        ),
+                        language,
+                    )
+                )
+                continue
+            if key == "growth_opportunities":
+                projected = project_report_value(
+                    display_report[key],
+                    include_technical=include_technical,
+                    section=key,
+                    available_evidence=available_evidence,
+                )
+                if not growth_opportunities_from_value(projected, language):
+                    parts.append(
+                        _section(
+                            title,
+                            _render_generic(projected, language),
+                            section_id="growth",
+                        )
+                    )
+                    continue
+                parts.append(
+                    _growth_section(
+                        projected,
+                        language,
+                        include_technical,
+                        available_evidence,
+                        counts_projected=True,
                     )
                 )
                 continue
             parts.append(
-                _growth_section(
-                    projected,
-                    language,
-                    include_technical,
-                    available_evidence,
-                    counts_projected=True,
+                _section(
+                    title,
+                    _render_generic(
+                        project_report_value(
+                            display_report[key],
+                            include_technical=include_technical,
+                            section=key,
+                            available_evidence=available_evidence,
+                        ),
+                        language,
+                    ),
+                    section_id=("opposing-views" if key == "counterarguments" else key.replace("_", "-")),
                 )
             )
-            continue
-        parts.append(
-            _section(
-                title,
-                _render_generic(
-                    project_report_value(
-                        display_report[key],
-                        include_technical=include_technical,
-                        section=key,
-                        available_evidence=available_evidence,
-                    ),
-                    language,
-                ),
-                section_id=("opposing-views" if key == "counterarguments" else key.replace("_", "-")),
+        except Exception as exc:
+            message = _pick(
+                language,
+                "本章节暂时无法显示；其他已验证章节仍予保留。",
+                "This section could not be displayed; other verified sections remain available.",
             )
-        )
+            technical = (
+                f"<div class=\"meta\"><code>{_escape(key)}: {_escape(type(exc).__name__)}</code></div>"
+                if include_technical
+                else ""
+            )
+            parts.append(
+                _section(
+                    title,
+                    f'<div class="callout callout-warning">{_escape(message)}</div>{technical}',
+                    section_id=("opposing-views" if key == "counterarguments" else key.replace("_", "-")),
+                )
+            )
     return "".join(parts)
 
 
@@ -1180,28 +1273,29 @@ def _sources_section(
 ) -> str:
     if not isinstance(evidence, list):
         return ""
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for item in evidence:
         if not isinstance(item, dict):
             continue
         url = str(item.get("source_url", "")).strip()
-        identity = (str(item.get("evidence_id", "")), url)
-        if not url or identity in seen:
+        if not url:
             continue
-        seen.add(identity)
-        unique.append(item)
-    if not unique:
+        document_id = str(item.get("document_id", "") or url)
+        identity = (document_id, url)
+        source = grouped.setdefault(identity, {
+            "title": item.get("title") or item.get("concept") or _pick(language, "SEC 来源", "SEC source"),
+            "source_url": url,
+            "locators": [],
+        })
+        locator = str(item.get("locator", "")).strip()
+        if locator and locator not in source["locators"]:
+            source["locators"].append(locator)
+    if not grouped:
         return ""
     rows: list[str] = []
-    for item in unique[:40]:
-        title = (
-            item.get("title")
-            or item.get("concept")
-            or _pick(language, "SEC 来源", "SEC source")
-        )
-        locator = str(item.get("locator", "")).strip()
-        suffix = f" · {locator}" if locator else ""
+    for item in grouped.values():
+        title = item["title"]
+        suffix = " · " + " · ".join(item["locators"]) if item["locators"] else ""
         rows.append(
             "<div class=\"source\">"
             f"<a href=\"{_escape(item['source_url'])}\">{_escape(title)}</a>"
@@ -1254,7 +1348,7 @@ def _technical_process(
     )
 
 
-def render_research_html(
+def _render_html_projection(
     run_id: str,
     artifacts: list[dict[str, Any]],
     language: str = "zh-CN",
@@ -1263,10 +1357,38 @@ def render_research_html(
     include_technical: bool = False,
 ) -> str:
     language = normalize_language(language)
-    title = company_name or _pick(language, "公司研究报告", "Company Research Report")
+    final = resolve_report_artifact(artifacts)
+    if not artifacts:
+        heading, message = no_final_report_notice(language, has_stage_materials=False)
+        return _document(
+            heading,
+            _section(
+                heading,
+                '<div class="callout callout-warning">' + _escape(message) + "</div>",
+                section_id="report-readiness",
+            ),
+            language,
+        )
+    title = report_identity_title(
+        artifacts, language, explicit_name=company_name
+    )
+    final_readiness = readiness_for_report_artifact(final, artifacts)
+    complete_report = (
+        isinstance(final_readiness, dict)
+        and final_readiness.get("state") == "complete"
+        and final_readiness.get("complete") is True
+    )
+    no_final_heading, no_final_message = no_final_report_notice(language)
+    hero_label = (
+        _pick(language, "长期公司研究", "Long-term company research")
+        if complete_report
+        else _pick(language, "阶段性研究", "Staged research")
+        if final is not None
+        else no_final_heading
+    )
     hero = (
         "<div class=\"hero\">"
-        f"<div class=\"eyebrow\">{_escape(_pick(language, '长期公司研究', 'Long-term company research'))}</div>"
+        f"<div class=\"eyebrow\">{_escape(hero_label)}</div>"
         f"<h1>{_escape(title)}</h1>"
         f"<div class=\"meta\">{_escape(_pick(language, '研究运行', 'Research run'))}: <code>{_escape(run_id)}</code></div>"
         "<div class=\"notice\">"
@@ -1285,7 +1407,6 @@ def render_research_html(
     )
     valuation = _artifact(artifacts, "deterministic-valuation")
     growth_artifact = _artifact(artifacts, "growth-opportunities", reverse=True)
-    final = _artifact(artifacts, "research-report", reverse=True)
     growth_rendered = False
     available_evidence = {
         str(item.get("evidence_id"))
@@ -1297,6 +1418,16 @@ def render_research_html(
     }
 
     body = [hero]
+    if final is None:
+        body.append(
+            _section(
+                no_final_heading,
+                '<div class="callout callout-warning">'
+                + _escape(no_final_message)
+                + "</div>",
+                section_id="report-readiness",
+            )
+        )
     if deterministic:
         body.append(
             _financial_section(
@@ -1313,6 +1444,17 @@ def render_research_html(
         body.append(_valuation_section(valuation.get("content"), language))
     if final:
         content = final.get("content", {})
+        readiness_notice = report_readiness_notice(final_readiness, language)
+        if readiness_notice:
+            body.append(
+                _section(
+                    readiness_notice[0],
+                    '<div class="callout callout-warning">'
+                    + _escape(readiness_notice[1])
+                    + "</div>",
+                    section_id="report-readiness",
+                )
+            )
         if content.get("mode") == "deterministic-only":
             body.append(
                 _section(
@@ -1436,3 +1578,21 @@ def render_research_html(
         + "</div>"
     )
     return _document(title, "".join(part for part in body if part), language)
+
+
+def render_research_html(
+    run_id: str,
+    artifacts: list[dict[str, Any]],
+    language: str = "zh-CN",
+    *,
+    company_name: str = "",
+    include_technical: bool = False,
+) -> str:
+    """Compatibility entry point; HTML lays out the shared ReportDocument."""
+    from .report_document import assemble_report_document, render_html
+
+    document = assemble_report_document(
+        run_id, artifacts, continuity=None, language=language,
+        company_name=company_name, include_technical=include_technical,
+    )
+    return render_html(document)

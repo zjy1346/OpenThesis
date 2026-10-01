@@ -3,15 +3,24 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = False, code: str = "MODEL_ERROR"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        code: str = "MODEL_ERROR",
+        retry_after_seconds: int | float | None = None,
+    ):
         self.retryable = retryable
         self.code = code
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(message)
 
 
@@ -64,6 +73,7 @@ class ModelConfig:
     configuration_version: int = 1
     role: str = "primary"
     timeout_seconds: int = 180
+    connection_id: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -152,6 +162,12 @@ class RustModelGatewayProvider:
         self.config = config
         configured_path = gateway_path or os.environ.get("OPENTHESIS_MODEL_GATEWAY_PATH", "")
         self.gateway_path = Path(configured_path) if configured_path else None
+        self._cancel_check: Callable[[], bool] | None = None
+
+    def set_cancel_check(self, cancel_check: Callable[[], bool] | None) -> None:
+        """Attach the run-scoped cancellation signal without changing prompts."""
+
+        self._cancel_check = cancel_check
 
     def test_connection(self) -> str:
         result = self.generate(
@@ -210,18 +226,26 @@ class RustModelGatewayProvider:
                 "模型请求超过网关大小限制。",
                 code="MODEL_GATEWAY_PROTOCOL_ERROR",
             )
+        timeout_seconds = max(5, min(600, int(self.config.timeout_seconds))) + 20
         options: dict[str, Any] = {
             "args": [str(path), "--model-gateway"],
             "input": encoded,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.DEVNULL,
             "check": False,
-            "timeout": max(5, min(600, int(self.config.timeout_seconds))) + 20,
+            "timeout": timeout_seconds,
         }
         if os.name == "nt":
             options["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
-            completed = subprocess.run(**options)
+            completed = (
+                self._run_cancellable_gateway(
+                    options["args"], encoded, timeout_seconds,
+                    int(options.get("creationflags", 0)),
+                )
+                if self._cancel_check is not None
+                else subprocess.run(**options)
+            )
         except subprocess.TimeoutExpired as exc:
             raise ProviderError(
                 "模型网关调用超时。",
@@ -252,10 +276,20 @@ class RustModelGatewayProvider:
             error = error if isinstance(error, dict) else {}
             code = str(error.get("code", "MODEL_GATEWAY_ERROR"))[:80]
             message = _safe_gateway_error_message(error.get("message", "模型网关调用失败。"))
+            retry_after = error.get("retry_after_seconds")
+            try:
+                retry_after_seconds = (
+                    max(1, min(300, int(retry_after)))
+                    if retry_after is not None and code == "MODEL_RATE_LIMITED"
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError):
+                retry_after_seconds = None
             raise ProviderError(
                 f"{code}: {message}",
                 retryable=bool(error.get("retryable", False)),
                 code=code,
+                retry_after_seconds=retry_after_seconds,
             )
         payload = response.get("result")
         if not isinstance(payload, dict):
@@ -268,6 +302,53 @@ class RustModelGatewayProvider:
         meta = payload.get("meta")
         result["_response_meta"] = dict(meta) if isinstance(meta, dict) else {}
         return result
+
+    def _run_cancellable_gateway(
+        self,
+        args: list[str],
+        encoded: bytes,
+        timeout_seconds: int,
+        creationflags: int,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Supervise the gateway so cancel and hard-timeout terminate it."""
+
+        started = time.monotonic()
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+        first = True
+        while True:
+            if self._cancel_check and self._cancel_check():
+                process.kill()
+                process.communicate()
+                raise ProviderError(
+                    "模型调用已取消。", retryable=False, code="MODEL_CANCELLED"
+                )
+            remaining = timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise ProviderError(
+                    "模型网关调用超时。", retryable=True, code="MODEL_TIMEOUT"
+                )
+            try:
+                stdout, _ = process.communicate(
+                    input=encoded if first else None,
+                    timeout=min(0.1, remaining),
+                )
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=int(process.returncode or 0),
+                    stdout=stdout,
+                    stderr=b"",
+                )
+            except subprocess.TimeoutExpired:
+                first = False
+                continue
 
     def _validated_gateway_path(self) -> Path:
         path = self.gateway_path

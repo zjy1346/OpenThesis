@@ -286,8 +286,10 @@ class CnInfoAdapter:
 
     def list_financial_filings(self, company: Company, *, limit: int = 5) -> list[FilingDocument]:
         exchange = Exchange(company.exchange)
+        code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(company.ticker))
+        security_code = code_match.group(1) if code_match else str(company.ticker).strip()[:6]
         row = next(
-            (item for item in self._search_rows(company.ticker[:6], 10) if item["code"] == company.ticker[:6]),
+            (item for item in self._search_rows(security_code, 10) if item["code"] == security_code),
             None,
         )
         if row is None:
@@ -349,8 +351,23 @@ class CnInfoAdapter:
                     code="FILING_STATUS_UNVERIFIED",
                 )
         if total_announcements and total_announcements > len(announcements):
-            page_count = min(10, (total_announcements + 29) // 30)
+            page_count = (total_announcements + 29) // 30
+            required_annual_cohorts = max(1, int(limit)) + 1
+
+            def annual_cohort_count(rows: list[Any]) -> int:
+                return len({
+                    filing.period_end
+                    for filing in (
+                        self._filing(company, item)
+                        for item in rows
+                        if isinstance(item, dict)
+                    )
+                    if filing is not None and filing.form_type == "ANNUAL_REPORT"
+                })
+
             for page_number in range(2, page_count + 1):
+                if annual_cohort_count(announcements) >= required_annual_cohorts:
+                    break
                 page_fields = dict(query_fields)
                 page_fields["pageNum"] = str(page_number)
                 page_payload = self.transport.post_form(

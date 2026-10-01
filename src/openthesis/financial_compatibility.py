@@ -41,7 +41,10 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _RULE_KEYS = frozenset(
-    {"title_aliases", "scope_aliases", "unit_aliases", "taxonomy_aliases"}
+    {
+        "title_aliases", "scope_aliases", "unit_aliases", "taxonomy_aliases",
+        "document_role_aliases", "period_aliases", "table_header_aliases",
+    }
 )
 _DANGEROUS_KEYS = frozenset(
     {
@@ -86,6 +89,9 @@ class FinancialRulesSnapshot:
     scope_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
     unit_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
     taxonomy_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    document_role_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    period_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    table_header_aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @classmethod
     def empty(cls) -> "FinancialRulesSnapshot":
@@ -109,6 +115,9 @@ class FinancialRulesSnapshot:
             freeze("scope_aliases"),
             freeze("unit_aliases"),
             freeze("taxonomy_aliases"),
+            freeze("document_role_aliases"),
+            freeze("period_aliases"),
+            freeze("table_header_aliases"),
         )
 
     def aliases(self, rule_name: str, canonical: str) -> tuple[str, ...]:
@@ -132,6 +141,9 @@ class FinancialRulesSnapshot:
             "scope_aliases": self.scope_aliases,
             "unit_aliases": self.unit_aliases,
             "taxonomy_aliases": self.taxonomy_aliases,
+            "document_role_aliases": self.document_role_aliases,
+            "period_aliases": self.period_aliases,
+            "table_header_aliases": self.table_header_aliases,
         }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -150,6 +162,9 @@ class FinancialRulesSnapshot:
             "scope_aliases": expand(self.scope_aliases),
             "unit_aliases": expand(self.unit_aliases),
             "taxonomy_aliases": expand(self.taxonomy_aliases),
+            "document_role_aliases": expand(self.document_role_aliases),
+            "period_aliases": expand(self.period_aliases),
+            "table_header_aliases": expand(self.table_header_aliases),
         }
 
     @classmethod
@@ -171,6 +186,8 @@ class FinancialRulesSnapshot:
             str(raw.get("payload_sha256", "")), str(raw.get("trust_status", "none")),
             freeze(raw.get("title_aliases")), freeze(raw.get("scope_aliases")),
             freeze(raw.get("unit_aliases")), freeze(raw.get("taxonomy_aliases")),
+            freeze(raw.get("document_role_aliases")), freeze(raw.get("period_aliases")),
+            freeze(raw.get("table_header_aliases")),
         )
 
 
@@ -576,3 +593,44 @@ class CompatibilityPackRegistry:
     def active_summaries(self) -> tuple[dict[str, str], ...]:
         packs, _ = self._reconcile(self._load_packs())
         return tuple(pack.summary() for pack in packs)
+
+    def install_verified(
+        self,
+        payload: bytes,
+        *,
+        corpus_preflight: Any | None = None,
+    ) -> CompatibilityPack:
+        """Install signed declarative rules atomically after an optional corpus gate.
+
+        Transport is intentionally outside this class.  Callers may download an
+        official manifest, but neither the manifest nor a pack can introduce a
+        URL, executable code, parser module or relaxed quality contract.
+        """
+
+        if len(payload) > _MAX_PACK_BYTES:
+            raise CompatibilityPackError("pack exceeds size limit")
+        try:
+            raw = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise CompatibilityPackError("pack is not valid UTF-8 JSON") from exc
+        fd, temp_name = tempfile.mkstemp(prefix="candidate-", suffix=".json", dir=self.root)
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            candidate = _parse_pack(raw, temp_path, self._trusted_public_keys)
+            if not candidate.supports_app(self.app_version):
+                raise CompatibilityPackError("pack is incompatible with this app")
+            if corpus_preflight is not None and corpus_preflight(FinancialRulesSnapshot.from_pack(candidate)) is not True:
+                raise CompatibilityPackError("pack failed the corpus preflight")
+            final_path = self.root / f"{candidate.pack_id}-{candidate.version}-{candidate.payload_sha256[:12]}.json"
+            os.replace(temp_path, final_path)
+            installed = _parse_pack(raw, final_path, self._trusted_public_keys)
+            return self.activate(installed.pack_id, installed.version)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass

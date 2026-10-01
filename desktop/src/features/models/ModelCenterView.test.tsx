@@ -104,6 +104,25 @@ describe("ModelCenterView", () => {
     expect(glmLogo.querySelector("img")).toHaveAttribute("src", expect.stringContaining("glm"));
   });
 
+  it("persists the configured model timeout through the model-center API", async () => {
+    render(<ModelCenterView language="en" />);
+    fireEvent.click(await screen.findByRole("button", { name: /OpenAI/ }));
+
+    const timeoutInput = await screen.findByLabelText("Request timeout (seconds): Primary GPT");
+    fireEvent.change(timeoutInput, { target: { value: "240" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save timeout" }));
+
+    await waitFor(() => expect(saveConfiguredModel).toHaveBeenCalledWith({
+      configured_model_id: model.configured_model_id,
+      connection_id: model.connection_id,
+      model_id: model.model_id,
+      alias: model.alias,
+      enabled: model.enabled,
+      capabilities: model.capabilities,
+      timeout_seconds: 240,
+    }));
+  });
+
   it("rotates a secret in an accessible dialog without reading the previous secret", async () => {
     render(<ModelCenterView language="en" />);
     fireEvent.click(await screen.findByRole("button", { name: /OpenAI/ }));
@@ -195,7 +214,7 @@ describe("ModelCenterView", () => {
     fireEvent.click(screen.getByRole("button", { name: "测试" }));
 
     await waitFor(() => expect(testConfiguredModel).toHaveBeenCalledWith(model.configured_model_id));
-    expect(await screen.findByText("连接测试成功。")).toBeVisible();
+    expect(await screen.findByText("连接检查成功；尚未测试完整研究容量。")).toBeVisible();
     expect(screen.queryByText("Connection succeeded.")).not.toBeInTheDocument();
   });
 
@@ -241,6 +260,19 @@ describe("ModelCenterView", () => {
     fireEvent.click(screen.getByText("Work account"));
     fireEvent.click(screen.getByRole("button", { name: /Test connection/ }));
     await waitFor(() => expect(testProviderConnection).toHaveBeenCalledWith(connection.connection_id, "custom-model"));
+  });
+
+  it("probes a custom endpoint before a model is configured", async () => {
+    vi.mocked(listProviderConnections).mockResolvedValue([{ ...connection, provider_id: "custom" }]);
+    vi.mocked(listConfiguredModels).mockResolvedValue([]);
+    render(<ModelCenterView language="en" />);
+    fireEvent.click(await screen.findByRole("button", { name: /Custom endpoint/ }));
+    fireEvent.click(screen.getByText("Work account"));
+
+    const testButton = screen.getByRole("button", { name: "Test connection · Endpoint probe (no model)" });
+    expect(testButton).toBeEnabled();
+    fireEvent.click(testButton);
+    await waitFor(() => expect(testProviderConnection).toHaveBeenCalledWith(connection.connection_id));
   });
 
   it("keeps built-ins first and deduplicates online discovery results", async () => {

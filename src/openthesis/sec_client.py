@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import time
 import urllib.error
 import urllib.request
+from email.utils import parsedate_to_datetime
+from dataclasses import dataclass
+from datetime import date
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -18,6 +22,95 @@ from .download_safety import UnsafeDisclosurePayload, store_immutable_payload
 SEC_DATA_BASE = "https://data.sec.gov"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+
+_ANNUAL_FORMS = frozenset({
+    "10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A",
+})
+_MIN_ANNUAL_DURATION_DAYS = 350
+_MAX_ANNUAL_DURATION_DAYS = 380
+
+
+def _normalize_sec_exchange(value: object) -> str:
+    if isinstance(value, list):
+        value = next((item for item in value if str(item).strip()), "")
+    normalized = str(value or "").strip().upper()
+    if "NASDAQ" in normalized:
+        return "NASDAQ"
+    if normalized in {"NYSE", "NEW YORK STOCK EXCHANGE"}:
+        return "NYSE"
+    if normalized in {"NYSE AMERICAN", "NYSEAMERICAN", "AMEX"}:
+        return "AMEX"
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodSemantics:
+    """Evidence-based classification of an SEC CompanyFacts annual candidate.
+
+    ``fp=FY`` is only a filing label. A flow is annual only when its actual
+    inclusive start/end span is within the normal fiscal-year window and its
+    SEC fiscal-year label falls inside that date interval. Instant facts are
+    point-in-time observations and therefore must have no duration start and
+    an end date in the labeled fiscal year.
+    """
+
+    kind: str
+    complete: bool
+    reason: str
+    period_days: int | None = None
+
+    @classmethod
+    def for_row(cls, row: dict[str, Any], expected_kind: str = "auto") -> PeriodSemantics:
+        kind = str(expected_kind or "auto").strip().lower()
+        if kind == "auto":
+            kind = "duration" if row.get("start") not in (None, "") else "instant"
+        if kind not in {"duration", "instant"}:
+            return cls("invalid", False, "unknown_period_kind")
+
+        form = str(row.get("form", "")).strip().upper()
+        if form not in _ANNUAL_FORMS:
+            return cls("invalid", False, "non_annual_form")
+        if str(row.get("fp", "")).strip().upper() != "FY":
+            return cls("invalid", False, "non_fy_label")
+        fiscal_year = row.get("fy")
+        if isinstance(fiscal_year, bool) or not isinstance(fiscal_year, int):
+            return cls("invalid", False, "missing_fiscal_year")
+        if not str(row.get("accn", "")).strip():
+            return cls("invalid", False, "missing_accession")
+        try:
+            filed = date.fromisoformat(str(row.get("filed", "")))
+            end = date.fromisoformat(str(row.get("end", "")))
+        except (TypeError, ValueError):
+            return cls("invalid", False, "invalid_source_date")
+        start_value = row.get("start")
+        if kind == "instant":
+            if start_value not in (None, ""):
+                return cls("invalid", False, "instant_has_duration_start")
+            if end.year != fiscal_year:
+                return cls("invalid", False, "instant_end_not_in_fiscal_year")
+            if end > filed:
+                return cls("invalid", False, "period_end_after_filing")
+            return cls("instant", True, "point_in_time_fy_end")
+
+        if start_value in (None, ""):
+            return cls("invalid", False, "duration_missing_start")
+        try:
+            start = date.fromisoformat(str(start_value))
+        except (TypeError, ValueError):
+            return cls("invalid", False, "invalid_start_date")
+        if end < start:
+            return cls("invalid", False, "period_end_before_start")
+        if end > filed:
+            return cls("invalid", False, "period_end_after_filing")
+        period_days = (end - start).days + 1
+        if period_days < _MIN_ANNUAL_DURATION_DAYS:
+            return cls("short_duration", False, "duration_below_annual_window", period_days)
+        if period_days > _MAX_ANNUAL_DURATION_DAYS:
+            return cls("invalid", False, "duration_above_annual_window", period_days)
+        if not (start.year <= fiscal_year <= end.year):
+            return cls("invalid", False, "fiscal_year_outside_period")
+        return cls("annual_duration", True, "complete_fiscal_year", period_days)
 
 
 CONCEPT_MAP: dict[str, tuple[str, ...]] = {
@@ -65,9 +158,17 @@ IFRS_CONCEPT_MAP: dict[str, tuple[str, ...]] = {
         "ProfitLossAttributableToOrdinaryEquityHoldersOfParentEntity",
         "ProfitLoss",
     ),
+    "operating_income": (
+        "ProfitLossFromOperatingActivities",
+        "OperatingProfitLoss",
+    ),
     "operating_cash_flow": (
         "CashFlowsFromUsedInOperatingActivities",
         "CashFlowsFromUsedInOperations",
+    ),
+    "capital_expenditure": (
+        "PurchaseOfPropertyPlantAndEquipment",
+        "PaymentsToAcquirePropertyPlantAndEquipment",
     ),
     "assets": ("Assets",),
     "liabilities": ("Liabilities",),
@@ -119,6 +220,54 @@ SEC_HK_ISSUERS: dict[str, tuple[str, str, str, str]] = {
     "09988.HK": ("0001577552", "BABA", "CNY", "US_GAAP"),
 }
 
+# Stable aliases attach to the security ticker, never to a display position.
+# Exact multilingual aliases are intentionally curated; typo tolerance is
+# restricted to Latin ticker/name tokens below so a fuzzy Chinese query cannot
+# silently select the wrong issuer.
+SEC_SECURITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "AAPL": ("苹果", "蘋果", "苹果公司", "蘋果公司"),
+    "MSFT": ("微软", "微軟", "微软公司", "微軟公司"),
+    "NVDA": ("英伟达", "英偉達", "辉达", "輝達"),
+    "AMZN": ("亚马逊", "亞馬遜"),
+    "GOOG": ("谷歌",),
+    "GOOGL": ("谷歌",),
+    "META": ("元宇宙平台", "脸书", "臉書"),
+    "TSLA": ("特斯拉",),
+    "BRK.B": ("伯克希尔哈撒韦", "波克夏海瑟威"),
+}
+
+
+def _bounded_damerau_levenshtein(left: str, right: str, limit: int) -> int:
+    """Optimal-string-alignment distance with an early length bound."""
+
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous_previous: list[int] | None = None
+    previous = list(range(len(right) + 1))
+    for row_index, left_char in enumerate(left, 1):
+        current = [row_index]
+        row_min = row_index
+        for column_index, right_char in enumerate(right, 1):
+            value = min(
+                current[column_index - 1] + 1,
+                previous[column_index] + 1,
+                previous[column_index - 1] + (left_char != right_char),
+            )
+            if (
+                previous_previous is not None
+                and row_index > 1
+                and column_index > 1
+                and left_char == right[column_index - 2]
+                and left[row_index - 2] == right_char
+            ):
+                value = min(value, previous_previous[column_index - 2] + 1)
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return limit + 1
+        previous_previous, previous = previous, current
+    return previous[-1]
+
 
 class SecClientError(RuntimeError):
     pass
@@ -166,36 +315,94 @@ class TextExtractor(HTMLParser):
         return raw.strip()
 
 
+def _retry_after_seconds(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(text).timestamp() - time.time()
+            return max(0.0, delay)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
 class SecClient:
-    def __init__(self, user_agent: str, cache_dir: Path, min_interval: float = 0.12):
+    def __init__(
+        self, user_agent: str, cache_dir: Path, min_interval: float = 0.12,
+        *, max_response_bytes: int = 64 * 1024 * 1024, max_attempts: int = 4,
+        request_deadline_seconds: float = 90.0,
+    ):
         if not user_agent or "@" not in user_agent:
             raise ValueError("SEC User-Agent 必须包含联系邮箱，例如 OpenThesis name@example.com")
         self.user_agent = user_agent
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.min_interval = min_interval
+        self.max_response_bytes = max(1, int(max_response_bytes))
+        self.max_attempts = max(1, int(max_attempts))
+        self.request_deadline_seconds = max(1.0, float(request_deadline_seconds))
         self._last_request = 0.0
+        # Discovery has historically returned only filings, so diagnostics
+        # are exposed out-of-band to preserve that API for existing callers.
+        self.discovery_diagnostics: tuple[str, ...] = ()
 
     def _request_bytes(self, url: str) -> bytes:
-        elapsed = time.monotonic() - self._last_request
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": self.user_agent,
-                "Accept-Encoding": "identity",
-                "Accept": "application/json,text/html,*/*",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = response.read()
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise SecClientError(f"SEC 请求失败：{url}\n{exc}") from exc
-        finally:
-            self._last_request = time.monotonic()
-        return payload
+        deadline = time.monotonic() + self.request_deadline_seconds
+        last_error: Exception | None = None
+        for attempt in range(self.max_attempts):
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": self.user_agent,
+                    "Accept-Encoding": "identity",
+                    "Accept": "application/json,text/html,*/*",
+                },
+            )
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                with urllib.request.urlopen(request, timeout=min(30.0, remaining)) as response:
+                    declared = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
+                    if declared and int(declared) > self.max_response_bytes:
+                        raise SecClientError("SEC_RESPONSE_TOO_LARGE")
+                    chunks: list[bytes] = []
+                    total = 0
+                    while True:
+                        chunk = response.read(min(64 * 1024, self.max_response_bytes - total + 1))
+                        if not chunk:
+                            return b"".join(chunks)
+                        total += len(chunk)
+                        if total > self.max_response_bytes:
+                            raise SecClientError("SEC_RESPONSE_TOO_LARGE")
+                        chunks.append(chunk)
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code not in {429, 503} or attempt + 1 >= self.max_attempts:
+                    break
+                retry_after = _retry_after_seconds(exc.headers.get("Retry-After", ""))
+                delay = retry_after if retry_after is not None else min(8.0, 0.5 * (2 ** attempt))
+                delay += random.uniform(0.0, min(0.25, delay * 0.1))
+                if time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = exc
+                if attempt + 1 >= self.max_attempts:
+                    break
+                delay = min(8.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.1)
+                if time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
+            finally:
+                self._last_request = time.monotonic()
+        raise SecClientError(f"SEC 请求失败：{url}\n{last_error or 'request deadline exceeded'}") from last_error
 
     def _get_json(self, url: str, cache_name: str | None = None) -> dict[str, Any]:
         cache_path = self.cache_dir / cache_name if cache_name else None
@@ -205,37 +412,82 @@ class SecClient:
                 return json.loads(cache_path.read_text(encoding="utf-8"))
         payload = self._request_bytes(url)
         if cache_path:
-            cache_path.write_bytes(payload)
+            temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
+            temporary.write_bytes(payload)
+            temporary.replace(cache_path)
         return json.loads(payload.decode("utf-8"))
-
     def search_companies(self, query: str, limit: int = 15) -> list[Company]:
-        query = query.strip().lower()
+        query = query.strip().casefold().replace("/", "-").replace(".", "-")
         if not query:
             return []
-        payload = self._get_json(SEC_TICKERS_URL, "company_tickers.json")
+        payload = self._get_json(
+            SEC_TICKERS_EXCHANGE_URL,
+            "company_tickers_exchange.json",
+        )
+        rows: list[dict[str, Any]] = []
+        if isinstance(payload.get("fields"), list) and isinstance(payload.get("data"), list):
+            fields = [str(field) for field in payload["fields"]]
+            rows = [
+                dict(zip(fields, values))
+                for values in payload["data"]
+                if isinstance(values, list) and len(values) == len(fields)
+            ]
+        else:
+            rows = [item for item in payload.values() if isinstance(item, dict)]
         matches: list[tuple[int, Company]] = []
-        for item in payload.values():
+        for item in rows:
             ticker = str(item.get("ticker", ""))
             name = str(item.get("title", ""))
-            haystack = f"{ticker} {name}".lower()
-            if query not in haystack:
+            if not name:
+                name = str(item.get("name", ""))
+            normalized_ticker = ticker.lower().replace("/", "-").replace(".", "-")
+            normalized_name = name.casefold()
+            aliases = tuple(
+                alias.casefold()
+                for alias in SEC_SECURITY_ALIASES.get(
+                    ticker.upper().replace("-", ".").replace("/", "."), ()
+                )
+            )
+            haystack = f"{normalized_ticker} {normalized_name}"
+            exact_alias = query in aliases
+            substring = query in haystack
+            fuzzy = False
+            fuzzy_distance = 99
+            if query.isascii() and query.isalnum() and len(query) >= 4:
+                threshold = 1 if len(query) <= 6 else 2
+                tokens = [normalized_ticker, *re.findall(r"[a-z0-9]{4,}", normalized_name)]
+                distances = [
+                    _bounded_damerau_levenshtein(query, token, threshold)
+                    for token in tokens
+                    if abs(len(query) - len(token)) <= threshold
+                ]
+                if distances:
+                    fuzzy_distance = min(distances)
+                    fuzzy = fuzzy_distance <= threshold
+            if not (exact_alias or substring or fuzzy):
                 continue
             score = 0
-            if ticker.lower() == query:
+            if normalized_ticker == query:
                 score += 100
-            if name.lower() == query:
+            if normalized_name == query:
                 score += 80
-            if ticker.lower().startswith(query):
+            if exact_alias:
+                score += 90
+            if normalized_ticker.startswith(query):
                 score += 40
-            if name.lower().startswith(query):
+            if normalized_name.startswith(query):
                 score += 20
+            if fuzzy:
+                score += 15 - fuzzy_distance
+            exchange = _normalize_sec_exchange(item.get("exchange"))
             matches.append(
                 (
                     score,
                     Company(
-                        cik=str(item["cik_str"]).zfill(10),
-                        ticker=ticker.upper(),
+                        cik=str(item.get("cik_str", item.get("cik", ""))).zfill(10),
+                        ticker=ticker.upper().replace("/", ".").replace("-", "."),
                         name=name,
+                        exchange=exchange,
                     ),
                 )
             )
@@ -243,39 +495,93 @@ class SecClient:
         return [company for _, company in matches[:limit]]
 
     def list_annual_filings(self, company: Company, limit: int = 5) -> list[FilingDocument]:
+        requested_limit = max(1, int(limit))
+        diagnostics: list[str] = []
         submissions = self._get_json(
             f"{SEC_DATA_BASE}/submissions/CIK{company.cik}.json",
             f"submissions-{company.cik}.json",
         )
         recent = submissions.get("filings", {}).get("recent", {})
-        forms = recent.get("form", [])
         filings: list[FilingDocument] = []
-        for index, form_type in enumerate(forms):
-            if form_type not in {"10-K", "20-F", "40-F"}:
-                continue
-            accession = recent["accessionNumber"][index]
-            accession_plain = accession.replace("-", "")
-            primary_document = recent["primaryDocument"][index]
+
+        def append_rows(rows: Any) -> None:
+            forms = rows.get("form", []) if isinstance(rows, dict) else []
+            accessions = rows.get("accessionNumber", []) if isinstance(rows, dict) else []
+            documents = rows.get("primaryDocument", []) if isinstance(rows, dict) else []
+            report_dates = rows.get("reportDate", []) if isinstance(rows, dict) else []
+            filing_dates = rows.get("filingDate", []) if isinstance(rows, dict) else []
+            if not all(isinstance(item, list) for item in (forms, accessions, documents)):
+                return
+            row_count = min(len(forms), len(accessions), len(documents))
             cik_plain = str(int(company.cik))
-            source_url = (
-                f"{SEC_ARCHIVES_BASE}/{cik_plain}/{accession_plain}/{primary_document}"
-            )
-            filings.append(
-                FilingDocument(
-                    document_id=f"sec:{company.cik}:{accession}",
-                    company_cik=company.cik,
-                    accession_number=accession,
-                    form_type=form_type,
-                    fiscal_period="FY",
-                    period_end=str(recent.get("reportDate", [""])[index]),
-                    filed_at=str(recent.get("filingDate", [""])[index]),
-                    primary_document=primary_document,
-                    source_url=source_url,
+            for index in range(row_count):
+                form_type = str(forms[index])
+                if form_type not in {"10-K", "20-F", "40-F"}:
+                    continue
+                accession = str(accessions[index])
+                primary_document = str(documents[index])
+                if not accession or not primary_document:
+                    continue
+                accession_plain = accession.replace("-", "")
+                filings.append(
+                    FilingDocument(
+                        document_id=f"sec:{company.cik}:{accession}",
+                        company_cik=company.cik,
+                        accession_number=accession,
+                        form_type=form_type,
+                        fiscal_period="FY",
+                        period_end=str(report_dates[index]) if index < len(report_dates) else "",
+                        filed_at=str(filing_dates[index]) if index < len(filing_dates) else "",
+                        primary_document=primary_document,
+                        source_url=(
+                            f"{SEC_ARCHIVES_BASE}/{cik_plain}/{accession_plain}/{primary_document}"
+                        ),
+                    )
                 )
-            )
-            if len(filings) >= limit:
+
+        append_rows(recent)
+        files = submissions.get("filings", {}).get("files", [])
+        for entry in files if isinstance(files, list) else []:
+            if len(filings) >= requested_limit:
                 break
-        return filings
+            name = str(entry.get("name", "")) if isinstance(entry, dict) else ""
+            # SEC's official shard names are flat CIK submissions JSON files.
+            # Reject path-like values instead of allowing a server response to
+            # influence local cache paths or request unrelated URLs.
+            if (
+                not name
+                or Path(name).name != name
+                or not name.startswith(f"CIK{company.cik}-submissions-")
+                or not name.endswith(".json")
+            ):
+                diagnostics.append("historical_shard_invalid_name")
+                continue
+            try:
+                shard = self._get_json(
+                    f"{SEC_DATA_BASE}/submissions/{name}", name
+                )
+                shard_rows = shard.get("filings", shard)
+                append_rows(shard_rows)
+            except Exception as exc:
+                # The return type remains list[FilingDocument] for backwards
+                # compatibility. Callers can inspect the bounded diagnostic
+                # and still use the recent filings that were already found.
+                diagnostics.append(f"historical_shard_failed:{name}:{type(exc).__name__}")
+
+        deduped: dict[str, FilingDocument] = {}
+        for filing in filings:
+            deduped.setdefault(filing.accession_number, filing)
+        result = sorted(
+            deduped.values(),
+            key=lambda item: (
+                str(item.period_end or ""),
+                str(item.filed_at or ""),
+                str(item.accession_number or ""),
+            ),
+            reverse=True,
+        )
+        self.discovery_diagnostics = tuple(dict.fromkeys(diagnostics))
+        return result[:requested_limit]
 
     def download_filing(self, filing: FilingDocument, target_dir: Path) -> FilingDocument:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -320,6 +626,25 @@ class SecClient:
             *[(concept, ifrs_full, tags) for concept, tags in IFRS_CONCEPT_MAP.items()],
             ("shares_outstanding", dei, CONCEPT_MAP["shares_outstanding"]),
         ]
+        annual_period_ends: dict[int, set[str]] = {}
+        for normalized, namespace, candidates in mappings:
+            if self._period_kind_for_concept(normalized) != "duration":
+                continue
+            for reported in candidates:
+                definition = namespace.get(reported)
+                units = definition.get("units", {}) if isinstance(definition, dict) else {}
+                if not isinstance(units, dict):
+                    continue
+                preferred_unit = self._preferred_unit(
+                    normalized, units, getattr(company, "reporting_currency", "")
+                )
+                if not preferred_unit:
+                    continue
+                for row in units.get(preferred_unit, []):
+                    if not isinstance(row, dict):
+                        continue
+                    if PeriodSemantics.for_row(row, "duration").complete:
+                        annual_period_ends.setdefault(int(row["fy"]), set()).add(str(row["end"]))
         seen: set[tuple[str, str, str, str]] = set()
         for normalized, namespace, candidates in mappings:
             selected_by_year: dict[int, tuple[int, str, dict[str, Any], str]] = {}
@@ -333,7 +658,13 @@ class SecClient:
                 )
                 if not preferred_unit:
                     continue
-                for row in self._select_annual_facts(units[preferred_unit], allow_foreign=True):
+                period_kind = self._period_kind_for_concept(normalized)
+                for row in self._select_annual_facts(
+                    units[preferred_unit],
+                    allow_foreign=True,
+                    period_kind=period_kind,
+                    period_ends=annual_period_ends if period_kind == "instant" else None,
+                ):
                     year = int(row["fy"])
                     current = selected_by_year.get(year)
                     candidate = (priority, reported, row, preferred_unit)
@@ -364,7 +695,20 @@ class SecClient:
                 seen.add(key)
                 namespace_name = "ifrs-full" if namespace is ifrs_full else "us-gaap" if namespace is us_gaap else "dei"
                 statement = SEC_STATEMENT_BY_CONCEPT.get(normalized, "")
-                currency = preferred_unit.upper() if preferred_unit else ""
+                unit_code = preferred_unit.upper() if preferred_unit else ""
+                is_share_fact = normalized == "shares_outstanding"
+                if is_share_fact:
+                    if unit_code not in {"SHARE", "SHARES"}:
+                        continue
+                    currency = ""
+                else:
+                    # CompanyFacts values are already reported in base XBRL
+                    # units.  Only ISO-like currency units may become trusted
+                    # money; ratios/per-share/custom units stay out of this
+                    # monetary path instead of being mislabeled.
+                    if len(unit_code) != 3 or not unit_code.isalpha():
+                        continue
+                    currency = unit_code
                 facts.append(
                     FinancialFact(
                         fact_id=hashlib.sha256(fact_key.encode()).hexdigest()[:24],
@@ -389,6 +733,7 @@ class SecClient:
                         consolidated_scope="consolidated",
                         currency=currency,
                         unit_scale=1.0,
+                        unit_provenance="structured_normalized",
                         revision="original",
                         source_document=f"SEC CompanyFacts {namespace_name}:{reported}",
                         raw_text=f"{namespace_name}:{reported}={row.get('val')} {preferred_unit}",
@@ -428,7 +773,12 @@ class SecClient:
                 preferred_unit = self._preferred_unit("liabilities", units, getattr(company, "reporting_currency", ""))
                 if not preferred_unit:
                     continue
-                for row in self._select_annual_facts(units.get(preferred_unit, []), allow_foreign=True):
+                for row in self._select_annual_facts(
+                    units.get(preferred_unit, []),
+                    allow_foreign=True,
+                    period_kind="instant",
+                    period_ends=annual_period_ends,
+                ):
                     try:
                         year = int(row["fy"])
                     except (KeyError, TypeError, ValueError):
@@ -499,6 +849,44 @@ class SecClient:
                 )
             )
 
+        # A separate conservative path covers issuers whose CompanyFacts
+        # history consistently contains parent stockholders' equity but no
+        # NCI concept at all.  A single missing NCI row is not evidence of
+        # zero, so require at least two distinct FY accessions and reject the
+        # path when either NCI or total-equity-with-NCI appears anywhere in
+        # the issuer payload.  This is the common fully-owned-subsidiary
+        # presentation used by AMZN-like filers, while mixed/NCI filers stay
+        # quarantined unless an explicit complete formula is available.
+        parent_balance_keys = set(parent_rows).intersection(balance_rows)
+        parent_balance_years = {key[2] for key in parent_balance_keys}
+        if (
+            not nci_rows
+            and not total_equity_rows
+            and len(parent_balance_years) >= 2
+        ):
+            history_note = f"issuer-wide no reported NCI across {len(parent_balance_years)} FY periods"
+            for key in parent_balance_keys:
+                parent_item = parent_rows[key]
+                balance_item = balance_rows[key]
+                balance_value = float(balance_item[1]["val"])
+                parent_value = float(parent_item[1]["val"])
+                derived_value = balance_value - parent_value
+                if derived_value < 0:
+                    continue
+                inputs = (
+                    (balance_item[0], balance_value),
+                    (parent_item[0], parent_value),
+                )
+                formula_candidates.setdefault(key, []).append(
+                    (
+                        derived_value,
+                        f"{balance_item[0]} - {parent_item[0]} ({history_note})",
+                        inputs,
+                        balance_item[1],
+                        balance_item[2],
+                    )
+                )
+
         for key, candidates in formula_candidates.items():
             if key in official_liability_keys:
                 continue
@@ -546,6 +934,7 @@ class SecClient:
                     consolidated_scope="consolidated",
                     currency=preferred_unit.upper(),
                     unit_scale=1.0,
+                    unit_provenance="structured_normalized",
                     revision="original",
                     source_document="SEC CompanyFacts us-gaap:derived-liabilities",
                     raw_text=f"derived liabilities = {formula} = {value:g}; inputs: {input_text}",
@@ -559,6 +948,17 @@ class SecClient:
     def _values_reconcile(left: float, right: float) -> bool:
         """Return whether two same-semantic XBRL values agree after rounding."""
         return abs(left - right) <= max(1.0, max(abs(left), abs(right)) * 0.01)
+
+    @staticmethod
+    def _period_kind_for_concept(normalized: str) -> str:
+        """Map standardized statement concepts to XBRL duration semantics."""
+
+        if normalized in {
+            "assets", "liabilities", "equity", "total_equity", "cash",
+            "accounts_receivable", "inventory", "shares_outstanding",
+        }:
+            return "instant"
+        return "duration"
 
     @staticmethod
     def _preferred_unit(
@@ -575,24 +975,75 @@ class SecClient:
         return next(iter(units), None)
 
     @staticmethod
-    def _select_annual_facts(rows: list[dict[str, Any]], *, allow_foreign: bool = False) -> list[dict[str, Any]]:
-        forms = {"10-K", "20-F", "40-F"} if allow_foreign else {"10-K"}
-        candidates = [
-            row
-            for row in rows
-            if row.get("form") in forms
-            and row.get("fp") == "FY"
-            and isinstance(row.get("fy"), int)
-        ]
-        # A later 10-K repeats prior years. Keep the latest-filed value for each
-        # fiscal year/end-date pair, then the most recent end date per fiscal year.
-        by_year: dict[int, dict[str, Any]] = {}
-        for row in sorted(candidates, key=lambda item: str(item.get("filed", ""))):
-            year = int(row["fy"])
-            current = by_year.get(year)
-            if current is None or str(row.get("end", "")) >= str(current.get("end", "")):
-                by_year[year] = row
-        return [by_year[year] for year in sorted(by_year, reverse=True)[:10]]
+    def _select_annual_facts(
+        rows: list[dict[str, Any]],
+        *,
+        allow_foreign: bool = False,
+        period_kind: str = "auto",
+        period_ends: dict[int, set[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Select only source-backed, semantically complete fiscal-year facts.
+
+        A filing's ``fp=FY`` is not sufficient for flow facts: SEC CompanyFacts
+        can contain a fourth-quarter duration with that label. Duration facts
+        need a real 350–380 day span. Instant facts use a separate path: they
+        must have no start and their as-of date must be in the labeled FY.
+        Later filed complete values (including 10-K/A restatements) take
+        precedence. A conflicting duplicate from the same filing revision is
+        quarantined rather than resolved by payload order.
+        """
+
+        accepted_forms = _ANNUAL_FORMS if allow_foreign else frozenset({"10-K", "10-K/A"})
+        candidates: list[tuple[int, str, str, str, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("form", "")).strip().upper() not in accepted_forms:
+                continue
+            semantics = PeriodSemantics.for_row(row, period_kind)
+            if not semantics.complete:
+                continue
+            fiscal_year = int(row["fy"])
+            if semantics.kind == "instant" and period_ends is not None:
+                known_ends = period_ends.get(fiscal_year)
+                if known_ends and str(row.get("end", "")) not in known_ends:
+                    continue
+            filed = str(row["filed"])
+            accession = str(row["accn"]).strip()
+            amended = str(row.get("form", "")).strip().upper().endswith("/A")
+            candidates.append((fiscal_year, filed, "1" if amended else "0", accession, row))
+
+        by_year: dict[int, list[tuple[int, str, str, str, dict[str, Any]]]] = {}
+        for candidate in candidates:
+            by_year.setdefault(candidate[0], []).append(candidate)
+
+        selected: list[dict[str, Any]] = []
+        for fiscal_year, year_candidates in by_year.items():
+            latest_revision = max(
+                (filed, amendment, accession)
+                for _, filed, amendment, accession, _ in year_candidates
+            )
+            top = [
+                candidate
+                for candidate in year_candidates
+                if candidate[1:4] == latest_revision
+            ]
+            # Duplicate rows in CompanyFacts are common; identical duplicates
+            # are harmless. Distinct start/value/end facts from the exact same
+            # accession and filed revision are not safely orderable.
+            identities = {
+                (
+                    str(candidate[4].get("start", "")),
+                    str(candidate[4].get("end", "")),
+                    repr(candidate[4].get("val")),
+                )
+                for candidate in top
+            }
+            if len(identities) != 1:
+                continue
+            selected.append(top[0][4])
+
+        return sorted(selected, key=lambda item: int(item["fy"]), reverse=True)[:10]
 
 
 class SecFinancialSourceAdapter:

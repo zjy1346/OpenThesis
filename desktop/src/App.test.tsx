@@ -238,14 +238,14 @@ describe("report-first workbench", () => {
       target: { value: "en" },
     });
     fireEvent.change(screen.getByLabelText("Report language"), {
-      target: { value: "zh-CN" },
+      target: { value: "zh-Hant" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
 
     expect(updatePreferences).toHaveBeenCalledWith(expect.objectContaining({
       ui_language: "en",
       ui_language_mode: "manual",
-      report_language: "zh-CN",
+      report_language: "zh-Hant",
     }));
   });
 

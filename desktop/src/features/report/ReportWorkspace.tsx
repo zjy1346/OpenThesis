@@ -13,7 +13,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { exportFinancialDiagnostics, exportResearchReport, getFinancialDiagnostics, getResearchReport, listConfiguredModels } from "../../backend";
-import type { ConfiguredModelSummary, ModelSelection, ResearchReport } from "../../types";
+import type { ConfiguredModelSummary, ModelSelection, RecoveryStageTarget, ResearchReport } from "../../types";
 
 type ReportCopy = {
   report: string;
@@ -32,6 +32,10 @@ type ReportCopy = {
   exportingReport: string;
   exportedReport: string;
   exportFailed: string;
+  retryModelStages: string;
+  retryingModelStages: string;
+  retryModelStagesSucceeded: string;
+  retryModelStagesFailed: string;
   retrySynthesis: string;
   retryingSynthesis: string;
   retrySynthesisSucceeded: string;
@@ -42,6 +46,14 @@ type ReportCopy = {
   synthesisCapacityRetry: string;
   synthesisCapacityNoModels: string;
   synthesisCapacityConfigure: string;
+  recoveryTitle: string;
+  recoveryBody: string;
+  recoveryModel: string;
+  recoveryRetry: string;
+  recoveryNoModels: string;
+  retryRecovery: string;
+  retryRecoverySucceeded: string;
+  retryRecoveryFailed: string;
   retryGrowth: string;
   retryingGrowth: string;
   retryGrowthSucceeded: string;
@@ -87,6 +99,19 @@ type ReportCopy = {
   financialErrorIntegrity: string;
   financialErrorConfiguration: string;
   partialReport: string;
+  reportReadinessComplete: string;
+  reportReadinessPartial: string;
+  reportReadinessActionRequired: string;
+  reportReadinessFailed: string;
+  reportReadinessMissingSections: string;
+  reportReadinessMissingStages: string;
+  reportReadinessRecovery: string;
+  reportRecoveryReviewDiagnostics: string;
+  reportRecoveryResumeStages: string;
+  reportRecoveryCompleteSections: string;
+  reportNoSubstantiveContent: string;
+  reportSectionLabels: Record<string, string>;
+  reportStageLabels: Record<string, string>;
   listingCurrency: string;
   reportingCurrency: string;
   sameCurrency: string;
@@ -95,7 +120,7 @@ type ReportCopy = {
 type FocusState = "normal" | "focused" | "closing";
 type ExportState = "idle" | "exporting" | "exported" | "failed";
 type RetryState = "idle" | "retrying" | "succeeded" | "failed";
-type RetryTarget = "synthesis" | "growth" | "financials" | "rebuild-financials" | "financial-report";
+type RetryTarget = RecoveryStageTarget | "financials" | "rebuild-financials" | "financial-report";
 
 const MIN_ZOOM = 0.9;
 const MAX_ZOOM = 1.3;
@@ -120,7 +145,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
+export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string) => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -136,8 +161,16 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   const [selectedCapacityModelId, setSelectedCapacityModelId] = useState("");
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
+  const reportReadGeneration = useRef(0);
+  const displayedRunId = useRef(report.run_id);
   const reportBody = stripReportPreamble(displayedReport.markdown);
-  const retryCopy = retryTarget === "financial-report"
+  const retryCopy = retryTarget === "model-stages"
+    ? {
+        retrying: copy.retryingModelStages,
+        succeeded: copy.retryModelStagesSucceeded,
+        failed: copy.retryModelStagesFailed,
+      }
+    : retryTarget === "financial-report"
     ? {
         retrying: copy.refreshingFinancialReport,
         succeeded: copy.refreshFinancialReportSucceeded,
@@ -154,6 +187,12 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
         retrying: copy.retryingGrowth,
         succeeded: copy.retryGrowthSucceeded,
         failed: copy.retryGrowthFailed,
+      }
+    : retryTarget === "counter-analysis" || retryTarget === "forecast-scenarios"
+    ? {
+        retrying: copy.retryRecovery,
+        succeeded: copy.retryRecoverySucceeded,
+        failed: copy.retryRecoveryFailed,
       }
     : {
       retrying: copy.retryingSynthesis,
@@ -215,6 +254,52 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
     : financialRetryPartial
       ? copy.financialRetryPartial
       : retryCopy.failed;
+  const readiness = displayedReport.report_readiness;
+  const readinessVerifiedComplete = Boolean(
+    readiness?.state === "complete"
+    && readiness.complete
+    && Array.isArray(readiness.substantive_sections)
+    && readiness.substantive_sections.length > 0
+    && displayedReport.research_complete !== false
+    && !displayedReport.action_required
+    && displayedReport.status !== "partial",
+  );
+  // Readability comes from the read contract's section projection. Overall
+  // research readiness describes completeness and must never hide saved work.
+  const noSubstantiveReport = displayedReport.is_substantive === false;
+  const readinessSections = (readiness?.missing_sections ?? [])
+    .map((section) => copy.reportSectionLabels[section])
+    .filter((label): label is string => Boolean(label));
+  const readinessStages = (readiness?.missing_stages ?? [])
+    .map((stage) => copy.reportStageLabels[stage])
+    .filter((label): label is string => Boolean(label));
+  const readinessRecovery = ({
+    review_run_diagnostics: copy.reportRecoveryReviewDiagnostics,
+    resume_or_repair_missing_research_stages: copy.reportRecoveryResumeStages,
+    complete_missing_or_unverified_sections: copy.reportRecoveryCompleteSections,
+  } as Record<string, string>)[readiness?.recovery_action ?? ""];
+  const readinessDetails = readiness && (
+    readinessSections.length > 0 || readinessStages.length > 0 || readinessRecovery
+  ) ? (
+    <div className="report-readiness-details">
+      {readinessSections.length > 0 && <div><strong>{copy.reportReadinessMissingSections}:</strong> {readinessSections.join(", ")}</div>}
+      {readinessStages.length > 0 && <div><strong>{copy.reportReadinessMissingStages}:</strong> {readinessStages.join(", ")}</div>}
+      {readinessRecovery && <div><strong>{copy.reportReadinessRecovery}:</strong> {readinessRecovery}</div>}
+    </div>
+  ) : null;
+  const readinessStatus = readinessVerifiedComplete
+    ? { text: copy.reportReadinessComplete, tone: "complete", role: "status" as const }
+    : readiness?.state === "failed"
+      ? { text: copy.reportReadinessFailed, tone: "error", role: "alert" as const }
+      : readiness?.state === "action_required"
+        ? { text: copy.reportReadinessActionRequired, tone: "partial", role: "alert" as const }
+        : readiness?.state === "substantive_partial"
+          ? { text: copy.reportReadinessPartial, tone: "partial", role: "alert" as const }
+          : readiness && (displayedReport.action_required || displayedReport.research_complete === false)
+            ? { text: copy.reportReadinessActionRequired, tone: "partial", role: "alert" as const }
+            : readiness && displayedReport.status === "partial"
+              ? { text: copy.reportReadinessPartial, tone: "partial", role: "alert" as const }
+              : null;
   const reportStatus = retryState === "retrying"
     ? { text: retryCopy.retrying, tone: "normal", role: "status" as const }
     : retryState === "succeeded"
@@ -231,13 +316,17 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
                 ? { text: copy.exportedReport, tone: "normal", role: "status" as const }
                 : exportState === "failed"
                   ? { text: copy.exportFailed, tone: "error", role: "alert" as const }
-                  : displayedReport.status === "partial"
-                    ? { text: copy.partialReport, tone: "partial", role: "status" as const }
-                    : null;
+                  : readinessStatus
+                    ?? (displayedReport.action_required || displayedReport.status === "partial"
+                      ? { text: copy.partialReport, tone: "partial", role: "alert" as const }
+                      : null);
   const compactRunId = displayedReport.run_id.length > 12
     ? `${displayedReport.run_id.slice(0, 12)}…`
     : displayedReport.run_id;
-  const contextCapacityExceeded = displayedReport.synthesis_error_code === "MODEL_CONTEXT_CAPACITY";
+  const recoveryPlan = displayedReport.recovery_plan;
+  const recoveryAvailable = Boolean(recoveryPlan?.available && onRetryRecoveryStage);
+  const contextCapacityExceeded = recoveryPlan?.error_code === "MODEL_CONTEXT_CAPACITY"
+    || displayedReport.synthesis_error_code === "MODEL_CONTEXT_CAPACITY";
 
   const cancelPendingClose = () => {
     if (closeTimer.current !== null) {
@@ -247,6 +336,8 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   };
 
   useEffect(() => {
+    reportReadGeneration.current += 1;
+    displayedRunId.current = report.run_id;
     setDisplayedReport(report);
     setTechnical(false);
     setTechnicalError("");
@@ -257,7 +348,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   }, [report]);
 
   useEffect(() => {
-    if (!contextCapacityExceeded) {
+    if (!recoveryAvailable && !contextCapacityExceeded) {
       setCapacityModels([]);
       setSelectedCapacityModelId("");
       return;
@@ -269,7 +360,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
         if (cancelled) return;
         const currentModelId = String(displayedReport.reproducibility?.model_configuration?.configured_model_id ?? "");
         const usable = items
-          .filter((item) => item.enabled && item.health_status === "ready" && item.configured_model_id !== currentModelId && (item.capabilities.includes("text_chat") || item.capabilities.includes("structured_json")))
+          .filter((item) => item.enabled && item.health_status === "ready" && (!contextCapacityExceeded || item.configured_model_id !== currentModelId) && (item.capabilities.includes("text_chat") || item.capabilities.includes("structured_json")))
           .sort((left, right) => (right.context_window_hint ?? -1) - (left.context_window_hint ?? -1));
         setCapacityModels(usable);
         setSelectedCapacityModelId(usable[0]?.configured_model_id ?? "");
@@ -284,7 +375,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
         if (!cancelled) setCapacityModelsLoading(false);
       });
     return () => { cancelled = true; };
-  }, [contextCapacityExceeded, displayedReport.reproducibility?.model_configuration?.configured_model_id]);
+  }, [contextCapacityExceeded, recoveryAvailable, displayedReport.recovery_plan?.plan_hash, displayedReport.reproducibility?.model_configuration?.configured_model_id]);
 
   const enterFocus = (withoutMotion = false) => {
     cancelPendingClose();
@@ -338,16 +429,27 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
 
   const toggleTechnical = async () => {
     const next = !technical;
+    const generation = ++reportReadGeneration.current;
+    const requestedRunId = report.run_id;
     setTechnicalLoading(true);
     setTechnicalError("");
     try {
       const nextReport = await getResearchReport(report.run_id, report.report_language, next);
+      if (
+        generation !== reportReadGeneration.current
+        || displayedRunId.current !== requestedRunId
+        || nextReport.run_id !== requestedRunId
+      ) return;
       setDisplayedReport(nextReport);
       setTechnical(next);
     } catch {
-      setTechnicalError(copy.technicalFailed);
+      if (generation === reportReadGeneration.current && displayedRunId.current === requestedRunId) {
+        setTechnicalError(copy.technicalFailed);
+      }
     } finally {
-      setTechnicalLoading(false);
+      if (generation === reportReadGeneration.current && displayedRunId.current === requestedRunId) {
+        setTechnicalLoading(false);
+      }
     }
   };
 
@@ -373,7 +475,9 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
   };
 
   const retryStage = async (target: RetryTarget, synthesisModel?: ModelSelection) => {
-    const action = target === "rebuild-financials"
+    const action = target === "model-stages"
+      ? onRetryModelStages
+      : target === "rebuild-financials"
       ? onRebuildFinancials
       : target === "financial-report"
       ? onRefreshFinancialReport
@@ -386,6 +490,27 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
     try {
       if (target === "synthesis") await onRetrySynthesis?.(synthesisModel);
       else await action();
+      setRetryState("succeeded");
+    } catch {
+      setRetryState("failed");
+    }
+  };
+
+  const retryPlannedRecovery = async () => {
+    if (!recoveryPlan?.available || !onRetryRecoveryStage) return;
+    const target = recoveryPlan.target;
+    const configured = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
+    if (!configured) return;
+    const model: ModelSelection = {
+      configured_model_id: configured.configured_model_id,
+      connection_id: configured.connection_id,
+      configuration_version: configured.configuration_version,
+      role: "primary",
+    };
+    setRetryTarget(target);
+    setRetryState("retrying");
+    try {
+      await onRetryRecoveryStage(target, model, recoveryPlan.plan_hash);
       setRetryState("succeeded");
     } catch {
       setRetryState("failed");
@@ -423,21 +548,56 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
           </div>
         </div>
         <div className="report-toolbar" role="toolbar" aria-label={copy.reportTools}>
-          {displayedReport.retryable_growth && onRetryGrowth && <button type="button" className="report-retry-button" aria-label={copy.retryGrowth} title={copy.retryGrowth} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("growth")}><RefreshCw size={16} /><span>{copy.retryGrowth}</span></button>}
-          {displayedReport.retryable_synthesis && onRetrySynthesis && !contextCapacityExceeded && <button type="button" className="report-retry-button" aria-label={copy.retrySynthesis} title={copy.retrySynthesis} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("synthesis")}><RefreshCw size={16} /><span>{copy.retrySynthesis}</span></button>}
-          <button type="button" aria-label={copy.zoomOut} title={copy.zoomOut} disabled={zoom <= MIN_ZOOM} onClick={() => setZoom((value) => nextZoom(value, -ZOOM_STEP))}><ZoomOut size={16} /></button>
-          <span className="zoom-value" aria-live="polite">{Math.round(zoom * 100)}%</span>
-          <button type="button" aria-label={copy.zoomIn} title={copy.zoomIn} disabled={zoom >= MAX_ZOOM} onClick={() => setZoom((value) => nextZoom(value, ZOOM_STEP))}><ZoomIn size={16} /></button>
-          <button type="button" aria-label={technical ? copy.hideTechnical : copy.showTechnical} aria-pressed={technical}
-            data-active={technical || undefined} title={technical ? copy.hideTechnical : copy.showTechnical}
-            disabled={technicalLoading} onClick={() => void toggleTechnical()}>
-            <Braces size={16} strokeWidth={technical ? 2.5 : 1.8} />
-          </button>
-          <button type="button" aria-label={copy.exportReport} title={copy.exportReport} disabled={exportState === "exporting"} onClick={() => void exportReport()}><Download size={16} /></button>
-          <button type="button" aria-label={focusState === "normal" ? copy.enterFocus : copy.exitFocus} title={focusState === "normal" ? copy.enterFocus : copy.exitFocus} onClick={focusState === "normal" ? () => enterFocus() : () => exitFocus()}>{focusState === "normal" ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
+          {!recoveryAvailable && displayedReport.retryable_model_stages && onRetryModelStages && <button type="button" className="report-retry-button" aria-label={copy.retryModelStages} title={copy.retryModelStages} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("model-stages")}><RefreshCw size={16} /><span>{copy.retryModelStages}</span></button>}
+          {!recoveryAvailable && displayedReport.retryable_growth && onRetryGrowth && <button type="button" className="report-retry-button" aria-label={copy.retryGrowth} title={copy.retryGrowth} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("growth")}><RefreshCw size={16} /><span>{copy.retryGrowth}</span></button>}
+          {!recoveryAvailable && displayedReport.retryable_synthesis && onRetrySynthesis && !contextCapacityExceeded && <button type="button" className="report-retry-button" aria-label={copy.retrySynthesis} title={copy.retrySynthesis} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("synthesis")}><RefreshCw size={16} /><span>{copy.retrySynthesis}</span></button>}
+          {!noSubstantiveReport && <>
+            <button type="button" aria-label={copy.zoomOut} title={copy.zoomOut} disabled={zoom <= MIN_ZOOM} onClick={() => setZoom((value) => nextZoom(value, -ZOOM_STEP))}><ZoomOut size={16} /></button>
+            <span className="zoom-value" aria-live="polite">{Math.round(zoom * 100)}%</span>
+            <button type="button" aria-label={copy.zoomIn} title={copy.zoomIn} disabled={zoom >= MAX_ZOOM} onClick={() => setZoom((value) => nextZoom(value, ZOOM_STEP))}><ZoomIn size={16} /></button>
+            <button type="button" aria-label={technical ? copy.hideTechnical : copy.showTechnical} aria-pressed={technical}
+              data-active={technical || undefined} title={technical ? copy.hideTechnical : copy.showTechnical}
+              disabled={technicalLoading} onClick={() => void toggleTechnical()}>
+              <Braces size={16} strokeWidth={technical ? 2.5 : 1.8} />
+            </button>
+            <button type="button" aria-label={copy.exportReport} title={copy.exportReport} disabled={exportState === "exporting"} onClick={() => void exportReport()}><Download size={16} /></button>
+            <button type="button" aria-label={focusState === "normal" ? copy.enterFocus : copy.exitFocus} title={focusState === "normal" ? copy.enterFocus : copy.exitFocus} onClick={focusState === "normal" ? () => enterFocus() : () => exitFocus()}>{focusState === "normal" ? <Maximize2 size={16} /> : <Minimize2 size={16} />}</button>
+          </>}
         </div>
       </header>
-      {contextCapacityExceeded && onRetrySynthesis && (
+      {noSubstantiveReport ? (
+        <section className="report-no-content" role="alert">
+          <h3>{reportStatus?.text ?? copy.reportReadinessActionRequired}</h3>
+          <p>{copy.reportNoSubstantiveContent}</p>
+          {readinessDetails}
+        </section>
+      ) : reportStatus && <div className={`report-status report-status-${reportStatus.tone}`} role={reportStatus.role}>
+        <span>{reportStatus.text}</span>
+        {readinessDetails}
+      </div>}
+      {recoveryAvailable && (
+        <section className="synthesis-capacity-recovery" aria-label={copy.recoveryTitle}>
+          <div>
+            <strong>{contextCapacityExceeded ? copy.synthesisCapacityTitle : copy.recoveryTitle}</strong>
+            <p>{contextCapacityExceeded ? copy.synthesisCapacityBody : copy.recoveryBody}</p>
+          </div>
+          {capacityModels.length > 0 ? (
+            <div className="synthesis-capacity-actions">
+              <label htmlFor="recovery-stage-model">{copy.recoveryModel}</label>
+              <select id="recovery-stage-model" value={selectedCapacityModelId} onChange={(event) => setSelectedCapacityModelId(event.target.value)} disabled={capacityModelsLoading || retryState === "retrying"}>
+                {capacityModels.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>{model.alias || model.model_id}{model.context_window_hint ? ` · ${model.context_window_hint.toLocaleString()} tokens` : ""}</option>)}
+              </select>
+              <button type="button" className="report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => void retryPlannedRecovery()}><RefreshCw size={16} /><span>{copy.recoveryRetry}</span></button>
+            </div>
+          ) : !capacityModelsLoading ? (
+            <div className="synthesis-capacity-actions">
+              <span>{copy.recoveryNoModels}</span>
+              {onConfigureCloud && <button type="button" className="report-retry-button" onClick={onConfigureCloud}>{copy.synthesisCapacityConfigure}</button>}
+            </div>
+          ) : null}
+        </section>
+      )}
+      {!recoveryAvailable && contextCapacityExceeded && onRetrySynthesis && (
         <section className="synthesis-capacity-recovery" aria-label={copy.synthesisCapacityTitle}>
           <div>
             <strong>{copy.synthesisCapacityTitle}</strong>
@@ -451,7 +611,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
               </select>
               <button type="button" className="report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => {
                 const model = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
-                if (model) void retryStage("synthesis", { configured_model_id: model.configured_model_id, configuration_version: model.configuration_version, role: "primary" });
+                if (model) void retryStage("synthesis", { configured_model_id: model.configured_model_id, connection_id: model.connection_id, configuration_version: model.configuration_version, role: "primary" });
               }}><RefreshCw size={16} /><span>{copy.synthesisCapacityRetry}</span></button>
             </div>
           ) : !capacityModelsLoading ? (
@@ -531,8 +691,7 @@ export function ReportWorkspace({ report, copy, onRetrySynthesis, onRetryGrowth,
           </div>
         </section>
       )}
-      {reportStatus && <div className={`report-status report-status-${reportStatus.tone}`} role={reportStatus.role}>{reportStatus.text}</div>}
-      <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown></div>
+      {!noSubstantiveReport && <div className="report-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{reportBody}</ReactMarkdown></div>}
     </article>
   );
 }

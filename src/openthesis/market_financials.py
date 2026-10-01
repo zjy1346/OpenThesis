@@ -97,6 +97,7 @@ class _Candidate:
     unit_multiplier: float = 1.0
     statement: str = ""
     scope: str = "consolidated"
+    unit_provenance: str = "unknown"
 
 
 CONCEPT_PATTERNS: tuple[ConceptPattern, ...] = (
@@ -343,8 +344,14 @@ def _parse_financial_pages_legacy(
                 number = _first_financial_value(tail)
                 if number is None:
                     continue
+                unit_provenance = "unknown"
                 if definition.concept == "reported_roe":
-                    value = number / 100.0 if abs(number) > 1 else number
+                    normalized_roe = _reported_roe_value(
+                        number, _roe_source_context(lines, line_index)
+                    )
+                    if normalized_roe is None:
+                        continue
+                    value, unit_provenance = normalized_roe
                 else:
                     value = number * multiplier
                 if definition.concept == "capital_expenditure":
@@ -366,6 +373,7 @@ def _parse_financial_pages_legacy(
                             page_is_quarterly_summary=page_is_quarterly_summary,
                             explicit_unit=explicit_multiplier is not None,
                         ),
+                        unit_provenance=unit_provenance,
                     )
                 )
 
@@ -431,6 +439,7 @@ def _parse_financial_pages_legacy(
             accession_number=filing.accession_number,
             source_url=filing.source_url,
             scope="consolidated",
+            unit_provenance=candidate.unit_provenance,
         )
         evidence = EvidenceRef(
             evidence_id=f"fact:{digest}",
@@ -473,6 +482,74 @@ def _first_financial_value(value: str) -> float | None:
     # with a footnote marker such as (1).
     cleaned = re.sub(r"^(?:[一二三四五六七八九十]+、\s*\d{1,3}|\(\d{1,2}\)|（\d{1,2}）)\s*", "", cleaned)
     return _first_value(cleaned)
+
+
+def _is_explicit_roe_unit_header(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return bool(re.fullmatch(
+        r"\s*(?:单位|unit)\s*[:：]?\s*(?:[%％]|百分比|percentage|\(\s*[%％]\s*\))\s*",
+        normalized,
+    ))
+
+
+def _roe_source_context(lines: list[str], line_index: int) -> str:
+    """Limit ROE unit evidence to its row and an explicit adjacent unit header."""
+    selected: list[str] = []
+    if line_index > 0 and _is_explicit_roe_unit_header(lines[line_index - 1]):
+        selected.append(lines[line_index - 1])
+    for offset, line in enumerate(lines[line_index:line_index + 3]):
+        lowered = unicodedata.normalize("NFKC", line).casefold()
+        if offset and any(
+            label.casefold() in lowered
+            for concept in CONCEPT_PATTERNS
+            if concept.concept != "reported_roe"
+            for label in _labels_for(concept)
+        ):
+            break
+        selected.append(line)
+        # A separate next line is used only when the ROE label itself has no
+        # value. Never let following metric rows contribute their units.
+        if _NUMBER.search(line):
+            break
+    return "\n".join(selected)
+
+
+def _reported_roe_value(number: float, source_text: str) -> tuple[float, str] | None:
+    """Normalize ROE only when the source declares its unit semantics.
+
+    Values such as ``0.85`` and ``85`` are ambiguous without source units;
+    magnitude is never used to guess whether a percentage conversion applies.
+    """
+    normalized = unicodedata.normalize("NFKC", source_text).casefold()
+    labels = (
+        "weighted average return on equity", "return on equity", "roe",
+        "加权平均净资产收益率", "净资产收益率", "净資產收益率",
+    )
+    lines = normalized.splitlines()
+    for line_index, line in enumerate(lines):
+        for label in labels:
+            position = line.find(label.casefold())
+            if position < 0:
+                continue
+            suffix = line[position + len(label):]
+            first_number = _NUMBER.search(suffix)
+            before_value = suffix if first_number is None else suffix[:first_number.start()]
+            after_value = (
+                "" if first_number is None
+                else suffix[first_number.end():first_number.end() + 5]
+            )
+            if re.search(
+                r"(?:decimal\s+ratio|ratio\s*\(\s*decimal\s*\)|小数比率|以小数表示)",
+                before_value,
+            ):
+                return number, "explicit_ratio"
+            if (
+                re.search(r"[%％]|percentage|百分比", before_value)
+                or re.match(r"\s{0,2}[%％]", after_value)
+                or (line_index > 0 and _is_explicit_roe_unit_header(lines[line_index - 1]))
+            ):
+                return number / 100.0, "explicit_percent"
+    return None
 
 
 def _explicit_unit_multiplier(text: str) -> float | None:
@@ -530,10 +607,6 @@ def _reject_candidate(concept: str, line: str, label: str) -> bool:
             return True
         if "%" in line and len(_NUMBER.findall(line)) <= 2:
             return True
-    if concept == "reported_roe" and "%" not in line and "percentage" not in lowered:
-        # Tables extracted from PDFs sometimes omit the percent sign, but prose
-        # without one is too ambiguous to become a deterministic ratio.
-        return True
     return False
 
 
@@ -826,7 +899,16 @@ def parse_financial_pages(
                 number = _first_financial_value(tail)
                 if number is None:
                     continue
-                value = number / 100.0 if definition.concept == "reported_roe" and abs(number) > 1 else number
+                unit_provenance = "unknown"
+                if definition.concept == "reported_roe":
+                    normalized_roe = _reported_roe_value(
+                        number, _roe_source_context(lines, line_index)
+                    )
+                    if normalized_roe is None:
+                        continue
+                    value, unit_provenance = normalized_roe
+                else:
+                    value = number
                 if definition.concept != "reported_roe":
                     value *= multiplier
                 if definition.concept == "capital_expenditure":
@@ -856,6 +938,7 @@ def parse_financial_pages(
                         multiplier if definition.concept != "reported_roe" else 1.0,
                         context.statement if context else _statement_for_concept(definition.concept, None),
                         context.consolidated_scope if context else "consolidated",
+                        unit_provenance,
                     )
                 )
 
@@ -899,6 +982,7 @@ def parse_financial_pages(
             parser_version=PARSER_VERSION,
             validation_status=ValidationStatus.READY_WITH_WARNINGS.value,
             revision="original",
+            unit_provenance=candidate.unit_provenance,
         )
         evidence = EvidenceRef(
             evidence_id=f"fact:{digest}",

@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Iterable
 
 from .domain import EvidenceRef, FilingDocument
+from .disclosure_index import cached_page_texts, remember_page_texts
 from .sec_client import SecClient
+
+
+QUALITATIVE_PARSER_VERSION = "filing-evidence-v2"
 
 
 TOPIC_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -74,13 +78,22 @@ TOPIC_PATTERNS['growth'] += (r'[发發]展[战戰]略', r'[业業][务務]展望
 def _disclosure_pages(path: Path):
     """Stream PDF pages, keeping citations tied to the source page."""
     if path.suffix.lower() == '.pdf':
+        cached = cached_page_texts(path)
+        if cached is not None:
+            for number, text in enumerate(cached, 1):
+                yield number, text
+            return
         import pdfplumber
+        pages: list[str] = []
         with pdfplumber.open(path) as document:
             for number, page in enumerate(document.pages, 1):
                 try:
-                    yield number, page.extract_text() or ''
+                    text = page.extract_text() or ''
+                    pages.append(text)
+                    yield number, text
                 finally:
                     page.close()
+        remember_page_texts(path, pages)
     else:
         yield None, SecClient.extract_filing_text(path)
 
@@ -140,6 +153,31 @@ def _clean_excerpt(text: str) -> str:
     return text.strip()
 
 
+def _looks_like_table_of_contents(excerpt: str) -> bool:
+    """Recognize a substantive contents block without a phrase-only regex.
+
+    SEC HTML commonly places a single ``Table of Contents`` anchor in the
+    page header immediately before the real audit/MD&A text.  Such a marker
+    must not suppress the surrounding evidence.  A contents block has
+    repeated item entries or dotted leaders; substantive prose alone is not
+    enough to classify it as navigation.
+    """
+    lowered = excerpt.casefold()
+    has_toc_heading = bool(re.search(r"目\s*[录錄]|目錄", excerpt))
+    has_leaders = bool(re.search(r"(?:\.\s*){3,}|…{2,}", excerpt))
+    entry_count = len(re.findall(
+        r"(?:\bitem\s+\d+[a-z]?\b|\bpart\s+\d+\b|第\s*[一二三四五六七八九十0-9]+\s*[章节節])",
+        excerpt,
+        flags=re.IGNORECASE,
+    ))
+    if has_leaders:
+        return entry_count >= 2 or "table of contents" in lowered or has_toc_heading
+    # A phrase-only header is often a page navigation anchor.  Without
+    # leaders it is a real contents block only when it contains several
+    # explicit entries and no surrounding substantive body is implied.
+    return ("table of contents" in lowered or has_toc_heading) and entry_count >= 3
+
+
 def extract_topic_evidence(
     filing: FilingDocument,
     *,
@@ -178,7 +216,9 @@ def _topic_evidence_from_text(filing, text, page, max_per_topic, radius):
                 if len(excerpt) < 120:
                     continue
                 # Contents lists are navigation, not substantive disclosure.
-                if re.search(r'(?:(?:\.\s*){3,}|…{2,}|目\s*[录錄]|table of contents)', excerpt, re.I):
+                # A lone page-header link is intentionally allowed when the
+                # excerpt also contains the protected body text.
+                if _looks_like_table_of_contents(excerpt):
                     continue
                 identity = f"{filing.document_id}|{page}|{topic}|{match.start()}|{excerpt}"
                 evidence_id = f"filing:{hashlib.sha256(identity.encode()).hexdigest()[:20]}"

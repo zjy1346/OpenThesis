@@ -7,6 +7,7 @@ type AboutCopy = {
   versionLabel: string;
   contractLabel: string;
   capabilitiesLabel: string;
+  buildLabel?: string;
   architectureTitle: string;
   architectureBody: string;
   privacyTitle: string;
@@ -25,6 +26,7 @@ export function AboutView({ bootstrap, copy }: { bootstrap: BootstrapResult; cop
         <div><dt>{copy.versionLabel}</dt><dd>{bootstrap.app_version}</dd></div>
         <div><dt>{copy.contractLabel}</dt><dd>JSON-RPC {bootstrap.contract_version}</dd></div>
         <div><dt>{copy.capabilitiesLabel}</dt><dd>{bootstrap.capabilities.length}</dd></div>
+        <div><dt>{copy.buildLabel ?? "Build"}</dt><dd>{bootstrap.build_info?.build_id ?? "development"}</dd></div>
       </dl>
       <div className="about-grid">
         <section><Sparkles size={19} /><h3>{copy.architectureTitle}</h3><p>{copy.architectureBody}</p></section>

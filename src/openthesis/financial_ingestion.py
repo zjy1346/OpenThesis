@@ -17,6 +17,7 @@ from typing import Any, Callable, Protocol, Sequence
 import hashlib
 import inspect
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -27,9 +28,9 @@ import time
 import types
 
 
-_PDF_PARSER_VERSION = "financial-ingestion-ast-v7"
+_PDF_PARSER_VERSION = "financial-ingestion-ast-v9"
 _PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
-_PDF_CACHE_POLICY_VERSION = "parse-cache-v1"
+_PDF_CACHE_POLICY_VERSION = "parse-cache-v2"
 
 
 @dataclass
@@ -44,6 +45,7 @@ _PDF_FLIGHT_LOCK = threading.Lock()
 _PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .disclosure_index import cached_page_texts, remember_page_texts
 from .disclosure_identity import DisclosureIdentityResolver, _date_tokens
 from .financial_compatibility import FinancialRulesSnapshot
 from .financial_taxonomy import (
@@ -57,6 +59,7 @@ from .vision_financials import (
     VisionFallbackConfig,
     VisionFinancialSourceAdapter,
     VisionPageRequest,
+    _run_pdfium_isolated,
 )
 
 
@@ -232,6 +235,41 @@ class PdfPageSection:
 class FinancialGroupValidation:
     identity: tuple[str, str, str, str, str]
     validation: FinancialValidation
+    role: str = ""
+
+
+def _validation_group_role(group: FinancialGroupValidation) -> str:
+    """Return the explicit period role, with legacy payload inference.
+
+    Older databases do not carry ``role``.  Their accepted/quarantined facts
+    still retain enough provenance to distinguish a same-filing comparative
+    column from the filing's target column.  Keeping that compatibility here
+    prevents every downstream consumer from inventing its own heuristic.
+    """
+
+    explicit = str(getattr(group, "role", "") or "").strip().casefold()
+    if explicit in {"target", "comparator", "audit"}:
+        return explicit
+    validation = getattr(group, "validation", None)
+    facts = tuple(getattr(validation, "accepted", ())) + tuple(
+        getattr(validation, "quarantined", ())
+    )
+    if facts and all(
+        str(getattr(fact, "usage_status", "") or "").casefold() == "comparator"
+        for fact in facts
+    ):
+        return "comparator"
+    return "target"
+
+
+def _fact_period_identity(fact: FinancialFact) -> tuple[str, str, str, str, str]:
+    return (
+        str(fact.accession_number),
+        str(fact.end_date)[:10],
+        str(fact.fiscal_period).upper(),
+        str(fact.consolidated_scope or fact.scope or "consolidated").casefold(),
+        str(fact.currency or fact.unit or "").upper(),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,21 +369,40 @@ def build_financial_profile(
     from .financials import calculate_interim_metrics, calculate_metrics
 
     groups = tuple(validation_groups)
-    rejected_accessions = {
-        group.identity[0]
-        for group in groups
+    profile_groups = tuple(
+        group for group in groups
+        if _validation_group_role(group) == "target"
+        and str(group.identity[3] or "consolidated").casefold() == "consolidated"
+        and (
+            not reporting_currency
+            or not group.identity[4]
+            or str(group.identity[4]).upper() == str(reporting_currency).upper()
+        )
+    )
+    rejected_identities = {
+        (
+            str(group.identity[0]), str(group.identity[1])[:10],
+            str(group.identity[2]).upper(), str(group.identity[3]).casefold(),
+            str(group.identity[4]).upper(),
+        )
+        for group in profile_groups
         if group.validation.status is ValidationStatus.REJECTED
     }
     accepted = tuple(
         fact for fact in facts
         if fact.validation_status != ValidationStatus.REJECTED.value
-        and fact.accession_number not in rejected_accessions
+        and _fact_period_identity(fact) not in rejected_identities
     )
     fact_dicts = tuple(fact.to_dict() for fact in accepted)
 
-    period_rows: dict[str, dict[str, Any]] = {}
+    period_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
     for filing in selected_filings:
-        period_rows[filing.accession_number] = {
+        key = (
+            filing.accession_number,
+            str(filing.period_end)[:10],
+            str(filing.fiscal_period or "FY").upper(),
+        )
+        period_rows[key] = {
             "accession_number": filing.accession_number,
             "period_end": filing.period_end,
             "fiscal_period": filing.fiscal_period,
@@ -356,7 +413,12 @@ def build_financial_profile(
             "issues": (),
         }
     for manifest in manifests:
-        row = period_rows.setdefault(manifest.accession_number, {
+        key = (
+            manifest.accession_number,
+            str(manifest.period_end)[:10],
+            str(manifest.fiscal_period or "FY").upper(),
+        )
+        row = period_rows.setdefault(key, {
             "accession_number": manifest.accession_number,
             "period_end": manifest.period_end,
             "fiscal_period": manifest.fiscal_period,
@@ -367,9 +429,10 @@ def build_financial_profile(
             "issues": (),
         })
         row.update(period_end=manifest.period_end, fiscal_period=manifest.fiscal_period, form_type=manifest.form_type)
-    for group in groups:
+    for group in profile_groups:
         accession, period_end, fiscal_period, scope, currency = group.identity
-        row = period_rows.setdefault(accession, {
+        key = (accession, str(period_end)[:10], str(fiscal_period).upper())
+        row = period_rows.setdefault(key, {
             "accession_number": accession,
             "period_end": period_end,
             "fiscal_period": fiscal_period,
@@ -387,9 +450,13 @@ def build_financial_profile(
             status=("rejected" if group.validation.status is ValidationStatus.REJECTED else "accepted"),
             issues=tuple(group.validation.issues),
         )
-    accepted_accessions = {fact.accession_number for fact in accepted}
-    for accession, row in period_rows.items():
-        if row["status"] == "no_facts" and accession in accepted_accessions:
+    accepted_periods = {
+        (fact.accession_number, str(fact.end_date)[:10], str(fact.fiscal_period).upper())
+        for fact in accepted
+        if str(getattr(fact, "usage_status", "") or "").casefold() != "comparator"
+    }
+    for key, row in period_rows.items():
+        if row["status"] == "no_facts" and key in accepted_periods:
             row["status"] = "accepted"
     period_continuity = tuple(
         sorted(period_rows.values(), key=lambda item: (str(item.get("period_end", "")), str(item.get("accession_number", ""))), reverse=True)
@@ -560,12 +627,24 @@ _LABELS: dict[str, tuple[str, ...]] = {
         "total shareholders' equity attributable to the parent company",
         "total equity attributable to shareholders of the company",
     ),
-    "total_equity": ("所有者权益合计", "所有者权益（或股东权益）合计", "所有者权益（或股东权", "股东权益合计", "total equity", "total shareholders' equity"),
+    "total_equity": ("所有者权益合计", "所有者权益（或股东权益）合计", "股东权益合计", "total equity", "total shareholders' equity"),
     "reported_roe": ("加权平均净资产收益率", "weighted average return on equity"),
     "profit_before_tax": ("利润总额", "profit before tax"),
     "profit_after_tax": ("净利润", "profit after tax", "net profit"),
     "operating_income": FINANCIAL_LABEL_ALIASES["operating_income"],
     "capital_expenditure": FINANCIAL_LABEL_ALIASES["capital_expenditure"],
+    # Optional cash-return facts. These are deliberately outside _CORE: their
+    # absence must not invalidate an otherwise usable financial statement.
+    "share_repurchase": (
+        "repurchase of ordinary shares", "repurchase of own shares",
+        "purchase of treasury shares", "share buyback",
+        "回购本公司股份", "回购股份", "购回股份", "购买库存股",
+    ),
+    "shareholder_dividends_paid": (
+        "dividends paid to shareholders", "dividends paid to equity holders",
+        "dividends paid to owners", "向股东支付股利", "向股东支付股息",
+        "向股东支付分红", "向所有者支付股利",
+    ),
     "gross_profit": FINANCIAL_LABEL_ALIASES["gross_profit"],
     "cost_of_revenue": FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
 }
@@ -578,6 +657,8 @@ _STATEMENT_FOR = {
     "operating_income": "income_statement", "gross_profit": "income_statement",
     "cost_of_revenue": "income_statement",
     "capital_expenditure": "cash_flow",
+    "share_repurchase": "cash_flow",
+    "shareholder_dividends_paid": "cash_flow",
 }
 _CORE = {"revenue", "net_income", "assets", "liabilities", "equity", "operating_cash_flow"}
 _COVERAGE_WARNING_ISSUES = frozenset({
@@ -1076,6 +1157,7 @@ def _period_columns(
     dual: list[tuple[int, float]] | None = None
     fallback: list[tuple[int, float]] | None = None
     headers_by_year: dict[int, str] = {}
+    header_rank_by_year: dict[int, int] = {}
     all_text = " ".join(row.text for row in rows)
     global_scale, _ = _unit_scale(all_text, rules)
     unit_cells: list[tuple[float, str]] = []
@@ -1088,19 +1170,30 @@ def _period_columns(
                 _, currency = _unit_scale(cell.text, rules)
                 if currency:
                     unit_cells.append(((cell.x0 + cell.x1) / 2, currency))
-        by_year: dict[int, float] = {}
+        by_year: dict[int, tuple[int, float, str]] = {}
         for cell in row.cells:
             effective_year = _effective_period_year(cell.text)
             if effective_year is not None:
-                by_year.setdefault(effective_year, (cell.x0 + cell.x1) / 2)
-                headers_by_year.setdefault(effective_year, cell.text.strip())
+                rank = _period_revision_rank(cell.text)
+                candidate = (rank, (cell.x0 + cell.x1) / 2, cell.text.strip())
+                if effective_year not in by_year or candidate[0] > by_year[effective_year][0]:
+                    by_year[effective_year] = candidate
                 continue
             match = re.search(r"20\d{2}", cell.text)
             if match:
                 year = int(match.group())
-                by_year.setdefault(year, (cell.x0 + cell.x1) / 2)
-                headers_by_year.setdefault(year, cell.text.strip())
-        candidates = sorted(by_year.items(), key=lambda item: item[1])
+                rank = _period_revision_rank(cell.text)
+                candidate = (rank, (cell.x0 + cell.x1) / 2, cell.text.strip())
+                if year not in by_year or candidate[0] > by_year[year][0]:
+                    by_year[year] = candidate
+        for year, (rank, _center, header) in by_year.items():
+            if rank >= header_rank_by_year.get(year, -1):
+                header_rank_by_year[year] = rank
+                headers_by_year[year] = header
+        candidates = sorted(
+            ((year, value[1]) for year, value in by_year.items()),
+            key=lambda item: item[1],
+        )
         if len(candidates) >= 2 and dual is None:
             dual = candidates
             continue
@@ -1209,6 +1302,21 @@ def _period_columns(
             )
         )
     return tuple(result)
+
+
+def _period_revision_rank(header: str) -> int:
+    """Prefer the issuer-designated restated/adjusted comparative column."""
+
+    compact = re.sub(r"\s+", "", str(header).casefold())
+    if any(marker in compact for marker in (
+        "调整后", "重述后", "經重列", "经重列", "restated", "adjusted", "revised",
+    )):
+        return 3
+    if any(marker in compact for marker in (
+        "调整前", "重述前", "未重列", "beforeadjustment", "unadjusted",
+    )):
+        return 0
+    return 1
 
 
 def _select_period_cell(
@@ -1451,6 +1559,7 @@ def _page_sections(
     page_number: int,
     default_currency: str,
     rules: FinancialRulesSnapshot | None = None,
+    chapter_unit: PdfTableContext | None = None,
 ) -> tuple[PdfPageSection, ...]:
     """Pure page-context state transition used by the PDF adapter.
 
@@ -1461,6 +1570,27 @@ def _page_sections(
     reclassifying the consolidated rows above it.
     """
     rows_tuple = tuple(rows)
+    # A statement page may be followed immediately by segment-note tables.
+    # Those tables often reuse labels such as "revenue" and have numeric
+    # columns, so ordinary continuation heuristics can otherwise inherit the
+    # consolidated income-statement context. Segment values need a typed
+    # segment identity before they can safely enter FinancialFact; until that
+    # contract exists, truncate at a detectable segment heading or isolate an
+    # explicit segment page when the table boundary cannot be located.
+    segment_start = next(
+        (index for index, row in enumerate(rows_tuple) if _is_segment_disclosure_heading(row.text)),
+        None,
+    )
+    if segment_start is not None:
+        prefix = rows_tuple[:segment_start]
+        if _statement_context("\n".join(row.text for row in prefix), rules) is None:
+            return ()
+        rows_tuple = prefix
+        # Keep unit/currency inference scoped to the statement side of the
+        # boundary too; note tables can use a different display scale.
+        page_text = "\n".join(row.text for row in prefix)
+    elif _is_explicit_segment_disclosure(page_text):
+        return ()
     scale, currency, explicit = _explicit_unit_info(page_text, rules)
     if _is_summary_page(page_text, rows_tuple, rules=rules):
         return (PdfPageSection(
@@ -1528,17 +1658,35 @@ def _page_sections(
                 and previous.unit_explicit
                 and continuation_title
             )
+            can_inherit_chapter_unit = bool(
+                not can_inherit_unit
+                and not explicit
+                and chapter_unit
+                and chapter_unit.unit_explicit
+                and 0 < page_number - chapter_unit.last_page <= 12
+                and (
+                    not chapter_unit.currency
+                    or not default_currency
+                    or chapter_unit.currency.upper() == default_currency.upper()
+                )
+                and scope == "consolidated"
+            )
             if can_inherit_unit:
                 section_scale = previous.multiplier
                 section_currency = previous.currency or default_currency
+            elif can_inherit_chapter_unit and chapter_unit is not None:
+                section_scale = chapter_unit.multiplier
+                section_currency = chapter_unit.currency or default_currency
             section_unit_provenance = (
-                "inherited" if can_inherit_unit else "explicit" if explicit else "unknown"
+                "inherited" if can_inherit_unit else
+                "chapter_inherited" if can_inherit_chapter_unit else
+                "explicit" if explicit else "unknown"
             )
             if not periods and previous and previous.statement == statement and previous.scope == scope:
                 periods = previous.periods
             sections.append(PdfPageSection(
                 PdfTableContext(statement, scope, section_scale, section_currency,
-                                explicit or can_inherit_unit, periods, page_number,
+                                explicit or can_inherit_unit or can_inherit_chapter_unit, periods, page_number,
                                 previous.inherited_pages + 1 if can_inherit_unit else 0,
                                 section_unit_provenance),
                 section_rows, False, can_inherit_unit,
@@ -1588,11 +1736,177 @@ def _row_label_text(row: PdfRowAST) -> str:
 
 def _known_label(text: str, rules: FinancialRulesSnapshot | None = None) -> bool:
     compact = _label_compact(text)
-    return any(_label_compact(label) in compact for labels in _labels_for_rules(rules).values() for label in labels)
+    return (
+        any(_label_compact(label) in compact for labels in _labels_for_rules(rules).values() for label in labels)
+        or _is_capex_cash_outflow_label(text)
+        or _capital_return_label(text) is not None
+    )
+
+
+def _profit_before_tax_row_issue(
+    fact: FinancialFact, ref: EvidenceRef | None
+) -> str | None:
+    """Require a PDF profit-before-tax value to remain bound to its row/column.
+
+    The parser stores the row text and box together with the selected period
+    column.  These checks make that association part of admission, rather
+    than trusting a canonical value whose label, numeric cell, or period has
+    drifted apart in a cached or transformed candidate.
+    """
+    reported_label = _label_compact(fact.reported_concept)
+    row_text = _label_compact(fact.raw_text)
+    if not reported_label or reported_label not in row_text:
+        return "profit_before_tax_row_label_mismatch"
+    if (
+        ref is None
+        or fact.source_page is None
+        or fact.source_bbox is None
+        or ref.bbox != fact.source_bbox
+        or ref.locator != f"page:{fact.source_page}"
+        or ref.excerpt != fact.raw_text
+    ):
+        return "profit_before_tax_evidence_binding_mismatch"
+    if fact.source_column:
+        years = {
+            int(value)
+            for value in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", fact.source_column)
+        }
+        if years and fact.fiscal_year not in years:
+            return "profit_before_tax_period_column_mismatch"
+    if not math.isfinite(float(fact.unit_scale)) or fact.unit_scale <= 0:
+        return "profit_before_tax_value_scale_invalid"
+    displayed_value = float(fact.value) / float(fact.unit_scale)
+    row_values = (
+        _parse_number(match.group())
+        for match in _NUM.finditer(fact.raw_text.replace("−", "-"))
+    )
+    if not any(
+        value is not None
+        and math.isclose(value, displayed_value, rel_tol=1e-10, abs_tol=0.005)
+        for value in row_values
+    ):
+        return "profit_before_tax_value_not_in_evidence_row"
+    return None
 
 
 def _label_compact(text: str) -> str:
     return normalize_financial_label(text)
+
+
+def _capex_cash_outflow_label(text: str) -> str:
+    """Return a normalized capex label, or empty for unrelated rows.
+
+    HKEX IFRS statements phrase the same cash outflow in several ways, often
+    wrapping the asset classes onto a second visual line.  Require both an
+    acquisition/payment verb and an explicit PPE or intangible-asset class;
+    proceeds/disposal rows are deliberately excluded.  Fact creation remains
+    restricted to the parser's formal cash-flow statement context.
+    """
+
+    normalized = _label_compact(text)
+    if not normalized:
+        return ""
+    if any(token in normalized for token in (
+        "proceed", "disposal", "disposed", "saleof", "saleproceeds",
+        "出售", "处置", "處置", "收回",
+    )):
+        return ""
+    outflow = any(token in normalized for token in (
+        "purchase", "purchases", "prepayment", "prepayments",
+        "acquisition", "acquisitions", "paymentfor", "paymentsfor",
+        "购置", "購置", "购建", "購建", "购入", "購入", "支付",
+    ))
+    ppe = any(token in normalized for token in (
+        "propertyplantandequipment", "fixedassets", "物业厂房及设备",
+        "固定资产",
+    ))
+    intangible = any(token in normalized for token in ("无形资产", "intangibleasset"))
+    if not outflow or not (ppe or intangible):
+        return ""
+    if ppe and intangible:
+        return "purchases of property, plant and equipment and intangible assets"
+    if intangible:
+        return "purchase of intangible assets"
+    return "purchase of property, plant and equipment"
+
+
+def _is_capex_cash_outflow_label(text: str) -> bool:
+    """Recognize capital-asset purchase rows beyond a finite alias list."""
+
+    return bool(_capex_cash_outflow_label(text))
+
+
+def _capital_return_label(text: str) -> tuple[str, str] | None:
+    """Classify only explicit cash paid for issuer share buybacks/dividends.
+
+    The caller already requires a formal cash-flow statement context. This
+    helper stays conservative about the recipient/instrument: investment
+    purchases, subsidiary/associate acquisitions, share disposals and proceeds
+    are not issuer capital returns. Original row text is retained separately
+    on every emitted fact as evidence.
+    """
+
+    normalized = _label_compact(text)
+    if not normalized:
+        return None
+    excluded = (
+        "proceed", "proceeds", "disposal", "disposed", "saleof", "saleproceeds",
+        "receivedfrom", "receiptfrom", "exerciseofshareoptions", "sharebased",
+        "equitysecurities", "investmentin", "associate", "subsidiar",
+        "noncontrolling", "出售", "处置", "處置", "所得", "收到",
+        "联营", "聯營", "子公司", "附属公司", "附屬公司", "非控股",
+    )
+    if any(token in normalized for token in excluded):
+        return None
+
+    share_words = ("share", "shares", "stock", "股份", "股票", "库存股", "庫存股")
+    if any(token in normalized for token in ("buyback", "repurchase", "回购", "回購", "购回", "購回")):
+        if any(token in normalized for token in share_words):
+            return "share_repurchase", "repurchase of own shares"
+    explicit_own_purchase = any(token in normalized for token in (
+        "treasuryshare", "ownshare", "ownshares", "companysshare", "companyshares",
+        "ordinaryshare", "ordinaryshares", "commonshare", "commonshares",
+    ))
+    if (
+        "purchase" in normalized
+        and explicit_own_purchase
+        and any(token in normalized for token in share_words)
+    ):
+        return "share_repurchase", "purchase of own shares"
+
+    dividend = any(token in normalized for token in ("dividend", "股利", "股息", "分红", "分紅"))
+    paid = any(token in normalized for token in (
+        "paid", "payment", "payments", "payable", "支付", "派付", "已付",
+    ))
+    recipient = any(token in normalized for token in (
+        "shareholder", "shareholders", "equityholder", "equityholders",
+        "ownersofthecompany", "ownersofparent", "股东", "股東", "所有者",
+    ))
+    if dividend and paid and recipient:
+        return "shareholder_dividends_paid", "dividends paid to shareholders"
+    return None
+
+
+def _is_explicit_segment_disclosure(text: str) -> bool:
+    """Identify explicit segment-note context without guessing a segment ID."""
+
+    return any(_is_segment_disclosure_heading(line) for line in text.splitlines())
+
+
+def _is_segment_disclosure_heading(text: str) -> bool:
+    markers = (
+        "segmentinformation", "operatingsegments", "reportablesegments",
+        "businesssegments", "分部资料", "分部資料", "分部信息",
+        "业务分部信息", "業務分部資料", "经营分部", "經營分部",
+    )
+    line_compact = _label_compact(text)
+    if not line_compact or len(line_compact) > 100:
+        return False
+    # Match short heading-like lines only. A narrative sentence that merely
+    # mentions segments must not suppress an otherwise valid statement page.
+    return any(marker in line_compact for marker in markers) and (
+        len(line_compact) <= 46 or line_compact.startswith(("note", "附注", "附註"))
+    )
 
 
 def _merge_capex_facts(
@@ -1723,6 +2037,34 @@ def _attribution_context(rows: Sequence[PdfRowAST], start: int) -> str:
     return ""
 
 
+def _completes_known_label(prefix: str, suffix: str, rules: FinancialRulesSnapshot | None = None) -> bool:
+    """Return whether a short, unrecognized tail completes a known label.
+
+    Some Chinese statements place a wrapped label fragment after the numeric
+    cells for that same row. Only permit the horizontal offset when the
+    concatenated fragments match the prefix and suffix of one registered
+    canonical label; arbitrary nearby text must remain a separate row.
+    """
+    prefix_compact = _label_compact(prefix)
+    suffix_compact = _label_compact(suffix)
+    if (
+        not prefix_compact
+        or not suffix_compact
+        or len(suffix_compact) > 12
+        or _known_label(prefix, rules)
+        or _known_label(suffix, rules)
+    ):
+        return False
+    return any(
+        normalized.startswith(prefix_compact)
+        and normalized.endswith(suffix_compact)
+        and len(normalized) >= len(prefix_compact) + len(suffix_compact)
+        for labels in _labels_for_rules(rules).values()
+        for label in labels
+        if (normalized := _label_compact(label))
+    )
+
+
 def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRulesSnapshot | None = None) -> PdfRowAST:
     """Merge at most three tightly-spaced visual rows from one table row.
 
@@ -1750,9 +2092,6 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
         candidate_labels = [
             cell for cell in candidate.cells if _parse_number(cell.text) is None
         ]
-        aligned = any(abs(cell.x0 - anchor) <= 14 for cell in candidate_labels)
-        if candidate_labels and not aligned:
-            break
         current_label = _row_label_text(
             PdfRowAST(
                 tuple(cell for row in variants for cell in row.cells),
@@ -1761,6 +2100,13 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
             )
         )
         candidate_label = _row_label_text(candidate)
+        wrapped_completion = _completes_known_label(
+            current_label, candidate_label, rules
+        )
+        aligned = any(abs(cell.x0 - anchor) <= 14 for cell in candidate_labels)
+        aligned = aligned or wrapped_completion
+        if candidate_labels and not aligned:
+            break
         combined_label = current_label + candidate_label
         current_has_values = any(_parse_number(cell.text) is not None for cell in variants[-1].cells)
         candidate_has_values = any(_parse_number(cell.text) is not None for cell in candidate.cells)
@@ -1771,6 +2117,12 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
         if candidate_has_values and current_label.casefold() in {"revenue", "revenues", "totalrevenue"}:
             break
         if current_has_values and candidate_has_values and candidate_label:
+            break
+        # A complete financial label after a numeric row starts a new line
+        # item, even when concatenating both labels still contains a known
+        # alias.  Incomplete wrapped tails (for example ``率``) remain
+        # mergeable because they are not independently recognized labels.
+        if current_has_values and candidate_label and _known_label(candidate_label, rules):
             break
         if candidate_label and current_label and _known_label(candidate_label, rules) and (
             "现金流" in current_label
@@ -1981,16 +2333,80 @@ def _vision_failed_pages(
                         break
                     if page_index not in chosen:
                         chosen.append(page_index)
+        formal_chosen = list(dict.fromkeys(chosen))
+
+        # Statement titles remain the primary targets, but a large share of
+        # issuer-specific context lives in related notes and segment tables.
+        # Select only pages tied to a currently incomplete statement and keep
+        # this secondary scan small enough for the existing consent/byte cap.
+        note_groups: dict[str, tuple[str, ...]] = {
+            "segments": (
+                "business segment", "operating segment", "segment information",
+                "reportable segment", "分部信息", "分部資料", "业务分部", "業務分部",
+                "分部报告", "分部報告",
+            ),
+            "capital": (
+                "capital expenditure", "capital expenditures", "purchases of property",
+                "purchase of property, plant", "construction in progress", "购建固定资产",
+                "購建固定資產", "资本性支出", "資本性支出", "购置物业、厂房及设备",
+                "購置物業、廠房及設備",
+            ),
+            "balance_notes": (
+                "borrowings", "lease liabilities", "debt maturity", "interest-bearing debt",
+                "trade receivables", "inventories", "应收账款", "應收帳款", "存货", "存貨",
+                "借款", "租赁负债", "租賃負債", "债务到期", "債務到期",
+            ),
+            "cash_notes": (
+                "operating cash flow", "cash generated from operations", "cash flows from",
+                "经营活动现金流", "經營活動現金流", "经营性现金流", "經營性現金流",
+            ),
+        }
+        wanted_note_groups: set[str] = set()
+        if "income_statement" in target:
+            wanted_note_groups.add("segments")
+        if "cash_flow" in target:
+            wanted_note_groups.update({"capital", "cash_notes"})
+        if "balance_sheet" in target:
+            wanted_note_groups.add("balance_notes")
+        issue_text = " ".join(str(item).casefold() for item in validation_issues)
+        if not wanted_note_groups and issue_text:
+            wanted_note_groups.update({"segments", "capital", "balance_notes"})
+
+        note_candidates: list[tuple[int, int]] = []
+        if wanted_note_groups:
+            contents_markers = ("table of contents", "contents", "目录", "目錄")
+            for page_index, page_text in enumerate(page_texts):
+                if page_index in formal_chosen:
+                    continue
+                normalized = re.sub(r"\s+", " ", page_text).casefold()
+                if any(marker in normalized[:240] for marker in contents_markers):
+                    continue
+                score = sum(
+                    1
+                    for group in wanted_note_groups
+                    if any(marker in normalized for marker in note_groups[group])
+                )
+                if score:
+                    note_candidates.append((score, page_index))
+        note_candidates.sort(key=lambda item: (-item[0], item[1]))
+        note_limit = min(6, max(0, min(config.max_pages, VISION_MAX_PAGES) - len(formal_chosen)))
+        ordered_chosen = formal_chosen + [
+            page_index
+            for _score, page_index in note_candidates[:note_limit]
+            if page_index not in formal_chosen
+        ]
         selected: list[VisionPageRequest] = []
         total = 0
-        for index in sorted(chosen):
+        for index in ordered_chosen:
             writer = PdfWriter()
             writer.add_page(reader.pages[index])
             buffer = BytesIO()
             writer.write(buffer)
             payload = buffer.getvalue()
-            if total + len(payload) > config.max_bytes or len(selected) >= min(config.max_pages, VISION_MAX_PAGES):
+            if len(selected) >= min(config.max_pages, VISION_MAX_PAGES):
                 break
+            if total + len(payload) > config.max_bytes:
+                continue
             selected.append(VisionPageRequest(index + 1, payload, filing.source_url, filing.primary_document))
             total += len(payload)
         return tuple(selected)
@@ -2008,6 +2424,8 @@ def _emit_ingestion_progress(
     status: str = "",
     error_code: str = "",
     elapsed_seconds: float = 0.0,
+    window_index: int | None = None,
+    window_total: int | None = None,
 ) -> None:
     """Emit optional per-filing detail without breaking legacy callbacks."""
 
@@ -2022,6 +2440,9 @@ def _emit_ingestion_progress(
             "error_code": error_code,
             "elapsed_seconds": max(0.0, float(elapsed_seconds)),
         }
+        if window_index is not None and window_total is not None:
+            detail["window_index"] = max(0, int(window_index))
+            detail["window_total"] = max(0, int(window_total))
     try:
         signature = inspect.signature(progress)
         accepts_detail = len(signature.parameters) >= 4
@@ -2219,10 +2640,26 @@ def _parse_local_pdfs_bounded(
                 item: tuple[str, FilingDocument, FilingManifest],
             ) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
                 key, filing, manifest = item
+                parse_started = time.monotonic()
+
+                def window_progress(index: int, count: int, status: str) -> None:
+                    _emit_ingestion_progress(
+                        progress,
+                        "filing-window",
+                        index,
+                        count,
+                        filing,
+                        status=f"window-{status}",
+                        elapsed_seconds=time.monotonic() - parse_started,
+                        window_index=index,
+                        window_total=count,
+                    )
+
                 try:
                     facts, refs, window_diagnostics = engine.parse_local_pdf_resumable(
                         company, filing, manifest,
                         cancel_check=cancel_check,
+                        progress=window_progress,
                     )
                     error = window_diagnostics[0] if window_diagnostics else None
                 except Exception as exc:
@@ -2442,20 +2879,27 @@ def _parse_pdf_process_worker_entry(
     candidate_pages: frozenset[int] | None,
     result_queue: Any,
     rules: FinancialRulesSnapshot | None = None,
+    index_precomputed: bool = False,
+    precomputed_diagnostic: str | None = None,
 ) -> None:
     """Process entrypoint which returns one bounded, pickle-safe result."""
 
     try:
         index_error = None
-        index_diagnostic = None
-        try:
-            indexed_pages, index_diagnostic = _candidate_financial_pages_with_diagnostic(
-                filing.local_path, rules=rules
-            )
-        except Exception as exc:
-            indexed_pages = None
-            index_error = f"pdf_index_failed:{type(exc).__name__}"
-        result_queue.put(("filing-index", key, indexed_pages, index_error, index_diagnostic))
+        index_diagnostic = precomputed_diagnostic
+        page_texts = None
+        if index_precomputed:
+            indexed_pages = candidate_pages
+        else:
+            try:
+                indexed_pages, index_diagnostic = _candidate_financial_pages_with_diagnostic(
+                    filing.local_path, rules=rules
+                )
+                page_texts = cached_page_texts(filing.local_path)
+            except Exception as exc:
+                indexed_pages = None
+                index_error = f"pdf_index_failed:{type(exc).__name__}"
+        result_queue.put(("filing-index", key, indexed_pages, index_error, index_diagnostic, page_texts))
         # A partial index is deliberately represented by None; the AST parser
         # then fails open to its full-document path for correctness.
         result_queue.put(("filing-result", _parse_pdf_process_worker(
@@ -2561,10 +3005,40 @@ def _parse_local_pdfs_isolated(
             key, filing, manifest = item
             if cancel_check is not None and cancel_check():
                 return
+            # The injectable worker seam keeps its historical argument
+            # contract; parent-side reuse belongs to the production worker.
+            cached_texts = (
+                cached_page_texts(filing.local_path)
+                if worker_entry is None
+                else None
+            )
+            precomputed_pages = None
+            precomputed_diagnostic = None
+            if cached_texts is not None:
+                precomputed_pages = _candidate_pages_from_text(
+                    cached_texts,
+                    continuation_pages=3,
+                    rules=engine._compatibility_rules,
+                )
+                precomputed_diagnostic = _scanned_image_diagnostic(
+                    cached_texts, rules=engine._compatibility_rules
+                )
             result_queue = context.Queue(maxsize=2)
-            worker_args = (key, company, filing, manifest, None, result_queue)
+            worker_args = (
+                key,
+                company,
+                filing,
+                manifest,
+                precomputed_pages,
+                result_queue,
+            )
             if worker_entry is None:
-                worker_args = (*worker_args, engine._compatibility_rules)
+                worker_args = (
+                    *worker_args,
+                    engine._compatibility_rules,
+                    cached_texts is not None,
+                    precomputed_diagnostic,
+                )
             process = context.Process(
                 target=entrypoint,
                 args=worker_args,
@@ -2674,12 +3148,14 @@ def _parse_local_pdfs_isolated(
                     progressed = True
                     kind = message[0]
                     if kind == "filing-index":
+                        filing = state["item"][1]
+                        if len(message) > 5 and message[5] is not None:
+                            remember_page_texts(filing.local_path, message[5])
                         if not state["indexed"]:
                             state["indexed"] = True
                             if len(message) > 4 and message[4]:
                                 state["index_diagnostic"] = str(message[4])
                             indexed += 1
-                            filing = state["item"][1]
                             _emit_ingestion_progress(
                                 progress,
                                 "filing-index",
@@ -2708,10 +3184,12 @@ def _parse_local_pdfs_isolated(
                         except queue.Empty:
                             continue
                         if pending_message and pending_message[0] == "filing-index":
+                            filing = state["item"][1]
+                            if len(pending_message) > 5 and pending_message[5] is not None:
+                                remember_page_texts(filing.local_path, pending_message[5])
                             if not state["indexed"]:
                                 state["indexed"] = True
                                 indexed += 1
-                                filing = state["item"][1]
                                 _emit_ingestion_progress(
                                     progress,
                                     "filing-index",
@@ -2910,6 +3388,7 @@ def _candidate_pages_from_text(
     starts: list[int] = []
     summary_pages: set[int] = set()
     statement_kinds: set[str] = set()
+    lexical_starts: list[int] = []
     for page_number, text in enumerate(page_texts, 1):
         compact = re.sub(r"\s+", "", text).casefold()
         labels = _labels_for_rules(rules)
@@ -2923,17 +3402,41 @@ def _candidate_pages_from_text(
         if statement_context is not None:
             starts.append(page_number)
             statement_kinds.add(statement_context[0])
+            continue
+        # Damaged/missing contents and clipped statement titles are common in
+        # very large exchange PDFs. Recover a bounded page only when several
+        # canonical row labels from one statement co-occur; a single narrative
+        # mention is intentionally insufficient.
+        for statement, threshold in (
+            ("income_statement", 3), ("balance_sheet", 4), ("cash_flow", 2),
+        ):
+            concepts = [
+                concept for concept, owner in _STATEMENT_FOR.items()
+                if owner == statement and concept != "reported_roe"
+            ]
+            hits = sum(
+                1 for concept in concepts
+                if any(_label_compact(label) in _label_compact(compact) for label in labels[concept])
+            )
+            if hits >= threshold:
+                lexical_starts.append(page_number)
+                statement_kinds.add(statement)
+                break
     # A partial index is unsafe: missing one statement can make the coordinate
     # parser report an apparently valid but incomplete filing. Returning None
     # deliberately fails open to the full-document parser.
     statement_kinds.update(mapped_statements)
-    if (not starts and not mapped_statements) or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
+    if (not starts and not lexical_starts and not mapped_statements) or statement_kinds != {"income_statement", "balance_sheet", "cash_flow"}:
         return None
     selected: set[int] = set()
     page_count = len(page_texts)
     for start in starts:
         selected.update(
             range(start, min(page_count, start + max(0, continuation_pages)) + 1)
+        )
+    for start in lexical_starts:
+        selected.update(
+            range(start, min(page_count, start + max(1, continuation_pages)) + 1)
         )
     for pages in mapped_statements.values():
         selected.update(pages)
@@ -2976,9 +3479,40 @@ def _candidate_financial_pages_pypdfium(
     finally:
         _close_pdf_resource(document)
     indexed = _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
+    remember_page_texts(path, page_texts)
     if return_diagnostics:
         return indexed, _scanned_image_diagnostic(page_texts, rules=rules)
     return indexed
+
+
+def _pdfium_candidate_pages_worker(
+    path: str,
+    continuation_pages: int,
+    rules: FinancialRulesSnapshot | None,
+) -> tuple[frozenset[int] | None, str | None]:
+    """Pickle-safe native indexing task used outside an existing PDF worker."""
+
+    result = _candidate_financial_pages_pypdfium(
+        path,
+        continuation_pages=continuation_pages,
+        rules=rules,
+        return_diagnostics=True,
+    )
+    if isinstance(result, tuple):
+        return result
+    return result, None
+
+
+def _pdfium_page_count_worker(path: str) -> int:
+    """Pickle-safe page-count task for the recovery/index path."""
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(path)
+    try:
+        return len(document)
+    finally:
+        _close_pdf_resource(document)
 
 
 def _candidate_financial_pages_pypdf(
@@ -2991,6 +3525,7 @@ def _candidate_financial_pages_pypdf(
 
     reader = PdfReader(path)
     page_texts = [(page.extract_text() or "") for page in reader.pages]
+    remember_page_texts(path, page_texts)
     indexed = _candidate_pages_from_text(page_texts, continuation_pages=continuation_pages, rules=rules)
     if return_diagnostics:
         return indexed, _scanned_image_diagnostic(page_texts, rules=rules)
@@ -3031,23 +3566,43 @@ def _scanned_image_diagnostic(
 def _candidate_financial_pages_with_diagnostic(
     path: str, *, continuation_pages: int = 3,
     rules: FinancialRulesSnapshot | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[frozenset[int] | None, str | None]:
     """Return the normal index plus a non-authorizing scan diagnostic."""
-    try:
-        indexed = _candidate_financial_pages_pypdfium(
-            path, continuation_pages=continuation_pages, rules=rules,
-            return_diagnostics=True,
-        )
-        if isinstance(indexed, tuple):
+    if cancel_check is not None and cancel_check():
+        return None, "pdf_parse_cancelled"
+    if mp.current_process().daemon:
+        # The ordinary AST pipeline is already in a killable per-filing child.
+        # Avoid nested spawn here; its parent owns the native-crash boundary.
+        try:
+            indexed = _pdfium_candidate_pages_worker(path, continuation_pages, rules)
+            pdfium_diagnostic = indexed[1]
             if indexed[0] is not None:
                 return indexed
-            # An incomplete PDFium text layer may still carry the useful scan
-            # classification; pypdf gets one compatibility attempt below.
+        except Exception:
+            indexed = None
+            pdfium_diagnostic = "PDFIUM_WORKER_ERROR"
+    else:
+        indexed, isolation_error = _run_pdfium_isolated(
+            _pdfium_candidate_pages_worker,
+            path,
+            continuation_pages,
+            rules,
+            timeout_seconds=45.0,
+            cancel_check=cancel_check,
+        )
+        if isolation_error == "PDFIUM_WORKER_CANCELLED":
+            return None, "pdf_parse_cancelled"
+        if isolation_error is not None:
+            pdfium_diagnostic = isolation_error
+            indexed = None
+        elif isinstance(indexed, tuple) and len(indexed) == 2:
             pdfium_diagnostic = indexed[1]
+            if indexed[0] is not None:
+                return indexed
         else:
-            pdfium_diagnostic = None
-    except Exception:
-        pdfium_diagnostic = None
+            indexed = None
+            pdfium_diagnostic = "PDFIUM_WORKER_ERROR"
     try:
         indexed = _candidate_financial_pages_pypdf(
             path, continuation_pages=continuation_pages, rules=rules,
@@ -3060,7 +3615,11 @@ def _candidate_financial_pages_with_diagnostic(
         return None, pdfium_diagnostic
 
 
-def _candidate_financial_pages(path: str, *, continuation_pages: int = 3, rules: FinancialRulesSnapshot | None = None) -> frozenset[int] | None:
+def _candidate_financial_pages(
+    path: str, *, continuation_pages: int = 3,
+    rules: FinancialRulesSnapshot | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> frozenset[int] | None:
     """Find formal statement pages with a low-memory text prepass.
 
     PDFium supplies the fast text layer for the normal path. If PDFium cannot
@@ -3070,30 +3629,42 @@ def _candidate_financial_pages(path: str, *, continuation_pages: int = 3, rules:
     """
 
     return _candidate_financial_pages_with_diagnostic(
-        path, continuation_pages=continuation_pages, rules=rules
+        path, continuation_pages=continuation_pages, rules=rules,
+        cancel_check=cancel_check,
     )[0]
 
 
-def _pdf_page_count(path: str) -> int | None:
+def _pdf_page_count(
+    path: str, *, cancel_check: Callable[[], bool] | None = None
+) -> int | None:
     """Read only the document page count without extracting page text."""
 
-    try:
-        import pypdfium2 as pdfium
-
-        document = pdfium.PdfDocument(path)
+    if cancel_check is not None and cancel_check():
+        return None
+    if mp.current_process().daemon:
         try:
-            return len(document)
-        finally:
-            close = getattr(document, "close", None)
-            if callable(close):
-                close()
-    except Exception:
-        try:
-            from pypdf import PdfReader
-
-            return len(PdfReader(path, strict=False).pages)
+            return _pdfium_page_count_worker(path)
         except Exception:
+            pass
+    else:
+        count, error = _run_pdfium_isolated(
+            _pdfium_page_count_worker,
+            path,
+            timeout_seconds=30.0,
+            cancel_check=cancel_check,
+        )
+        if error == "PDFIUM_WORKER_CANCELLED":
             return None
+        if error is None and isinstance(count, int) and count >= 0:
+            return count
+    if cancel_check is not None and cancel_check():
+        return None
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(path, strict=False).pages)
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3344,12 +3915,20 @@ class FinancialIngestionEngine:
             actual_hash = self._file_sha256(filing.local_path)
         except OSError:
             return [], [], ("pdf_file_unreadable",)
-        page_count = _pdf_page_count(filing.local_path)
+        page_count = _pdf_page_count(
+            filing.local_path, cancel_check=cancel_check
+        )
+        if cancel_check is not None and cancel_check():
+            return [], [], ("pdf_parse_cancelled",)
         selected_pages = candidate_pages
         if selected_pages is None:
             indexed_pages = _candidate_financial_pages(
-                filing.local_path, rules=self._compatibility_rules
+                filing.local_path,
+                rules=self._compatibility_rules,
+                cancel_check=cancel_check,
             )
+            if cancel_check is not None and cancel_check():
+                return [], [], ("pdf_parse_cancelled",)
             if indexed_pages is None:
                 # ``None`` means the inexpensive index could not establish a
                 # complete statement-page map.  Fail open to the real document
@@ -3598,39 +4177,84 @@ class FinancialIngestionEngine:
             progress=progress,
             reporting_currency=company.reporting_currency,
         )
-        issues = list(compiled.diagnostics)
-        for item in compiled.validations:
-            issues.extend(item.issues)
-        # Audit-only parent-company rows must not downgrade a complete
-        # consolidated research cohort. They remain visible in group
-        # diagnostics, while status follows the cohort that can enter research.
-        research_groups = tuple(
-            item for item in compiled.group_validations
-            if len(item.identity) > 3
+        target_identities: set[tuple[str, str, str]] = set()
+        for filing in filings:
+            candidate_groups = tuple(
+                item for item in compiled.validations
+                if item.identity[0] == filing.accession_number
+                and str(item.identity[3]).casefold() == "consolidated"
+            )
+            if not candidate_groups:
+                continue
+            declared_end = str(filing.period_end or "")[:10]
+            selected = next(
+                (
+                    item for item in candidate_groups
+                    if str(item.identity[1])[:10] == declared_end
+                ),
+                max(candidate_groups, key=lambda item: str(item.identity[1])[:10]),
+            )
+            target_identities.add((
+                selected.identity[0],
+                str(selected.identity[1])[:10],
+                str(selected.identity[2]).upper(),
+            ))
+        primary_facts = tuple(
+            fact
+            for item in compiled.validations
+            if (
+                item.identity[0],
+                str(item.identity[1])[:10],
+                str(item.identity[2]).upper(),
+            ) in target_identities
             and str(item.identity[3]).casefold() == "consolidated"
-        ) or tuple(compiled.group_validations)
-        has_rejected_group = any(
-            getattr(item.validation.status, "value", item.validation.status)
-            == ValidationStatus.REJECTED.value
-            for item in research_groups
+            for fact in item.accepted
         )
-        has_warning_group = any(
-            getattr(item.validation.status, "value", item.validation.status)
-            == ValidationStatus.READY_WITH_WARNINGS.value
-            for item in research_groups
+        # A legacy caller expects ``accepted_facts`` to contain the selected
+        # filing cohorts, not hidden comparison columns or auxiliary audit
+        # facts.  Preserve partial target facts when a cohort is incomplete;
+        # the canonical compiler status still keeps those facts out of model
+        # capabilities that require a complete profile.
+        if not primary_facts:
+            primary_facts = tuple(
+                fact for fact in compiled.resolved_facts
+                if str(fact.usage_status or "").casefold() != "comparator"
+            )
+        issues = list(compiled.diagnostics)
+        selected_target_groups = tuple(
+            item for item in compiled.validations
+            if (
+                item.identity[0],
+                str(item.identity[1])[:10],
+                str(item.identity[2]).upper(),
+            ) in target_identities
+            and str(item.identity[3]).casefold() == "consolidated"
+        )
+        for item in compiled.validations:
+            identity = tuple(item.identity)
+            if (
+                len(identity) >= 5
+                and (identity[0], str(identity[1])[:10], str(identity[2]).upper())
+                in target_identities
+                and str(identity[3]).casefold() == "consolidated"
+            ):
+                issues.extend(item.issues)
+        target_groups_healthy = bool(selected_target_groups) and all(
+            item.status == ValidationStatus.VERIFIED.value
+            for item in selected_target_groups
         )
         status = (
             ValidationStatus.REJECTED
-            if not compiled.resolved_facts
+            if not primary_facts
             else ValidationStatus.READY_WITH_WARNINGS
-            if has_rejected_group or has_warning_group or not compiled.allow_ai
+            if not compiled.allow_ai or not target_groups_healthy
             else ValidationStatus.VERIFIED
         )
         validation = FinancialValidation(
             status,
             tuple(dict.fromkeys(issues)),
-            frozenset(fact.concept for fact in compiled.resolved_facts),
-            tuple(compiled.resolved_facts),
+            frozenset(fact.concept for fact in primary_facts),
+            primary_facts,
             tuple(compiled.quarantined_facts),
         )
         groups = list(compiled.group_validations)
@@ -3640,7 +4264,7 @@ class FinancialIngestionEngine:
             for fact in group.validation.quarantined:
                 fact.validation_status = ValidationStatus.REJECTED.value
         return FinancialDataset(
-            tuple(compiled.resolved_facts),
+            primary_facts,
             tuple(compiled.evidence),
             tuple(compiled.manifest),
             validation,
@@ -3688,9 +4312,12 @@ class FinancialIngestionEngine:
         identity: tuple[str, str, str, str, str],
         evidence_map: dict[str, EvidenceRef] | None = None,
         required_concepts: set[str] | frozenset[str] | None = None,
+        expected_company_id: str | None = None,
     ) -> FinancialGroupValidation:
         """Public quality-gate seam used by canonical adapters/compiler."""
-        return self._validate_group(facts, identity, evidence_map, required_concepts)
+        return self._validate_group(
+            facts, identity, evidence_map, required_concepts, expected_company_id
+        )
 
     def _validate_group(
         self,
@@ -3698,10 +4325,15 @@ class FinancialIngestionEngine:
         identity: tuple[str, str, str, str, str],
         evidence_map: dict[str, EvidenceRef] | None = None,
         required_concepts: set[str] | frozenset[str] | None = None,
+        expected_company_id: str | None = None,
     ) -> FinancialGroupValidation:
-        values = {fact.concept: fact.value for fact in facts}
         issues: list[str] = []
-        covered = set(values) & _CORE
+        fact_issues: dict[str, list[str]] = {}
+
+        def isolate(fact: FinancialFact, issue: str) -> None:
+            fact_issues.setdefault(fact.fact_id, []).append(issue)
+            issues.append(issue)
+
         required = set(required_concepts or {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"})
         # A normalized structured fact may legitimately use scale=1 while a
         # PDF fact from the same filing retains the table's displayed unit.
@@ -3719,23 +4351,21 @@ class FinancialIngestionEngine:
             ):
                 scale_key = (fact.source_document, fact.parser_version, fact.statement)
                 statement_scales.setdefault(scale_key, set()).add(float(fact.unit_scale))
-        if any(len(scales) > 1 for scales in statement_scales.values()):
+        for (source_document, parser_version, statement), scales in statement_scales.items():
+            if len(scales) <= 1:
+                continue
             issues.append("statement_unit_scale_inconsistent")
-        if {"revenue", "net_income"}.issubset(required) and not {"revenue", "net_income"}.issubset(values):
-            issues.append("income_statement_core_missing")
-        if "operating_cash_flow" in required and "operating_cash_flow" not in values:
-            issues.append("cash_flow_core_missing")
-        balance_required = {"assets", "liabilities"} & required
-        equity_required = bool({"equity", "total_equity"} & required)
-        if (balance_required - values.keys()) or (equity_required and not ({"equity", "total_equity"} & values.keys())):
-            issues.append("balance_sheet_core_missing")
-        missing_required = required - values.keys()
-        if "equity" in missing_required and "total_equity" in values:
-            missing_required.remove("equity")
-        if missing_required or (equity_required and not ({"equity", "total_equity"} & values.keys())):
-            issues.append("core_coverage_insufficient")
+            for fact in facts:
+                if (
+                    fact.source_document == source_document
+                    and fact.parser_version == parser_version
+                    and fact.statement == statement
+                ):
+                    isolate(fact, "statement_unit_scale_inconsistent")
         expected_identity = identity[1:]
         for fact in facts:
+            if expected_company_id is not None and str(fact.company_cik or "").strip() != expected_company_id:
+                isolate(fact, "issuer_identity_mismatch")
             fact_identity = (
                 fact.end_date,
                 (fact.fiscal_period or "FY").upper(),
@@ -3743,56 +4373,114 @@ class FinancialIngestionEngine:
                 fact.currency or "",
             )
             if fact_identity != expected_identity:
-                issues.append("group_identity_inconsistent")
+                isolate(fact, "group_identity_inconsistent")
             if not fact.accession_number or not fact.source_url or not fact.raw_text:
-                issues.append("provenance_missing")
+                isolate(fact, "provenance_missing")
             statement_expected = _STATEMENT_FOR.get(fact.concept)
             if statement_expected and fact.statement != statement_expected and fact.concept != "reported_roe":
-                issues.append("statement_mismatch")
+                isolate(fact, "statement_mismatch")
+            if (
+                fact.concept == "reported_roe"
+                and fact.unit_provenance not in {"explicit_percent", "explicit_ratio"}
+            ):
+                # A reported ROE is a ratio, but its source display may be a
+                # percentage or a decimal. Keep the field out of trusted
+                # research until the source explicitly establishes which.
+                isolate(fact, "ratio_unit_unknown")
             ref = (evidence_map or {}).get(fact.fact_id)
             if fact.parser_version.startswith("financial-ingestion-ast") and (ref is None or ref.bbox is None):
-                issues.append("pdf_evidence_bbox_missing")
+                isolate(fact, "pdf_evidence_bbox_missing")
             if (
                 fact.parser_version.startswith("financial-ingestion-ast")
-                and
-                fact.concept in required
-                and fact.concept not in {"reported_roe"}
+                and fact.parser_version != _PDF_PARSER_VERSION
+            ):
+                isolate(fact, "stale_financial_parser_contract")
+            if (
+                fact.concept == "profit_before_tax"
+                and fact.parser_version.startswith("financial-ingestion-ast")
+            ):
+                row_issue = _profit_before_tax_row_issue(fact, ref)
+                if row_issue:
+                    isolate(fact, row_issue)
+            if fact.parser_version.startswith("vision-"):
+                expected_vision_statement = _STATEMENT_FOR.get(fact.concept)
+                if (
+                    expected_vision_statement is None
+                    or fact.statement != expected_vision_statement
+                    or fact.unit_provenance != "vision_explicit"
+                    or fact.consolidated_scope != "consolidated"
+                    or fact.unit_scale not in {1.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 100_000_000.0, 1_000_000_000.0}
+                    or not fact.raw_text
+                ):
+                    isolate(fact, "vision_fact_contract_invalid")
+            if (
+                fact.parser_version.startswith("financial-ingestion-ast")
+                and fact.concept in _STATEMENT_FOR
+                and fact.concept != "reported_roe"
                 and fact.unit_provenance == "unknown"
             ):
-                issues.append("unit_provenance_missing")
+                # Optional money fields (notably total equity) are no safer
+                # than required ones when their displayed unit is unknown.
+                # Keep unit safety separate from the current coverage profile.
+                isolate(fact, "unit_provenance_missing")
             if fact.parser_version.startswith("vision-"):
                 if ref is None or not ref.content_hash or not ref.locator.startswith("page:") or str(fact.source_page or 0) != ref.locator.split(":", 1)[1] or ref.evidence_id != f"fact:{fact.fact_id}":
-                    issues.append("vision_evidence_provenance_missing")
-        if values.get("revenue") is not None and values["revenue"] < 0:
-            issues.append("negative_revenue")
-        assets, liabilities = values.get("assets"), values.get("liabilities")
-        equity = values.get("total_equity", values.get("equity"))
-        if assets and liabilities is not None:
-            ratio = liabilities / assets
-            if ratio < 0.01 or ratio > 1.5:
-                issues.append("implausible_liabilities_to_assets")
-        if assets and equity is not None and abs(equity) / abs(assets) < 0.01:
-            issues.append("implausible_total_equity")
-        if assets and liabilities is not None and equity is not None:
-            if abs(assets - liabilities - equity) / max(abs(assets), 1.0) > 0.08:
+                    isolate(fact, "vision_evidence_provenance_missing")
+        safe_facts = [fact for fact in facts if fact.fact_id not in fact_issues]
+        safe_values = {fact.concept: fact.value for fact in safe_facts}
+        if safe_values.get("revenue") is not None and safe_values["revenue"] < 0:
+            for fact in safe_facts:
+                if fact.concept == "revenue":
+                    isolate(fact, "negative_revenue")
+            safe_facts = [fact for fact in safe_facts if fact.concept != "revenue"]
+            safe_values.pop("revenue", None)
+        # Economic ratios are not parser-integrity proofs: banks can have
+        # unusual leverage and issuers can report negative or thin equity.
+        # Check the accounting identity only when total equity (rather than
+        # parent-attributable equity) is explicitly available.
+        assets = safe_values.get("assets")
+        liabilities = safe_values.get("liabilities")
+        total_equity = safe_values.get("total_equity")
+        invalid_concepts: set[str] = set()
+        if assets is not None and liabilities is not None and total_equity is not None:
+            if abs(assets - liabilities - total_equity) / max(abs(assets), 1.0) > 0.08:
                 issues.append("balance_sheet_imbalance")
-        roe = values.get("reported_roe")
-        if roe is not None and not -5 <= roe <= 5:
-            issues.append("implausible_reported_roe")
+                invalid_concepts.update({"assets", "liabilities", "total_equity"})
+        for fact in safe_facts:
+            if fact.concept in invalid_concepts:
+                isolate(fact, "balance_sheet_imbalance")
+        accepted = tuple(fact for fact in safe_facts if fact.concept not in invalid_concepts)
+        accepted_ids = {fact.fact_id for fact in accepted}
+        quarantined = tuple(fact for fact in facts if fact.fact_id not in accepted_ids)
+        accepted_concepts = {fact.concept for fact in accepted}
+        covered = accepted_concepts & _CORE
+        missing_required = required - accepted_concepts
+        if "equity" in missing_required and "total_equity" in accepted_concepts:
+            missing_required.remove("equity")
+        if {"revenue", "net_income"}.issubset(required) and not {"revenue", "net_income"}.issubset(covered):
+            issues.append("income_statement_core_missing")
+        if "operating_cash_flow" in required and "operating_cash_flow" not in covered:
+            issues.append("cash_flow_core_missing")
+        balance_required = {"assets", "liabilities"} & required
+        equity_required = bool({"equity", "total_equity"} & required)
+        if (balance_required - covered) or (equity_required and not ({"equity", "total_equity"} & accepted_concepts)):
+            issues.append("balance_sheet_core_missing")
+        if missing_required or (equity_required and not ({"equity", "total_equity"} & accepted_concepts)):
+            issues.append("core_coverage_insufficient")
         fatal_issues = [issue for issue in issues if issue not in _COVERAGE_WARNING_ISSUES]
         status = (
             ValidationStatus.REJECTED
-            if fatal_issues
+            if not accepted and (fatal_issues or facts)
             else ValidationStatus.READY_WITH_WARNINGS
-            if issues
+            if issues or quarantined
             else ValidationStatus.VERIFIED
         )
         validation = FinancialValidation(
             status,
             tuple(dict.fromkeys(issues)),
             frozenset(covered),
-            tuple(facts) if not fatal_issues else (),
-            () if not fatal_issues else tuple(facts),
+            accepted,
+            quarantined,
         )
         return FinancialGroupValidation(identity, validation)
 
@@ -3813,6 +4501,9 @@ class FinancialIngestionEngine:
         facts: list[FinancialFact] = []
         refs: list[EvidenceRef] = []
         previous: PdfTableContext | None = _checkpoint_context_from_dict(initial_context)
+        chapter_unit: PdfTableContext | None = (
+            previous if previous and previous.unit_explicit else None
+        )
         self._last_pdf_context = previous
         rules = compatibility_rules or self._compatibility_rules
         if not index_precomputed:
@@ -3846,15 +4537,28 @@ class FinancialIngestionEngine:
                             rows_by_top.append([cell])
                 rows = tuple(PdfRowAST(tuple(sorted(cells, key=lambda c: c.x0)), min(c.top for c in cells), (min(c.x0 for c in cells), min(c.top for c in cells), max(c.x1 for c in cells), max(c.bottom for c in cells))) for cells in rows_by_top if cells)
                 page_text = page.extract_text() or ""
-                sections = _page_sections(previous, page_text, rows, page_number, company.reporting_currency, rules)
+                sections = _page_sections(
+                    previous, page_text, rows, page_number,
+                    company.reporting_currency, rules, chapter_unit,
+                )
                 for section in sections:
                     context = section.context
+                    if context.unit_provenance == "explicit":
+                        chapter_unit = context
                     statement, scope = context.statement, context.scope
                     multiplier, table_currency = context.multiplier, context.currency
                     table_rows = section.rows
                     table = PdfTableAST(page_number, statement, scope, table_currency, multiplier, _period_headers(table_rows), table_rows)
                     columns = context.periods or _period_columns(table.rows, rules=rules)
                     table_text = ' '.join(item.text for item in table.rows)
+                    percent_unit_header = any(
+                        re.search(
+                            r"(?:单位|unit)\s*[:：]?\s*[（(]?\s*[%％]|[（(]\s*[%％]\s*[）)]",
+                            row.text,
+                            re.IGNORECASE,
+                        )
+                        for row in table.rows[:12]
+                    )
                     # CAS English statements use Operating income for top-line
                     # revenue, unlike US GAAP operating profit. Require the
                     # paired numbered cost header in the same formal table.
@@ -3997,6 +4701,21 @@ class FinancialIngestionEngine:
                                 label = "revenue"
                             if label is None and concept == "equity" and row.bbox in equity_totals:
                                 label = "equity attributable to equity holders of the company"
+                            if (
+                                label is None
+                                and concept == "capital_expenditure"
+                            ):
+                                # Retain the observed label so the existing
+                                # component classifier can distinguish an
+                                # aggregate PPE+intangibles outflow from
+                                # separately disclosed component rows.  The
+                                # verbatim wording remains in raw_text.
+                                label = _capex_cash_outflow_label(compact) or None
+                            if concept in {"share_repurchase", "shareholder_dividends_paid"}:
+                                capital_return = _capital_return_label(compact)
+                                if capital_return is None or capital_return[0] != concept:
+                                    continue
+                                label = capital_return[1]
                             # Summary labels such as 毛利率 contain 毛利.  Only
                             # an explicitly reported ratio may be accepted from
                             # a summary page; monetary facts require their
@@ -4060,7 +4779,10 @@ class FinancialIngestionEngine:
                             parsed = _parse_number(selected.text)
                             if parsed is None:
                                 continue
-                            if concept == "capital_expenditure":
+                            if concept in {
+                                "capital_expenditure", "share_repurchase",
+                                "shareholder_dividends_paid",
+                            }:
                                 parsed = abs(parsed)
                             selected_center = (selected.x0 + selected.x1) / 2
                             selected_column = next(
@@ -4085,8 +4807,28 @@ class FinancialIngestionEngine:
                             ):
                                 fact_unit_provenance = "explicit"
                             value = float(parsed) * (1.0 if concept == "reported_roe" else fact_multiplier)
-                            if concept == "reported_roe" and abs(value) > 1:
-                                value /= 100.0
+                            if concept == "reported_roe":
+                                # Percent semantics come from the disclosed
+                                # cell/row, never from magnitude. `_parse_number`
+                                # already normalizes a percent sign attached to
+                                # the cell; split percent markers are handled
+                                # here. A bare 0.85 remains 0.85 with unknown
+                                # provenance instead of being guessed as 85%.
+                                percent_declared = "%" in selected.text or "％" in selected.text
+                                row_percent_declared = (
+                                    not percent_declared
+                                    and (
+                                        any(marker in merged_row.text for marker in ("%", "％", "百分比"))
+                                        or (summary_page and percent_unit_header)
+                                    )
+                                )
+                                if row_percent_declared:
+                                    value /= 100.0
+                                fact_unit_provenance = (
+                                    "explicit_percent"
+                                    if percent_declared or row_percent_declared
+                                    else "unknown"
+                                )
                             # Avoid repeated nested rows and parent-only tables.
                             period_start = _period_start(manifest) if statement in {"income_statement", "cash_flow"} else None
                             identity = f"{filing.document_id}|{concept}|{page_number}|{merged_row.bbox}|{value}"
@@ -4214,7 +4956,10 @@ class FinancialIngestionEngine:
                                     comparison_value = _parse_number(comparison_cell.text)
                                     if comparison_value is None:
                                         continue
-                                    if concept == "capital_expenditure":
+                                    if concept in {
+                                        "capital_expenditure", "share_repurchase",
+                                        "shareholder_dividends_paid",
+                                    }:
                                         comparison_value = abs(comparison_value)
                                     comparison_end = _shift_period_year(
                                         manifest.period_end, comparison_column.year

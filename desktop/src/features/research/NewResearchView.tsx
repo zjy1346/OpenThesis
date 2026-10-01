@@ -143,7 +143,13 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const marketProfile = marketCatalog.find((item) => item.market === market);
   const requiresSecIdentity = marketProfile?.requires_sec_identity ?? market === "US";
   const visionPolicy = parseVisionFallbackPolicy(bootstrap.preferences.vision_fallback_policy);
-  const visionFallback = visionFallbackSelectionFromPolicy(visionPolicy, market === "CN_A" ? "ch" : "en");
+  const visionFallbackSelection = visionFallbackSelectionFromPolicy(visionPolicy, market === "CN_A" ? "ch" : "en");
+  const visionFallbackModel = configuredModels.find(
+    (model) => model.configured_model_id === visionFallbackSelection?.model?.configured_model_id,
+  );
+  const visionFallback = visionFallbackSelection?.model && visionFallbackModel
+    ? { ...visionFallbackSelection, model: { ...visionFallbackSelection.model, connection_id: visionFallbackModel.connection_id } }
+    : visionFallbackSelection;
   const usableModels = useMemo(
     () => configuredModels.filter((model) => model.enabled && model.health_status === "ready"),
     [configuredModels],
@@ -194,6 +200,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     const model = configuredModels.find((item) => item.configured_model_id === configuredModelId);
     return model ? {
       configured_model_id: model.configured_model_id,
+      connection_id: model.connection_id,
       configuration_version: model.configuration_version ?? 1,
       role,
     } : undefined;

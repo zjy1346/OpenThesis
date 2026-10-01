@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Sequence, TYPE_CHECKING
 
 from .domain import (
     Company,
@@ -19,7 +20,11 @@ from .domain import (
 )
 
 
-SCHEMA_VERSION = 11
+if TYPE_CHECKING:
+    from .research_continuity import StageAttempt
+
+
+SCHEMA_VERSION = 13
 
 # One immutable description of the derived-data inputs.  Source records are
 # never migrated in place; a changed input contract makes current reads miss
@@ -27,7 +32,7 @@ SCHEMA_VERSION = 11
 DERIVED_PIPELINE_CONTRACT = {
     "version": "financial-derived-pipeline-v1",
     "disclosure_identity": "disclosure-identity-v1",
-    "parser": "financial-ingestion-ast-v7",
+    "parser": "financial-ingestion-ast-v9",
     "rules": "financial-rules-v1",
     "facts": CURRENT_DERIVED_VERSION,
     "validation": "financial-validation-v1",
@@ -169,6 +174,7 @@ class Storage:
                      source_column TEXT NOT NULL DEFAULT '',
                      raw_text TEXT NOT NULL DEFAULT '',
                     parser_version TEXT NOT NULL DEFAULT '',
+                    generation_id TEXT NOT NULL DEFAULT '',
                     validation_status TEXT NOT NULL DEFAULT 'unvalidated',
                     extraction_status TEXT NOT NULL DEFAULT 'unresolved',
                     usage_status TEXT NOT NULL DEFAULT 'audit_only',
@@ -200,6 +206,7 @@ class Storage:
                     fiscal_period TEXT NOT NULL,
                     consolidated_scope TEXT NOT NULL,
                     currency TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'target',
                     status TEXT NOT NULL,
                     issues_json TEXT NOT NULL,
                     covered_concepts_json TEXT NOT NULL,
@@ -210,6 +217,27 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS idx_validation_groups_company
                 ON financial_validation_groups(company_cik, period_end DESC);
+
+                CREATE TABLE IF NOT EXISTS financial_ingestion_candidates (
+                    generation_id TEXT PRIMARY KEY,
+                    company_cik TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    parser_version TEXT NOT NULL DEFAULT '',
+                    source_hashes_json TEXT NOT NULL DEFAULT '{}',
+                    accessions_json TEXT NOT NULL DEFAULT '[]',
+                    state TEXT NOT NULL,
+                    diagnostics_json TEXT NOT NULL DEFAULT '[]',
+                    candidate_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS financial_active_generations (
+                    company_cik TEXT NOT NULL,
+                    accession_number TEXT NOT NULL,
+                    generation_id TEXT NOT NULL,
+                    PRIMARY KEY(company_cik, accession_number),
+                    FOREIGN KEY(generation_id)
+                        REFERENCES financial_ingestion_candidates(generation_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS financial_retry_state (
                     company_cik TEXT PRIMARY KEY,
@@ -289,6 +317,58 @@ class Storage:
                     FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS research_stage_attempts (
+                    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    outcome TEXT NOT NULL,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    message TEXT NOT NULL DEFAULT '',
+                    diagnostics_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+                    UNIQUE(run_id, stage, attempt)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_stage_attempt_run
+                ON research_stage_attempts(run_id, attempt_id);
+
+                CREATE TABLE IF NOT EXISTS research_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_research_job_run
+                ON research_jobs(run_id, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS report_revisions (
+                    revision_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    parent_revision_id TEXT,
+                    generation INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+                    FOREIGN KEY(parent_revision_id) REFERENCES report_revisions(revision_id),
+                    UNIQUE(run_id, generation),
+                    UNIQUE(run_id, content_sha256)
+                );
+
+                CREATE TABLE IF NOT EXISTS latest_report_revisions (
+                    run_id TEXT PRIMARY KEY,
+                    revision_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
+                    FOREIGN KEY(revision_id) REFERENCES report_revisions(revision_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS thesis_versions (
                     thesis_version_id TEXT PRIMARY KEY,
                     company_cik TEXT NOT NULL,
@@ -313,6 +393,12 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS market_snapshot_cache (
                     cache_key TEXT PRIMARY KEY,
                     snapshot_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS qualitative_evidence_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    evidence_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -346,6 +432,7 @@ class Storage:
                      "source_column": "TEXT NOT NULL DEFAULT ''",
                      "raw_text": "TEXT NOT NULL DEFAULT ''",
                     "parser_version": "TEXT NOT NULL DEFAULT ''",
+                    "generation_id": "TEXT NOT NULL DEFAULT ''",
                     "validation_status": "TEXT NOT NULL DEFAULT 'unvalidated'",
                     "extraction_status": "TEXT NOT NULL DEFAULT 'unresolved'",
                     "usage_status": "TEXT NOT NULL DEFAULT 'audit_only'",
@@ -361,8 +448,12 @@ class Storage:
             self._ensure_columns(
                 db,
                 "financial_validation_groups",
-                {"derived_version": "TEXT NOT NULL DEFAULT 'legacy'"},
+                {
+                    "derived_version": "TEXT NOT NULL DEFAULT 'legacy'",
+                    "role": "TEXT NOT NULL DEFAULT 'target'",
+                },
             )
+            self._backfill_active_fact_generations(db)
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -404,6 +495,35 @@ class Storage:
         for name, definition in columns.items():
             if name not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _backfill_active_fact_generations(db: sqlite3.Connection) -> None:
+        """Repair generation tags written by early candidate-ledger builds."""
+        rows = db.execute(
+            "SELECT a.company_cik, a.generation_id, c.candidate_json "
+            "FROM financial_active_generations a "
+            "JOIN financial_ingestion_candidates c USING(generation_id)"
+        ).fetchall()
+        for row in rows:
+            try:
+                candidate = json.loads(str(row["candidate_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            fact_ids = {
+                str(fact.get("fact_id", ""))
+                for key in ("accepted_facts", "quarantined_facts", "audit_facts")
+                for fact in candidate.get(key, ())
+                if isinstance(fact, dict) and fact.get("fact_id")
+            } if isinstance(candidate, dict) else set()
+            if not fact_ids:
+                continue
+            placeholders = ", ".join("?" for _ in fact_ids)
+            db.execute(
+                f"UPDATE financial_facts SET generation_id = ? "
+                f"WHERE company_cik = ? AND fact_id IN ({placeholders}) "
+                "AND COALESCE(generation_id, '') = ''",
+                (str(row["generation_id"]), str(row["company_cik"]), *sorted(fact_ids)),
+            )
 
     def save_company(self, company: Company) -> None:
         with self.connect() as db:
@@ -841,7 +961,13 @@ class Storage:
         validation_groups: list[Any] | tuple[Any, ...] = (),
         evidence: list[Any] | tuple[Any, ...] = (),
         audit_facts: list[FinancialFact] | tuple[FinancialFact, ...] = (),
-    ) -> None:
+        *,
+        generation_id: str | None = None,
+        parser_version: str = "",
+        source_hashes: dict[str, str] | None = None,
+        complete_accessions: set[str] | frozenset[str] | None = None,
+        candidate_diagnostics: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any] | None:
         """Atomically replace facts, evidence, and validation decisions.
 
         Rejected facts are retained with ``validation_status=REJECTED`` for
@@ -850,6 +976,144 @@ class Storage:
         """
         unique = sorted({value for value in accession_numbers if value})
         with self.connect() as db:
+            promotable = set(unique)
+            accession_states: dict[str, str] = {item: "promoted" for item in unique}
+            normalized_hashes = {
+                str(key): str(value).casefold()
+                for key, value in (source_hashes or {}).items()
+                if key and value
+            }
+            if generation_id:
+                # Tag candidate facts before both staging and active
+                # materialization. Readers can then match rows to the active
+                # generation instead of observing a mixed accession.
+                accepted_facts = [replace(fact, generation_id=generation_id) for fact in accepted_facts]
+                quarantined_facts = [
+                    replace(fact, generation_id=generation_id)
+                    for fact in (quarantined_facts or ())
+                ]
+                audit_facts = [replace(fact, generation_id=generation_id) for fact in audit_facts]
+                now = utc_now_iso()
+                parser_value = str(parser_version or "")
+                group_payload = []
+                for group in validation_groups:
+                    validation = getattr(group, "validation", None)
+                    group_payload.append({
+                        "identity": list(getattr(group, "identity", ())),
+                        "role": str(getattr(group, "role", "") or "target"),
+                        "status": str(getattr(getattr(validation, "status", None), "value", "")),
+                        "issues": list(getattr(validation, "issues", ())),
+                        "covered_concepts": sorted(getattr(validation, "covered_concepts", ())),
+                        "accepted_fact_ids": [fact.fact_id for fact in getattr(validation, "accepted", ())],
+                        "quarantined_fact_ids": [fact.fact_id for fact in getattr(validation, "quarantined", ())],
+                    })
+                candidate_payload = {
+                    "accepted_facts": [fact.to_dict() for fact in accepted_facts],
+                    "quarantined_facts": [fact.to_dict() for fact in (quarantined_facts or ())],
+                    "audit_facts": [fact.to_dict() for fact in audit_facts],
+                    "evidence": [item.to_dict() for item in evidence],
+                    "validation_groups": group_payload,
+                }
+                diagnostics = list(dict.fromkeys(str(item) for item in candidate_diagnostics if item))
+
+                for accession in unique:
+                    if complete_accessions is not None and accession not in complete_accessions:
+                        accession_states[accession] = "incomplete"
+                        diagnostics.append(f"{accession}:candidate_parse_incomplete")
+                        promotable.discard(accession)
+                        continue
+
+                    # When exactly the same source bytes are reparsed, a
+                    # drastic loss of distinct statement concepts is an
+                    # investigation trigger. It is not evidence that old
+                    # numbers are correct; the old set is kept active while
+                    # the new candidate and its provenance remain auditable.
+                    existing_hash_row = db.execute(
+                        "SELECT content_hash FROM filings WHERE company_cik = ? AND accession_number = ? ORDER BY ingested_at DESC LIMIT 1",
+                        (company_cik, accession),
+                    ).fetchone()
+                    existing_hash = str(existing_hash_row[0] if existing_hash_row else "")
+                    candidate_hash = normalized_hashes.get(accession, "")
+                    existing = db.execute(
+                        "SELECT concept, parser_version FROM financial_facts "
+                        "WHERE company_cik = ? AND accession_number = ? "
+                        "AND COALESCE(validation_status, 'unvalidated') <> 'REJECTED' "
+                        "AND COALESCE(usage_status, 'audit_only') IN ('canonical_research', 'comparator')",
+                        (company_cik, accession),
+                    ).fetchall()
+                    existing_parsers = {str(row["parser_version"] or "") for row in existing}
+                    existing_core = {
+                        str(row["concept"]).casefold() for row in existing
+                    } & {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity", "total_equity"}
+                    candidate_core = {
+                        str(fact.concept).casefold() for fact in accepted_facts
+                        if fact.accession_number == accession
+                    } & {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity", "total_equity"}
+                    same_source = bool(
+                        existing_hash and candidate_hash
+                        and existing_hash.casefold() == candidate_hash
+                    )
+                    known_untrusted_legacy = any(
+                        version.endswith("ast-v7") for version in existing_parsers
+                    )
+                    if (
+                        same_source
+                        and not known_untrusted_legacy
+                        and len(existing_core) >= 4
+                        and len(candidate_core) <= 1
+                    ):
+                        accession_states[accession] = "investigate"
+                        promotable.discard(accession)
+                        diagnostics.append(
+                            f"{accession}:same_source_core_coverage_shrank:{','.join(sorted(existing_core - candidate_core))}"
+                        )
+
+                candidate_state = (
+                    "promoted" if len(promotable) == len(unique)
+                    else "partially_promoted" if promotable
+                    else "investigate" if "investigate" in accession_states.values()
+                    else "incomplete"
+                )
+                db.execute(
+                        "INSERT OR REPLACE INTO financial_ingestion_candidates("
+                    "generation_id, company_cik, created_at, parser_version, "
+                        "source_hashes_json, accessions_json, state, diagnostics_json, candidate_json"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        generation_id, company_cik, now, parser_value,
+                        json.dumps(normalized_hashes, sort_keys=True),
+                        json.dumps(unique), candidate_state,
+                        json.dumps(diagnostics, ensure_ascii=False),
+                        json.dumps(candidate_payload, ensure_ascii=False),
+                    ),
+                )
+                if not promotable:
+                    return {
+                        "generation_id": generation_id,
+                        "state": candidate_state,
+                        "accessions": accession_states,
+                        "diagnostics": diagnostics,
+                    }
+
+                accepted_facts = [fact for fact in accepted_facts if fact.accession_number in promotable]
+                quarantined_facts = [fact for fact in (quarantined_facts or ()) if fact.accession_number in promotable]
+                audit_facts = [fact for fact in audit_facts if fact.accession_number in promotable]
+                validation_groups = [
+                    group for group in validation_groups
+                    if tuple(getattr(group, "identity", ()))
+                    and tuple(getattr(group, "identity", ()))[0] in promotable
+                ]
+                document_ids = {
+                    str(row[0])
+                    for accession in promotable
+                    for row in db.execute(
+                        "SELECT document_id FROM filings WHERE company_cik = ? AND accession_number = ?",
+                        (company_cik, accession),
+                    ).fetchall()
+                }
+                evidence = [item for item in evidence if str(getattr(item, "document_id", "")) in document_ids]
+                unique = sorted(promotable)
+
             for accession in unique:
                 # Evidence is keyed by filing document rather than accession.
                 # Resolve the document ids before replacing parser output so a
@@ -932,24 +1196,50 @@ class Storage:
                 status = getattr(getattr(validation, "status", None), "value", str(getattr(validation, "status", "REJECTED")))
                 # Include the issuer key to avoid collisions when two
                 # securities use the same accession/period identity.
-                group_id = "|".join((company_cik, *identity))
+                role = str(getattr(group, "role", "") or "target").casefold()
+                if role not in {"target", "comparator", "audit"}:
+                    role = "target"
+                group_id = "|".join((company_cik, *identity, role))
                 db.execute(
                     """
                     INSERT OR REPLACE INTO financial_validation_groups(
                         group_id, company_cik, accession_number, period_end,
-                        fiscal_period, consolidated_scope, currency, status,
+                        fiscal_period, consolidated_scope, currency, role, status,
                         issues_json, covered_concepts_json, updated_at, derived_version
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         group_id, company_cik, identity[0], identity[1], identity[2],
-                        identity[3], identity[4], status,
+                        identity[3], identity[4], role, status,
                         json.dumps(list(getattr(validation, "issues", ())), ensure_ascii=False),
                         json.dumps(sorted(getattr(validation, "covered_concepts", frozenset())), ensure_ascii=False),
                         utc_now_iso(), CURRENT_DERIVED_VERSION,
                     ),
                 )
+            if generation_id:
+                for accession in unique:
+                    db.execute(
+                        "INSERT OR REPLACE INTO financial_active_generations "
+                        "(company_cik, accession_number, generation_id) VALUES(?, ?, ?)",
+                        (company_cik, accession, generation_id),
+                    )
+                db.execute(
+                    "UPDATE financial_ingestion_candidates SET state = ? WHERE generation_id = ?",
+                    (
+                        "promoted" if all(state == "promoted" for state in accession_states.values())
+                        else "partially_promoted",
+                        generation_id,
+                    ),
+                )
             self._clear_rebuild_marker_if_fully_rebuilt(db)
+        if generation_id:
+            return {
+                "generation_id": generation_id,
+                "state": "promoted" if all(state == "promoted" for state in accession_states.values()) else "partially_promoted",
+                "accessions": accession_states,
+                "diagnostics": diagnostics,
+            }
+        return None
 
     @staticmethod
     def _clear_rebuild_marker_if_fully_rebuilt(db: sqlite3.Connection) -> None:
@@ -994,8 +1284,9 @@ class Storage:
                 entity, market, statement, period_start, consolidated_scope,
                  currency, unit_scale, unit_provenance, revision, source_document, source_page,
                  source_bbox_json, source_column, raw_text, parser_version, validation_status
-                , extraction_status, usage_status, provenance_status, derived_version
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                , extraction_status, usage_status, provenance_status, derived_version,
+                generation_id
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1034,21 +1325,39 @@ class Storage:
                     fact.usage_status,
                     fact.provenance_status,
                     fact.derived_version,
+                     fact.generation_id,
                 )
                 for fact in facts
             ],
         )
 
     def get_facts(self, cik: str) -> list[dict[str, Any]]:
+        return self.get_financial_research_snapshot(cik)["facts"]
+
+    def get_financial_research_snapshot(self, cik: str) -> dict[str, Any]:
+        """Capture facts and active generation pointers in one read view."""
         with self.connect() as db:
+            db.execute("BEGIN")
+            generations = {
+                str(row["accession_number"]): str(row["generation_id"])
+                for row in db.execute(
+                    "SELECT accession_number, generation_id "
+                    "FROM financial_active_generations WHERE company_cik = ?",
+                    (cik,),
+                ).fetchall()
+            }
             rows = db.execute(
                 """
                 SELECT f.* FROM financial_facts f
                 LEFT JOIN security_listings l ON l.security_id = f.company_cik
+                LEFT JOIN financial_active_generations g
+                  ON g.company_cik = f.company_cik
+                 AND g.accession_number = f.accession_number
                 WHERE f.company_cik = ?
                   AND COALESCE(f.validation_status, 'unvalidated') <> 'REJECTED'
                   AND COALESCE(f.usage_status, 'audit_only') IN ('canonical_research', 'comparator')
                   AND COALESCE(f.derived_version, 'legacy') = ?
+                  AND (g.generation_id IS NULL OR f.generation_id = g.generation_id)
                   AND COALESCE(f.consolidated_scope, 'consolidated') = 'consolidated'
                   AND (
                       l.reporting_currency IS NULL
@@ -1059,7 +1368,10 @@ class Storage:
                 """,
                 (cik, CURRENT_DERIVED_VERSION),
             ).fetchall()
-        return [self._fact_row(row) for row in rows]
+        return {
+            "facts": [self._fact_row(row) for row in rows],
+            "generations": generations,
+        }
 
     def get_facts_audit(self, cik: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -1067,7 +1379,62 @@ class Storage:
                 "SELECT * FROM financial_facts WHERE company_cik = ? ORDER BY fiscal_year DESC, concept",
                 (cik,),
             ).fetchall()
-        return [self._fact_row(row) for row in rows]
+            candidates = db.execute(
+                "SELECT generation_id, candidate_json FROM financial_ingestion_candidates "
+                "WHERE company_cik = ? ORDER BY created_at DESC, generation_id DESC",
+                (cik,),
+            ).fetchall()
+        result = [self._fact_row(row) for row in rows]
+        seen = {
+            (str(item.get("fact_id", "")), str(item.get("generation_id", "")))
+            for item in result
+        }
+        # Candidate generations are deliberately excluded from normal research
+        # reads. Keep their facts inspectable through the audit view without
+        # materializing or overwriting the currently active generation.
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate["candidate_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            generation_id = str(candidate["generation_id"] or "")
+            for bucket, usage_status in (
+                ("accepted_facts", "candidate_audit"),
+                ("quarantined_facts", "quarantined"),
+                ("audit_facts", "audit_only"),
+            ):
+                fact_items = payload.get(bucket, [])
+                if not isinstance(fact_items, list):
+                    continue
+                for raw in fact_items:
+                    if not isinstance(raw, dict):
+                        continue
+                    fact = dict(raw)
+                    fact_id = str(fact.get("fact_id", ""))
+                    if not fact_id:
+                        continue
+                    fact_generation = str(fact.get("generation_id") or generation_id)
+                    identity = (fact_id, fact_generation)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    fact["generation_id"] = fact_generation
+                    fact["usage_status"] = usage_status
+                    if bucket == "quarantined_facts":
+                        fact["validation_status"] = "REJECTED"
+                    fact.setdefault("source_bbox", None)
+                    result.append(fact)
+        result.sort(
+            key=lambda item: (
+                -int(item.get("fiscal_year") or 0),
+                str(item.get("concept", "")),
+                str(item.get("generation_id", "")),
+                str(item.get("fact_id", "")),
+            )
+        )
+        return result
 
     @staticmethod
     def _fact_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -1136,14 +1503,51 @@ class Storage:
             result.append(item)
         return result
 
+    def save_qualitative_evidence_cache(
+        self, cache_key: str, evidence: list[dict[str, Any]]
+    ) -> None:
+        """Persist immutable parser output keyed by content and parser contract."""
+
+        with self.connect() as db:
+            db.execute(
+                """
+                INSERT INTO qualitative_evidence_cache(cache_key, evidence_json, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    evidence_json=excluded.evidence_json,
+                    updated_at=excluded.updated_at
+                """,
+                (cache_key, json.dumps(evidence, ensure_ascii=False), utc_now_iso()),
+            )
+
+    def get_qualitative_evidence_cache(
+        self, cache_key: str
+    ) -> list[dict[str, Any]] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT evidence_json FROM qualitative_evidence_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(str(row[0]))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else None
+
     def save_run(self, run: ResearchRun) -> None:
         payload = run.to_dict()
         with self.connect() as db:
             db.execute(
                 """
-                INSERT OR REPLACE INTO research_runs(
+                INSERT INTO research_runs(
                     run_id, company_cik, payload_json, status, started_at, completed_at
                 ) VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    status=excluded.status,
+                    completed_at=excluded.completed_at
                 """,
                 (
                     run.run_id,
@@ -1158,14 +1562,23 @@ class Storage:
     def save_run_with_artifacts(
         self, run: ResearchRun, artifacts: list[ResearchArtifact]
     ) -> None:
-        """Persist a run snapshot and its replacement artifacts atomically."""
+        """Persist a run snapshot and new immutable artifacts atomically.
+
+        Artifact identifiers are content identities, not overwrite slots.  A
+        repeated identical write is idempotent; reusing an identifier for
+        different content is a storage-integrity error.
+        """
         payload = run.to_dict()
         with self.connect() as db:
             db.execute(
                 """
-                INSERT OR REPLACE INTO research_runs(
+                INSERT INTO research_runs(
                     run_id, company_cik, payload_json, status, started_at, completed_at
                 ) VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    status=excluded.status,
+                    completed_at=excluded.completed_at
                 """,
                 (
                     run.run_id,
@@ -1177,29 +1590,75 @@ class Storage:
                 ),
             )
             for artifact in artifacts:
-                db.execute(
-                    """
-                    INSERT OR REPLACE INTO artifacts(
-                        artifact_id, run_id, artifact_type, title, payload_json,
-                        model_id, agent_id, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        artifact.artifact_id,
-                        artifact.run_id,
-                        artifact.artifact_type,
-                        artifact.title,
-                        json.dumps(artifact.content, ensure_ascii=False),
-                        artifact.model_id,
-                        artifact.agent_id,
-                        artifact.created_at,
-                    ),
+                encoded = json.dumps(
+                    artifact.content,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
                 )
+                existing = db.execute(
+                    """
+                    SELECT run_id, artifact_type, title, payload_json,
+                           model_id, agent_id
+                    FROM artifacts WHERE artifact_id = ?
+                    """,
+                    (artifact.artifact_id,),
+                ).fetchone()
+                if existing is None:
+                    db.execute(
+                        """
+                        INSERT INTO artifacts(
+                            artifact_id, run_id, artifact_type, title,
+                            payload_json, model_id, agent_id, created_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            artifact.artifact_id,
+                            artifact.run_id,
+                            artifact.artifact_type,
+                            artifact.title,
+                            encoded,
+                            artifact.model_id,
+                            artifact.agent_id,
+                            artifact.created_at,
+                        ),
+                    )
+                    if artifact.artifact_type == "research-report":
+                        self._append_report_revision_db(
+                            db, artifact.run_id, artifact.content
+                        )
+                    continue
+                try:
+                    stored_content = json.loads(existing["payload_json"])
+                except (TypeError, json.JSONDecodeError):
+                    stored_content = None
+                expected = (
+                    artifact.run_id,
+                    artifact.artifact_type,
+                    artifact.title,
+                    artifact.content,
+                    artifact.model_id,
+                    artifact.agent_id,
+                )
+                actual = (
+                    existing["run_id"],
+                    existing["artifact_type"],
+                    existing["title"],
+                    stored_content,
+                    existing["model_id"],
+                    existing["agent_id"],
+                )
+                if actual != expected:
+                    raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT")
+                if artifact.artifact_type == "research-report":
+                    self._append_report_revision_db(
+                        db, artifact.run_id, artifact.content
+                    )
 
     def interrupt_running_runs(
-        self, reason: str = "应用在研究完成前退出，任务已标记为中断"
+        self, reason: str = "应用在研究完成前退出；已保留完成阶段，可从同一研究记录继续"
     ) -> int:
-        """Mark runs left active by a previous process as safely interrupted."""
+        """Recover active runs as visible partial records after process exit."""
         completed_at = utc_now_iso()
         with self.connect() as db:
             rows = db.execute(
@@ -1215,7 +1674,7 @@ class Storage:
                 if reason not in errors:
                     errors.append(reason)
                 payload["errors"] = errors
-                payload["status"] = RunStatus.CANCELLED.value
+                payload["status"] = RunStatus.PARTIAL.value
                 payload["completed_at"] = completed_at
                 db.execute(
                     """
@@ -1225,33 +1684,259 @@ class Storage:
                     """,
                     (
                         json.dumps(payload, ensure_ascii=False),
-                        RunStatus.CANCELLED.value,
+                        RunStatus.PARTIAL.value,
                         completed_at,
                         row["run_id"],
                     ),
                 )
+                job_rows = db.execute(
+                    "SELECT job_id, snapshot_json FROM research_jobs WHERE run_id = ? AND state IN ('queued', 'running', 'cancelling')",
+                    (row["run_id"],),
+                ).fetchall()
+                for job_row in job_rows:
+                    try:
+                        snapshot = json.loads(job_row["snapshot_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        snapshot = {"job_id": job_row["job_id"], "run_id": row["run_id"]}
+                    snapshot.update({
+                        "state": "completed", "stage": "partial", "percent": 100,
+                        "message": reason, "error_code": "PROCESS_INTERRUPTED",
+                    })
+                    db.execute(
+                        "UPDATE research_jobs SET state = 'completed', stage = 'partial', snapshot_json = ?, updated_at = ? WHERE job_id = ?",
+                        (json.dumps(snapshot, ensure_ascii=False), completed_at, job_row["job_id"]),
+                    )
         return len(rows)
 
     def save_artifact(self, artifact: ResearchArtifact) -> None:
+        encoded = json.dumps(
+            artifact.content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         with self.connect() as db:
+            try:
+                db.execute(
+                    """
+                    INSERT INTO artifacts(
+                        artifact_id, run_id, artifact_type, title, payload_json,
+                        model_id, agent_id, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact.artifact_id, artifact.run_id, artifact.artifact_type,
+                        artifact.title, encoded, artifact.model_id, artifact.agent_id,
+                        artifact.created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                existing = db.execute(
+                    "SELECT run_id, artifact_type, title, payload_json, model_id, agent_id FROM artifacts WHERE artifact_id = ?",
+                    (artifact.artifact_id,),
+                ).fetchone()
+                expected = (
+                    artifact.run_id, artifact.artifact_type, artifact.title,
+                    artifact.content, artifact.model_id, artifact.agent_id,
+                )
+                actual = None
+                if existing is not None:
+                    try:
+                        stored_content = json.loads(existing["payload_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        stored_content = None
+                    actual = (
+                        existing["run_id"], existing["artifact_type"], existing["title"],
+                        stored_content, existing["model_id"], existing["agent_id"],
+                    )
+                if actual != expected:
+                    raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT") from exc
+            if artifact.artifact_type == "research-report":
+                self._append_report_revision_db(
+                    db, artifact.run_id, artifact.content
+                )
+
+    def append_stage_attempt(self, attempt: "StageAttempt") -> None:
+        payload = attempt.to_dict()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT COALESCE(MAX(attempt), 0) AS value FROM research_stage_attempts WHERE run_id = ? AND stage = ?",
+                (payload["run_id"], payload["stage"]),
+            ).fetchone()
+            ordinal = max(int(payload["attempt"]), int(row["value"]) + 1)
             db.execute(
                 """
-                INSERT OR REPLACE INTO artifacts(
-                    artifact_id, run_id, artifact_type, title, payload_json,
-                    model_id, agent_id, created_at
+                INSERT INTO research_stage_attempts(
+                    run_id, stage, attempt, outcome, error_code, message,
+                    diagnostics_json, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    artifact.artifact_id,
-                    artifact.run_id,
-                    artifact.artifact_type,
-                    artifact.title,
-                    json.dumps(artifact.content, ensure_ascii=False),
-                    artifact.model_id,
-                    artifact.agent_id,
-                    artifact.created_at,
+                    payload["run_id"], payload["stage"], ordinal,
+                    payload["outcome"], payload["error_code"], payload["message"],
+                    json.dumps(payload["diagnostics"], ensure_ascii=False),
+                    payload["created_at"],
                 ),
             )
+
+    def save_research_job(self, snapshot: dict[str, Any]) -> None:
+        run_id = str(snapshot.get("run_id") or "")
+        if not run_id:
+            return
+        with self.connect() as db:
+            if db.execute("SELECT 1 FROM research_runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+                return
+            db.execute(
+                """
+                INSERT INTO research_jobs(job_id, run_id, state, stage, snapshot_json, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    state=excluded.state,
+                    stage=excluded.stage,
+                    snapshot_json=excluded.snapshot_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(snapshot["job_id"]), run_id, str(snapshot.get("state", "queued")),
+                    str(snapshot.get("stage", "preparing")),
+                    json.dumps(snapshot, ensure_ascii=False), utc_now_iso(),
+                ),
+            )
+
+    def get_research_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT snapshot_json FROM research_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            value = json.loads(row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def continuity_snapshot(self, run_id: str) -> dict[str, Any]:
+        with self.connect() as db:
+            rows = db.execute(
+                """
+                SELECT stage, attempt, outcome, error_code, message,
+                       diagnostics_json, created_at
+                FROM research_stage_attempts WHERE run_id = ? ORDER BY attempt_id
+                """,
+                (run_id,),
+            ).fetchall()
+        attempts: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["diagnostics"] = json.loads(item.pop("diagnostics_json"))
+            except (TypeError, json.JSONDecodeError):
+                item["diagnostics"] = {}
+            attempts.append(item)
+        return {"run_id": run_id, "attempts": attempts, "latest": attempts[-1] if attempts else None}
+
+    def append_report_revision(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Append an immutable report revision and atomically advance latest."""
+
+        with self.connect() as db:
+            return self._append_report_revision_db(
+                db,
+                run_id,
+                payload,
+                expected_generation=expected_generation,
+            )
+
+    @staticmethod
+    def _append_report_revision_db(
+        db: sqlite3.Connection,
+        run_id: str,
+        payload: dict[str, Any],
+        *,
+        expected_generation: int | None = None,
+    ) -> dict[str, Any]:
+        """Append and advance a report revision inside the caller transaction."""
+
+        import hashlib
+
+        encoded = json.dumps(
+            payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+        )
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        created_at = utc_now_iso()
+        latest = db.execute(
+            "SELECT revision_id, generation FROM latest_report_revisions WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        current_generation = int(latest["generation"]) if latest is not None else 0
+        if expected_generation is not None and current_generation != expected_generation:
+            raise RuntimeError("REPORT_REVISION_CONFLICT")
+        existing = db.execute(
+            "SELECT revision_id, generation, parent_revision_id, created_at FROM report_revisions WHERE run_id = ? AND content_sha256 = ?",
+            (run_id, digest),
+        ).fetchone()
+        if existing is not None:
+            return {
+                **dict(existing),
+                "run_id": run_id,
+                "content_sha256": digest,
+                "payload": payload,
+            }
+        generation = current_generation + 1
+        parent = str(latest["revision_id"]) if latest is not None else None
+        revision_id = f"{run_id}:report:{generation}:{digest[:16]}"
+        db.execute(
+            """
+            INSERT INTO report_revisions(
+                revision_id, run_id, parent_revision_id, generation,
+                payload_json, content_sha256, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (revision_id, run_id, parent, generation, encoded, digest, created_at),
+        )
+        if latest is None:
+            db.execute(
+                "INSERT INTO latest_report_revisions(run_id, revision_id, generation) VALUES(?, ?, ?)",
+                (run_id, revision_id, generation),
+            )
+        else:
+            cursor = db.execute(
+                """
+                UPDATE latest_report_revisions SET revision_id = ?, generation = ?
+                WHERE run_id = ? AND generation = ?
+                """,
+                (revision_id, generation, run_id, current_generation),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("REPORT_REVISION_CONFLICT")
+        return {
+            "revision_id": revision_id,
+            "run_id": run_id,
+            "parent_revision_id": parent,
+            "generation": generation,
+            "content_sha256": digest,
+            "created_at": created_at,
+            "payload": payload,
+        }
+
+    def latest_report_revision(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """
+                SELECT r.* FROM latest_report_revisions l
+                JOIN report_revisions r ON r.revision_id = l.revision_id
+                WHERE l.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result.pop("payload_json"))
+        return result
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -1304,6 +1989,10 @@ class Storage:
             )
             db.execute("DELETE FROM artifacts WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM financial_recovery_cases WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM research_jobs WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM research_stage_attempts WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM latest_report_revisions WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM report_revisions WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM research_runs WHERE run_id = ?", (run_id,))
         return True
 

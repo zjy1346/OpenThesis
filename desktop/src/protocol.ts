@@ -43,6 +43,8 @@ export const BACKEND_METHODS = [
     "research.start",
   "research.market_snapshot",
   "research.retry_growth",
+  "research.retry_stage",
+  "research.retry_model_stages",
   "research.retry_financials",
   "research.refresh_financial_report",
   "research.start_financial_retry",
@@ -82,6 +84,8 @@ export type BackendParams = {
   "research.start": ResearchRequest;
   "research.market_snapshot": { company: Company; valuation?: ResearchRequest["valuation"] };
   "research.retry_growth": { run_id: string; model: ModelSelection };
+  "research.retry_stage": { run_id: string; target: string; model?: ModelSelection; plan_hash: string };
+  "research.retry_model_stages": { run_id: string; model?: ModelSelection };
   "research.retry_financials": { run_id: string };
   "research.refresh_financial_report": { run_id: string; language?: Language };
   "research.start_financial_retry": { run_id: string };
@@ -111,6 +115,8 @@ export type BackendResult = {
   "research.start": ResearchJob;
   "research.market_snapshot": MarketSnapshotPreview;
   "research.retry_growth": ResearchReport;
+  "research.retry_stage": ResearchReport;
+  "research.retry_model_stages": ResearchReport;
   "research.retry_financials": ResearchReport;
   "research.refresh_financial_report": ResearchReport;
   "research.start_financial_retry": ResearchJob;
