@@ -128,6 +128,30 @@ describe("ResearchProgress", () => {
     expect(screen.getByLabelText("Estimated remaining")).toBeInTheDocument();
   });
 
+  it("exposes filing error codes as keyboard-accessible diagnostics", () => {
+    render(
+      <ResearchProgress
+        language="en"
+        job={{
+          job_id: "diagnostic",
+          state: "running",
+          message: "",
+          percent: 31,
+          run_id: null,
+          stage: "filing-validation",
+          filing_states: {
+            blocked: { filing_id: "blocked", label: "2025", status: "blocked", error_code: "FILING_VALIDATION_BLOCKED", elapsed_seconds: 12 },
+          },
+        }}
+        labels={{ cancel: "Cancel", cancelling: "Stopping", agents: "Agents", running: "Running", retrying: "Retrying", queued: "Queued", completed: "Done", cancelled: "Cancelled", failed: "Failed", unknown: "Waiting" }}
+        onCancel={vi.fn()}
+      />,
+    );
+    const diagnostic = screen.getByLabelText("Filing diagnostic: FILING_VALIDATION_BLOCKED");
+    expect(diagnostic).toHaveAttribute("tabindex", "0");
+    expect(diagnostic).toHaveAttribute("title", expect.stringContaining("Open financial diagnostics"));
+  });
+
   it("does not estimate remaining while cloud approval is waiting", () => {
     render(
       <ResearchProgress

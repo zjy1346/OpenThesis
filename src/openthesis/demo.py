@@ -106,8 +106,10 @@ def demo_facts() -> list[dict[str, Any]]:
                     "end_date": f"{year}-12-31",
                     "filed_at": f"{year + 1}-02-15",
                     "accession_number": f"DEMO-{year}",
+                    "generation_id": "synthetic-demo-fixture-v1",
                     "source_url": "openthesis://synthetic-demo-data",
                     "scope": "consolidated",
+                    "consolidated_scope": "consolidated",
                 }
             )
     return facts

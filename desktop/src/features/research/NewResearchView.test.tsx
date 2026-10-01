@@ -102,8 +102,8 @@ describe("NewResearch configured models", () => {
 
     await waitFor(() => expect(onStart).toHaveBeenCalled());
     const request = onStart.mock.calls[0][0];
-    expect(request.model).toEqual({ configured_model_id: "primary-model", configuration_version: 4, role: "primary" });
-    expect(request.vision_fallback.model).toEqual({ configured_model_id: "vision-model", configuration_version: 2, role: "vision" });
+    expect(request.model).toEqual({ configured_model_id: "primary-model", connection_id: "primary-connection", configuration_version: 4, role: "primary" });
+    expect(request.vision_fallback.model).toEqual({ configured_model_id: "vision-model", connection_id: "vision-connection", configuration_version: 2, role: "vision" });
     expect(request.vision_fallback.provider).toBe("configured_model");
     expect(request.vision_fallback.approval_mode).toBe("review_each_plan");
     expect(JSON.stringify(request)).not.toMatch(/api_key|token|base_url|preset_id/i);

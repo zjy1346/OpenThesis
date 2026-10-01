@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.7.3",
+    [string]$Version = "",
     [string]$CargoTarget = "D:\OpenThesisToolchain\cargo-target\openthesis",
     [ValidateSet("unsigned-test", "authenticode-required")]
     [string]$SignatureMode = "unsigned-test"
@@ -21,6 +21,15 @@ function Get-PeSubsystem([string]$Path) {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$canonicalVersionLine = Select-String -LiteralPath (Join-Path $projectRoot "pyproject.toml") -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+if (-not $canonicalVersionLine) {
+    throw "Unable to read the canonical version from pyproject.toml."
+}
+$canonicalVersion = $canonicalVersionLine.Matches[0].Groups[1].Value
+if (-not $Version) { $Version = $canonicalVersion }
+if ($Version -ne $canonicalVersion) {
+    throw "Requested package version $Version does not match canonical version $canonicalVersion."
+}
 $output = Join-Path $projectRoot "installer-output"
 $zip = Join-Path $output "OpenThesis-$Version-windows-x64-portable.zip"
 $checksum = "$zip.sha256"
@@ -53,26 +62,28 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $archive = [IO.Compression.ZipFile]::OpenRead($zip)
 try {
     $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
+    $portableRoot = "OpenThesis-$Version"
     foreach ($required in @(
-        "OpenThesis/OpenThesis.exe",
-        "OpenThesis/bin/openthesis-sidecar/openthesis-sidecar.exe"
+        "$portableRoot/OpenThesis.exe",
+        "$portableRoot/bin/openthesis-sidecar/openthesis-sidecar.exe",
+        "$portableRoot/bin/openthesis-sidecar/_internal/openthesis/resources/build-info.json"
     )) {
         if ($required -notin $entries) {
             throw "Portable ZIP is missing required entry: $required"
         }
     }
     if (-not ($entries | Where-Object {
-        $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/python*.dll"
+        $_ -like "$portableRoot/bin/openthesis-sidecar/_internal/python*.dll"
     })) {
         throw "Portable ZIP is missing the sidecar Python runtime."
     }
     if (-not ($entries | Where-Object {
-        $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/VCRUNTIME*.dll"
+        $_ -like "$portableRoot/bin/openthesis-sidecar/_internal/VCRUNTIME*.dll"
     })) {
         throw "Portable ZIP is missing the VCRUNTIME runtime."
     }
     if ($entries | Where-Object {
-        $_ -like "OpenThesis/bin/openthesis-sidecar/_internal/VCRUNTIME*.bin"
+        $_ -like "$portableRoot/bin/openthesis-sidecar/_internal/VCRUNTIME*.bin"
     }) {
         throw "Portable ZIP contains a Tauri-only VCRUNTIME staging name."
     }

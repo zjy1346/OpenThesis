@@ -127,11 +127,19 @@ export type ModelRole = "primary" | "comparison" | "verification" | "vision" | "
 
 export type ModelReference = {
   configured_model_id: string;
+  connection_id?: string;
   configuration_version: number;
   role: ModelRole;
 };
 
 export type ModelSelection = ModelReference;
+
+export type RecoveryStageTarget =
+  | "model-stages"
+  | "growth"
+  | "counter-analysis"
+  | "forecast-scenarios"
+  | "synthesis";
 
 export type ProviderModelPreset = {
   model_id: string;
@@ -360,6 +368,13 @@ export type ResearchRunSummary = {
 export type BootstrapResult = {
   contract_version: string;
   app_version: string;
+  build_info?: {
+    version: string;
+    commit: string;
+    build_time_utc: string;
+    contract_version: string;
+    build_id: string;
+  };
   capabilities: string[];
   preferences: Preferences;
   recent_runs: ResearchRunSummary[];
@@ -420,6 +435,20 @@ export type FinancialDiagnostics = {
 
 export type ResearchReport = {
   run_id: string;
+  report_contract_version?: string;
+  report_revision_id?: string | null;
+  report_input_generation?: string;
+  report_read_state?: "ready" | "partial" | "diagnostic_only";
+  is_substantive?: boolean;
+  visible_sections?: Array<{
+    section_id: string;
+    title: string;
+    source_artifact_ids: string[];
+    verification_state: "verified" | "partial" | "unverified" | "needs_review" | string;
+    is_substantive: boolean;
+    diagnostic_code?: string;
+  }>;
+  report_read_diagnostics?: Array<{ code: string; location: string }>;
   ticker: string;
   company_name: string;
   status: string;
@@ -431,8 +460,30 @@ export type ResearchReport = {
   industry_support?: "standard" | "financial_beta";
   market_snapshot?: ResearchRequest["market_snapshot"] | null;
   retryable_synthesis?: boolean;
+  retryable_model_stages?: boolean;
   synthesis_error_code?: string;
   retryable_growth?: boolean;
+  recovery_plan?: {
+    target: RecoveryStageTarget;
+    stages: string[];
+    reason: string;
+    error_code?: string;
+    input_artifact_ids: string[];
+    plan_hash: string;
+    available: boolean;
+  };
+  attempt_complete?: boolean;
+  research_complete?: boolean;
+  action_required?: boolean;
+  report_readiness?: {
+    state: "complete" | "substantive_partial" | "action_required" | "failed" | string;
+    complete: boolean;
+    substantive_sections?: string[];
+    missing_sections?: string[];
+    missing_stages?: string[];
+    issues?: string[];
+    recovery_action?: string;
+  };
   financial_retry?: FinancialRetryResult;
   financial_report_refresh?: {
     status: "succeeded" | "failed" | string;
@@ -518,6 +569,9 @@ export type ResearchJob = {
     status: FilingProgressStatus;
     error_code?: string;
     elapsed_seconds?: number;
+    window_index?: number | null;
+    window_total?: number | null;
+    last_activity_at?: string;
   }>;
   error_code?: string | null;
   market?: Market | null;
@@ -536,6 +590,9 @@ export type ResearchJob = {
   vision_approval_pending?: boolean;
   vision_approval?: boolean | null;
   operation_result?: FinancialRetryResult | null;
+  attempt_complete?: boolean;
+  research_complete?: boolean;
+  action_required?: boolean;
 };
 
 export type ThesisVersion = {

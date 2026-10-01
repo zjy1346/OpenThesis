@@ -193,6 +193,16 @@ fn validate_hello_result(response: &Value) -> Result<(), String> {
     if result.get("contract_version").and_then(Value::as_str) != Some("2.0") {
         return Err("research core startup protocol error".to_string());
     }
+    let desktop_build: Value = serde_json::from_str(include_str!("../resources/build-info.json"))
+        .map_err(|_| "desktop build identity is invalid".to_string())?;
+    let expected = desktop_build.get("build_id").and_then(Value::as_str).unwrap_or("unknown");
+    let actual = result.get("build_info")
+        .and_then(|value| value.get("build_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if expected != "development" && expected != actual {
+        return Err(format!("mixed application components: desktop build {expected}, research core build {actual}"));
+    }
     Ok(())
 }
 

@@ -55,6 +55,77 @@ describe("report presentation", () => {
     resolveRetry?.();
   });
 
+  it("shows action-required state even when the attempt itself completed", () => {
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "completed", attempt_complete: true, research_complete: false, action_required: true, report_language: "en", markdown: "# Report", html: "" }} copy={COPY.en} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.partialReport);
+  });
+
+  it("does not present an empty action-required run as a report shell", () => {
+    render(<ReportWorkspace report={{
+      run_id: "empty-run", ticker: "600519", company_name: "Moutai", status: "failed",
+      report_language: "en", attempt_complete: true, research_complete: false, action_required: true,
+      report_contract_version: "1", report_input_generation: "snapshot-1", report_read_state: "diagnostic_only",
+      is_substantive: false, visible_sections: [],
+      report_readiness: {
+        state: "action_required", complete: false, substantive_sections: [],
+        missing_sections: ["executive_summary", "claims"], missing_stages: ["verified-research-dossier"],
+        issues: ["research_report_artifact_missing"], recovery_action: "resume_or_repair_missing_research_stages",
+      }, markdown: "# OpenThesis Long-term Company Research\n\nNo report content.", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.reportReadinessActionRequired);
+    expect(screen.getByText(COPY.en.reportNoSubstantiveContent)).toBeInTheDocument();
+    expect(screen.getByText("Executive summary, Key conclusions")).toBeInTheDocument();
+    expect(screen.getByText("Verified research dossier")).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.reportRecoveryResumeStages)).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "OpenThesis Long-term Company Research" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.exportReport })).not.toBeInTheDocument();
+  });
+
+  it("preserves substantive partial research and only shows recovery details returned by the API", () => {
+    render(<ReportWorkspace report={{
+      run_id: "partial-run", ticker: "1211", company_name: "BYD", status: "completed",
+      report_language: "en", attempt_complete: true, research_complete: false, action_required: true,
+      report_readiness: {
+        state: "substantive_partial", complete: false, substantive_sections: ["business_model", "claims"],
+        missing_sections: ["scenarios"], missing_stages: [], issues: [], recovery_action: "complete_missing_or_unverified_sections",
+      }, markdown: "# Preserved completed research\n\nUseful verified content.", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.reportReadinessPartial);
+    expect(screen.getByRole("heading", { name: "Preserved completed research" })).toBeInTheDocument();
+    expect(screen.getByText("Long-term scenarios")).toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.reportReadinessMissingStages)).not.toBeInTheDocument();
+    expect(screen.getByText(COPY.en.reportRecoveryCompleteSections)).toBeInTheDocument();
+  });
+
+  it("keeps saved sections visible when overall readiness has no complete-section list", () => {
+    render(<ReportWorkspace report={{
+      run_id: "partial-with-body", ticker: "1211", company_name: "BYD", status: "partial",
+      report_language: "en", report_contract_version: "1", report_input_generation: "snapshot-2",
+      report_read_state: "partial", is_substantive: true,
+      visible_sections: [{ section_id: "executive_summary", title: "Executive summary", source_artifact_ids: ["r1"], verification_state: "partial", is_substantive: true }],
+      report_readiness: { state: "action_required", complete: false, substantive_sections: [], missing_sections: ["claims"], missing_stages: [], issues: [], recovery_action: "review_run_diagnostics" },
+      markdown: "# Saved research\n\nThis verified section remains readable even though required stages are incomplete.", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByRole("heading", { name: "Saved research" })).toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.reportNoSubstantiveContent)).not.toBeInTheDocument();
+  });
+
+  it("marks a readiness-verified report as complete without partial recovery details", () => {
+    render(<ReportWorkspace report={{
+      run_id: "complete-run", ticker: "1211", company_name: "BYD", status: "completed",
+      report_language: "en", attempt_complete: true, research_complete: true, action_required: false,
+      report_readiness: { state: "complete", complete: true, substantive_sections: ["claims"], missing_sections: [], missing_stages: [], issues: [], recovery_action: "" },
+      markdown: "# Complete report", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent(COPY.en.reportReadinessComplete);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.reportReadinessMissingSections)).not.toBeInTheDocument();
+  });
+
   it("offers a tested larger-context model only after an explicit capacity failure", async () => {
     vi.mocked(listConfiguredModels).mockResolvedValue([
       { configured_model_id: "current", connection_id: "c1", model_id: "small", alias: "Small", free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null, enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null, context_window_hint: 32_000, temperature: null, timeout_seconds: 120, configuration_version: 1 },
@@ -66,7 +137,29 @@ describe("report presentation", () => {
     expect(await screen.findByRole("combobox", { name: COPY.en.synthesisCapacityModel })).toHaveValue("large");
     expect(screen.queryByRole("button", { name: COPY.en.retrySynthesis })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: COPY.en.synthesisCapacityRetry }));
-    await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", configuration_version: 4, role: "primary" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", connection_id: "c2", configuration_version: 4, role: "primary" }));
+  });
+
+  it("lets any persisted failed model stage resume with the selected model and fresh plan hash", async () => {
+    vi.mocked(listConfiguredModels).mockResolvedValue([
+      { configured_model_id: "current", connection_id: "c1", model_id: "small", alias: "Small", free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null, enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null, context_window_hint: 32_000, temperature: null, timeout_seconds: 120, configuration_version: 1 },
+      { configured_model_id: "selected", connection_id: "c2", model_id: "capable", alias: "Capable", free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null, enabled: true, capabilities: ["text_chat", "structured_json"], health_status: "ready", last_discovered_at: null, context_window_hint: 200_000, temperature: null, timeout_seconds: 120, configuration_version: 4 },
+    ]);
+    const resume = vi.fn(async () => undefined);
+    render(<ReportWorkspace report={{
+      run_id: "run", ticker: "NVDA", company_name: "NVIDIA", status: "partial", report_language: "en",
+      recovery_plan: { target: "counter-analysis", stages: ["counter-analysis", "forecast-scenarios", "final-synthesis"], reason: "counter_analysis_failed_or_unverified", input_artifact_ids: ["a1"], plan_hash: "plan-current", available: true, error_code: "MODEL_RESPONSE_INVALID" },
+      reproducibility: { model_configuration: { configured_model_id: "current" }, research_configuration: {}, data_snapshot: {} },
+      markdown: "# Report", html: "",
+    }} copy={COPY.en} onRetryRecoveryStage={resume} />);
+
+    expect(await screen.findByRole("combobox", { name: COPY.en.recoveryModel })).toHaveValue("selected");
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.recoveryRetry }));
+    await waitFor(() => expect(resume).toHaveBeenCalledWith(
+      "counter-analysis",
+      { configured_model_id: "selected", connection_id: "c2", configuration_version: 4, role: "primary" },
+      "plan-current",
+    ));
   });
 
   it("retries only the growth stage from an empty growth report", async () => {
@@ -80,6 +173,19 @@ describe("report presentation", () => {
     expect(retryGrowth).toHaveBeenCalledTimes(1);
     expect(retrySynthesis).not.toHaveBeenCalled();
     expect(await screen.findByText(COPY.en.retryingGrowth)).toBeInTheDocument();
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    resolveRetry?.();
+  });
+
+  it("resumes failed base model stages without repeating financial ingestion", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const retryModelStages = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve; }));
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en", retryable_model_stages: true, markdown: "# Report", html: "" }} copy={COPY.en} onRetryModelStages={retryModelStages} />);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.retryModelStages }));
+
+    expect(retryModelStages).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(COPY.en.retryingModelStages)).toBeInTheDocument();
     expect(screen.getAllByRole("status")).toHaveLength(1);
     resolveRetry?.();
   });

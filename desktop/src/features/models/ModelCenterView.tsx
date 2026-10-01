@@ -43,7 +43,7 @@ type DialogState =
 const EN = {
   intro: "Configure connections once, then select model references in research and OT Studio. Secrets are stored only in Windows Credential Manager; existing keys are never returned to this page.",
   search: "Search providers", all: "All", cloud: "Cloud", local: "Local", free: "Free paths",
-  connection: "connection", connections: "connections", ready: "Ready", untested: "Untested", disabled: "Disabled", unauthorized: "Unauthorized", rateLimited: "Rate limited", unavailable: "Unavailable",
+  connection: "connection", connections: "connections", ready: "Connection checked", untested: "Untested", disabled: "Disabled", unauthorized: "Unauthorized", rateLimited: "Rate limited", unavailable: "Unavailable",
   configure: "Configure provider", close: "Close", registration: "Registration and API keys", addConnection: "Add connection",
   displayName: "Connection name", endpoint: "Endpoint", region: "Region", apiKey: "API key",
   apiKeyHint: "After saving, only the configured state remains visible.", save: "Save connection", saving: "Saving…",
@@ -51,12 +51,13 @@ const EN = {
   localPrivacy: "Local Ollama: research content stays in the Ollama service on this computer.",
   remotePrivacy: "Remote Ollama: research content is sent to that address and is not labelled local.",
   existing: "Existing connections", enable: "Enable", disable: "Disable", replaceKey: "Replace key", delete: "Delete",
-  models: "Configured models", discover: "Discover models", discovering: "Discovering…", testConnection: "Test connection", testingConnection: "Testing connection…", testUsing: "Uses", advancedModels: "Advanced: custom model ID", manualModel: "Manual model ID",
+  models: "Configured models", discover: "Discover models", discovering: "Discovering…", testConnection: "Test connection", testingConnection: "Testing connection…", testUsing: "Uses", endpointProbe: "Endpoint probe (no model)", advancedModels: "Advanced: custom model ID", manualModel: "Manual model ID",
   addManual: "Add candidate", selectModels: "Select one or more models", addModels: "Add selected models",
   selectModel: "Select model", visionCapability: "Vision input", visionCapabilityHint: "Enable only when this exact model accepts image input. Testing will verify both text and vision before it becomes available in research.",
+  timeout: "Request timeout (seconds)", timeoutHint: "Set how long OpenThesis waits for this model request (5–600 seconds).", saveTimeout: "Save timeout", timeoutSaved: "Timeout saved.", timeoutInvalid: "Enter a whole number from 5 to 600 seconds.",
   testing: "Testing…", test: "Test", noConnections: "No connections yet. Add an account or an existing Ollama service.",
   noModels: "No configured models yet.", noProviders: "No providers match this filter.",
-  credentialSaved: "Credential saved securely.", connectionSaved: "Connection saved.", modelsSaved: "Models added.", testSucceeded: "Connection succeeded.",
+  credentialSaved: "Credential saved securely.", connectionSaved: "Connection saved.", modelsSaved: "Models added.", testSucceeded: "Connection check succeeded; full research capacity was not benchmarked.",
   rotateTitle: "Replace the saved API key", rotateBody: "The new key is tested before it becomes active. If testing fails, the current key remains unchanged.",
   deleteConnectionTitle: "Delete this connection?", confirmDelete: "This permanently removes the connection, its configured models, and its Windows credential.",
   deleteModelTitle: "Delete this configured model?", confirmDeleteModel: "The connection and saved credential remain available.",
@@ -72,7 +73,7 @@ type ModelCenterText = { [Key in keyof typeof EN]: string };
 const ZH: ModelCenterText = {
   intro: "先配置模型连接，再在研究和 OT 创作工作室中按引用选择。密钥只写入 Windows 凭据管理器，页面无法读取旧密钥明文。",
   search: "搜索服务商", all: "全部", cloud: "云端", local: "本地", free: "免费路径",
-  connection: "个连接", connections: "个连接", ready: "可用", untested: "未测试", disabled: "已禁用", unauthorized: "未授权", rateLimited: "已限流", unavailable: "不可用",
+  connection: "个连接", connections: "个连接", ready: "连接已检查", untested: "未测试", disabled: "已禁用", unauthorized: "未授权", rateLimited: "已限流", unavailable: "不可用",
   configure: "配置服务商", close: "关闭", registration: "注册与获取密钥", addConnection: "添加连接",
   displayName: "连接名称", endpoint: "接口地址", region: "区域", apiKey: "API Key",
   apiKeyHint: "保存后只显示“已配置”，不会回显明文。", save: "保存连接", saving: "正在保存…",
@@ -80,12 +81,13 @@ const ZH: ModelCenterText = {
   localPrivacy: "本地 Ollama：研究内容留在这台电脑上的 Ollama 服务中。",
   remotePrivacy: "远程 Ollama：研究内容会发送到该远程地址，且不会标记为本地。",
   existing: "已有连接", enable: "启用", disable: "禁用", replaceKey: "替换密钥", delete: "删除",
-  models: "已配置模型", discover: "发现模型", discovering: "正在发现…", testConnection: "测试连接", testingConnection: "正在测试连接…", testUsing: "测试模型", advancedModels: "高级：自定义模型 ID", manualModel: "手动模型 ID",
+  models: "已配置模型", discover: "发现模型", discovering: "正在发现…", testConnection: "测试连接", testingConnection: "正在测试连接…", testUsing: "测试模型", endpointProbe: "接口探测（无需模型）", advancedModels: "高级：自定义模型 ID", manualModel: "手动模型 ID",
   addManual: "加入候选", selectModels: "选择一个或多个模型", addModels: "添加所选模型",
   selectModel: "选择模型", visionCapability: "视觉输入", visionCapabilityHint: "仅当该具体模型支持图像输入时开启。测试会同时验证文本与视觉请求，全部通过后才会出现在研究页。",
+  timeout: "请求超时（秒）", timeoutHint: "设置 OpenThesis 等待该模型响应的时间（5–600 秒）。", saveTimeout: "保存超时设置", timeoutSaved: "超时设置已保存。", timeoutInvalid: "请输入 5–600 之间的整数秒数。",
   testing: "正在测试…", test: "测试", noConnections: "还没有连接。先添加一个账户或本地 Ollama。",
   noModels: "还没有已配置模型。", noProviders: "没有匹配的服务商。",
-  credentialSaved: "凭据已安全保存。", connectionSaved: "连接已保存。", modelsSaved: "模型已添加。", testSucceeded: "连接测试成功。",
+  credentialSaved: "凭据已安全保存。", connectionSaved: "连接已保存。", modelsSaved: "模型已添加。", testSucceeded: "连接检查成功；尚未测试完整研究容量。",
   rotateTitle: "替换已保存的 API Key", rotateBody: "新密钥会先经过连接测试，再切换为当前密钥；测试失败时旧密钥保持不变。",
   deleteConnectionTitle: "删除这个连接？", confirmDelete: "此操作会永久删除连接、其中的已配置模型和 Windows 系统凭据。",
   deleteModelTitle: "删除这个已配置模型？", confirmDeleteModel: "连接及其系统凭据仍会保留。",
@@ -98,14 +100,15 @@ const ZH: ModelCenterText = {
 
 const ZH_HANT: ModelCenterText = {
   ...ZH,
+  timeout: "請求逾時（秒）", timeoutHint: "設定 OpenThesis 等待此模型回應的時間（5–600 秒）。", saveTimeout: "儲存逾時設定", timeoutSaved: "逾時設定已儲存。", timeoutInvalid: "請輸入 5–600 之間的整數秒數。",
   intro: "先設定模型連線，再在研究與 OT 創作工作室中按引用選擇。金鑰只寫入 Windows 認證管理員，頁面無法讀取舊金鑰明文。",
   search: "搜尋服務商", local: "本機", configure: "設定服務商", addConnection: "新增連線",
   displayName: "連線名稱", endpoint: "介面位址", apiKeyHint: "儲存後只顯示「已設定」，不會回顯明文。",
   save: "儲存連線", saving: "正在儲存…", existing: "現有連線", enable: "啟用", disable: "停用",
   replaceKey: "替換金鑰", models: "已設定模型", discover: "探索模型", discovering: "正在探索…",
-  selectModels: "選擇一個或多個模型", addModels: "新增所選模型", noConnections: "尚未建立連線。",
+  selectModels: "選擇一個或多個模型", addModels: "新增所選模型", endpointProbe: "介面探測（無需模型）", noConnections: "尚未建立連線。",
   noModels: "尚未設定模型。", credentialSaved: "憑據已安全儲存。", connectionSaved: "連線已儲存。",
-  modelsSaved: "模型已新增。", testSucceeded: "連線測試成功。", rotateTitle: "替換已儲存的 API Key",
+  modelsSaved: "模型已新增。", ready: "連線已檢查", testSucceeded: "連線檢查成功；尚未測試完整研究容量。", rotateTitle: "替換已儲存的 API Key",
   rotateBody: "新金鑰會先經過連線測試，再切換為目前金鑰；測試失敗時舊金鑰保持不變。",
   deleteConnectionTitle: "刪除這個連線？", confirmDelete: "此操作會永久刪除連線、其中已設定的模型和 Windows 系統憑據。",
   deleteModelTitle: "刪除這個已設定模型？", confirmDeleteModel: "連線及其系統憑據仍會保留。",
@@ -162,6 +165,12 @@ function presetModels(provider: ProviderDefinition): DiscoveredModel[] {
   return (provider.recommended_models ?? []).map((model) => ({ model_id: model.model_id, alias: model.alias, billing_class: model.billing_class, capabilities: model.capabilities }));
 }
 
+function normalizeTimeout(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) return null;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds >= 5 && seconds <= 600 ? seconds : null;
+}
+
 function statusLabel(connection: ProviderConnectionSummary, text: ModelCenterText): string {
   if (!connection.enabled) return text.disabled;
   switch (connection.status) {
@@ -200,6 +209,8 @@ export function ModelCenterView({ language }: { language: Language }) {
   const [selectedModels, setSelectedModels] = useState<Set<string>>(new Set());
   const [visionModelIds, setVisionModelIds] = useState<Set<string>>(new Set());
   const [manualModel, setManualModel] = useState("");
+  const [newModelTimeout, setNewModelTimeout] = useState("180");
+  const [timeoutDrafts, setTimeoutDrafts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -258,7 +269,7 @@ export function ModelCenterView({ language }: { language: Language }) {
   const busyForConnection = (id: string) =>
     busy === "test-connection:" + id || busy === "connection:" + id || busy.startsWith("dialog:");
   const busyForModel = (id: string) =>
-    busy === "test:" + id || busy.startsWith("dialog:");
+    busy === "test:" + id || busy === "timeout:" + id || busy.startsWith("dialog:");
   const visibleProviders = useMemo(() => {
     const search = query.trim().toLowerCase();
     return providers.filter((item) => {
@@ -329,6 +340,8 @@ export function ModelCenterView({ language }: { language: Language }) {
 
   const addModels = async () => {
     if (!connectionId || !selectedModels.size) return;
+    const timeoutSeconds = normalizeTimeout(newModelTimeout);
+    if (timeoutSeconds === null) { setError(text.timeoutInvalid); return; }
     setBusy("save-models"); setError("");
     try {
       for (const modelId of selectedModels) {
@@ -340,10 +353,31 @@ export function ModelCenterView({ language }: { language: Language }) {
           configured_model_id: modelReferenceId(connectionId, modelId), connection_id: connectionId,
           model_id: modelId, alias: candidate?.alias || modelId,
           enabled: true, capabilities: [...capabilities],
+          timeout_seconds: timeoutSeconds,
         });
       }
       setSelectedModels(new Set()); setNotice(text.modelsSaved); await reload();
     } catch (reason) { setError(errorMessage(reason)); } finally { setBusy(""); }
+  };
+
+  const saveModelTimeout = async (model: ConfiguredModelSummary) => {
+    const timeout = normalizeTimeout(timeoutDrafts[model.configured_model_id] ?? String(model.timeout_seconds || 180));
+    if (timeout === null) { setError(text.timeoutInvalid); return; }
+    setBusy("timeout:" + model.configured_model_id); setError(""); setNotice("");
+    try {
+      await saveConfiguredModel({
+        configured_model_id: model.configured_model_id,
+        connection_id: model.connection_id,
+        model_id: model.model_id,
+        alias: model.alias,
+        enabled: model.enabled,
+        capabilities: model.capabilities,
+        timeout_seconds: timeout,
+      });
+      setNotice(text.timeoutSaved);
+      await reload();
+    } catch (reason) { setError(errorMessage(reason)); }
+    finally { setBusy(""); }
   };
 
   const replaceKey = (connection: ProviderConnectionSummary, trigger: HTMLElement) => {
@@ -465,7 +499,11 @@ export function ModelCenterView({ language }: { language: Language }) {
               <small><span className="connection-status" data-status={connection.enabled ? connection.status || "untested" : "disabled"}>{statusLabel(connection, text)}</span>{connection.has_secret && <><KeyRound size={12} />{text.apiKey}</>}</small>
             </button>
             <div className="connection-actions">
-              <button type="button" title={`${text.testUsing}: ${provider.default_test_model_id || connectionTestModelId(connection) || text.manualModel}`} aria-label={`${text.testConnection} · ${text.testUsing}: ${provider.default_test_model_id || connectionTestModelId(connection) || text.manualModel}`} disabled={Boolean(busy) || !connection.enabled || (!provider.default_test_model_id && provider.provider_id !== "ollama" && !connectionTestModelId(connection))} onClick={() => void testConnection(connection)}>{busy === "test-connection:" + connection.connection_id ? text.testingConnection : text.testConnection}</button>
+              {(() => {
+                const testModelId = provider.default_test_model_id || connectionTestModelId(connection);
+                const testTarget = testModelId ? `${text.testUsing}: ${testModelId}` : text.endpointProbe;
+                return <button type="button" title={testTarget} aria-label={`${text.testConnection} · ${testTarget}`} disabled={Boolean(busy) || !connection.enabled || (!provider.default_test_model_id && provider.provider_id !== "ollama" && provider.provider_id !== "custom" && !connectionTestModelId(connection))} onClick={() => void testConnection(connection)}>{busy === "test-connection:" + connection.connection_id ? text.testingConnection : text.testConnection}</button>;
+              })()}
               {provider.requires_api_key && <button type="button" disabled={busyForConnection(connection.connection_id)} onClick={(event) => replaceKey(connection, event.currentTarget)}>{text.replaceKey}</button>}
               <button type="button" disabled={busyForConnection(connection.connection_id)} onClick={() => void toggleConnection(connection)}>{connection.enabled ? text.disable : text.enable}</button>
               <button type="button" disabled={busyForConnection(connection.connection_id)} aria-label={text.delete} onClick={(event) => removeConnection(connection, event.currentTarget)}><Trash2 size={14} /></button>
@@ -493,6 +531,7 @@ export function ModelCenterView({ language }: { language: Language }) {
           </details>
           {discovered.length > 0 && <fieldset className="discovered-models"><legend>{text.selectModels}</legend>
             <p className="field-caption">{text.visionCapabilityHint}</p>
+            <label className="model-timeout-editor">{text.timeout}<input aria-label={text.timeout} type="number" min={5} max={600} step={1} value={newModelTimeout} onChange={(event) => setNewModelTimeout(event.target.value)} /><small>{text.timeoutHint}</small></label>
             {discovered.map((model) => <div className="discovered-model-option" key={model.model_id}>
               <label className="discovered-model-select"><input aria-label={`${text.selectModel}: ${model.alias}`} type="checkbox" checked={selectedModels.has(model.model_id)} onChange={(event) => setSelectedModels((current) => { const next = new Set(current); if (event.target.checked) next.add(model.model_id); else next.delete(model.model_id); return next; })} /><span><strong>{model.alias}</strong><small>{model.model_id} · {costLabel(model, text)}</small></span></label>
               <label className="model-capability-check"><input aria-label={`${text.visionCapability}: ${model.alias}`} type="checkbox" checked={visionModelIds.has(model.model_id)} onChange={(event) => setVisionModelIds((current) => { const next = new Set(current); if (event.target.checked) next.add(model.model_id); else next.delete(model.model_id); return next; })} /><span>{text.visionCapability}</span></label>
@@ -500,7 +539,7 @@ export function ModelCenterView({ language }: { language: Language }) {
             <button className="primary-action" type="button" disabled={!selectedModels.size || busy === "discover" || busy === "save-models"} onClick={() => void addModels()}>{text.addModels}</button>
           </fieldset>}
           <div className="configured-model-list">
-            {connectionModels.map((model) => <article key={model.configured_model_id}><div><strong>{model.alias}</strong><span>{model.model_id}</span><small>{costLabel(model, text)} · {text.status}: {model.health_status || text.untested}{model.capabilities.includes("vision") ? ` · ${text.visionBadge}` : ""}</small></div><div><button type="button" disabled={busyForModel(model.configured_model_id)} onClick={() => void testModel(model)}>{busy === "test:" + model.configured_model_id ? text.testing : text.test}</button><button type="button" aria-label={text.delete} disabled={busyForModel(model.configured_model_id)} onClick={(event) => removeModel(model, event.currentTarget)}><Trash2 size={14} /></button></div></article>)}
+            {connectionModels.map((model) => <article key={model.configured_model_id}><div><strong>{model.alias}</strong><span>{model.model_id}</span><small>{costLabel(model, text)} · {text.status}: {model.health_status || text.untested}{model.capabilities.includes("vision") ? ` · ${text.visionBadge}` : ""}</small></div><label className="model-timeout-editor">{text.timeout}<input aria-label={`${text.timeout}: ${model.alias}`} type="number" min={5} max={600} step={1} value={timeoutDrafts[model.configured_model_id] ?? String(model.timeout_seconds || 180)} onChange={(event) => setTimeoutDrafts((current) => ({ ...current, [model.configured_model_id]: event.target.value }))} /><small>{text.timeoutHint}</small><button type="button" disabled={busyForModel(model.configured_model_id)} onClick={() => void saveModelTimeout(model)}>{busy === "timeout:" + model.configured_model_id ? text.working : text.saveTimeout}</button></label><div><button type="button" disabled={busyForModel(model.configured_model_id)} onClick={() => void testModel(model)}>{busy === "test:" + model.configured_model_id ? text.testing : text.test}</button><button type="button" aria-label={text.delete} disabled={busyForModel(model.configured_model_id)} onClick={(event) => removeModel(model, event.currentTarget)}><Trash2 size={14} /></button></div></article>)}
             {!connectionModels.length && <p className="model-empty">{text.noModels}</p>}
           </div>
         </section>}

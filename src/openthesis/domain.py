@@ -129,6 +129,9 @@ class FinancialFact:
     # Original visual column header for same-filing comparison provenance.
     # Appended so older positional/database callers remain compatible.
     source_column: str = ""
+    # Active parser generation which produced this fact. Empty values are
+    # retained only for pre-generation legacy imports and synthetic fixtures.
+    generation_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -210,6 +210,9 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
       indexing: ["建立页索引", "Indexing", "建立頁面索引"],
       "local-parsing": ["本地解析", "Local parsing", "本地解析"],
       "local-validating": ["本地校验", "Local validating", "本地驗證"],
+      "window-checkpointed": ["窗口已保存", "Window saved", "視窗已保存"],
+      "window-cache-hit": ["窗口已恢复", "Window restored", "視窗已恢復"],
+      "window-failed": ["窗口失败", "Window failed", "視窗失敗"],
       "cloud-awaiting-approval": ["等待云端授权", "Awaiting cloud approval", "等待雲端授權"],
       "cloud-processing": ["云端处理中", "Cloud processing", "雲端處理中"],
       "canonical-compiling": ["汇总校验中", "Canonical compiling", "彙總驗證中"],
@@ -250,8 +253,15 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
         {filingStates.map((filing) => <div className="filing-progress-row" key={filing.filing_id} data-status={filing.status}>
           <span>{filing.label}</span>
           <strong>{filingStatus(filing.status)}</strong>
+          {Number(filing.window_total ?? 0) > 0 && <small>
+            {language === "en" ? "Window" : language === "zh-Hant" ? "視窗" : "窗口"} {filing.window_index ?? 0}/{filing.window_total}
+          </small>}
           <time dateTime={`PT${Math.max(0, filing.elapsed_seconds ?? 0)}S`}>{formatElapsedTime(filing.elapsed_seconds ?? 0)}</time>
-          {filing.error_code && <code>{filing.error_code}</code>}
+          {filing.error_code && <code
+            tabIndex={0}
+            aria-label={language === "en" ? `Filing diagnostic: ${filing.error_code}` : language === "zh-Hant" ? `財報診斷：${filing.error_code}` : `财报诊断：${filing.error_code}`}
+            title={language === "en" ? `Diagnostic code: ${filing.error_code}. Open financial diagnostics for evidence and recovery details.` : language === "zh-Hant" ? `診斷代碼：${filing.error_code}。可開啟財報診斷查看證據與恢復詳情。` : `诊断代码：${filing.error_code}。可打开财报诊断查看证据与恢复详情。`}
+          >{filing.error_code}</code>}
         </div>)}
       </div>}
       {totalAgents > 0 && <div className="agent-progress" aria-label={copy.agents}>

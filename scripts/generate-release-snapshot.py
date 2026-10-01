@@ -22,6 +22,10 @@ EXCLUDED = (
     "desktop/src-tauri/resources/bin",
     "desktop/node_modules/.vite",
     "desktop/node_modules/.cache",
+    # Generated immediately before compilation from version, commit and build
+    # time; development placeholders are not package inputs.
+    "src/openthesis/resources/build-info.json",
+    "desktop/src-tauri/resources/build-info.json",
 )
 
 

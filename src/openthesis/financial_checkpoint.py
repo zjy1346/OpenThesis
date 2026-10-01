@@ -367,19 +367,29 @@ def _invoke_worker(
     timeout termination rather than leaving a background thread behind.
     """
 
+    def run_synchronously() -> Any:
+        worker_context = dict(context or {})
+        return worker(window, worker_context) if _worker_accepts_context(worker) else worker(window)
+
     if timeout_seconds is None:
-        return worker(window, dict(context or {})) if _worker_accepts_context(worker) else worker(window)
+        return run_synchronously()
     try:
         pickle.dumps(worker)
     except (pickle.PickleError, TypeError, AttributeError):
-        return worker(window, dict(context or {})) if _worker_accepts_context(worker) else worker(window)
+        return run_synchronously()
     mp_context = mp.get_context("spawn")
     # A Queue uses a feeder thread in the child.  Waiting for that process to
     # exit before reading can deadlock when a real table payload exceeds the
     # Windows pipe buffer: the feeder waits for a reader while the parent
     # waits for the feeder.  A one-way Pipe lets the parent drain the payload
     # while the worker is still alive and keeps the timeout/cancel boundary.
-    result_receiver, result_sender = mp_context.Pipe(duplex=False)
+    try:
+        result_receiver, result_sender = mp_context.Pipe(duplex=False)
+    except (OSError, RuntimeError):
+        # Sandboxed or resource-constrained hosts can deny creation of the
+        # Windows pipe before process.start() is reached. Preserve the same
+        # worker and caller-side quality checks through the synchronous path.
+        return run_synchronously()
     process = None
     try:
         process = mp_context.Process(
@@ -398,7 +408,7 @@ def _invoke_worker(
             # normal compiler/quality gate remains in force.
             result_sender.close()
             result_receiver.close()
-            return worker(window, dict(context or {})) if _worker_accepts_context(worker) else worker(window)
+            return run_synchronously()
         result_sender.close()
         deadline = time.monotonic() + max(0.01, float(timeout_seconds))
         kind: str | None = None

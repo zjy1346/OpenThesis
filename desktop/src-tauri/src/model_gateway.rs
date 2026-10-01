@@ -602,6 +602,45 @@ impl ModelGateway {
                     .map_err(GatewayError::configuration)
             })
             .transpose()?;
+        if requested_model_id.is_none()
+            && connection.provider_id == "custom"
+            && provider.default_test_model_id.is_none()
+            && configured_model.is_none()
+        {
+            let discovered = self.discover_models_with_secret(connection_id, None)?;
+            let _ = self
+                .center
+                .mark_connection_status(connection_id, "ready", None);
+            let endpoint_host = reqwest::Url::parse(&connection.endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .unwrap_or_default();
+            return Ok(GatewayTestResult {
+                ok: true,
+                message: format!(
+                    "Endpoint responded; model inference was not tested ({} model(s) discovered).",
+                    discovered.len()
+                ),
+                meta: GatewayResponseMeta {
+                    configured_model_id: format!("connection-probe.{connection_id}"),
+                    connection_id: connection_id.to_string(),
+                    provider_id: connection.provider_id.clone(),
+                    model_id: "endpoint-probe".to_string(),
+                    alias: format!("{} endpoint probe", provider.display_name),
+                    endpoint_host,
+                    finish_reason: None,
+                    content_length: 0,
+                    credential_version: 0,
+                    connection_configuration_version: 0,
+                    model_configuration_version: 0,
+                    billing_class: "probe".to_string(),
+                    free_source_url: None,
+                    free_verified_at: None,
+                    temperature: None,
+                    timeout_seconds: 30,
+                },
+            });
+        }
         let model_id = requested_model_id
             .map(str::to_string)
             .or(discovered_ollama_model)
@@ -789,6 +828,8 @@ pub struct GatewayError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl GatewayError {
@@ -797,6 +838,7 @@ impl GatewayError {
             code: code.to_string(),
             message: message.into(),
             retryable,
+            retry_after_seconds: None,
         }
     }
 
@@ -978,6 +1020,15 @@ fn post_json(
 
 fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value, GatewayError> {
     let status = response.status();
+    let retry_after_seconds = if status.as_u16() == 429 {
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after_seconds)
+    } else {
+        None
+    };
     if status.is_redirection() {
         return Err(GatewayError::new(
             "MODEL_REDIRECT_BLOCKED",
@@ -1046,7 +1097,9 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
         } else {
             format!("The provider returned HTTP {}: {}", status.as_u16(), detail)
         };
-        return Err(GatewayError::new(code, message, retryable));
+        let mut error = GatewayError::new(code, message, retryable);
+        error.retry_after_seconds = retry_after_seconds;
+        return Err(error);
     }
     let result = serde_json::from_slice::<Value>(&body).map_err(|_| {
         GatewayError::new(
@@ -1057,6 +1110,14 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
     });
     body.zeroize();
     result
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|seconds| seconds.clamp(1, 300))
 }
 
 fn response_format_is_unsupported(error: &GatewayError) -> bool {
@@ -1263,10 +1324,22 @@ mod tests {
     }
 
     fn response_server(status: &str, body: &str, request_count: usize) -> String {
+        response_server_with_retry_after(status, body, request_count, None)
+    }
+
+    fn response_server_with_retry_after(
+        status: &str,
+        body: &str,
+        request_count: usize,
+        retry_after: Option<&str>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let status = status.to_string();
         let body = body.to_string();
+        let retry_after = retry_after
+            .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+            .unwrap_or_default();
         std::thread::spawn(move || {
             for _ in 0..request_count {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1279,8 +1352,8 @@ mod tests {
                     line.clear();
                 }
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
                 );
                 stream.write_all(response.as_bytes()).unwrap();
             }
@@ -1371,6 +1444,30 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_retry_after_is_bounded_and_returned_without_body_details() {
+        let endpoint = response_server_with_retry_after(
+            "429 Too Many Requests",
+            r#"{"error":{"message":"rate limit"}}"#,
+            1,
+            Some("19"),
+        );
+        let (center, model_id) = configured_custom(endpoint, None);
+        let error = ModelGateway::new(center)
+            .generate(&model_id, "system", "user", true)
+            .unwrap_err();
+        assert_eq!(error.code, "MODEL_RATE_LIMITED");
+        assert_eq!(error.retry_after_seconds, Some(19));
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn retry_after_accepts_only_bounded_delta_seconds() {
+        assert_eq!(parse_retry_after_seconds("0"), Some(1));
+        assert_eq!(parse_retry_after_seconds("900"), Some(300));
+        assert_eq!(parse_retry_after_seconds("tomorrow"), None);
+    }
+
+    #[test]
     fn redirects_are_never_followed() {
         let endpoint = one_response_server("302 Found", "{}");
         let (center, model_id) = configured_custom(endpoint, None);
@@ -1444,6 +1541,30 @@ mod tests {
         let models = center.list_models().unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model_id, "test-model");
+    }
+
+    #[test]
+    fn custom_connection_probe_works_without_a_model() {
+        let endpoint = one_response_server("200 OK", r#"{"data":[]}"#);
+        let center = center();
+        center
+            .save_connection(SaveConnectionInput {
+                connection_id: "custom-probe".into(),
+                provider_id: "custom".into(),
+                display_name: "Custom probe".into(),
+                region: "global".into(),
+                endpoint,
+                enabled: true,
+            })
+            .unwrap();
+
+        let result = ModelGateway::new(center.clone())
+            .test_connection("custom-probe", None)
+            .unwrap();
+        assert!(result.ok);
+        assert_eq!(result.meta.model_id, "endpoint-probe");
+        assert!(result.message.contains("model inference"));
+        assert!(center.list_models().unwrap().is_empty());
     }
 
     #[test]

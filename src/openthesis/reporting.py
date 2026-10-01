@@ -19,7 +19,23 @@ from .growth import (
     scenario_label,
 )
 from .i18n import EN, UI_HANT, ZH_HANT, normalize_language
-from .report_projection import normalize_report_sections, project_report_value, report_display_value, report_field_label
+from .report_projection import (
+    claim_body_text,
+    claim_text_format_notice,
+    normalize_report_sections,
+    format_report_semantic_value,
+    project_report_value,
+    report_display_value,
+    report_field_label,
+    report_identity_title,
+    resolve_report_identity,
+)
+from .report_readiness import (
+    no_final_report_notice,
+    readiness_for_report_artifact,
+    report_readiness_notice,
+)
+from .report_revisions import resolve_report_artifact
 
 
 SECTION_LABELS_ZH = {
@@ -178,26 +194,43 @@ def staged_context_capacity_notice(
     }
 
 
-def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[str]:
+def _render_value(
+    value: Any,
+    language: str = "zh-CN",
+    level: int = 0,
+    field_name: str | None = None,
+) -> list[str]:
     english = normalize_language(language) == EN
     labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if normalize_language(language) == ZH_HANT else SECTION_LABELS_ZH
     if value is None:
         return [_locale_text(language, "证据不足或尚未提供。", "證據不足或尚未提供。", "Insufficient evidence or not provided.")]
+    semantic_value = format_report_semantic_value(value, field_name)
+    if semantic_value is not None:
+        return [semantic_value]
     if isinstance(value, str):
         return [report_display_value(value, language)]
     if isinstance(value, bool):
         return [_locale_text(language, "是" if value else "否", "是" if value else "否", "Yes" if value else "No")]
     if isinstance(value, (int, float)):
-        return [str(value)]
+        if isinstance(value, float):
+            return [f"{value:,.4f}".rstrip("0").rstrip(".")]
+        return [f"{value:,}"]
     if isinstance(value, list):
         if not value:
             return [_locale_text(language, "暂无。", "暫無。", "None.")]
         lines: list[str] = []
         for item in value:
-            rendered = _render_value(item, language, level + 1)
-            lines.append(f"- {rendered[0]}")
-            lines.extend(f"  {line}" for line in rendered[1:])
-        return lines
+            rendered = _render_value(item, language, level + 1, field_name)
+            if not rendered:
+                continue
+            if rendered[0].lstrip().startswith("- "):
+                # Structured list entries already start with their own
+                # semantic bullet; don't prefix a second one.
+                lines.extend(rendered)
+            else:
+                lines.append(f"- {rendered[0]}")
+                lines.extend(f"  {line}" for line in rendered[1:])
+        return lines or [_locale_text(language, "暂无可显示内容。", "暫無可顯示內容。", "No displayable content.")]
     if isinstance(value, dict):
         lines = []
         for key, item in value.items():
@@ -208,14 +241,16 @@ def _render_value(value: Any, language: str = "zh-CN", level: int = 0) -> list[s
                 label = growth_field_label(str(key), language)
             if label is None:
                 label = report_field_label(key, language)
-            rendered = _render_value(item, language, level + 1)
+            rendered = _render_value(item, language, level + 1, str(key))
+            if not rendered:
+                continue
             if isinstance(item, (dict, list)):
                 lines.append(f"**{label}**")
                 lines.extend(rendered)
             else:
                 separator = ": " if english else "："
                 lines.append(f"- **{label}{separator}** {rendered[0]}")
-        return lines
+        return lines or [_locale_text(language, "暂无可显示内容。", "暫無可顯示內容。", "No displayable content.")]
     return [str(value)]
 
 
@@ -224,8 +259,23 @@ def _render_claims(value: object, language: str) -> list[str]:
     claims = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
     if not claims:
         return _render_value(value, language)
-    grouped: dict[float | None, list[dict[str, Any]]] = {}
+    safe_claims: list[dict[str, Any]] = []
+    malformed_count = 0
     for claim in claims:
+        raw_text = claim.get("text")
+        if raw_text in (None, "", [], ()):
+            raw_text = claim.get("conclusion") or claim.get("argument")
+        text, malformed = claim_body_text(raw_text)
+        malformed = malformed or bool(claim.get("text_format_warning"))
+        malformed_count += int(malformed)
+        if text:
+            safe_claims.append({**claim, "text": text})
+    if not safe_claims:
+        if malformed_count:
+            return [claim_text_format_notice(language) + f" ({malformed_count})"]
+        return _render_value(value, language)
+    grouped: dict[float | None, list[dict[str, Any]]] = {}
+    for claim in safe_claims:
         raw_confidence = claim.get("confidence")
         if isinstance(raw_confidence, bool):
             confidence = None
@@ -236,6 +286,8 @@ def _render_claims(value: object, language: str) -> list[str]:
                 confidence = None
         grouped.setdefault(confidence, []).append(claim)
     lines: list[str] = []
+    if malformed_count:
+        lines.extend([f"> {claim_text_format_notice(language)} ({malformed_count})", ""])
     for confidence in sorted(
         grouped,
         key=lambda item: (item is None, 0.0 if item is None else -item),
@@ -261,7 +313,18 @@ def _render_claims(value: object, language: str) -> list[str]:
             if not text:
                 continue
             kind = report_display_value(str(claim.get("kind", "inference")), language)
-            lines.append(f"- **{kind}** · {text}")
+            evidence_count = claim.get("evidence_count")
+            evidence_note = (
+                _locale_text(
+                    language,
+                    f" · {evidence_count} 条有效引用",
+                    f" · {evidence_count} 條有效引用",
+                    f" · {evidence_count} valid references",
+                )
+                if isinstance(evidence_count, int) and evidence_count > 0
+                else ""
+            )
+            lines.append(f"- **{kind}** · {text}{evidence_note}")
         lines.append("")
     return lines
 
@@ -444,7 +507,58 @@ def _artifact_title(artifact: dict[str, Any], language: str) -> str:
     return str(artifact.get("title", ""))
 
 
-def render_research_run(
+def _financial_metric_gap_notes(metrics: list[object], language: str) -> list[str]:
+    """Render deterministic, actionable financial gaps in the shared report source."""
+    english = normalize_language(language) == EN
+    traditional = normalize_language(language) == ZH_HANT
+    lines: list[str] = []
+    for row in metrics[:5]:
+        if not isinstance(row, dict) or row.get("revenue_growth") is not None:
+            continue
+        gap = str(row.get("comparison_gap") or "")
+        year = row.get("year", "—")
+        if gap.startswith("missing_"):
+            missing_year = gap.removeprefix("missing_")
+            message = (
+                f"Fiscal {year} revenue growth is missing verified fiscal {missing_year} revenue."
+                if english
+                else f"{year} 財年收入增長缺少 {missing_year} 財年已驗證收入"
+                if traditional
+                else f"{year} 财年收入增长缺少 {missing_year} 财年已验证收入"
+            )
+        elif gap:
+            message = (
+                f"Fiscal {year} revenue growth lacks a verified comparable revenue value."
+                if english
+                else f"{year} 財年收入增長缺少已驗證的可比收入"
+                if traditional
+                else f"{year} 财年收入增长缺少已验证的可比收入"
+            )
+        else:
+            continue
+        lines.append(f"- {message}")
+
+    latest = next((row for row in metrics if isinstance(row, dict)), None)
+    if latest is not None and latest.get("return_on_equity") is None:
+        reasons = {
+            "missing_net_income": ("net income is missing", "缺少淨利潤資料", "缺少净利润数据"),
+            "missing_equity": ("equity data is missing", "缺少權益資料", "缺少权益数据"),
+            "non_positive_equity": ("equity is zero or negative; not applicable", "權益為零或負數，不適用", "权益为零或负数，不适用"),
+        }
+        reason = reasons.get(str(latest.get("return_on_equity_gap") or ""))
+        if reason:
+            message = (
+                f"Return on equity could not be calculated: {reason[0]}"
+                if english
+                else f"淨資產收益率無法計算：{reason[1]}"
+                if traditional
+                else f"净资产收益率无法计算：{reason[2]}"
+            )
+            lines.append(f"- {message}")
+    return lines
+
+
+def _render_markdown_projection(
     run_id: str,
     artifacts: list[dict[str, Any]],
     language: str = "zh-CN",
@@ -453,6 +567,14 @@ def render_research_run(
     include_technical: bool = False,
 ) -> str:
     language = normalize_language(language)
+    identity = resolve_report_identity(artifacts, explicit_name=company_name)
+    company_name = (
+        report_identity_title(
+            artifacts, language, explicit_name=company_name
+        )
+        if identity["name"]
+        else ""
+    )
     english = language == EN
     traditional = language == ZH_HANT
     section_labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
@@ -476,14 +598,38 @@ def render_research_run(
         ),
         None,
     )
-    final = next(
-        (
-            artifact
-            for artifact in reversed(artifacts)
-            if artifact["artifact_type"] == "research-report"
-        ),
-        None,
-    )
+    final = resolve_report_artifact(artifacts)
+    final_readiness = readiness_for_report_artifact(final, artifacts)
+    if not artifacts:
+        heading, message = no_final_report_notice(language, has_stage_materials=False)
+        return "\n".join(
+            [
+                f"# {heading}",
+                "",
+                f"{message}",
+                "",
+                _pick(language, f"研究运行：`{run_id}`", f"Research run: `{run_id}`"),
+                "",
+            ]
+        )
+    if final is None:
+        lines[0] = _pick(
+            language,
+            "# OpenThesis 阶段性研究",
+            "# OpenThesis Staged Research",
+        )
+        heading, message = no_final_report_notice(language)
+        lines.extend([f"## {heading}", "", f"> {message}", ""])
+    else:
+        if isinstance(final_readiness, dict) and (
+            final_readiness.get("state") != "complete"
+            or not final_readiness.get("complete")
+        ):
+            lines[0] = _pick(
+                language,
+                "# OpenThesis 阶段性研究",
+                "# OpenThesis Staged Research",
+            )
     growth_artifact = next(
         (
             artifact
@@ -503,7 +649,7 @@ def render_research_run(
     }
     if deterministic:
         metrics = deterministic["content"].get("metrics")
-        if company_name and isinstance(metrics, list):
+        if isinstance(metrics, list):
             lines.extend(
                 [
                     deterministic_summary(
@@ -515,6 +661,9 @@ def render_research_run(
                     "",
                 ]
             )
+            gap_notes = _financial_metric_gap_notes(metrics, language)
+            if gap_notes:
+                lines.extend([_pick(language, "## 财务数据缺口", "## Financial Data Gaps"), "", *gap_notes, ""])
             content = deterministic.get("content", {})
             interim_metrics = content.get("interim_metrics")
             latest_interim = (
@@ -795,7 +944,7 @@ def render_research_run(
             [
                 "Equity market value is matched to an FCFE proxy; this is not an enterprise-value model.",
                 "The model assumes the FCFE proxy grows at a constant rate during the explicit forecast period.",
-                "This result explains market-implied expectations; it is not a price target.",
+                reverse_dcf_disclaimer(language),
             ]
             if english
             else [
@@ -810,6 +959,17 @@ def render_research_run(
 
     if final:
         content = final["content"]
+        verification_content = content.get("verification")
+        readiness_notice = report_readiness_notice(final_readiness, language)
+        if readiness_notice:
+            lines.extend(
+                [
+                    f"## {readiness_notice[0]}",
+                    "",
+                    f"> {readiness_notice[1]}",
+                    "",
+                ]
+            )
         if content.get("mode") == "deterministic-only":
             notice = _pick(
                 language,
@@ -838,6 +998,19 @@ def render_research_run(
                     "",
                 ])
             if content.get("mode") == "staged-fallback":
+                staged_heading = (
+                    "## 階段性研究報告" if traditional
+                    else "## Staged Research Report" if english
+                    else "## 阶段性研究报告"
+                )
+                staged_message = (
+                    "> 最終綜合未完整生成。以下內容保留自已完成的研究階段，可在補齊缺失項後重新整合。"
+                    if traditional
+                    else "> Final synthesis is incomplete. The content below preserves completed research stages and can be integrated again after missing items are addressed."
+                    if english
+                    else "> 最终综合未完整生成。以下内容保留自已完成的研究阶段，可在补齐缺失项后重新整合。"
+                )
+                lines.extend([staged_heading, "", staged_message, ""])
                 capacity_notice = staged_context_capacity_notice(content.get("report"), language)
                 if capacity_notice:
                     lines.extend(
@@ -857,36 +1030,42 @@ def render_research_run(
                 for key in section_labels:
                     if key not in display_report:
                         continue
-                    projected = project_report_value(
-                        display_report[key],
-                        include_technical=include_technical,
-                        section=key,
-                        available_evidence=available_evidence,
-                    )
-                    rendered = (
-                        _render_growth_opportunities(
-                            projected,
-                            language,
+                    try:
+                        projected = project_report_value(
+                            display_report[key],
                             include_technical=include_technical,
+                            section=key,
                             available_evidence=available_evidence,
-                            counts_projected=True,
                         )
-                        if key == "growth_opportunities"
-                        else _render_claims(
-                            projected,
-                            language,
+                        rendered = (
+                            _render_growth_opportunities(
+                                projected,
+                                language,
+                                include_technical=include_technical,
+                                available_evidence=available_evidence,
+                                counts_projected=True,
+                            )
+                            if key == "growth_opportunities"
+                            else _render_claims(projected, language)
+                            if key == "claims"
+                            else _render_value(projected, language)
                         )
-                        if key == "claims"
-                        else _render_value(
-                            projected,
-                            language,
-                        )
-                    )
-                    if key == "growth_opportunities":
-                        if not growth_opportunities_from_value(projected, language):
-                            rendered = _render_value(projected, language)
-                        else:
-                            growth_rendered = True
+                        if key == "growth_opportunities":
+                            if not growth_opportunities_from_value(projected, language):
+                                rendered = _render_value(projected, language)
+                            else:
+                                growth_rendered = True
+                    except Exception as exc:
+                        rendered = [
+                            _locale_text(
+                                language,
+                                "本章节暂时无法显示；其他已验证章节仍予保留。",
+                                "本章節暫時無法顯示；其他已驗證章節仍予保留。",
+                                "This section could not be displayed; other verified sections remain available.",
+                            )
+                        ]
+                        if include_technical:
+                            rendered.append(f"`{key}: {type(exc).__name__}`")
                     lines.extend(
                         [
                             f"## {section_labels[key]}",
@@ -1062,7 +1241,7 @@ def render_research_run(
                 "",
             ]
         )
-        for item in unique_sources[:40]:
+        for item in unique_sources:
             title = (
                 item.get("title")
                 or item.get("concept")
@@ -1077,10 +1256,15 @@ def render_research_run(
 
     lines.extend([_pick(language, "## 研究过程", "## Research Process"), ""])
     for artifact in artifacts:
-        lines.append(
-            f"- {_artifact_title(artifact, language)} · "
-            f"`{artifact['agent_id']}` · `{artifact['model_id']}`"
-        )
+        # Ordinary reports expose a localized artifact role and outcome only.
+        # Private agent/model/gateway identifiers belong to technical audit data.
+        if include_technical:
+            lines.append(
+                f"- {_artifact_title(artifact, language)} · "
+                f"`{artifact.get('agent_id', '')}` · `{artifact.get('model_id', '')}`"
+            )
+        else:
+            lines.append(f"- {_artifact_title(artifact, language)} · {_pick(language, '已保留', 'Preserved')}")
     lines.extend(
         [
             "",
@@ -1096,4 +1280,35 @@ def render_research_run(
             ),
         ]
     )
+    if include_technical:
+        lines.extend(
+            [
+                "",
+                _pick(language, "## 技术详情", "## Technical Details"),
+                "",
+            ]
+        )
+        for artifact in artifacts:
+            lines.append(
+                f"- {_artifact_title(artifact, language)} · "
+                f"`{artifact.get('agent_id', '')}` · `{artifact.get('model_id', '')}`"
+            )
     return "\n".join(lines)
+
+
+def render_research_run(
+    run_id: str,
+    artifacts: list[dict[str, Any]],
+    language: str = "zh-CN",
+    *,
+    company_name: str = "",
+    include_technical: bool = False,
+) -> str:
+    """Compatibility entry point; all output is rendered from ReportDocument."""
+    from .report_document import assemble_report_document, render_markdown
+
+    document = assemble_report_document(
+        run_id, artifacts, continuity=None, language=language,
+        company_name=company_name, include_technical=include_technical,
+    )
+    return render_markdown(document)

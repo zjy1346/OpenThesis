@@ -13,6 +13,8 @@ from datetime import date, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
+import math
+import multiprocessing as mp
 import re
 import threading
 import time
@@ -21,6 +23,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .model_scheduler import shared_model_scheduler
 from .providers import ProviderError
 
 
@@ -28,6 +31,111 @@ VISION_MAX_PAGES = 20
 VISION_MAX_BYTES = 10 * 1024 * 1024
 VISION_TASK_SCHEMA_VERSION = "vision-task-v1"
 MINERU_UPLOAD_PROTOCOL_VERSION = "oss-put-v2"
+
+_VISION_CONCEPT_STATEMENTS = {
+    "revenue": "income_statement",
+    "net_income": "income_statement",
+    "profit_before_tax": "income_statement",
+    "profit_after_tax": "income_statement",
+    "operating_income": "income_statement",
+    "gross_profit": "income_statement",
+    "cost_of_revenue": "income_statement",
+    "operating_cash_flow": "cash_flow",
+    "capital_expenditure": "cash_flow",
+    "assets": "balance_sheet",
+    "liabilities": "balance_sheet",
+    "equity": "balance_sheet",
+    "total_equity": "balance_sheet",
+}
+
+_VISION_UNIT_SCALES = {
+    1.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 100_000_000.0, 1_000_000_000.0,
+}
+
+
+def _compact_source_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _vision_source_phrase_present(raw_text: str, phrase: str) -> bool:
+    compact_phrase = _compact_source_text(phrase)
+    return bool(compact_phrase and compact_phrase in _compact_source_text(raw_text))
+
+
+def _vision_unit_scale_is_explicit(unit_text: str, scale: float) -> bool:
+    text = _compact_source_text(unit_text)
+    if not text:
+        return False
+    terms = {
+        1.0: ("yuan", "元", "dollar", "港元", "港幣", "港币", "人民币", "人民幣", "cny", "rmb", "hkd", "usd"),
+        1_000.0: ("thousand", "千元", "千人民币", "千人民幣", "千港元", "千美元", "000s"),
+        10_000.0: ("ten thousand", "万元", "万人民币", "万人民幣", "万港元", "万美元"),
+        100_000.0: ("hundred thousand", "十万元", "十万港元", "十万美元"),
+        1_000_000.0: ("million", "百万", "百万元", "百万港元", "百万美元", "000000s"),
+        100_000_000.0: ("hundred million", "亿元", "亿港元", "亿美元"),
+        1_000_000_000.0: ("billion", "十亿元", "十亿港元", "十亿美元"),
+    }
+    if scale == 1.0 and any(
+        marker in text
+        for marker in ("thousand", "千", "tenmillion", "万", "million", "百万", "hundredmillion", "亿", "billion", "十亿", "000s")
+    ):
+        return False
+    return any(_compact_source_text(term) in text for term in terms.get(scale, ()))
+
+
+def _vision_currency_is_explicit(unit_text: str, currency: str) -> bool:
+    text = _compact_source_text(unit_text)
+    aliases = {
+        "CNY": ("cny", "rmb", "人民币", "人民幣", "yuan", "元", "¥", "￥"),
+        "HKD": ("hkd", "hk$", "港元", "港币", "港幣"),
+        "USD": ("usd", "us$", "美元", "dollar", "$"),
+    }
+    return any(_compact_source_text(term) in text for term in aliases.get(currency.upper(), ()))
+
+
+def _parse_vision_number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1].strip()
+    try:
+        parsed = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return -abs(parsed) if negative else parsed
+
+
+def _unverified_vision_observation(
+    row: Mapping[str, Any],
+    filing: FilingDocument,
+    pages_by_number: Mapping[int, VisionPageRequest],
+) -> EvidenceRef | None:
+    """Retain a bounded transcription without making it a financial fact."""
+    try:
+        page_no = int(row.get("original_page"))
+        page = pages_by_number[page_no]
+    except (TypeError, ValueError, KeyError):
+        return None
+    label = str(row.get("label") or row.get("concept") or "").strip()[:120]
+    raw_text = str(row.get("raw_text", "")).strip()[:2000]
+    value = row.get("value_text", row.get("reported_value", row.get("value")))
+    value_text = str(value).strip()[:160] if value is not None else ""
+    if not label or not raw_text or not value_text or not re.search(r"\d", value_text):
+        return None
+    digest = sha256(
+        f"{filing.document_id}|{page_no}|{page.content_hash}|{label}|{value_text}|{raw_text}".encode("utf-8")
+    ).hexdigest()[:32]
+    return EvidenceRef(
+        f"observation:{digest}", filing.document_id, filing.source_url,
+        f"Unverified visual observation (not used in calculations): {label}",
+        f"page:{page_no}",
+        f"Displayed value: {value_text}\nSource transcription: {raw_text}",
+        filing.filed_at, page.content_hash,
+    )
 
 
 def _vision_period_start(fiscal_period: str, period_end: str, statement: str) -> str | None:
@@ -56,12 +164,121 @@ class VisionAdapterError(RuntimeError):
         super().__init__(code)
 
 
+def _pdfium_process_entry(worker: Callable[..., Any], args: tuple[Any, ...], sender: Any) -> None:
+    """Call a PDFium operation in a child without returning exception payloads."""
+
+    try:
+        sender.send(("result", worker(*args)))
+    except BaseException as exc:
+        code = getattr(exc, "code", "")
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", code):
+            code = "PDFIUM_WORKER_ERROR"
+        try:
+            sender.send(("error", code))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        try:
+            sender.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _run_pdfium_isolated(
+    worker: Callable[..., Any],
+    *args: Any,
+    timeout_seconds: float = 45.0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[Any | None, str | None]:
+    """Run native PDFium work with a killable process deadline.
+
+    This uses the same spawn + one-way-pipe + deadline/cancel pattern as the
+    durable PDF-window worker. A daemon PDF worker already has an outer hard
+    process boundary, so it executes directly there instead of trying to nest
+    a multiprocessing child. Spawn failures never fall back to an unsafe
+    in-process PDFium call.
+    """
+
+    if mp.current_process().daemon:
+        try:
+            return worker(*args), None
+        except BaseException as exc:
+            code = getattr(exc, "code", "")
+            return None, code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", code) else "PDFIUM_WORKER_ERROR"
+
+    try:
+        context = mp.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, "PDFIUM_WORKER_START_FAILED"
+
+    process = context.Process(
+        target=_pdfium_process_entry,
+        args=(worker, tuple(args), sender),
+        name="pdfium-native-worker",
+    )
+    process.daemon = True
+    try:
+        try:
+            process.start()
+        except (OSError, RuntimeError, ValueError, TypeError, AttributeError):
+            return None, "PDFIUM_WORKER_START_FAILED"
+        sender.close()
+        deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+        while True:
+            if cancel_check is not None and cancel_check():
+                return None, "PDFIUM_WORKER_CANCELLED"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "PDFIUM_WORKER_TIMEOUT"
+            if receiver.poll(min(0.05, remaining)):
+                try:
+                    kind, value = receiver.recv()
+                except (EOFError, OSError):
+                    return None, "PDFIUM_WORKER_EXIT"
+                process.join(timeout=0.5)
+                if process.is_alive():
+                    return None, "PDFIUM_WORKER_EXIT"
+                if kind == "error":
+                    return None, str(value)
+                if kind != "result":
+                    return None, "PDFIUM_WORKER_EXIT"
+                return value, None
+            if not process.is_alive():
+                if receiver.poll(0.2):
+                    try:
+                        kind, value = receiver.recv()
+                    except (EOFError, OSError):
+                        return None, "PDFIUM_WORKER_EXIT"
+                    if kind == "error":
+                        return None, str(value)
+                    if kind == "result":
+                        return value, None
+                return None, "PDFIUM_WORKER_EXIT"
+    finally:
+        try:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1.0)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=1.0)
+        except (AssertionError, OSError, ValueError):
+            pass
+        for connection in (sender, receiver):
+            try:
+                connection.close()
+            except (OSError, ValueError):
+                pass
+
+
 @dataclass(frozen=True, slots=True)
 class VisionFallbackConfig:
     enabled: bool = False
     consent: bool = False
     provider: str = "configured_model"
     configured_model_id: str = ""
+    connection_id: str = ""
     configuration_version: int = 1
     timeout_seconds: float = 60.0
     max_pages: int = VISION_MAX_PAGES
@@ -726,6 +943,7 @@ class GatewayVisionAdapter:
         image_renderer: Callable[[bytes], bytes] | None = None,
     ):
         self.provider = provider
+        self._uses_default_renderer = image_renderer is None
         self.image_renderer = image_renderer or default_pdf_to_png
 
     def extract(self, company, filing, pages, config, *, cancel_check=None):
@@ -740,24 +958,44 @@ class GatewayVisionAdapter:
             for page in pages:
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
-                image = self.image_renderer(page.pdf_bytes)
+                if self._uses_default_renderer:
+                    image = default_pdf_to_png(page.pdf_bytes, cancel_check=cancel_check)
+                else:
+                    image = self.image_renderer(page.pdf_bytes)
                 if not image:
                     raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
                 prompt = (
                     "Return JSON only with this shape: "
-                    "{facts:[{concept,value,currency,unit_scale,statement,scope,"
-                    "period_end,original_page,raw_text}]}. "
+                    "{facts:[{concept,value,currency,unit_scale,unit_text,statement,"
+                    "scope,scope_text,period_end,period_text,original_page,raw_text}],"
+                    "observations:[{label,value_text,original_page,raw_text}]}. "
                     f"Use only original_page {page.original_page}; prefer consolidated "
-                    "scope, preserve the stated period and currency, and omit uncertain values."
+                    "scope, preserve the stated period and currency, and omit uncertain facts. "
+                    "For every fact quote unit_text, scope_text, and period_text verbatim "
+                    "from the page and include all three in raw_text with the numeric row. "
+                    "Only emit supported standard concepts; put other visible numeric metrics "
+                    "in observations as text, never as facts. Observations are unverified "
+                    "and must not be used for calculations."
+                )
+                scheduler = shared_model_scheduler(
+                    config.connection_id or config.configured_model_id,
+                    limit=2,
                 )
                 try:
-                    structured = self.provider.generate_vision(
-                        "Extract candidate financial facts from one approved filing page. "
-                        "Do not infer missing values or use outside knowledge.",
-                        prompt,
-                        image,
-                    )
+                    with scheduler.slot(cancel_check):
+                        structured = self.provider.generate_vision(
+                            "Extract candidate financial facts from one approved filing page. "
+                            "Do not infer missing values or use outside knowledge. "
+                            "Never promote segment, custom, or ambiguous metrics to financial facts.",
+                            prompt,
+                            image,
+                        )
+                    scheduler.mark_success()
+                except InterruptedError as exc:
+                    raise VisionAdapterError("VISION_CANCELLED") from exc
                 except ProviderError as exc:
+                    if exc.code == "MODEL_RATE_LIMITED":
+                        scheduler.mark_rate_limited(exc.retry_after_seconds)
                     if exc.code == "MODEL_TIMEOUT":
                         raise VisionAdapterError("VISION_TIMEOUT") from exc
                     if exc.code in {"MODEL_UNAUTHORIZED", "MODEL_CREDENTIAL_MISSING"}:
@@ -775,7 +1013,7 @@ class GatewayVisionAdapter:
             if not facts:
                 return VisionExtractionResult(
                     (),
-                    (),
+                    tuple(refs),
                     tuple(diagnostics) or ("VISION_NO_CANDIDATES",),
                     page_errors[0] if page_errors else "VISION_NO_CANDIDATES",
                 )
@@ -978,11 +1216,14 @@ class VisionTaskCoordinator:
             return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
 
 
-def default_pdf_to_png(pdf_bytes: bytes) -> bytes:
-    """Render the first PDF page in memory with bounded pixels and no temp file."""
+def _render_pdfium_page(pdf_bytes: bytes) -> bytes:
+    """Native PDFium renderer; called only behind a process boundary."""
+
+    import pypdfium2 as pdfium
+
+    document = pdfium.PdfDocument(pdf_bytes)
+    page = bitmap = image = None
     try:
-        import pypdfium2 as pdfium
-        document = pdfium.PdfDocument(pdf_bytes)
         if len(document) < 1:
             raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
         page = document[0]
@@ -996,16 +1237,46 @@ def default_pdf_to_png(pdf_bytes: bytes) -> bytes:
         data = output.getvalue()
         if len(data) > 8 * 1024 * 1024:
             raise VisionAdapterError("VISION_IMAGE_SIZE_LIMIT")
-        try:
-            page.close()
-            document.close()
-        except Exception:
-            pass
+        return data
+    finally:
+        for resource in (image, bitmap, page, document):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+def default_pdf_to_png(
+    pdf_bytes: bytes,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    timeout_seconds: float = 35.0,
+) -> bytes:
+    """Render page one in memory inside a killable native-worker process."""
+    try:
+        data, error = _run_pdfium_isolated(
+            _render_pdfium_page,
+            bytes(pdf_bytes),
+            timeout_seconds=timeout_seconds,
+            cancel_check=cancel_check,
+        )
+        if error == "VISION_IMAGE_SIZE_LIMIT":
+            raise VisionAdapterError(error)
+        if error == "PDFIUM_WORKER_CANCELLED":
+            raise VisionAdapterError("VISION_CANCELLED")
+        if error == "PDFIUM_WORKER_TIMEOUT":
+            raise VisionAdapterError("VISION_IMAGE_RENDER_TIMEOUT")
+        if error is not None or not isinstance(data, bytes):
+            raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
         return data
     except VisionAdapterError:
         raise
-    except Exception as exc:
-        raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED") from exc
+    except Exception:
+        # Exception strings and worker payloads are intentionally discarded;
+        # they may contain local paths or document-derived content.
+        raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED") from None
 
 
 def parse_vision_markdown(
@@ -1017,12 +1288,28 @@ def parse_vision_markdown(
     """Conservatively turn labelled markdown rows into candidate facts."""
     if not markdown or not pages:
         return VisionExtractionResult(error_code="VISION_EMPTY_MARKDOWN", diagnostics=("VISION_EMPTY_MARKDOWN",))
-    scale = 1.0
-    compact = markdown.lower()
-    if "million" in compact or "百万" in markdown:
-        scale = 1_000_000.0
-    elif "thousand" in compact or "千元" in markdown:
-        scale = 1_000.0
+    context = markdown[:2000]
+    unit_match = re.search(r"(?im)^\s*(?:unit|currency|单位|币种|幣種)\s*[:：]?\s*[^\n]+", markdown)
+    scope_match = re.search(r"(?im)^.{0,80}(?:consolidated|合并|合併|綜合).{0,100}$", markdown)
+    period_match = re.search(rf"(?im)^.{{0,100}}{re.escape(str(filing.period_end)[:4])}.{{0,100}}$", markdown)
+    if not unit_match or not scope_match or not period_match:
+        return VisionExtractionResult(error_code="VISION_CONTEXT_NOT_EXPLICIT", diagnostics=("VISION_CONTEXT_NOT_EXPLICIT",))
+    unit_text = unit_match.group(0).strip()
+    scope_text = scope_match.group(0).strip()
+    period_text = period_match.group(0).strip()
+    compact = unit_text.lower()
+    scale = next(
+        (candidate for candidate in (1_000_000_000.0, 100_000_000.0, 1_000_000.0, 100_000.0, 10_000.0, 1_000.0, 1.0)
+         if _vision_unit_scale_is_explicit(unit_text, candidate)),
+        0.0,
+    )
+    currency = company.reporting_currency.upper()
+    if (
+        scale not in _VISION_UNIT_SCALES
+        or not _vision_currency_is_explicit(unit_text, currency)
+        or any(marker in scope_text.casefold() for marker in ("parent company", "母公司", "单体", "單體", "个别报表", "個別報表"))
+    ):
+        return VisionExtractionResult(error_code="VISION_CONTEXT_NOT_EXPLICIT", diagnostics=("VISION_CONTEXT_NOT_EXPLICIT",))
     labels = {
         "revenue": r"(?:revenue|operating revenue|营业收入)",
         "net_income": r"(?:net income|net profit|净利润)",
@@ -1044,6 +1331,8 @@ def parse_vision_markdown(
         if negative:
             value = -value
         statement = "cash_flow" if concept == "operating_cash_flow" else "balance_sheet" if concept in {"assets", "liabilities", "total_equity"} else "income_statement"
+        if _VISION_CONCEPT_STATEMENTS.get(concept) != statement:
+            continue
         fact = FinancialFact(
             hashlib_id := f"{filing.document_id}:{concept}:{first_page.original_page}:{first_page.content_hash[:16]}:{value}",
             company.security_id, concept, concept,
@@ -1053,13 +1342,13 @@ def parse_vision_markdown(
             scope="consolidated", entity=company.name, market=company.market, statement=statement,
             period_start=_vision_period_start(filing.fiscal_period, filing.period_end, statement),
             consolidated_scope="consolidated", currency=company.reporting_currency,
-            unit_scale=scale, source_document=filing.primary_document, source_page=first_page.original_page,
-            source_bbox=None, raw_text=match.group(0), parser_version="vision-candidate-v1",
+            unit_scale=scale, unit_provenance="vision_explicit", source_document=filing.primary_document, source_page=first_page.original_page,
+            source_bbox=None, raw_text=context, parser_version="vision-markdown-v2",
         )
         facts.append(fact)
         evidence.append(EvidenceRef(
             f"fact:{fact.fact_id}", filing.document_id, filing.source_url,
-            filing.primary_document, f"page:{first_page.original_page}", match.group(0),
+            filing.primary_document, f"page:{first_page.original_page}", context,
             filing.filed_at, first_page.content_hash,
         ))
     if not facts:
@@ -1068,49 +1357,103 @@ def parse_vision_markdown(
 
 
 def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pages: Sequence[VisionPageRequest]) -> VisionExtractionResult:
-    """Parse the strict custom-vision schema into bounded candidate facts."""
-    rows = payload.get("facts") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
+    """Parse explicitly evidenced standard facts and separate unverified observations."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("facts", []), list):
         return VisionExtractionResult(error_code="VISION_STRUCTURED_JSON_REQUIRED", diagnostics=("VISION_STRUCTURED_JSON_REQUIRED",))
-    allowed = {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity", "total_equity"}
-    scales = {1.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0}
+    rows = payload.get("facts", [])[:200]
+    observation_rows = payload.get("observations", [])
+    if not isinstance(observation_rows, list):
+        observation_rows = []
+    observation_rows = observation_rows[:20]
     facts: list[FinancialFact] = []
     refs: list[EvidenceRef] = []
     pages_by_number = {page.original_page: page for page in pages}
+    consolidated_markers = ("consolidated", "合并", "合併", "綜合")
+    parent_markers = ("parent company", "parent only", "company only", "母公司", "單體", "单体", "个别报表", "個別報表")
     for row in rows:
-        if not isinstance(row, dict) or row.get("concept") not in allowed:
+        if not isinstance(row, dict):
+            continue
+        concept = str(row.get("concept", ""))
+        expected_statement = _VISION_CONCEPT_STATEMENTS.get(concept)
+        if expected_statement is None:
+            observation = _unverified_vision_observation(row, filing, pages_by_number)
+            if observation is not None:
+                refs.append(observation)
             continue
         try:
             page_no = int(row.get("original_page"))
             page = pages_by_number[page_no]
-            value = float(row["value"])
-            scale = float(row.get("unit_scale", 1.0))
-            end_date = str(row.get("period_end", ""))
-            if scale not in scales or str(row.get("scope", "")) != "consolidated" or end_date != filing.period_end:
-                continue
-            currency = str(row.get("currency", "")).upper()
-            if currency != company.reporting_currency.upper():
-                continue
+            reported_value = _parse_vision_number(row.get("value"))
+            scale = float(row.get("unit_scale"))
+            end_date = str(row.get("period_end", "")).strip()[:10]
+            currency = str(row.get("currency", "")).strip().upper()
             statement = str(row.get("statement", ""))
-            if statement not in {"income_statement", "balance_sheet", "cash_flow"}:
+            scope = str(row.get("scope", "")).strip().casefold()
+            unit_text = str(row.get("unit_text", "")).strip()[:160]
+            scope_text = str(row.get("scope_text", "")).strip()[:160]
+            period_text = str(row.get("period_text", "")).strip()[:160]
+            raw_text = str(row.get("raw_text", "")).strip()[:2000]
+            if (
+                reported_value is None
+                or scale not in _VISION_UNIT_SCALES
+                or end_date != str(filing.period_end)[:10]
+                or currency != company.reporting_currency.upper()
+                or statement != expected_statement
+                or scope != "consolidated"
+                or not raw_text
+                or str(filing.period_end)[:4] not in period_text
+                or not any(marker in scope_text.casefold() for marker in consolidated_markers)
+                or any(marker in scope_text.casefold() for marker in parent_markers)
+                or not _vision_source_phrase_present(raw_text, unit_text)
+                or not _vision_source_phrase_present(raw_text, scope_text)
+                or not _vision_source_phrase_present(raw_text, period_text)
+                or not _vision_unit_scale_is_explicit(unit_text, scale)
+                or not _vision_currency_is_explicit(unit_text, currency)
+            ):
+                observation = _unverified_vision_observation(row, filing, pages_by_number)
+                if observation is not None:
+                    refs.append(observation)
                 continue
-            raw_text = str(row.get("raw_text", "")).strip()
-            if not raw_text:
-                continue
-            value *= scale
         except (KeyError, TypeError, ValueError):
+            observation = _unverified_vision_observation(row, filing, pages_by_number)
+            if observation is not None:
+                refs.append(observation)
             continue
+        value = reported_value * scale
+        if not math.isfinite(value):
+            continue
+        period_start = _vision_period_start(filing.fiscal_period, filing.period_end, statement)
+        fact_id = f"{filing.document_id}:{concept}:{page_no}:{page.content_hash[:16]}:{value}"
         fact = FinancialFact(
-            f"{filing.document_id}:{row['concept']}:{page_no}:{page.content_hash[:16]}:{value}", company.security_id, row["concept"], row["concept"], value,
+            fact_id, company.security_id, concept, concept, value,
             currency, int(filing.period_end[:4]), filing.fiscal_period, filing.form_type,
-            _vision_period_start(filing.fiscal_period, filing.period_end, statement), filing.period_end,
-            filing.filed_at, filing.accession_number, filing.source_url, scope="consolidated", entity=company.name,
-            market=company.market, statement=statement, period_start=_vision_period_start(filing.fiscal_period, filing.period_end, statement),
-            consolidated_scope="consolidated", currency=currency, unit_scale=scale, source_document=filing.primary_document,
-            source_page=page_no, raw_text=raw_text, parser_version="vision-json-v1",
+            period_start, filing.period_end, filing.filed_at, filing.accession_number,
+            filing.source_url, scope="consolidated", entity=company.name,
+            market=company.market, statement=statement, period_start=period_start,
+            consolidated_scope="consolidated", currency=currency, unit_scale=scale,
+            unit_provenance="vision_explicit", source_document=filing.primary_document,
+            source_page=page_no, raw_text=raw_text, parser_version="vision-json-v2",
         )
         facts.append(fact)
-        refs.append(EvidenceRef(f"fact:{fact.fact_id}", filing.document_id, filing.source_url, filing.primary_document, f"page:{page_no}", raw_text, filing.filed_at, page.content_hash))
+        refs.append(EvidenceRef(
+            f"fact:{fact_id}", filing.document_id, filing.source_url,
+            filing.primary_document, f"page:{page_no}", raw_text, filing.filed_at,
+            page.content_hash,
+        ))
+
+    for row in observation_rows:
+        if not isinstance(row, dict):
+            continue
+        observation = _unverified_vision_observation(row, filing, pages_by_number)
+        if observation is not None:
+            refs.append(observation)
+    unique_refs: dict[str, EvidenceRef] = {}
+    for ref in refs:
+        unique_refs.setdefault(ref.evidence_id, ref)
+    refs = list(unique_refs.values())
+
     if not facts:
-        return VisionExtractionResult(error_code="VISION_NO_CANDIDATES", diagnostics=("VISION_NO_CANDIDATES",))
+        return VisionExtractionResult(
+            (), tuple(refs), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES"
+        )
     return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_CANDIDATES_ONLY",))

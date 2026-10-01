@@ -17,6 +17,7 @@ import type {
   ProviderDefinition,
   ResearchJob,
   ResearchReport,
+  RecoveryStageTarget,
   ResearchRequest,
   ResearchPackSummary,
   ThesisVersion,
@@ -49,6 +50,19 @@ export function getResearchReport(
     run_id: runId,
     ...(language ? { language } : {}),
     ...(includeTechnical ? { include_technical: true } : {}),
+  }).then((report) => {
+    if (report.run_id !== runId) throw new Error("REPORT_IDENTITY_MISMATCH");
+    if (
+      report.report_contract_version !== "1"
+      || typeof report.report_input_generation !== "string"
+      || typeof report.is_substantive !== "boolean"
+      || !Array.isArray(report.visible_sections)
+      || typeof report.report_read_state !== "string"
+      || !["ready", "partial", "diagnostic_only"].includes(report.report_read_state)
+    ) {
+      throw new Error("REPORT_CONTRACT_MISMATCH");
+    }
+    return report;
   });
 }
 
@@ -128,6 +142,7 @@ export function saveConfiguredModel(input: {
   alias: string;
   enabled: boolean;
   capabilities: string[];
+  timeout_seconds?: number;
 }): Promise<ConfiguredModelSummary> {
   return invoke<ConfiguredModelSummary>("model_center_save_configured_model", { input });
 }
@@ -201,11 +216,32 @@ export function retryResearchSynthesis(
   return request("research.retry_synthesis", { run_id: runId, ...(model ? { model } : {}) });
 }
 
+export function retryResearchModelStages(
+  runId: string,
+  model?: ModelSelection,
+): Promise<ResearchReport> {
+  return request("research.retry_model_stages", { run_id: runId, ...(model ? { model } : {}) });
+}
+
 export function retryResearchGrowth(
   runId: string,
   model: ModelSelection,
 ): Promise<ResearchReport> {
   return request("research.retry_growth", { run_id: runId, model });
+}
+
+export function retryResearchStage(
+  runId: string,
+  target: RecoveryStageTarget,
+  model: ModelSelection,
+  planHash: string,
+): Promise<ResearchReport> {
+  return request("research.retry_stage", {
+    run_id: runId,
+    target,
+    model,
+    plan_hash: planHash,
+  });
 }
 
 export function retryResearchFinancials(runId: string): Promise<ResearchReport> {

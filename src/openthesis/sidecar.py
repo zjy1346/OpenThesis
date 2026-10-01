@@ -14,6 +14,7 @@ from .service import (
     ServiceConfigurationError,
     _FinancialReportRefreshError,
 )
+from .application_services import ReportReadError
 
 
 class JsonLineServer:
@@ -43,6 +44,8 @@ class JsonLineServer:
             return _error(request_id, -32602, "invalid preferences")
         except ServiceConfigurationError as exc:
             return _error(request_id, -32010, exc.code)
+        except ReportReadError as exc:
+            return _error(request_id, -32030, exc.code)
         except (TypeError, ValueError):
             return _error(request_id, -32602, "invalid parameters")
         except KeyError as exc:
@@ -167,12 +170,34 @@ class JsonLineServer:
             if model is not None and not isinstance(model, dict):
                 raise ValueError("model must be an object")
             return self.service.retry_research_synthesis(run_id, model)
+        if method == "research.retry_model_stages":
+            run_id = params.get("run_id")
+            model = params.get("model")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            if model is not None and not isinstance(model, dict):
+                raise ValueError("model must be an object")
+            return self.service.retry_research_model_stages(run_id, model)
         if method == "research.retry_growth":
             run_id = params.get("run_id")
             model = params.get("model")
             if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
                 raise ValueError("run_id and model are required")
             return self.service.retry_research_growth(run_id, model)
+        if method == "research.retry_stage":
+            run_id = params.get("run_id")
+            target = params.get("target")
+            model = params.get("model")
+            plan_hash = params.get("plan_hash")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            if not isinstance(target, str) or not target:
+                raise ValueError("target is required")
+            if model is not None and not isinstance(model, dict):
+                raise ValueError("model must be an object")
+            if plan_hash is not None and not isinstance(plan_hash, str):
+                raise ValueError("plan_hash must be a string")
+            return self.service.retry_research_stage(run_id, target, model, plan_hash)
         if method == "research.retry_financials":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:

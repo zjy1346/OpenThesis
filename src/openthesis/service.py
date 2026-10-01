@@ -13,25 +13,30 @@ import time
 import uuid
 import urllib.parse
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
+from .build_identity import load_build_info
 from .comparison import compare_research_runs
 from .application_services import (
     DisclosureService,
     FinancialPipeline,
+    ReportReadError,
+    ReportReadSnapshot,
     ReportService,
     ResearchOrchestrator,
 )
 from .demo import DEMO_COMPANY, demo_facts
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso
-from .filing_parser import build_filing_evidence
+from .filing_parser import QUALITATIVE_PARSER_VERSION, build_filing_evidence
 from .research_readiness import readiness, primary_market_alternative
 from .filing_selection import select_research_filings
 from .i18n import EN, ZH_HANT, normalize_language, resolve_system_language, resolve_ui_language, translate_error
 from .market_data import MarketDataError, MarketDataModule
+from .market_capabilities import DEFAULT_MARKET_CAPABILITIES
+from .disclosure_coverage import DisclosureCoveragePlanner
 from .market_snapshot import (
     FxRouter,
     EastmoneyPublicQuoteAdapter,
@@ -44,7 +49,6 @@ from .financial_ingestion import (
     FinancialIngestionEngine,
     FinancialDataset,
     FinancialGroupValidation,
-    build_financial_profile,
     FinancialProfile,
 )
 from .financial_compiler import (
@@ -56,6 +60,7 @@ from .financial_compiler import (
 from .financial_recognition import FinancialRecognitionCoordinator
 from .financial_evidence import FinancialEvidenceCoordinator, FinancialEvidenceRequest
 from .financial_recovery import FinancialRecoveryController, RecoveryState
+from .financial_admission import FinancialAdmission
 from .financials import deterministic_summary
 from .market_financials import FinancialValidation, ValidationStatus
 from .markets import COMMON_MARKET_COMPANIES, MARKET_PROFILES, Market, normalize_market
@@ -68,10 +73,16 @@ from .packs import (
     install_pack,
     list_installed_packs,
 )
-from .providers import ModelConfig, create_provider
+from .providers import ModelConfig, ProviderError, create_provider
 from .report_html import render_research_html
 from .research import ResearchCancelled, ResearchWorkflow
+from .research_continuity import ResearchContinuityCoordinator, StageOutcome
+from .research_recovery import ResearchRecoveryPlanner
 from .reporting import render_research_run
+from .safe_report import SafeReportAssembler
+from .report_readiness import (
+    readiness_for_report_artifact,
+)
 from .sec_client import SEC_HK_ISSUERS, SecClient, SecClientError, SecFinancialSourceAdapter
 from .storage import DERIVED_PIPELINE_CONTRACT, Storage
 from .vision_financials import (
@@ -120,6 +131,7 @@ PREFERENCE_DEFAULTS: dict[str, str] = {
     "vision_enabled": "false",
     "vision_provider": "mineru_flash",
     "vision_configured_model_id": "",
+    "vision_connection_id": "",
     "vision_configuration_version": "1",
     "vision_approval_mode": "review_each_plan",
     "vision_standing_authorization": "false",
@@ -166,6 +178,7 @@ def _latest_annual_validations(
         if str(item.identity[1])[:10] == str(period_end)[:10]
         and str(item.identity[2]).upper() == "FY"
         and str(item.identity[3]).strip().lower() == "consolidated"
+        and str(getattr(item, "role", "target")) == "target"
         and str(item.status) == ValidationStatus.VERIFIED.value
         and concepts_cover_profile(
             (fact.concept for fact in item.accepted), _CORE_FINANCIAL_CONCEPTS
@@ -249,6 +262,7 @@ class _ResearchJob:
     vision_approval_pending: bool = False
     vision_approval_event: threading.Event = field(default_factory=threading.Event, repr=False)
     operation_result: dict[str, Any] | None = None
+    run: ResearchRun | None = field(default=None, repr=False)
 
     @staticmethod
     def _is_external_stage(stage: str) -> bool:
@@ -280,6 +294,12 @@ class _ResearchJob:
             external_seconds += current_bucket
         else:
             active_seconds += current_bucket
+        attempt_complete = self.state in {"completed", "failed", "cancelled"}
+        research_complete = bool(
+            attempt_complete
+            and self.run is not None
+            and self.run.status is RunStatus.COMPLETED
+        )
         return {
             "job_id": self.job_id,
             "state": self.state,
@@ -310,6 +330,9 @@ class _ResearchJob:
             "vision_approval": self.vision_approval,
             "vision_approval_pending": self.vision_approval_pending,
             "operation_result": dict(self.operation_result) if self.operation_result else None,
+            "attempt_complete": attempt_complete,
+            "research_complete": research_complete,
+            "action_required": bool(attempt_complete and not research_complete),
         }
 
 
@@ -331,6 +354,7 @@ class AppService:
     ):
         self.storage = Storage(data_dir)
         self.interrupted_run_count = self.storage.interrupt_running_runs()
+        self._continuity = ResearchContinuityCoordinator(self.storage)
         self.app_version = app_version
         self._sec_client_factory = sec_client_factory
         self._provider_factory = provider_factory
@@ -373,6 +397,7 @@ class AppService:
         self._financial_recovery = FinancialRecoveryController(
             self.storage, app_version=self.app_version
         )
+        self._financial_admission = FinancialAdmission()
         self._financial_pipeline = FinancialPipeline(
             self._financial_ingestion,
             self._financial_recognition,
@@ -385,6 +410,8 @@ class AppService:
         self._vision_adapter_factory = vision_adapter_factory or _default_vision_adapter_factory
         self._jobs: dict[str, _ResearchJob] = {}
         self._jobs_lock = threading.Lock()
+        self._recovery_planner = ResearchRecoveryPlanner()
+        self._active_recoveries: dict[tuple[str, str], tuple[threading.Event, str]] = {}
 
     def _ingestion_for(
         self, company: Company, filings: Sequence[FilingDocument]
@@ -498,9 +525,11 @@ class AppService:
         )
 
     def hello(self) -> dict[str, Any]:
+        build_info = load_build_info()
         return {
             "contract_version": CONTRACT_VERSION,
             "app_version": self.app_version,
+            "build_info": build_info,
             "capabilities": [
                 "app.bootstrap",
                 "settings.update",
@@ -521,7 +550,9 @@ class AppService:
                 "research.start",
                 "research.market_snapshot",
                 "research.retry_growth",
+                "research.retry_model_stages",
                 "research.retry_synthesis",
+                "research.retry_stage",
                 "research.retry_financials",
                 "research.rebuild_financials",
                 "research.refresh_financial_report",
@@ -883,20 +914,158 @@ class AppService:
         language: str | None = None,
         include_technical: bool = False,
     ) -> dict[str, Any]:
-        run = self.storage.get_run(run_id)
+        try:
+            run = self.storage.get_run(run_id)
+        except Exception as exc:
+            raise ReportReadError("REPORT_STORAGE_UNAVAILABLE") from exc
         if run is None:
             raise KeyError("research run not found")
-        payload = _decode_payload(run.get("payload_json"))
+        if str(run.get("run_id") or "") != str(run_id):
+            raise ReportReadError("REPORT_IDENTITY_MISMATCH")
+
+        read_diagnostics: list[dict[str, str]] = []
+        try:
+            payload = _decode_payload(run.get("payload_json"))
+        except Exception:
+            payload = {}
+            read_diagnostics.append({"code": "REPORT_PROJECTION_FAILED", "location": "run-payload"})
+        if not isinstance(payload, dict):
+            payload = {}
+            read_diagnostics.append({"code": "REPORT_PROJECTION_FAILED", "location": "run-payload"})
+        try:
+            saved_report_language = self.storage.get_setting("report_language", "zh-CN")
+        except Exception:
+            saved_report_language = "zh-CN"
+            read_diagnostics.append({"code": "REPORT_STORAGE_UNAVAILABLE", "location": "report-language"})
         report_language = normalize_language(
             language
             or str(payload.get("report_language", ""))
-            or self.storage.get_setting("report_language", "zh-CN")
+            or saved_report_language
         )
-        artifacts = self.storage.get_artifacts(run_id)
+        try:
+            artifacts = self.storage.get_artifacts(run_id)
+        except Exception as exc:
+            raise ReportReadError("REPORT_STORAGE_UNAVAILABLE") from exc
+        recovery_artifacts = list(artifacts)
+        try:
+            raw_revision = self.storage.latest_report_revision(run_id)
+        except Exception:
+            raw_revision = None
+            read_diagnostics.append({"code": "REPORT_STORAGE_UNAVAILABLE", "location": "report-revision"})
+        report_revision_payload = raw_revision.get("payload") if isinstance(raw_revision, dict) else None
+        if raw_revision is not None:
+            try:
+                artifacts = _artifacts_for_report_projection(artifacts, report_revision_payload)
+            except Exception:
+                read_diagnostics.append({"code": "REPORT_PROJECTION_FAILED", "location": "report-revision"})
         company = payload.get("company", {})
         if not isinstance(company, dict):
             company = {}
-        financial_status = _financial_status(self.storage, company, payload, run_id=run_id)
+        try:
+            financial_status = _financial_status(self.storage, company, payload, run_id=run_id)
+        except Exception:
+            financial_status = {
+                "state": "unavailable", "retryable": False, "history_years": 0,
+                "expected_periods": [], "available_periods": [], "missing_periods": [],
+                "unverified_periods": [], "nodes": [], "issues": [], "attempt_count": 0,
+                "last_stage": "", "last_error": "", "updated_at": "",
+                "next_action": "", "model_calls": 0, "token_delta": 0,
+            }
+            read_diagnostics.append({"code": "FINANCIAL_STATUS_UNAVAILABLE", "location": "financial-status"})
+        revision_id = str(raw_revision.get("revision_id") or "") if raw_revision else ""
+        revision_generation = int(raw_revision.get("generation") or 0) if raw_revision else 0
+        report_revision = {
+            key: value for key, value in raw_revision.items() if key != "payload"
+        } if isinstance(raw_revision, dict) else None
+        try:
+            continuity = self._continuity.snapshot(run_id)
+        except Exception:
+            continuity = {"state": "unavailable", "latest": None, "attempts": []}
+            read_diagnostics.append({"code": "RECOVERY_METADATA_UNAVAILABLE", "location": "continuity"})
+
+        snapshot = ReportReadSnapshot(
+            run_id=run_id,
+            company_name=str(run.get("name") or ""),
+            run_status=str(run.get("status") or ""),
+            artifacts=artifacts,
+            continuity=continuity,
+            language=report_language,
+            include_technical=include_technical,
+            revision_id=revision_id,
+            revision_generation=revision_generation,
+        )
+        try:
+            report_read = self._report_service.read(snapshot)
+        except Exception:
+            try:
+                safe = SafeReportAssembler().assemble(
+                    run_id=run_id, company_name=str(run.get("name") or ""),
+                    status=str(run.get("status") or ""), artifacts=artifacts,
+                    continuity=continuity, language=report_language,
+                    renderer_error="report_projection_failed",
+                )
+            except Exception as exc:
+                raise ReportReadError("REPORT_PROJECTION_FAILED") from exc
+            from .application_services import ReportReadResult
+            report_read = ReportReadResult(
+                run_id=run_id, report_contract_version="1",
+                report_revision_id=revision_id or None,
+                report_input_generation=snapshot.input_generation,
+                read_state="diagnostic_only", is_substantive=False,
+                visible_sections=(),
+                diagnostics=({"code": "REPORT_PROJECTION_FAILED", "location": "report"},),
+                markdown=safe.markdown, html=safe.html,
+            )
+        if report_read.run_id != run_id:
+            raise ReportReadError("REPORT_IDENTITY_MISMATCH")
+        read_diagnostics.extend(report_read.diagnostics)
+        try:
+            completion = _report_completion_state(
+                run, artifacts, continuity,
+                readiness=report_read.document.readiness.to_dict()
+                if report_read.document is not None else None,
+            )
+        except Exception:
+            completion = {
+                "attempt_complete": str(run.get("status")) in {"completed", "partial", "failed", "cancelled"},
+                "research_complete": False,
+                "report_readiness": {
+                    "state": "unknown", "complete": False,
+                    "substantive_sections": [], "missing_sections": [],
+                    "missing_stages": [], "issues": ["REPORT_READINESS_UNAVAILABLE"],
+                    "recovery_action": "review_run_diagnostics",
+                },
+                "action_required": True,
+            }
+            read_diagnostics.append({"code": "REPORT_PROJECTION_FAILED", "location": "readiness"})
+        try:
+            recovery_description = self._recovery_planner.describe(
+                recovery_artifacts, continuity, target="auto"
+            )
+        except Exception:
+            recovery_description = {
+                "target": "auto", "stages": [], "reason": "recovery_metadata_unavailable",
+                "input_artifact_ids": [], "plan_hash": "", "available": False,
+                "error_code": "RECOVERY_METADATA_UNAVAILABLE",
+            }
+            read_diagnostics.append({"code": "RECOVERY_METADATA_UNAVAILABLE", "location": "recovery-plan"})
+        try:
+            retryable_synthesis = _report_retryable(artifacts)
+            retryable_model_stages = _model_stages_retryable(artifacts, continuity)
+            synthesis_error_code = _synthesis_error_code(artifacts)
+            retryable_growth = _growth_retryable(artifacts)
+        except Exception:
+            retryable_synthesis = retryable_model_stages = retryable_growth = False
+            synthesis_error_code = ""
+            recovery_description = {
+                **recovery_description,
+                "available": False,
+                "stages": [],
+                "reason": "recovery_metadata_unavailable",
+                "error_code": "RECOVERY_METADATA_UNAVAILABLE",
+            }
+            read_diagnostics.append({"code": "RECOVERY_METADATA_UNAVAILABLE", "location": "retry-metadata"})
+
         return {
             "run_id": run_id,
             "ticker": run["ticker"],
@@ -914,24 +1083,24 @@ class AppService:
                 "research_configuration": payload.get("research_configuration", {}),
                 "data_snapshot": payload.get("data_snapshot", {}),
             },
-            "retryable_synthesis": _report_retryable(artifacts),
-            "synthesis_error_code": _synthesis_error_code(artifacts),
-            "retryable_growth": _growth_retryable(artifacts),
+            "retryable_synthesis": retryable_synthesis,
+            "retryable_model_stages": retryable_model_stages,
+            "synthesis_error_code": synthesis_error_code,
+            "retryable_growth": retryable_growth,
+            "recovery_plan": recovery_description,
+            **completion,
+            "report_contract_version": report_read.report_contract_version,
+            "report_revision_id": report_read.report_revision_id,
+            "report_input_generation": report_read.report_input_generation,
+            "report_read_state": report_read.read_state,
+            "is_substantive": report_read.is_substantive,
+            "visible_sections": list(report_read.visible_sections),
+            "report_read_diagnostics": read_diagnostics,
             "financial_status": financial_status,
-            "markdown": self._report_service.markdown(
-                run_id,
-                artifacts,
-                language=report_language,
-                company_name=run["name"],
-                include_technical=include_technical,
-            ),
-            "html": self._report_service.html(
-                run_id,
-                artifacts,
-                language=report_language,
-                company_name=run["name"],
-                include_technical=include_technical,
-            ),
+            "continuity": continuity,
+            "report_revision": report_revision,
+            "markdown": report_read.markdown,
+            "html": report_read.html,
         }
 
     def financial_diagnostics(self, run_id: str) -> dict[str, Any]:
@@ -1104,10 +1273,22 @@ class AppService:
                 if str(item.get("validation_status", "")).upper() == ValidationStatus.REJECTED.value
             )
         )
+        processed_any = bool(retry_trace["processed"])
+        if not target_accessions:
+            # Adapters may report already-healthy cached nodes as processed.
+            # They are observations, not retry work: a no-target invocation
+            # is a true no-op and must not create revisions or downgrade the
+            # previous successful recovery result.
+            processed_any = False
+            accepted_ids = ()
+            rejected_ids = ()
         if not target_accessions and not accepted_ids and not self.storage.get_facts(storage_key):
             errors.append("quality:no_financial_facts")
         updated_artifacts: tuple[str, ...] = ()
-        if not errors or accepted_ids:
+        # A healthy no-op retry must not mint another report revision or
+        # rewrite the same deterministic artifacts.  Rebuild only when this
+        # invocation actually processed at least one filing node.
+        if processed_any and (not errors or accepted_ids):
             try:
                 progress("artifact-rebuild", 0, 1)
                 updated_artifacts = self._rebuild_financial_artifacts(
@@ -1116,7 +1297,6 @@ class AppService:
                 progress("artifact-rebuild", 1, 1)
             except Exception as exc:
                 errors.append(f"artifact-rebuild:{type(exc).__name__}")
-        processed_any = bool(retry_trace["processed"])
         if not errors and processed_any:
             self.storage.resolve_financial_recovery_cases(
                 run_id, tuple(sorted(retry_trace["processed"]))
@@ -1195,7 +1375,6 @@ class AppService:
         job = _ResearchJob(
             job_id=uuid.uuid4().hex,
             run_id=run_id,
-            ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             stage="filing-discovery",
         )
         with self._jobs_lock:
@@ -1211,7 +1390,16 @@ class AppService:
     def _run_financial_retry_job(
         self, job: _ResearchJob, run_id: str, force: bool
     ) -> None:
-        language = job.ui_language
+        # Preference reads are SQLite-backed and can be delayed by antivirus
+        # hooks on Windows.  Resolve them after returning control to the RPC
+        # loop so retry/cancel/status controls never wait on that I/O.
+        try:
+            language = normalize_language(
+                self.preferences().get("ui_language", job.ui_language)
+            )
+        except Exception:
+            language = job.ui_language
+        job.ui_language = language
         self._update_job(
             job, state="running", stage="filing-discovery", percent=3,
             message=_ui_message(
@@ -1367,8 +1555,19 @@ class AppService:
                 status = ValidationStatus(str(row.get("status", "REJECTED")))
             except ValueError:
                 status = ValidationStatus.REJECTED
+            role = str(row.get("role", "target") or "target").casefold()
             group_facts = tuple(
-                item for item in facts if item.accession_number == identity[0]
+                item for item in facts
+                if item.accession_number == identity[0]
+                and str(item.end_date)[:10] == identity[1][:10]
+                and str(item.fiscal_period).upper() == identity[2].upper()
+                and str(item.consolidated_scope or item.scope or "consolidated").casefold()
+                == identity[3].casefold()
+                and (not identity[4] or str(item.currency or item.unit or "").upper() == identity[4].upper())
+                and (
+                    (role == "comparator" and str(item.usage_status).casefold() == "comparator")
+                    or (role != "comparator" and str(item.usage_status).casefold() != "comparator")
+                )
             )
             quarantined = tuple(
                 FinancialFact(
@@ -1376,6 +1575,8 @@ class AppService:
                 )
                 for item in audit_rows
                 if item.get("accession_number") == identity[0]
+                and str(item.get("end_date", ""))[:10] == identity[1][:10]
+                and str(item.get("fiscal_period", "")).upper() == identity[2].upper()
                 and str(item.get("validation_status", "")).upper() == ValidationStatus.REJECTED.value
             )
             validation = FinancialValidation(
@@ -1385,11 +1586,11 @@ class AppService:
                 group_facts,
                 quarantined,
             )
-            groups.append(FinancialGroupValidation(identity, validation))
-        profile = build_financial_profile(
+            groups.append(FinancialGroupValidation(identity, validation, role))
+        admitted = self._financial_admission.admit_facts(
+            company,
             facts,
-            groups,
-            company.reporting_currency,
+            validation_groups=groups,
             selected_filings=self.storage.get_filings(storage_key),
             requested_annual_count=(
                 int(payload.get("research_configuration", {}).get("annual_history_years"))
@@ -1398,6 +1599,9 @@ class AppService:
                 else None
             ),
         )
+        profile = admitted.profile
+        if not (profile.metrics or profile.interim_metrics):
+            return ()
         from .research import build_fact_evidence
 
         evidence = build_fact_evidence(list(profile.fact_dicts))
@@ -1429,6 +1633,11 @@ class AppService:
                 "interim_metrics": interim_metrics,
                 "evidence": evidence,
                 "currency": company.reporting_currency,
+                "financial_generations": {
+                    str(item.get("accession_number")): str(item.get("generation_id"))
+                    for item in profile.fact_dicts
+                    if item.get("accession_number") and item.get("generation_id")
+                },
                 "financial_quality": quality,
             },
             agent_id="calculation-engine-retry",
@@ -1446,31 +1655,38 @@ class AppService:
                     sorted(item.get("fact_id", "") for item in profile.fact_dicts)
                 ),
             }
+            report_artifacts = self.storage.get_artifacts(run_id)
+            latest_revision = self.storage.latest_report_revision(run_id)
+            if latest_revision is not None:
+                report_artifacts = _artifacts_for_report_projection(
+                    report_artifacts, latest_revision.get("payload")
+                )
             existing_report = next(
                 (
-                    item for item in reversed(self.storage.get_artifacts(run_id))
+                    item for item in reversed(report_artifacts)
                     if item.get("artifact_type") == "research-report"
                 ),
                 None,
             )
-            content = dict(existing_report.get("content", {})) if existing_report else {}
-            content["mode"] = "financial-refresh"
-            content["financial_refresh"] = {
-                "updated_at": utc_now_iso(),
-                "fact_count": len(profile.fact_dicts),
-                "status": profile.status.value,
-                "model_called": False,
-                "qualitative_snapshot_stale": True,
+            content = {
+                "mode": "financial-refresh-overlay",
+                "base_report_artifact_id": (
+                    str(existing_report.get("artifact_id", "")) if existing_report else ""
+                ),
+                "financial_refresh": {
+                    "updated_at": utc_now_iso(),
+                    "fact_count": len(profile.fact_dicts),
+                    "status": profile.status.value,
+                    "model_called": False,
+                    "qualitative_snapshot_stale": True,
+                    "financial_quality": quality,
+                },
             }
-            report_value = content.get("report")
-            if isinstance(report_value, dict):
-                report_value = dict(report_value)
-                report_value["financial_quality"] = quality
-                content["report"] = report_value
-            else:
-                content["financial_quality"] = quality
+            overlay_digest = hashlib.sha256(
+                json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:16]
             report_artifact = ResearchArtifact(
-                artifact_id=f"{run_id}:research-report:retry-{digest}",
+                artifact_id=f"{run_id}:research-report:overlay-{overlay_digest}",
                 run_id=run_id,
                 artifact_type="research-report",
                 title="Financial Refresh Report",
@@ -1742,6 +1958,37 @@ class AppService:
             # research/model input.  INCOMPLETE groups therefore remain
             # visible without being promoted to AI-eligible data.
             accepted_facts = list({fact.fact_id: fact for fact in accepted_facts}.values())
+            parse_failure_codes = (
+                "pdf_window_incomplete", "pdf_window_failed",
+                "pdf_window_exhausted", "pdf_parse_cancelled",
+                "pdf_file_missing", "pdf_file_unreadable",
+                "pdf_candidate_pages_unavailable", "cache_hash_mismatch",
+            )
+            parse_incomplete = any(
+                marker in str(diagnostic).casefold()
+                for diagnostic in (
+                    *getattr(dataset, "diagnostics", ()),
+                    *getattr(canonical, "diagnostics", ()),
+                )
+                for marker in parse_failure_codes
+            )
+            has_verified_sibling = any(
+                str(getattr(item, "status", "")) == ValidationStatus.VERIFIED.value
+                for item in source_groups
+            )
+            # A weak/missing statement group does not make a completely parsed
+            # filing incomplete when verified sibling facts exist. Quarantine
+            # only those rows and preserve the rest; parser-window failure or
+            # cancellation still prevents the accession from being promoted.
+            incomplete = production_dataset and (
+                not source_groups or not has_verified_sibling
+                or parse_incomplete or cancel_check()
+            )
+            parser_versions = sorted({
+                str(fact.parser_version or "")
+                for fact in [*accepted_facts, *quarantined, *audit_only_facts]
+                if fact.parser_version
+            })
             self.storage.replace_financial_ingestion(
                 company.security_id,
                 [filing.accession_number],
@@ -1751,10 +1998,14 @@ class AppService:
                 evidence + [EvidenceRef(**item) for item in build_filing_evidence([filing])
                             if item.get('kind') != 'material_gap'],
                 audit_only_facts,
-            )
-            incomplete = production_dataset and (
-                not source_groups
-                or any(item.status != ValidationStatus.VERIFIED.value for item in source_groups)
+                generation_id=uuid.uuid4().hex,
+                parser_version=",".join(parser_versions),
+                source_hashes={filing.accession_number: filing.content_hash},
+                complete_accessions=(
+                    set() if incomplete or cancel_check()
+                    else {filing.accession_number}
+                ),
+                candidate_diagnostics=list(getattr(dataset, "diagnostics", ()) or ()),
             )
             if accepted_facts and incomplete:
                 # A partial, auditable repair is useful for deterministic
@@ -2034,7 +2285,146 @@ class AppService:
         progress("filing-validation", 1, 1)
         return errors
 
+    def _execute_recovery_plan(
+        self,
+        run_id: str,
+        *,
+        target: str,
+        operation: Callable[[Any], dict[str, Any]],
+        model: dict[str, Any] | None = None,
+        plan_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute one planner-owned recovery and coalesce duplicate clicks."""
+
+        artifacts = self.storage.get_artifacts(run_id)
+        plan = self._recovery_planner.plan(
+            artifacts, self._continuity.snapshot(run_id), target=target
+        )
+        if not plan.available:
+            raise ValueError("MODEL_STAGE_RESUME_NOT_AVAILABLE")
+        if plan_hash and plan_hash != plan.plan_hash:
+            raise ValueError("MODEL_RECOVERY_PLAN_STALE")
+        key = (run_id, plan.plan_hash)
+        model_identity = json.dumps(
+            {
+                "configured_model_id": str((model or {}).get("configured_model_id", "")),
+                "connection_id": str((model or {}).get("connection_id", "")),
+                "configuration_version": int((model or {}).get("configuration_version", 0) or 0),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) if isinstance(model, dict) else "saved-model"
+        with self._jobs_lock:
+            active = self._active_recoveries.get(key)
+            owner = active is None
+            if owner:
+                active = threading.Event()
+                self._active_recoveries[key] = (active, model_identity)
+            elif active[1] != model_identity:
+                raise ValueError("MODEL_RECOVERY_ALREADY_RUNNING")
+        assert active is not None
+        if not owner:
+            # The first request owns all provider calls.  A duplicate waits
+            # for the same durable run result rather than starting a second
+            # stage attempt.
+            active[0].wait()
+            return self.get_report(run_id)
+        configuration = model if isinstance(model, dict) else {}
+        diagnostics = {
+            **plan.to_dict(),
+            "configured_model_id": str(configuration.get("configured_model_id", ""))[:128],
+            "configuration_version": int(configuration.get("configuration_version", 0) or 0),
+        }
+        try:
+            result = operation(plan)
+            self._continuity.checkpoint(
+                run_id, "model-recovery", StageOutcome.COMPLETE,
+                diagnostics=diagnostics,
+            )
+            return result
+        except ProviderError as exc:
+            self._continuity.checkpoint(
+                run_id,
+                "model-recovery",
+                StageOutcome.WAITING_RETRYABLE if exc.retryable else StageOutcome.NEEDS_ACTION,
+                error_code=exc.code,
+                diagnostics=diagnostics,
+            )
+            raise
+        except Exception as exc:
+            self._continuity.checkpoint(
+                run_id, "model-recovery", StageOutcome.NEEDS_ACTION,
+                error_code=str(getattr(exc, "code", type(exc).__name__))[:80],
+                diagnostics=diagnostics,
+            )
+            raise
+        finally:
+            with self._jobs_lock:
+                event, _identity = self._active_recoveries.pop(key, (active, model_identity))
+                event.set()
+
     def retry_research_synthesis(
+        self, run_id: str, model: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self._execute_recovery_plan(
+            run_id,
+            target="synthesis",
+            model=model,
+            operation=lambda _plan: self._retry_research_synthesis_once(run_id, model),
+        )
+
+    def retry_research_model_stages(
+        self, run_id: str, model: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self._execute_recovery_plan(
+            run_id,
+            target="model-stages",
+            model=model,
+            operation=lambda plan: self._retry_research_model_stages_once(
+                run_id, model, resume_target=plan.target
+            ),
+        )
+
+    def retry_research_growth(
+        self, run_id: str, model: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._execute_recovery_plan(
+            run_id,
+            target="growth",
+            model=model,
+            operation=lambda plan: self._retry_research_model_stages_once(
+                run_id, model, resume_target=plan.target
+            ),
+        )
+
+    def retry_research_stage(
+        self,
+        run_id: str,
+        target: str,
+        model: dict[str, Any] | None,
+        plan_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Resume exactly one planner-selected stage chain with an explicit model."""
+        if target not in {
+            "model-stages", "growth", "counter-analysis",
+            "forecast-scenarios", "synthesis",
+        }:
+            raise ValueError("MODEL_RECOVERY_TARGET_INVALID")
+        if target == "synthesis":
+            operation = lambda _plan: self._retry_research_synthesis_once(run_id, model)
+        else:
+            operation = lambda plan: self._retry_research_model_stages_once(
+                run_id, model, resume_target=plan.target
+            )
+        return self._execute_recovery_plan(
+            run_id,
+            target=target,
+            model=model,
+            plan_hash=plan_hash,
+            operation=operation,
+        )
+
+    def _retry_research_synthesis_once(
         self, run_id: str, model: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         stored = self.storage.get_run(run_id)
@@ -2079,7 +2469,80 @@ class AppService:
         )
         return self.get_report(run_id, language=run.report_language)
 
-    def retry_research_growth(
+    def _retry_research_model_stages_once(
+        self, run_id: str, model: dict[str, Any] | None = None,
+        *, resume_target: str = "model-stages",
+    ) -> dict[str, Any]:
+        """Resume failed base agents without repeating previously trusted work.
+
+        This seam deliberately reuses canonical facts and cached qualitative
+        evidence.  It performs no official discovery, download, PDF parsing or
+        financial compilation.  Persisted successful base-agent artifacts are
+        supplied to the workflow so only failed/missing roles are called again;
+        dependent analysis is then refreshed from the rebuilt dossier.
+        """
+
+        stored = self.storage.get_run(run_id)
+        if stored is None:
+            raise KeyError("research run not found")
+        artifacts = self.storage.get_artifacts(run_id)
+        payload = _decode_payload(stored.get("payload_json"))
+        company_payload = payload.get("company")
+        if not isinstance(company_payload, dict):
+            raise ValueError("saved company is invalid")
+        model_reference = model if isinstance(model, dict) and model else payload.get("model_configuration")
+        config = _model_config_from_request(model_reference)
+        if not config.enabled:
+            raise ValueError("an enabled model is required")
+        company = Company(**company_payload)
+        retry_facts = _canonical_retry_snapshot(self.storage, company, payload)
+        filings = self.storage.get_filings(_financial_storage_key(company.to_dict()))
+        filing_evidence = _cached_filing_evidence(self.storage, filings)
+        research_configuration = payload.get("research_configuration", {})
+        research_configuration = research_configuration if isinstance(research_configuration, dict) else {}
+        run = ResearchRun(
+            run_id=run_id,
+            company=company,
+            workflow_id=str(payload.get("workflow_id", "long-term-fundamentals")),
+            research_pack_id=str(payload.get("research_pack_id", "")),
+            research_pack_version=str(payload.get("research_pack_version", "")),
+            provider_id=config.provider,
+            model_id=config.model,
+            data_as_of=str(payload.get("data_as_of", date.today().isoformat())),
+            status=RunStatus(str(stored.get("status", "partial"))),
+            started_at=str(payload.get("started_at", stored.get("started_at", utc_now_iso()))),
+            completed_at=stored.get("completed_at"),
+            errors=list(payload.get("errors", [])),
+            report_language=normalize_language(str(payload.get("report_language", "zh-CN"))),
+            market_snapshot=payload.get("market_snapshot"),
+            model_configuration=dict(model_reference or {}),
+            research_configuration=dict(research_configuration),
+            data_snapshot=dict(payload.get("data_snapshot", {})),
+        )
+        workflow = self._research_orchestrator.create(
+            self._select_pack(run.research_pack_id),
+            config,
+            report_language=run.report_language,
+            ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
+            parallel_agents=bool(research_configuration.get("parallel_agents", True)),
+        )
+        workflow.run(
+            company,
+            [fact.to_dict() for fact in retry_facts],
+            filing_evidence=filing_evidence,
+            valuation_inputs=research_configuration.get("valuation_inputs"),
+            market_snapshot=payload.get("market_snapshot") or research_configuration.get("market_snapshot"),
+            reproducibility={
+                "research_configuration": dict(research_configuration),
+                "data_snapshot": dict(payload.get("data_snapshot", {})),
+            },
+            existing_run=run,
+            resume_artifacts=artifacts,
+            resume_target=resume_target,
+        )
+        return self.get_report(run_id, language=run.report_language)
+
+    def _retry_research_growth_once(
         self, run_id: str, model: dict[str, Any]
     ) -> dict[str, Any]:
         stored = self.storage.get_run(run_id)
@@ -2116,10 +2579,19 @@ class AppService:
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=False,
         )
-        workflow.retry_growth(
-            run,
-            self.storage.get_artifacts(run_id),
+        workflow.run(
+            company,
             [fact.to_dict() for fact in retry_facts],
+            filing_evidence=_cached_filing_evidence(
+                self.storage, self.storage.get_filings(_financial_storage_key(company.to_dict()))
+            ),
+            reproducibility={
+                "research_configuration": dict(payload.get("research_configuration", {})),
+                "data_snapshot": dict(payload.get("data_snapshot", {})),
+            },
+            existing_run=run,
+            resume_artifacts=self.storage.get_artifacts(run_id),
+            resume_target="growth",
         )
         return self.get_report(run_id, language=run.report_language)
 
@@ -2155,17 +2627,45 @@ class AppService:
         if comparison_configs and not primary_config.enabled:
             raise ValueError("comparison requires an enabled primary model")
 
+        company = DEMO_COMPANY if mode == "demo" else _company_from_request(request.get("company"))
+        selected_pack = self._select_pack(str(request.get("pack_id", "")))
+        report_language = normalize_language(self.preferences().get("report_language", "zh-CN"))
+        self.storage.save_company(company)
+        run = ResearchRun(
+            run_id=uuid.uuid4().hex,
+            company=company,
+            workflow_id="complete-fundamental-research",
+            research_pack_id=selected_pack.pack_id,
+            research_pack_version=selected_pack.version,
+            provider_id=primary_config.provider,
+            model_id=primary_config.model,
+            data_as_of=utc_now_iso(),
+            status=RunStatus.CREATED,
+            report_language=report_language,
+            model_configuration={
+                "configured_model_id": primary_config.configured_model_id,
+                "configuration_version": primary_config.configuration_version,
+                "role": primary_config.role,
+            },
+            research_configuration={
+                "report_language": report_language,
+                "research_pack_id": selected_pack.pack_id,
+                "research_pack_version": selected_pack.version,
+                "research_pack_content_identity": selected_pack.content_hash,
+            },
+        )
+        self._continuity.start(run)
         job = _ResearchJob(
             job_id=uuid.uuid4().hex,
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
+            run_id=run.run_id,
+            run=run,
         )
         with self._jobs_lock:
             self._jobs[job.job_id] = job
         request_payload = dict(request)
-        # A recovery session is stable before a ResearchRun exists. It is
-        # deliberately not a job id and is migrated to the real run once the
-        # workflow creates one.
-        request_payload["_financial_recovery_session_id"] = f"recovery:{uuid.uuid4().hex}"
+        request_payload["_financial_recovery_session_id"] = run.run_id
+        self.storage.save_research_job(job.snapshot())
         threading.Thread(
             target=self._run_research,
             args=(job, request_payload),
@@ -2178,6 +2678,9 @@ class AppService:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
             if job is None:
+                saved = self.storage.get_research_job(job_id)
+                if saved is not None:
+                    return saved
                 raise KeyError("research job not found")
             return job.snapshot()
 
@@ -2242,6 +2745,7 @@ class AppService:
                 job.finished_at = time.perf_counter()
             for key, value in updates.items():
                 setattr(job, key, value)
+            self.storage.save_research_job(job.snapshot())
 
     def _ingestion_progress(
         self,
@@ -2279,6 +2783,9 @@ class AppService:
                 "status": str(detail.get("status") or stage),
                 "error_code": str(detail.get("error_code") or ""),
                 "elapsed_seconds": round(float(detail.get("elapsed_seconds") or 0.0), 3),
+                "window_index": detail.get("window_index"),
+                "window_total": detail.get("window_total"),
+                "last_activity_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
             updates["filing_states"] = filing_states
         self._update_job(job, **updates)
@@ -2374,6 +2881,7 @@ class AppService:
         vision_filing_hashes: set[str] = set()
         vision_approval_ledger: dict[str, tuple[str, int, int]] = {}
         vision_authorization_active = True
+        config = ModelConfig()
         try:
             mode = request.get("mode")
             company = (
@@ -2383,6 +2891,7 @@ class AppService:
             )
             company_market = normalize_market(company.market)
             market_profile = MARKET_PROFILES[company_market]
+            market_capability = DEFAULT_MARKET_CAPABILITIES.require(company_market.value)
             selected_pack = self._select_pack(str(request.get("pack_id", "")))
             history_years = _research_history_years(request, selected_pack)
             self._update_job(
@@ -2438,7 +2947,9 @@ class AppService:
                     "horizon_years": (valuation_inputs or {}).get("horizon_years", 5),
                 }
             filing_evidence: list[dict[str, Any]] = []
+            financial_capabilities: dict[str, bool] = {}
             financial_profile: FinancialProfile | None = None
+            active_financial_generations: dict[str, str] = {}
             # Settings is the sole current authorization source.  A historical
             # or legacy request payload may be retained for audit, but cannot
             # reactivate cloud page uploads after the user revoked the policy.
@@ -2612,6 +3123,15 @@ class AppService:
                         recovery.error_code or "NO_FILINGS_AVAILABLE"
                     )
                 filings = list(recovery.filings)
+                self._record_disclosure_coverage(
+                    job,
+                    DisclosureCoveragePlanner().evaluate(
+                        filings,
+                        requested_count=history_years,
+                        authority=market_capability.official_authority,
+                        failures=recovery.diagnostics if recovery.state is RecoveryState.RESOLVED_STALE else (),
+                    ),
+                )
                 if recovery.state is RecoveryState.RESOLVED_STALE:
                     request["_financial_freshness"] = recovery.freshness
                     request["_financial_recovery_diagnostics"] = list(recovery.diagnostics)
@@ -2675,7 +3195,7 @@ class AppService:
                         raise ResearchCancelled()
                     if not filings and download_errors:
                         raise _ResearchDataUnavailable("FILING_DOWNLOAD_FAILED")
-                    filing_evidence = build_filing_evidence(filings)
+                    filing_evidence = _cached_filing_evidence(self.storage, filings)
                 else:
                     # SEC Company Facts is a structured official source and
                     # does not require local PDF bytes.  Keep metadata for
@@ -2719,8 +3239,12 @@ class AppService:
                     normalized, self._financial_ingestion, company=company,
                     expected_period_end=expected_period_end
                 )
-                if latest_sec is None:
-                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
+                # This is a best-candidate probe, not a global readiness gate.
+                # The canonical admission below can preserve a verified older
+                # year or safe siblings from an incomplete latest filing.  A
+                # missing latest-complete group only disables the dependent
+                # trend/valuation capabilities; quarantined facts are never
+                # copied into ``facts`` or model context.
                 # Recompile the complete requested annual window through the
                 # same canonical target view.  The latest-group probe above is
                 # only a display/selection check; model input must never use
@@ -2740,10 +3264,19 @@ class AppService:
                         normalized,
                         reporting_currency=company.reporting_currency,
                     )
-                    if not canonical.allow_ai:
+                    admitted = self._financial_admission.admit(
+                        company,
+                        canonical,
+                        selected_filings=filings,
+                        manifests=canonical.manifests,
+                        requested_annual_count=history_years,
+                    )
+                    financial_capabilities = admitted.capability_map
+                    financial_profile = admitted.profile
+                    if not admitted.research_ready:
                         raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
-                    self.storage.save_facts(list(canonical.research_facts))
-                    facts = [item.to_dict() for item in canonical.research_facts]
+                    self.storage.save_facts(list(admitted.facts))
+                    facts = list(admitted.fact_dicts)
                 self._update_job(
                     job,
                     stage="filing-validation",
@@ -2784,6 +3317,15 @@ class AppService:
                     request["_financial_recovery_diagnostics"] = list(recovery.diagnostics)
                 plan = select_research_filings(candidates, annual_limit=history_years)
                 filings = list(plan.documents)
+                self._record_disclosure_coverage(
+                    job,
+                    DisclosureCoveragePlanner().evaluate(
+                        filings,
+                        requested_count=history_years,
+                        authority=market_capability.official_authority,
+                        failures=recovery.diagnostics if recovery.state is RecoveryState.RESOLVED_STALE else (),
+                    ),
+                )
                 downloaded = []
                 if bool(request.get("download_filings", True)):
                     target = self.storage.filings_dir / company.security_id.replace(":", "_")
@@ -2958,10 +3500,12 @@ class AppService:
                     stage_total=len(research_reports),
                     percent=29,
                 )
-                filing_evidence.extend(item.to_dict() for item in dataset.evidence)
+                filing_evidence.extend(_financial_evidence_record(item) for item in dataset.evidence)
                 # Canonical financial cells cannot substitute for the official
                 # business / MD&A / risk body required by qualitative roles.
-                filing_evidence.extend(build_filing_evidence(research_reports))
+                filing_evidence.extend(
+                    _cached_filing_evidence(self.storage, research_reports)
+                )
                 manifest_by_document = {item.document_id: item for item in dataset.manifest}
                 for filing in research_reports:
                     manifest = manifest_by_document.get(filing.document_id)
@@ -3004,17 +3548,43 @@ class AppService:
                     latest_annual.period_end if latest_annual is not None else "",
                 )
                 currencies = {str(item.identity[4]).upper() for item in latest_fy_candidates if item.identity[4]}
-                if len(currencies) > 1:
+                preferred_currency = str(company.reporting_currency or "").upper()
+                preferred_candidates = [
+                    item for item in latest_fy_candidates
+                    if str(item.identity[4]).upper() == preferred_currency
+                ]
+                reporting_currency_changed = False
+                # Multiple extracted currency lanes are not inherently a
+                # conflict: issuers routinely disclose translated or note
+                # currencies.  Stay on the issuer's verified reporting lane
+                # when it exists; fail closed only when no lane is preferred
+                # and the evidence cannot determine a unique one.
+                currency_lane_ambiguous = len(currencies) > 1 and not preferred_candidates
+                if currency_lane_ambiguous:
+                    # The numeric currency lane is unresolved, but the issuer
+                    # and its official filings remain valid research material.
+                    # Admission keeps only the requested reporting-currency
+                    # facts; continue qualitative work and expose a targeted
+                    # financial recovery item instead of ending the run.
                     request["_financial_recovery_targets"] = [
                         item.accession_number for item in research_reports
                         if item.accession_number
                     ]
-                    raise _ResearchDataUnavailable("FILING_DATA_QUALITY_FAILED")
-                if len(currencies) == 1:
+                    request["_financial_recovery_reason"] = "FINANCIAL_CURRENCY_LANE_AMBIGUOUS"
+                if not preferred_candidates and len(currencies) == 1:
                     disclosed_currency = next(iter(currencies))
                     if disclosed_currency != company.reporting_currency.upper():
                         company.reporting_currency = disclosed_currency
                         self.storage.save_company(company)
+                        reporting_currency_changed = True
+                if reporting_currency_changed:
+                    canonical = FinancialFactCompiler().compile_facts(
+                        company,
+                        research_reports,
+                        dataset.accepted_facts,
+                        reporting_currency=company.reporting_currency,
+                    )
+                    canonical_groups = _compiler_validation_groups(canonical.validations)
                 latest_candidates = [
                     item for item in latest_fy_candidates
                     if str(item.identity[4]).upper() == str(company.reporting_currency).upper()
@@ -3023,24 +3593,24 @@ class AppService:
                     max(latest_candidates, key=lambda item: str(item.identity[0]))
                     if latest_candidates else None
                 )
-                if latest_annual is None or latest_group is None or not canonical.allow_ai:
-                    request["_financial_recovery_targets"] = [
-                        item.accession_number for item in research_reports
-                        if item.accession_number
-                    ]
-                    scanner_code = _scanner_diagnostic_code(
-                        getattr(canonical, "diagnostics", ()),
-                        getattr(dataset, "diagnostics", ()),
-                    )
-                    raise _ResearchDataUnavailable(
-                        scanner_code or "FILING_DATA_QUALITY_FAILED"
-                    )
+                admitted = self._financial_admission.admit(
+                    company,
+                    canonical,
+                    selected_filings=research_reports,
+                    manifests=dataset.manifest,
+                    evidence=dataset.evidence,
+                    requested_annual_count=history_years,
+                )
+                financial_capabilities = admitted.capability_map
+                if currency_lane_ambiguous:
+                    financial_capabilities = dict(financial_capabilities)
+                    financial_capabilities["reporting_currency_ambiguous"] = True
                 # The ingestion engine may retain accepted facts from multiple
                 # statement scopes/currencies for auditability.  Only the
                 # consolidated facts in the issuer's reporting currency are a
                 # valid research context; parent-company and foreign-currency
                 # groups remain in the audit store but never reach an Agent.
-                accepted = list({fact.fact_id: fact for fact in canonical.research_facts}.values())
+                accepted = list({fact.fact_id: fact for fact in admitted.facts}.values())
                 accepted_ids = {fact.fact_id for fact in accepted}
                 # Keep facts which the parser marked accepted but which do not
                 # belong to the research scope as audit-only; do not mutate
@@ -3062,7 +3632,36 @@ class AppService:
                     fact for fact in canonical.quarantined_facts
                     if fact.fact_id not in {item.fact_id for item in quarantined}
                 )
-                self.storage.replace_financial_ingestion(
+                candidate_accessions = {
+                    item.accession_number for item in research_reports
+                    if item.accession_number
+                    and not any(
+                        item.document_id in str(diagnostic)
+                        and any(marker in str(diagnostic).casefold() for marker in (
+                            "pdf_window_incomplete", "pdf_window_failed",
+                            "pdf_window_exhausted", "pdf_parse_cancelled",
+                            "pdf_file_missing", "pdf_file_unreadable",
+                            "pdf_candidate_pages_unavailable",
+                            "cache_hash_mismatch",
+                        ))
+                        for diagnostic in (
+                            *getattr(dataset, "diagnostics", ()),
+                            *getattr(canonical, "diagnostics", ()),
+                        )
+                    )
+                    and any(
+                        tuple(getattr(group, "identity", ()))
+                        and tuple(getattr(group, "identity", ()))[0] == item.accession_number
+                        and getattr(getattr(group, "validation", None), "status", None) == ValidationStatus.VERIFIED
+                        for group in canonical_groups
+                    )
+                }
+                parser_versions = sorted({
+                    str(fact.parser_version or "")
+                    for fact in [*accepted, *quarantined, *audit_only]
+                    if fact.parser_version
+                })
+                promotion = self.storage.replace_financial_ingestion(
                     company.security_id,
                     [item.accession_number for item in research_reports],
                     accepted,
@@ -3070,21 +3669,62 @@ class AppService:
                     canonical_groups,
                     list(dataset.evidence),
                     audit_only,
+                    generation_id=uuid.uuid4().hex,
+                    parser_version=",".join(parser_versions),
+                    source_hashes={
+                        item.accession_number: item.content_hash
+                        for item in research_reports if item.accession_number
+                    },
+                    complete_accessions=candidate_accessions,
+                    candidate_diagnostics=[
+                        *getattr(dataset, "diagnostics", ()),
+                        *getattr(canonical, "diagnostics", ()),
+                    ],
                 )
-                facts = [item.to_dict() for item in accepted]
-                financial_profile = build_financial_profile(
+                # Only read the materialized active generations after staging.
+                # A partial/investigated parse remains available in the
+                # candidate ledger but is never sent directly to a model.
+                selected_accessions = {
+                    item.accession_number for item in research_reports
+                    if item.accession_number
+                }
+                active_snapshot = self.storage.get_financial_research_snapshot(company.security_id)
+                active_financial_generations = {
+                    str(accession): str(generation_id)
+                    for accession, generation_id in active_snapshot.get("generations", {}).items()
+                    if accession in selected_accessions
+                }
+                active_rows = [
+                    row for row in active_snapshot.get("facts", [])
+                    if str(row.get("accession_number", "")) in selected_accessions
+                ]
+                accepted = [
+                    FinancialFact(**{
+                        field_name: row.get(field_name)
+                        for field_name in FinancialFact.__dataclass_fields__
+                    })
+                    for row in active_rows
+                ]
+                if promotion and promotion.get("state") != "promoted":
+                    request["_financial_recovery_targets"] = [
+                        accession for accession, state in promotion.get("accessions", {}).items()
+                        if state != "promoted"
+                    ]
+                    request["_financial_candidate_diagnostics"] = list(
+                        promotion.get("diagnostics", ())
+                    )
+                admitted = self._financial_admission.admit_facts(
+                    company,
                     accepted,
-                    canonical_groups,
-                    company.reporting_currency,
                     selected_filings=research_reports,
                     manifests=dataset.manifest,
                     requested_annual_count=history_years,
                 )
-                if not facts:
-                    request["_financial_recovery_targets"] = [
-                        item.accession_number for item in research_reports
-                        if item.accession_number
-                    ]
+                financial_capabilities = admitted.capability_map
+                if currency_lane_ambiguous:
+                    financial_capabilities = dict(financial_capabilities)
+                    financial_capabilities["reporting_currency_ambiguous"] = True
+                if not admitted.research_ready:
                     scanner_code = _scanner_diagnostic_code(
                         getattr(canonical, "diagnostics", ()),
                         getattr(dataset, "diagnostics", ()),
@@ -3092,9 +3732,42 @@ class AppService:
                     raise _ResearchDataUnavailable(
                         scanner_code or "FILING_DATA_QUALITY_FAILED"
                     )
+                accepted = list(admitted.facts)
+                facts = [item.to_dict() for item in accepted]
+                financial_profile = admitted.profile
+                # Accepted audit rows are not sufficient research input by
+                # themselves. A malformed period can survive row-level
+                # parsing yet project to no usable annual or interim metric;
+                # never spend model tokens on that empty financial view.
+                if (
+                    not facts
+                    or not (
+                        financial_profile.metrics
+                        or financial_profile.interim_metrics
+                    )
+                ):
+                    request["_financial_recovery_targets"] = [
+                        item.accession_number for item in research_reports
+                        if item.accession_number
+                    ]
+                    financial_capabilities = dict(financial_capabilities)
+                    for capability in (
+                        "financial_snapshot", "annual_trend", "interim_comparison",
+                        "model_financial_analysis",
+                    ):
+                        financial_capabilities[capability] = False
+                    financial_capabilities["financial_recovery_pending"] = True
 
-            if mode == "company" and not facts:
-                raise _ResearchDataUnavailable("FILING_FORMAT_UNSUPPORTED")
+            # Filing metadata is not research evidence.  If parsing/admission
+            # produced neither a safe fact nor sourced filing text, there is
+            # no financial material to continue with, even though the filing
+            # catalogue itself was reachable.
+            if mode == "company" and not facts and not filing_evidence:
+                raise _ResearchDataUnavailable(
+                    "FILING_DATA_QUALITY_FAILED"
+                    if research_reports
+                    else "FILING_FORMAT_UNSUPPORTED"
+                )
 
             reproducibility = _build_research_snapshot(
                 company,
@@ -3114,6 +3787,18 @@ class AppService:
                     and any(request["valuation"].get(key) not in (None, "", 0) for key in ("market_cap_billions", "discount_rate_percent", "terminal_growth_percent", "horizon_years"))
                     else "policy_default"
                 ),
+            )
+            reproducibility.setdefault("data_snapshot", {})["financial_capabilities"] = financial_capabilities
+            if not active_financial_generations:
+                active_financial_generations = {
+                    str(item.get("accession_number")): str(item.get("generation_id"))
+                    for item in facts
+                    if isinstance(item, dict)
+                    and item.get("accession_number")
+                    and item.get("generation_id")
+                }
+            reproducibility["data_snapshot"]["financial_generations"] = dict(
+                active_financial_generations
             )
 
             def agent_progress(agent_id: str, state: str) -> None:
@@ -3169,6 +3854,7 @@ class AppService:
                 valuation_inputs=valuation_inputs,
                 market_snapshot=market_snapshot,
                 reproducibility=reproducibility,
+                existing_run=job.run,
                 progress=lambda message, percent: progress(
                     message,
                     percent,
@@ -3198,27 +3884,64 @@ class AppService:
                     agent_progress=agent_progress,
                 )
                 comparison_base, comparison_span = run_segment(index)
-                secondary = comparison_workflow.run(
-                    company,
-                    financial_profile or facts,
-                    filing_evidence=filing_evidence,
-                    valuation_inputs=valuation_inputs,
-                    market_snapshot=market_snapshot,
-                    reproducibility=reproducibility,
-                    progress=lambda message, percent, base=comparison_base, span=comparison_span, current=index: progress(
-                        message,
-                        percent,
-                        base=base,
-                        span=span,
-                        prefix=_ui_message(
-                            ui_language,
-                            f"Comparison {current}/{len(comparison_configs)}: ",
-                            f"对比模型 {current}/{len(comparison_configs)}：",
-                            f"比較模型 {current}/{len(comparison_configs)}：",
+                try:
+                    secondary = comparison_workflow.run(
+                        company,
+                        financial_profile or facts,
+                        filing_evidence=filing_evidence,
+                        valuation_inputs=valuation_inputs,
+                        market_snapshot=market_snapshot,
+                        reproducibility=reproducibility,
+                        progress=lambda message, percent, base=comparison_base, span=comparison_span, current=index: progress(
+                            message,
+                            percent,
+                            base=base,
+                            span=span,
+                            prefix=_ui_message(
+                                ui_language,
+                                f"Comparison {current}/{len(comparison_configs)}: ",
+                                f"对比模型 {current}/{len(comparison_configs)}：",
+                                f"比較模型 {current}/{len(comparison_configs)}：",
+                            ),
                         ),
-                    ),
-                )
-                compare_research_runs(self.storage, primary, secondary, report_language)
+                    )
+                    compare_research_runs(
+                        self.storage, primary, secondary, report_language
+                    )
+                except ResearchCancelled:
+                    raise
+                except Exception as exc:
+                    # Comparison is an additive view over the authoritative
+                    # primary report.  Its failure must remain observable but
+                    # cannot turn a completed primary report into a blank or
+                    # failed research job.
+                    safe_comparison_error = _redact(str(exc), secrets)[:400]
+                    self._continuity.checkpoint(
+                        primary.run_id,
+                        f"comparison:{index}",
+                        StageOutcome.WAITING_RETRYABLE
+                        if isinstance(exc, (MarketDataError, SecClientError))
+                        else StageOutcome.NEEDS_ACTION,
+                        error_code=getattr(
+                            exc, "code", type(exc).__name__
+                        ),
+                        message=safe_comparison_error,
+                        diagnostics={
+                            "comparison_index": index,
+                            "model_id": comparison_config.public_id,
+                        },
+                    )
+                    primary.errors.append(
+                        f"comparison:{index}:{getattr(exc, 'code', type(exc).__name__)}"
+                    )
+                    primary.status = RunStatus.PARTIAL
+                    self.storage.save_run(primary)
+                    continue
+            self._continuity.checkpoint(
+                primary.run_id,
+                "completed" if primary.status is RunStatus.COMPLETED else "synthesis",
+                StageOutcome.COMPLETE if primary.status is RunStatus.COMPLETED else StageOutcome.DEGRADED,
+            )
             self._update_job(
                 job,
                 state="completed",
@@ -3237,11 +3960,30 @@ class AppService:
                 run_id=primary.run_id,
             )
         except ResearchCancelled:
+            if job.run is not None:
+                job.run.status = RunStatus.CANCELLED
+                job.run.completed_at = utc_now_iso()
+                if "research cancelled" not in job.run.errors:
+                    job.run.errors.append("research cancelled")
+                self.storage.save_run(job.run)
+                self._continuity.checkpoint(
+                    job.run.run_id,
+                    job.stage or "cancelled",
+                    StageOutcome.CANCELLED,
+                    error_code="RESEARCH_CANCELLED",
+                    message=_ui_message(
+                        ui_language,
+                        "Research cancelled",
+                        "研究已取消",
+                        "研究已取消",
+                    ),
+                )
             self._update_job(
                 job,
                 state="cancelled",
                 stage="cancelled",
                 message=_ui_message(ui_language, "Research cancelled", "研究已取消", "研究已取消"),
+                run_id=(job.run.run_id if job.run is not None else job.run_id),
             )
         except _ResearchDataUnavailable as exc:
             # A financial quality failure gets one bounded, model-free repair
@@ -3298,12 +4040,14 @@ class AppService:
                 }
                 else recovery_error or root_error
             )
-            self._update_job(
-                job,
-                state="failed",
-                stage="data-unavailable",
-                error_code=final_error,
-                message=_research_data_message(final_error, ui_language),
+            message = _research_data_message(final_error, ui_language)
+            self._preserve_interrupted_research(
+                job, stage="data-unavailable", error_code=final_error,
+                message=message, outcome=(
+                    StageOutcome.BLOCKED_INTEGRITY
+                    if final_error in {"FILING_DATA_QUALITY_FAILED", "FILING_STATUS_UNVERIFIED"}
+                    else StageOutcome.WAITING_RETRYABLE
+                ),
             )
         except (MarketDataError, SecClientError) as exc:
             code = getattr(exc, "code", "FILING_FETCH_FAILED")
@@ -3323,35 +4067,29 @@ class AppService:
                 except Exception:
                     pass
             recovery_error = str(request.get("_financial_auto_retry_error", "")).split(";", 1)[0].strip()
-            self._update_job(
-                job,
-                state="failed",
-                stage="data-unavailable",
-                error_code=recovery_error or code,
-                message=_research_data_message(recovery_error or code, ui_language),
+            final_error = recovery_error or code
+            self._preserve_interrupted_research(
+                job, stage="data-unavailable", error_code=final_error,
+                message=_research_data_message(final_error, ui_language),
+                outcome=StageOutcome.WAITING_RETRYABLE,
             )
         except Exception as exc:
             safe_error = _redact(str(exc), secrets)[:800]
-            timed_out = "timeout" in safe_error.lower() or "timed out" in safe_error.lower()
+            failure_code, retryable, timed_out = _classify_research_exception(exc, safe_error)
             if timed_out:
-                timeout = _normalize_timeout_seconds(
-                    (request.get("model") or {}).get("timeout_seconds")
-                    if isinstance(request.get("model"), dict)
-                    else None
-                )
+                timeout = _normalize_timeout_seconds(config.timeout_seconds)
                 safe_error = _ui_message(
                     ui_language,
                     f"Model request timed out after {timeout}s; increase the timeout or retry.",
                     f"模型请求超过 {timeout} 秒未响应；可提高超时设置后重试。",
                     f"模型請求超過 {timeout} 秒未回應；可提高逾時設定後重試。",
                 )
-            self._update_job(
+            self._preserve_interrupted_research(
                 job,
-                state="failed",
-                stage="failed",
-                error_code=("MODEL_TIMEOUT" if timed_out else "RESEARCH_FAILED"),
-                message=safe_error
-                or _ui_message(ui_language, "Research failed", "研究失败", "研究失敗"),
+                stage="model-wait" if timed_out else "interrupted",
+                error_code=failure_code,
+                message=safe_error or _ui_message(ui_language, "Research interrupted", "研究已中断", "研究已中斷"),
+                outcome=StageOutcome.WAITING_RETRYABLE if retryable else StageOutcome.NEEDS_ACTION,
             )
         finally:
             # Explicitly invalidate run-scoped batch consent on every terminal
@@ -3359,6 +4097,59 @@ class AppService:
             vision_authorization_active = False
             vision_filing_hashes.clear()
             vision_approval_ledger.clear()
+
+    def _preserve_interrupted_research(
+        self,
+        job: _ResearchJob,
+        *,
+        stage: str,
+        error_code: str,
+        message: str,
+        outcome: StageOutcome,
+    ) -> None:
+        run = job.run
+        if run is None and job.run_id:
+            stored = self.storage.get_run(job.run_id)
+            payload = _decode_payload(stored.get("payload_json")) if stored else {}
+            company_payload = payload.get("company")
+            if stored and isinstance(company_payload, dict):
+                run = ResearchRun(
+                    run_id=job.run_id, company=Company(**company_payload),
+                    workflow_id=str(payload.get("workflow_id", "complete-fundamental-research")),
+                    research_pack_id=str(payload.get("research_pack_id", "")),
+                    research_pack_version=str(payload.get("research_pack_version", "")),
+                    provider_id=str(payload.get("provider_id", "")), model_id=str(payload.get("model_id", "")),
+                    data_as_of=str(payload.get("data_as_of", utc_now_iso())),
+                    status=RunStatus(str(stored.get("status", "running"))),
+                    started_at=str(payload.get("started_at", stored.get("started_at", utc_now_iso()))),
+                    errors=list(payload.get("errors", [])), report_language=str(payload.get("report_language", "zh-CN")),
+                    model_configuration=dict(payload.get("model_configuration", {})),
+                    research_configuration=dict(payload.get("research_configuration", {})),
+                    data_snapshot=dict(payload.get("data_snapshot", {})),
+                )
+        if run is not None:
+            self._continuity.preserve_visible_result(
+                run, stage=stage, outcome=outcome, error_code=error_code,
+                message=message, retryable=outcome is StageOutcome.WAITING_RETRYABLE,
+            )
+            job.run_id = run.run_id
+        self._update_job(
+            job, state="completed", stage="partial", percent=100,
+            error_code=error_code, message=message,
+        )
+
+    def _record_disclosure_coverage(self, job: _ResearchJob, coverage: Any) -> None:
+        if job.run is None:
+            return
+        job.run.data_snapshot["disclosure_coverage"] = coverage.to_dict()
+        self.storage.save_run(job.run)
+        self._continuity.checkpoint(
+            job.run.run_id,
+            "disclosure-coverage",
+            StageOutcome.COMPLETE if coverage.complete else StageOutcome.DEGRADED,
+            diagnostics=coverage.to_dict(),
+            message=("" if coverage.complete else "Official disclosure history is incomplete"),
+        )
 
     def _select_pack(self, pack_id: str) -> ResearchPack:
         packs = list_installed_packs(self.storage.data_dir / "research-packs")
@@ -3368,6 +4159,81 @@ class AppService:
             if pack.pack_id == pack_id:
                 return pack
         raise ValueError("research pack not found")
+
+
+def _qualitative_cache_key(filing: FilingDocument) -> str:
+    digest = str(filing.content_hash or "").strip().casefold()
+    path = Path(str(filing.local_path or ""))
+    if not digest and path.is_file():
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+    return (
+        f"{QUALITATIVE_PARSER_VERSION}:{digest}"
+        if digest else ""
+    )
+
+
+def _cached_filing_evidence(
+    storage: Storage,
+    filings: list[FilingDocument] | tuple[FilingDocument, ...],
+    *,
+    maximum_filings: int = 2,
+) -> list[dict[str, Any]]:
+    """Load immutable disclosure evidence without rescanning unchanged PDFs."""
+
+    ordered = sorted(filings, key=lambda item: item.filed_at, reverse=True)
+    annual = next((item for item in ordered if item.fiscal_period == "FY"), None)
+    selected = ([annual] if annual else []) + [item for item in ordered if item is not annual]
+    collected: list[dict[str, Any]] = []
+    for filing in selected[:max(1, int(maximum_filings))]:
+        key = _qualitative_cache_key(filing)
+        cached = storage.get_qualitative_evidence_cache(key) if key else None
+        cache_missing = cached is None
+        if cached is None:
+            cached = [
+                dict(item)
+                for item in build_filing_evidence((filing,), maximum_filings=1)
+            ]
+        normalized: list[dict[str, Any]] = []
+        for source in cached:
+            item = dict(source)
+            if item.get("kind") != "material_gap":
+                item.update(
+                    {
+                        "kind": "filing_text",
+                        "company_cik": filing.company_cik,
+                        "fiscal_year": int(filing.period_end[:4])
+                        if len(filing.period_end) >= 4 and filing.period_end[:4].isdigit()
+                        else None,
+                        "fiscal_period": filing.fiscal_period,
+                        "end_date": filing.period_end,
+                        "form_type": filing.form_type,
+                        "accession_number": filing.accession_number,
+                    }
+                )
+            normalized.append(item)
+        cached = normalized
+        if key and cache_missing:
+            storage.save_qualitative_evidence_cache(key, cached)
+        collected.extend(cached)
+    return collected
+
+
+def _financial_evidence_record(item: EvidenceRef) -> dict[str, Any]:
+    """Project persisted references without erasing visual observation status."""
+    record = item.to_dict()
+    if str(record.get("evidence_id", "")).startswith("observation:"):
+        record.update(
+            {
+                "kind": "unverified_visual_observation",
+                "verification_status": "unverified",
+                "usable_for_calculation": False,
+            }
+        )
+    return record
 
 
 def _research_history_years(request: dict[str, Any], pack: Any | None = None) -> int:
@@ -3706,7 +4572,9 @@ def _compiler_validation_groups(validations: Any) -> list[FinancialGroupValidati
             tuple(getattr(item, "accepted", ())),
             tuple(getattr(item, "quarantined", ())),
         )
-        projected.append(FinancialGroupValidation(tuple(item.identity), validation))
+        projected.append(FinancialGroupValidation(
+            tuple(item.identity), validation, str(getattr(item, "role", "target"))
+        ))
     return projected
 
 
@@ -3856,6 +4724,86 @@ def _latest_sec_verified_group(
     return None
 
 
+def _artifacts_for_report_projection(
+    artifacts: list[dict[str, Any]], latest_payload: Any
+) -> list[dict[str, Any]]:
+    """Project the CAS-selected report last without changing storage order."""
+
+    projected = list(artifacts)
+    if not isinstance(latest_payload, dict):
+        return projected
+    for index in range(len(projected) - 1, -1, -1):
+        item = projected[index]
+        if (
+            item.get("artifact_type") == "research-report"
+            and item.get("content") == latest_payload
+        ):
+            projected.append(projected.pop(index))
+            break
+    return projected
+
+
+def _report_completion_state(
+    run: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    continuity: dict[str, Any] | None,
+    *,
+    readiness: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep execution termination separate from research completeness."""
+
+    status = str(run.get("status", "")).casefold()
+    attempt_complete = status in {
+        RunStatus.COMPLETED.value,
+        RunStatus.PARTIAL.value,
+        RunStatus.FAILED.value,
+        RunStatus.CANCELLED.value,
+    }
+    final = next(
+        (item for item in reversed(artifacts) if item.get("artifact_type") == "research-report"),
+        None,
+    )
+    research_complete = False
+    default_readiness: dict[str, Any] = {
+        "state": "action_required" if final is None else "substantive_partial",
+        "complete": False,
+        "substantive_sections": [],
+        "missing_sections": [],
+        "missing_stages": [],
+        "issues": ["research_report_artifact_missing"] if final is None else [],
+        "recovery_action": "resume_or_repair_missing_research_stages",
+    }
+    readiness_value = readiness
+    if readiness_value is None and isinstance(final, dict):
+        readiness_value = readiness_for_report_artifact(
+            final, artifacts, run_status=status
+        )
+    if readiness_value is None:
+        readiness_value = default_readiness
+    if isinstance(readiness_value, dict):
+        readiness_value = dict(readiness_value)
+        research_complete = (
+            status == RunStatus.COMPLETED.value and bool(readiness_value.get("complete"))
+        )
+    latest = continuity.get("latest") if isinstance(continuity, dict) else None
+    continuity_requires_action = bool(
+        isinstance(latest, dict)
+        and latest.get("outcome") in {
+            StageOutcome.WAITING_RETRYABLE.value,
+            StageOutcome.NEEDS_ACTION.value,
+            StageOutcome.BLOCKED_INTEGRITY.value,
+        }
+    )
+    return {
+        "attempt_complete": attempt_complete,
+        "research_complete": research_complete,
+        "report_readiness": readiness_value,
+        "action_required": bool(
+            attempt_complete and (not research_complete or continuity_requires_action)
+        ),
+    }
+
+
 def _report_retryable(artifacts: list[dict[str, Any]]) -> bool:
     required_stage_types = {
         "deterministic-financial-summary",
@@ -3877,6 +4825,16 @@ def _report_retryable(artifacts: list[dict[str, Any]]) -> bool:
     if final is None:
         return stages_complete
     return bool(stages_complete and final.get("content", {}).get("retryable"))
+
+
+def _model_stages_retryable(
+    artifacts: list[dict[str, Any]], continuity: dict[str, Any] | None = None
+) -> bool:
+    """Expose only the planner-owned base-stage recovery operation."""
+
+    return ResearchRecoveryPlanner().plan(
+        artifacts, continuity, target="model-stages"
+    ).available
 
 
 def _synthesis_error_code(artifacts: list[dict[str, Any]]) -> str:
@@ -3997,7 +4955,20 @@ def _model_config_from_request(value: Any) -> ModelConfig:
         configuration_version=configuration_version,
         role=role,
         timeout_seconds=600,
+        connection_id=_normalize_model_connection_id(value.get("connection_id")),
     )
+
+
+def _normalize_model_connection_id(value: Any) -> str:
+    connection_id = str(value or "").strip()
+    if not connection_id:
+        return ""
+    if len(connection_id) > 128 or not all(
+        character.isascii() and (character.isalnum() or character in "_.-")
+        for character in connection_id
+    ):
+        raise ValueError("model connection id is invalid")
+    return connection_id
 
 
 def _validate_ot_suggestion_path(path: Any, draft: dict[str, Any]) -> str:
@@ -4101,6 +5072,29 @@ def _request_bool(value: Any, default: bool) -> bool:
     return bool(value)
 
 
+def _classify_research_exception(
+    error: BaseException, safe_message: str = ""
+) -> tuple[str, bool, bool]:
+    """Map an execution failure to the durable recovery vocabulary.
+
+    Provider codes are authoritative; localized message text is only a legacy
+    fallback.  This prevents a Chinese timeout message (or HTTP 503) from
+    being mislabeled as an unrecoverable generic research failure.
+    """
+
+    if isinstance(error, ProviderError):
+        code = str(error.code or "MODEL_ERROR")[:80]
+        timed_out = code == "MODEL_TIMEOUT"
+        return code, bool(error.retryable or timed_out), timed_out
+    lowered = str(safe_message or error).casefold()
+    timed_out = "timeout" in lowered or "timed out" in lowered or "超时" in lowered or "逾時" in lowered
+    return (
+        "MODEL_TIMEOUT" if timed_out else "RESEARCH_FAILED",
+        timed_out,
+        timed_out,
+    )
+
+
 def _normalize_timeout_seconds(value: Any, default: int = 180) -> int:
     try:
         seconds = int(value)
@@ -4133,6 +5127,7 @@ def _vision_config_from_request(value: Any) -> VisionFallbackConfig | None:
             enabled=True,
             consent=bool(value.get("consent", False)),
             provider="mineru_flash",
+            connection_id="",
             timeout_seconds=60.0,
             language=str(value.get("language", "auto")),
             require_page_approval=True,
@@ -4146,6 +5141,7 @@ def _vision_config_from_request(value: Any) -> VisionFallbackConfig | None:
         consent=bool(value.get("consent", False)),
         provider="configured_model",
         configured_model_id=model_config.configured_model_id,
+        connection_id=model_config.connection_id,
         configuration_version=model_config.configuration_version,
         timeout_seconds=float(model_config.timeout_seconds),
         language=str(value.get("language", "auto")),
@@ -4200,8 +5196,15 @@ def _parse_persisted_vision_policy(
         and value.get("authorization_scope") == "financial_failed_pages"
     )
     model = value.get("model")
+    connection_id = ""
     if value.get("provider") == "configured_model":
         model_id = model.get("configured_model_id") if isinstance(model, dict) else None
+        try:
+            connection_id = _normalize_model_connection_id(
+                model.get("connection_id") if isinstance(model, dict) else ""
+            )
+        except ValueError:
+            valid = False
         valid = bool(
             valid
             and isinstance(model, dict)
@@ -4225,6 +5228,7 @@ def _parse_persisted_vision_policy(
         "configured_model_id": str(model.get("configured_model_id", ""))
         if isinstance(model, dict)
         else "",
+        "connection_id": connection_id,
         "configuration_version": int(model.get("configuration_version", 1))
         if isinstance(model, dict)
         and isinstance(model.get("configuration_version", 1), int)
@@ -4288,6 +5292,7 @@ def _vision_policy_snapshot(preferences: dict[str, str]) -> dict[str, Any]:
         "enabled": str(preferences.get("vision_enabled", "false")) == "true",
         "provider": provider,
         "configured_model_id": str(preferences.get("vision_configured_model_id", "")),
+        "connection_id": str(preferences.get("vision_connection_id", "")),
         "configuration_version": configuration_version,
         "approval_mode": str(
             preferences.get("vision_approval_mode", "review_each_plan")
@@ -4319,6 +5324,7 @@ def _vision_request_from_preferences(preferences: dict[str, str]) -> dict[str, A
     if provider == "configured_model":
         request["model"] = {
             "configured_model_id": str(snapshot["configured_model_id"]),
+            "connection_id": str(snapshot.get("connection_id", "")),
             "configuration_version": int(snapshot["configuration_version"]),
             "role": "vision",
         }
@@ -4430,6 +5436,7 @@ def _default_vision_adapter_factory(
             configuration_version=config.configuration_version,
             role="vision",
             timeout_seconds=max(30, min(600, int(config.timeout_seconds))),
+            connection_id=config.connection_id,
         )
     )
     if provider is None:

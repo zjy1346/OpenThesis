@@ -48,15 +48,19 @@ export default function App() {
   const {
     bootstrap,
     report,
+    reportLoadState,
     job,
     error,
     canRetry,
     selectRun,
+    retryReportRead,
     removeRun,
     beginResearch,
     retryResearch,
+    retryModelStages,
     retrySynthesis,
     retryGrowth,
+    retryRecoveryStage,
     retryFinancials,
     rebuildFinancials,
     refreshFinancialReport,
@@ -197,8 +201,8 @@ export default function App() {
           <div><span className="eyebrow"><Sparkles size={14} /> OpenThesis</span><h1>{pageTitle[activeView]}</h1></div>
           <div className="status-cluster"><span className="status-dot" /><span>{bootstrap ? `Core ${bootstrap.contract_version}` : copy.loading}</span></div>
         </header>
-        {error && <div className="error-banner" role="alert" data-tone={error.kind === "research-failed" && error.code === "NO_FILINGS_AVAILABLE" ? "notice" : undefined}>
-          <span>{error.kind === "report-unavailable" ? copy.reportUnavailable : (error.detail ?? copy.coreUnavailable)}</span>
+        {error && error.kind !== "report-unavailable" && <div className="error-banner" role="alert" data-tone={error.kind === "research-failed" && error.code === "NO_FILINGS_AVAILABLE" ? "notice" : undefined}>
+          <span>{error.detail ?? copy.coreUnavailable}</span>
           <div className="error-actions">
             {error.kind === "research-failed" && error.code?.startsWith("VISION_") && (
               <button type="button" onClick={() => setActiveView("settings")}>{copy.openVisionSettings}</button>
@@ -261,8 +265,30 @@ export default function App() {
             <AboutView bootstrap={bootstrap} copy={copy} />
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
+          ) : report && reportLoadState.status === "failed" && reportLoadState.run_id === report.run_id && reportLoadState.preserving_previous ? (
+            <>
+              <div className="report-status report-status-partial" role="alert">
+                <span>{copy.reportPreviousVersion}</span>
+                <button type="button" onClick={() => void retryReportRead()}>{copy.retryReportRead}</button>
+              </div>
+              <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+            </>
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+            <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+          ) : reportLoadState.status === "loading" || bootstrap.recent_runs.length > 0 && reportLoadState.status === "idle" ? (
+            <LoadingState label={copy.reportReading} />
+          ) : reportLoadState.status === "failed" ? (
+            <section className="report-no-content" role="alert">
+              <h3>{copy.reportUnavailable}</h3>
+              <p>{copy.reportReadFailure
+                .replace("{company}", reportLoadState.company_name || reportLoadState.ticker || reportLoadState.run_id)
+                .replace("{ticker}", reportLoadState.ticker || "—")
+                .replace("{code}", reportLoadState.code)}</p>
+              <div className="error-actions">
+                <button type="button" onClick={() => void retryReportRead()}>{copy.retryReportRead}</button>
+                <button type="button" onClick={() => setActiveView("history")}>{copy.returnResearchHistory}</button>
+              </div>
+            </section>
           ) : (
             <EmptyState title={copy.emptyTitle} body={copy.emptyBody} demoAction={copy.startDemo}
               realAction={copy.startReal} hint={copy.demoHint}
