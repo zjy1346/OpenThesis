@@ -11,6 +11,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 from typing import Any, Iterable
+from .research_execution.registry import standard_model_registry
+from .research_materials import material_capabilities
+from .resilience.contracts import digest
 
 
 BASE_AGENTS = (
@@ -26,6 +29,7 @@ class RecoveryPlan:
     stages: tuple[str, ...]
     reason: str
     input_artifact_ids: tuple[str, ...]
+    request_state_digest: str = ""
 
     @property
     def available(self) -> bool:
@@ -39,6 +43,7 @@ class RecoveryPlan:
                 "stages": self.stages,
                 "reason": self.reason,
                 "inputs": self.input_artifact_ids,
+                "request_state_digest": self.request_state_digest,
             },
             ensure_ascii=True,
             sort_keys=True,
@@ -65,12 +70,12 @@ class ResearchRecoveryPlanner:
         "forecast-scenarios": "forecast-scenarios",
         "synthesis": "research-report",
     }
-    _STAGE_DOWNSTREAM = {
-        "growth": ("growth-opportunities", "counter-analysis", "forecast-scenarios", "final-synthesis"),
-        "counter-analysis": ("counter-analysis", "forecast-scenarios", "final-synthesis"),
-        "forecast-scenarios": ("forecast-scenarios", "final-synthesis"),
-        "synthesis": ("final-synthesis",),
-    }
+    _TARGET_STAGE = {"growth": "growth-opportunities", "counter-analysis": "counter-analysis",
+                     "forecast-scenarios": "forecast-scenarios", "synthesis": "final-synthesis"}
+
+    @classmethod
+    def _downstream_stages(cls, target: str) -> tuple[str, ...]:
+        return standard_model_registry().descendants((cls._TARGET_STAGE[target],))
     _FAILURE_STAGE_ALIASES = {
         "base-agents": "model-stages",
         **{agent: "model-stages" for agent in BASE_AGENTS},
@@ -92,6 +97,7 @@ class ResearchRecoveryPlanner:
         continuity: dict[str, Any] | None = None,
         *,
         target: str = "auto",
+        request_states: Iterable[dict[str, Any]] = (),
     ) -> dict[str, Any]:
         """Return a stable, UI-ready recovery description from saved state.
 
@@ -99,11 +105,31 @@ class ResearchRecoveryPlanner:
         from this method without coupling report rendering to planner internals.
         """
         items = tuple(item for item in artifacts if isinstance(item, dict))
-        plan = self.plan(items, continuity, target=target)
+        states = tuple(request_states)
+        plan = self.plan(items, continuity, target=target, request_states=states)
+        relevant = [item for item in states if item.get("stage_id") in plan.stages]
+        unknown = tuple(sorted({item["stage_id"] for item in relevant if item.get("unknown")}))
+        active = any(item.get("active") for item in relevant)
+        saved = tuple(sorted({item["stage_id"] for item in relevant if item.get("has_candidate")}))
+        saved = tuple(sorted(set(saved) | {str(content["result"]["stage_id"])
+            for item in items if item.get("artifact_type") in {"stage-checkpoint", "stage-candidate"}
+            and isinstance(content := item.get("content"), dict)
+            and isinstance(content.get("result"), dict) and content["result"].get("has_candidate") is True
+            and isinstance(content["result"].get("stage_id"), str)}))
         return {
             **plan.to_dict(),
             "available": plan.available,
             "error_code": self.failure_code(items, plan.target),
+            "requires_new_attempt_authorization": bool(unknown),
+            "unknown_stages": list(unknown), "request_in_progress": active,
+            "operations": [
+                *([{"code": "revalidate_saved_content", "stages": list(saved),
+                    "requires_provider": False, "requires_confirmation": False}] if saved else []),
+                {"code": "authorize_new_attempt_for_unknown" if unknown else "resume_missing_analysis",
+                 "stages": list(plan.stages), "requires_provider": True,
+                 "requires_confirmation": bool(unknown), "possible_duplicate_charge": bool(unknown)},
+            ] if plan.available else ([{"code": "revalidate_saved_content", "stages": list(saved),
+                "requires_provider": False, "requires_confirmation": False}] if saved else []),
         }
 
     def failure_code(
@@ -157,12 +183,16 @@ class ResearchRecoveryPlanner:
         continuity: dict[str, Any] | None = None,
         *,
         target: str = "auto",
+        request_states: Iterable[dict[str, Any]] = (),
     ) -> RecoveryPlan:
         items = tuple(item for item in artifacts if isinstance(item, dict))
         identities = tuple(sorted({
             str(item.get("artifact_id") or "") for item in items
             if item.get("artifact_id")
         }))
+        state_identity = digest(tuple(request_states)) if request_states else ""
+        def make_plan(target, stages, reason, identities):
+            return RecoveryPlan(target, stages, reason, identities, state_identity)
         types = {str(item.get("artifact_type") or "") for item in items}
         latest_agent_artifacts: dict[str, dict[str, Any]] = {}
         has_unbound_agent_result = False
@@ -186,18 +216,18 @@ class ResearchRecoveryPlanner:
             }
         }
         missing_base = tuple(agent for agent in BASE_AGENTS if agent not in successful_agents)
-        base_retryable = self._base_retryable(items, continuity)
+        base_recoverable = self._base_recoverable(items, continuity)
 
         # Recovery re-enters the same workflow with persisted artifacts.  The
         # workflow seeds successful analyses and invokes only missing roles;
         # downstream stages are refreshed from the rebuilt dossier.
-        if missing_base and base_retryable and target in {"auto", "model-stages"}:
+        if missing_base and base_recoverable and target in {"auto", "model-stages"}:
             if has_unbound_agent_result:
-                return RecoveryPlan(target, (), "unbound_agent_artifact_requires_review", identities)
-            return RecoveryPlan(
+                return make_plan(target, (), "unbound_agent_artifact_requires_review", identities)
+            return make_plan(
                 "model-stages",
-                (*missing_base, "growth-opportunities", "counterarguments", "scenarios", "final-synthesis"),
-                "retryable_base_stage_incomplete",
+                standard_model_registry().descendants(missing_base),
+                "base_stage_incomplete",
                 identities,
             )
 
@@ -208,10 +238,10 @@ class ResearchRecoveryPlanner:
         )
         if stage_target in {"growth", "counter-analysis", "forecast-scenarios", "synthesis"}:
             if not self._stage_prerequisites_present(stage_target, items):
-                return RecoveryPlan(stage_target, (), "stage_prerequisites_not_verified", identities)
-            return RecoveryPlan(
+                return make_plan(stage_target, (), "stage_capabilities_unavailable", identities)
+            return make_plan(
                 stage_target,
-                self._STAGE_DOWNSTREAM[stage_target],
+                self._downstream_stages(stage_target),
                 f"{stage_target.replace('-', '_')}_failed_or_unverified",
                 identities,
             )
@@ -221,12 +251,9 @@ class ResearchRecoveryPlanner:
         ):
             growth = self._latest(items, "growth-opportunities")
             if target == "growth" or self._growth_retryable(growth):
-                downstream = ("final-synthesis",) if {
-                    "counter-analysis", "forecast-scenarios"
-                }.issubset(types) else ()
-                return RecoveryPlan(
+                return make_plan(
                     "growth",
-                    ("growth-opportunities", *downstream),
+                    self._downstream_stages("growth"),
                     "growth_stage_incomplete",
                     identities,
                 )
@@ -239,53 +266,32 @@ class ResearchRecoveryPlanner:
                 if isinstance(report.get("content"), dict) else False
             )
             if target == "synthesis" or retryable:
-                return RecoveryPlan(
+                return make_plan(
                     "synthesis", ("final-synthesis",),
                     "final_synthesis_incomplete", identities,
                 )
-        return RecoveryPlan(target, (), "no_retryable_stage", identities)
+        return make_plan(target, (), "no_recoverable_stage", identities)
 
     @staticmethod
     def _stage_prerequisites_present(
         target: str, items: tuple[dict[str, Any], ...]
     ) -> bool:
-        prerequisites = {
-            "growth": {"deterministic-financial-summary", "verified-research-dossier"},
-            "counter-analysis": {
-                "deterministic-financial-summary", "verified-research-dossier",
-                "growth-opportunities",
-            },
-            "forecast-scenarios": {
-                "deterministic-financial-summary", "verified-research-dossier",
-                "growth-opportunities", "counter-analysis",
-            },
-            "synthesis": {
-                "deterministic-financial-summary", "verified-research-dossier",
-                "growth-opportunities", "counter-analysis", "forecast-scenarios",
-            },
-        }
-        latest: dict[str, dict[str, Any]] = {}
-        for item in items:
-            artifact_type = str(item.get("artifact_type") or "")
-            if artifact_type:
-                latest[artifact_type] = item
-        required = prerequisites.get(target, set())
-        if not required.issubset(latest):
+        summary = ResearchRecoveryPlanner._latest(items, "deterministic-financial-summary")
+        content = summary.get("content") if isinstance(summary, dict) else None
+        if not isinstance(content, dict):
             return False
-        for artifact_type in required:
-            item = latest[artifact_type]
-            content = item.get("content")
-            if not isinstance(content, dict):
-                return False
-            if artifact_type == "verified-research-dossier":
-                analyses = content.get("verified_analyses", content.get("analyses"))
-                if not isinstance(analyses, dict) or not analyses:
-                    return False
-            elif artifact_type in {
-                "growth-opportunities", "counter-analysis", "forecast-scenarios",
-            } and not ResearchRecoveryPlanner._artifact_verified(item):
-                return False
-        return True
+        company = content.get("company")
+        capabilities = set()
+        if isinstance(company, dict) and company.get("cik") and company.get("ticker"):
+            capabilities.add("company_identity")
+        evidence = content.get("evidence", [])
+        capabilities.update(material_capabilities({"evidence": evidence}))
+        stage_id = ResearchRecoveryPlanner._TARGET_STAGE.get(target)
+        if stage_id is None:
+            return False
+        # Optional preceding analyses are context, not a second hard DAG.
+        # The executor applies this same spec and validates every new claim.
+        return not standard_model_registry().get(stage_id).missing_capabilities(capabilities)
 
     def _latest_failed_model_stage(self, items: tuple[dict[str, Any], ...]) -> str:
         latest_failure: dict[str, int] = {}
@@ -365,10 +371,18 @@ class ResearchRecoveryPlanner:
         } or (isinstance(validation, dict) and validation.get("passed") is False)
 
     @staticmethod
-    def _base_retryable(
+    def _base_recoverable(
         items: tuple[dict[str, Any], ...], continuity: dict[str, Any] | None,
     ) -> bool:
         for item in reversed(items):
+            if item.get("artifact_type") == "stage-checkpoint":
+                content = item.get("content")
+                result = content.get("result") if isinstance(content, dict) else None
+                validation = result.get("validation") if isinstance(result, dict) else None
+                if (isinstance(result, dict) and result.get("stage_id") in BASE_AGENTS
+                        and result.get("error_code")
+                        and not (isinstance(validation, dict) and validation.get("passed"))):
+                    return True
             if item.get("artifact_type") != "stage-outcome":
                 continue
             content = item.get("content")
@@ -376,19 +390,19 @@ class ResearchRecoveryPlanner:
                 continue
             if (
                 str(content.get("agent_id") or "") in BASE_AGENTS
-                and bool(content.get("retryable"))
-                and content.get("outcome") == "waiting_retryable"
+                and content.get("outcome") in {"waiting_retryable", "needs_action", "failed_internal"}
             ):
                 return True
             if (
                 content.get("stage") == "base-agents"
-                and int(content.get("completed", -1)) == 0
-                and bool(content.get("retryable"))
+                and content.get("completed") == 0
+                and (content.get("retryable") is True or
+                     content.get("outcome") in {"waiting_retryable", "needs_action", "failed_internal"})
             ):
                 return True
         latest = continuity.get("latest") if isinstance(continuity, dict) else None
         return bool(
             isinstance(latest, dict)
-            and latest.get("outcome") == "waiting_retryable"
+            and latest.get("outcome") in {"waiting_retryable", "needs_action", "failed_internal"}
             and str(latest.get("error_code") or "").startswith("MODEL_")
         )

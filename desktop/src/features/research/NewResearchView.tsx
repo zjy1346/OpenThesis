@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Building2, ExternalLink } from "lucide-react";
 import { MarketReadiness, FxDetails } from './MarketReadiness';
+import { modelEligibility } from "../../modelEligibility";
 
 import {
   installResearchPack,
@@ -12,6 +13,7 @@ import {
 import type {
   BootstrapResult,
   Company,
+  CompanySearchResponse,
   Market,
   ConfiguredModelSummary,
   ModelReference,
@@ -41,6 +43,11 @@ type ResearchCopy = {
   companySearch: string;
   searchAction: string;
   searching: string;
+  searchReady?: string;
+  searchResults?: string;
+  searchCachedIdentity?: string;
+  searchUnverifiedIdentity?: string;
+  searchErrorGeneric?: string;
   commonCompanies: string;
   coreUnavailable: string;
   marketSnapshotLoading: string;
@@ -97,6 +104,21 @@ type ResearchCopy = {
   visionConfiguredModel: string;
   visionApprovalEach: string;
   visionApprovalResearch: string;
+  searchEmpty?: string;
+  searchDegraded?: string;
+  searchUnavailable?: string;
+  searchFailed?: string;
+  searchRetry?: string;
+  searchDiagnostic?: string;
+  copyDiagnosticId?: string;
+  diagnosticCopied?: string;
+  openNetworkSettings?: string;
+  searchErrorNetwork?: string;
+  searchErrorDns?: string;
+  searchErrorRateLimit?: string;
+  searchErrorIdentity?: string;
+  launchFailed?: string;
+  launchingResearch?: string;
 };
 
 const SEC_DEVELOPER_DOCS = "https://www.sec.gov/search-filings/edgar-application-programming-interfaces";
@@ -113,12 +135,26 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [email, setEmail] = useState(bootstrap.preferences.sec_contact_email || "");
   const [market, setMarket] = useState<Market>(bootstrap.preferences.research_market || "US");
   const [query, setQuery] = useState("");
-  const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<Company[]>([]);
+  const [searchState, setSearchState] = useState<"idle" | "loading" | "ready" | "empty" | "degraded" | "unavailable" | "failed">("idle");
+  const [searchResponse, setSearchResponse] = useState<CompanySearchResponse | null>(null);
   const [selected, setSelected] = useState<Company | null>(null);
   const [marketPreview, setMarketPreview] = useState<Awaited<ReturnType<typeof captureMarketSnapshot>> | null>(null);
   const [marketPreviewLoading, setMarketPreviewLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [copiedDiagnosticId, setCopiedDiagnosticId] = useState("");
+  const [launching, setLaunching] = useState(false);
+  const searchSequence = useRef(0);
+  const searchTimeout = useRef<number | undefined>(undefined);
+  const clearSearchTimeout = () => {
+    if (searchTimeout.current !== undefined) {
+      window.clearTimeout(searchTimeout.current);
+      searchTimeout.current = undefined;
+    }
+  };
+  useEffect(() => () => {
+    searchSequence.current += 1;
+    clearSearchTimeout();
+  }, []);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModelSummary[]>([]);
   const [modelLoadError, setModelLoadError] = useState("");
   const [primaryModelId, setPrimaryModelId] = useState("");
@@ -151,7 +187,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     ? { ...visionFallbackSelection, model: { ...visionFallbackSelection.model, connection_id: visionFallbackModel.connection_id } }
     : visionFallbackSelection;
   const usableModels = useMemo(
-    () => configuredModels.filter((model) => model.enabled && model.health_status === "ready"),
+    () => configuredModels.filter((model) => modelEligibility(model, "text_chat").selectable),
     [configuredModels],
   );
   useEffect(() => {
@@ -160,7 +196,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       .then((items) => {
         if (cancelled) return;
         setConfiguredModels(items);
-        const usable = items.filter((model) => model.enabled && model.health_status === "ready");
+        const usable = items.filter((model) => modelEligibility(model, "text_chat").selectable);
         setPrimaryModelId((current) => current || usable[0]?.configured_model_id || "");
       })
       .catch((reason) => {
@@ -206,35 +242,77 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     } : undefined;
   };
 
+  const invalidateSearch = () => {
+    searchSequence.current += 1;
+    clearSearchTimeout();
+    setSearchState("idle");
+    setSearchResponse(null);
+    setSearchError("");
+  };
+
   const chooseMarket = (next: Market) => {
+    invalidateSearch();
     setMarket(next);
     setSelected(null);
-    setResults([]);
-    setSearchError("");
     setMarketCurrency(marketCatalog.find((item) => item.market === next)?.default_currency ?? "USD");
   };
 
   const findCompanies = async () => {
+    if (searchState === "loading") return;
     if (requiresSecIdentity && !email.includes("@")) {
       setSearchError(copy.secRequired);
+      setSearchState("failed");
       return;
     }
-    setSearching(true);
+    const sequence = ++searchSequence.current;
+    const searchMarket = market;
+    const searchQuery = query.trim();
+    if (!searchQuery) return;
+    const requestId = typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let timedOut = false;
+    let timeout: number | undefined;
+    const isCurrent = () => sequence === searchSequence.current && market === searchMarket && query.trim() === searchQuery;
+    setSelected(null);
+    setSearchResponse(null);
+    setCopiedDiagnosticId("");
+    setSearchState("loading");
     setSearchError("");
     try {
+      timeout = window.setTimeout(() => {
+        timedOut = true;
+        if (isCurrent()) {
+          setSearchState("failed");
+          setSearchError(copy.searchFailed ?? copy.coreUnavailable);
+        }
+      }, 15_000);
+      searchTimeout.current = timeout;
       await onSavePreferences({
-        research_market: market,
+        research_market: searchMarket,
         ...(requiresSecIdentity ? { sec_contact_profile: profile, sec_contact_email: email } : {}),
       });
-      setResults(await searchCompanies(query, market));
+      if (!isCurrent() || timedOut) return;
+      const responsePromise = searchCompanies(searchQuery, searchMarket, requestId);
+      const response = await responsePromise;
+      if (!isCurrent() || timedOut) return;
+      setSearchResponse(response);
+      setSearchState(response.state);
+      if (response.state === "empty") setSelected(null);
     } catch (reason) {
-      setSearchError(reason instanceof Error ? reason.message : copy.coreUnavailable);
+      if (isCurrent() && !timedOut) {
+        const errorCode = reason instanceof Error ? reason.message.split(/[\s:]/, 1)[0] : "";
+        setSearchError(searchErrorMessage(errorCode, copy));
+        setSearchState("failed");
+      }
     } finally {
-      setSearching(false);
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      if (searchTimeout.current === timeout) searchTimeout.current = undefined;
     }
   };
 
   const launch = async () => {
+    if (launching) return;
     if (!selected || (requiresSecIdentity && !email.includes("@"))) {
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
@@ -253,41 +331,50 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       setSearchError(copy.visionMissing);
       return;
     }
-    await onSavePreferences({
-      sec_contact_profile: profile,
-      sec_contact_email: email,
-      parallel_agents: String(parallelAgents),
-      research_market: market,
-    });
-    const hasManualMarketSnapshot = Boolean(marketCap.trim() || marketPrice.trim());
-    const hasValuationOverride = Boolean(
-      marketCap.trim()
-      || discountRate !== "10"
-      || terminalGrowth !== "3"
-    );
-    await onStart({
-      mode: "company",
-      company: selected,
-      download_filings: downloadFilings,
-      pack_id: packId,
-      model: primary,
-      compare_enabled: comparisons.length > 0,
-      comparison_models: comparisons,
-      parallel_agents: parallelAgents,
-      auto_market_snapshot: true,
-      ...(hasValuationOverride ? { valuation: {
-        market_cap_billions: Number(marketCap) || 0,
-        discount_rate_percent: Number(discountRate) || 10,
-        terminal_growth_percent: Number(terminalGrowth) || 3,
-      } } : {}),
-      ...(hasManualMarketSnapshot ? { market_snapshot: {
-        price: Number(marketPrice) || 0,
-        market_cap_billions: Number(marketCap) || 0,
-        currency: marketCurrency,
-        as_of: marketAsOf,
-      } } : {}),
-      ...(visionFallback ? { vision_fallback: visionFallback } : {}),
-    });
+    setLaunching(true);
+    setSearchError("");
+    try {
+      await onSavePreferences({
+        sec_contact_profile: profile,
+        sec_contact_email: email,
+        parallel_agents: String(parallelAgents),
+        research_market: market,
+      });
+      const hasManualMarketSnapshot = Boolean(marketCap.trim() || marketPrice.trim());
+      const hasValuationOverride = Boolean(
+        marketCap.trim()
+        || discountRate !== "10"
+        || terminalGrowth !== "3"
+      );
+      await onStart({
+        mode: "company",
+        company: selected,
+        download_filings: downloadFilings,
+        pack_id: packId,
+        model: primary,
+        compare_enabled: comparisons.length > 0,
+        comparison_models: comparisons,
+        parallel_agents: parallelAgents,
+        auto_market_snapshot: true,
+        ...(hasValuationOverride ? { valuation: {
+          market_cap_billions: Number(marketCap) || 0,
+          discount_rate_percent: Number(discountRate) || 10,
+          terminal_growth_percent: Number(terminalGrowth) || 3,
+        } } : {}),
+        ...(hasManualMarketSnapshot ? { market_snapshot: {
+          price: Number(marketPrice) || 0,
+          market_cap_billions: Number(marketCap) || 0,
+          currency: marketCurrency,
+          as_of: marketAsOf,
+        } } : {}),
+        ...(visionFallback ? { vision_fallback: visionFallback } : {}),
+      });
+    } catch (reason) {
+      const errorCode = reason instanceof Error ? reason.message.split(/[\s:]/, 1)[0] : "";
+      setSearchError(errorCode ? searchErrorMessage(errorCode, copy, copy.launchFailed ?? copy.coreUnavailable) : (copy.launchFailed ?? copy.coreUnavailable));
+    } finally {
+      setLaunching(false);
+    }
   };
 
   const importPack = async (file: File | undefined) => {
@@ -323,6 +410,49 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     }
   };
 
+  const chooseSearchCompany = (company: Company) => {
+    if (searchResponse?.state === "unavailable" || company.identity_state === "unresolved_code") return;
+    setSelected(company);
+    setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD");
+    setSearchError("");
+  };
+
+  const copyDiagnostic = async (diagnosticId: string) => {
+    let copied = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(diagnosticId);
+        copied = true;
+      }
+    } catch {
+      // Fall through to the local copy fallback when clipboard permission is unavailable.
+    }
+    if (!copied) {
+      try {
+        const input = document.createElement("textarea");
+        input.value = diagnosticId;
+        input.setAttribute("readonly", "");
+        input.style.position = "fixed";
+        input.style.opacity = "0";
+        document.body.appendChild(input);
+        input.select();
+        copied = document.execCommand("copy");
+        input.remove();
+      } catch {
+        copied = false;
+      }
+    }
+    setCopiedDiagnosticId(copied ? diagnosticId : "");
+  };
+
+  const searchStatusText = searchState === "loading" ? copy.searching
+    : searchState === "ready" ? (copy.searchReady ?? "Verified results are ready.")
+      : searchState === "empty" ? (copy.searchEmpty ?? "No matching official company was found.")
+        : searchState === "degraded" ? (copy.searchDegraded ?? "Official search is incomplete; cached verified results may be selected.")
+          : searchState === "unavailable" ? (copy.searchUnavailable ?? "Official search is unavailable; displayed codes are not verified and cannot be selected.")
+        : searchState === "failed" ? ""
+              : "";
+
   return (
     <div className="research-setup">
       <header className="setup-heading"><span className="eyebrow">OpenThesis</span><h2>{copy.setupTitle}</h2><p>{copy.setupBody}</p></header>
@@ -348,11 +478,25 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
             <button className="refresh-button" type="button" onClick={() => void openSecHelp()}><ExternalLink size={15} />{copy.openSecDocs}</button>
           </details>
           </>}
-          <div className="search-row"><input aria-label={copy.companySearch} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={copy.companySearch} />
-            <button type="button" onClick={() => void findCompanies()} disabled={searching || !query.trim()}>{searching ? copy.searching : copy.searchAction}</button></div>
+          <div className="search-row"><input aria-label={copy.companySearch} value={query} onChange={(event) => { invalidateSearch(); setSelected(null); setQuery(event.target.value); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); void findCompanies(); } }} placeholder={copy.companySearch} />
+            <button type="button" onClick={() => void findCompanies()} disabled={searchState === "loading" || !query.trim()}>{searchState === "loading" ? copy.searching : searchState === "failed" || searchState === "unavailable" ? (copy.searchRetry ?? copy.searchAction) : copy.searchAction}</button></div>
+          <div className={`company-search-status ${searchState === "degraded" ? "warning" : ""}`} role="status" aria-live="polite" aria-atomic="true">{searchStatusText}</div>
           <span className="field-caption">{copy.commonCompanies}</span>
           <div className="company-chips">{bootstrap.common_companies.filter((company) => (company.market ?? "US") === market).map((company) => <button key={company.security_id || company.cik} type="button" data-selected={selected?.cik === company.cik || undefined} onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}>{company.ticker}</button>)}</div>
-          {results.length > 0 && <div className="company-results">{results.map((company) => <button key={company.security_id || company.cik} type="button" onClick={() => { setSelected(company); setMarketCurrency(company.listing_currency || marketProfile?.default_currency || "USD"); }}><Building2 size={16} /><span><strong>{company.ticker}</strong>{company.name}</span></button>)}</div>}
+          {searchResponse && (searchResponse.state === "unavailable"
+            ? searchResponse.companies.filter((company) => company.identity_state === "unresolved_code")
+            : searchResponse.companies).length > 0 && <div className="company-results" aria-label={copy.searchResults ?? copy.companySearch}>{(searchResponse.state === "unavailable"
+              ? searchResponse.companies.filter((company) => company.identity_state === "unresolved_code")
+              : searchResponse.companies).map((company) => {
+            const selectable = searchResponse.state !== "unavailable" && company.identity_state !== "unresolved_code";
+            return <button key={company.security_id || company.cik} type="button" disabled={!selectable} aria-disabled={!selectable} onClick={() => chooseSearchCompany(company)}><Building2 size={16} /><span><strong>{company.ticker}</strong>{company.name}{company.identity_state === "cached_verified" && <small>{copy.searchCachedIdentity ?? "Cached identity; confirm the warning before research."}</small>}{company.identity_state === "unresolved_code" && <small>{copy.searchUnverifiedIdentity ?? "Unverified code; it cannot start research."}</small>}</span></button>;
+          })}</div>}
+          {searchResponse?.diagnostics.map((diagnostic) => <div className="company-search-diagnostic" key={diagnostic.diagnostic_id}>
+            <span>{searchErrorMessage(diagnostic.code, copy)}</span>
+            <code>{diagnostic.diagnostic_id}</code>
+            <button type="button" className="secondary-button" onClick={() => void copyDiagnostic(diagnostic.diagnostic_id)} aria-label={`${copy.copyDiagnosticId ?? "Copy diagnostic ID"}: ${diagnostic.diagnostic_id}`}>{copiedDiagnosticId === diagnostic.diagnostic_id ? (copy.diagnosticCopied ?? "Copied") : (copy.copyDiagnosticId ?? "Copy ID")}</button>
+          </div>)}
+          {searchResponse?.state === "unavailable" && onOpenVisionSettings && <button className="secondary-button network-settings-link" type="button" onClick={onOpenVisionSettings}>{copy.openNetworkSettings ?? "Open network settings"}</button>}
           {selected && <div className="selected-company"><Building2 size={18} /><span><strong>{selected.ticker}</strong>{selected.name}</span></div>}
           {selected && <MarketReadiness company={selected} language={bootstrap.preferences.ui_language} onSwitch={(company) => {
             chooseMarket(company.market || 'CN_A');
@@ -432,7 +576,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
             <label>{copy.discountRate}<input inputMode="decimal" value={discountRate} onChange={(event) => setDiscountRate(event.target.value)} /></label>
             <label>{copy.terminalGrowth}<input inputMode="decimal" value={terminalGrowth} onChange={(event) => setTerminalGrowth(event.target.value)} /></label>
           </div></details>
-          <button className="primary-button launch-button" type="button" disabled={!selected} onClick={() => void launch()}>{selected ? copy.launchResearch : copy.chooseCompany}</button>
+          <button className="primary-button launch-button" type="button" disabled={!selected || launching} onClick={() => void launch()}>{launching ? (copy.launchingResearch ?? copy.searching) : selected ? copy.launchResearch : copy.chooseCompany}</button>
         </section>
       </div>
     </div>
@@ -443,6 +587,19 @@ function isFreeModel(model: ConfiguredModelSummary): boolean {
   return model.billing_class === "free_tier"
     || model.billing_class === "local_no_provider_fee"
     || model.free_tier;
+}
+
+function searchErrorMessage(code: string, copy: ResearchCopy, fallback = copy.searchErrorGeneric ?? copy.coreUnavailable): string {
+  switch (code) {
+    case "SOURCE_NETWORK_UNAVAILABLE": return copy.searchErrorNetwork ?? fallback;
+    case "SOURCE_DNS_POLICY_BLOCKED": return copy.searchErrorDns ?? fallback;
+    case "DNS_POLICY_BLOCKED": return copy.searchErrorDns ?? fallback;
+    case "SOURCE_RATE_LIMITED": return copy.searchErrorRateLimit ?? fallback;
+    case "RATE_LIMITED": return copy.searchErrorRateLimit ?? fallback;
+    case "SOURCE_IDENTITY_INVALID": return copy.searchErrorIdentity ?? fallback;
+    case "IDENTITY_INVALID": return copy.searchErrorIdentity ?? fallback;
+    default: return fallback;
+  }
 }
 
 function ConfiguredModelPicker({ id, label, models, value, onChange }: {

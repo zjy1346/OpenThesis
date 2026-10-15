@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Iterator
@@ -64,9 +65,11 @@ class ModelRequestScheduler:
         """Cool down sibling work and reduce future concurrency after HTTP 429."""
         try:
             seconds = float(retry_after_seconds) if retry_after_seconds is not None else 30.0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             seconds = 30.0
-        seconds = max(1.0, min(300.0, seconds))
+        if not math.isfinite(seconds):
+            seconds = 30.0
+        seconds = max(1.0, seconds)
         with self._condition:
             self._limit = max(1, self._limit // 2)
             self._cooldown_until = max(self._cooldown_until, self._clock() + seconds)

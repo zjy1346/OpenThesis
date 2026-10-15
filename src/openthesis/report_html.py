@@ -9,6 +9,7 @@ from .financials import (
     format_growth,
     format_money,
     format_percent,
+    read_metric_period,
     reverse_dcf_disclaimer,
     reverse_dcf_status_text,
 )
@@ -332,13 +333,37 @@ def _metric_cell(label: str, value: str) -> str:
     )
 
 
+def _metric_period_rows(
+    rows: list[object], *, annual: bool,
+) -> tuple[list[tuple[dict[str, Any], Any]], list[str]]:
+    valid: list[tuple[dict[str, Any], Any]] = []
+    diagnostics: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            diagnostics.append("METRIC_PERIOD_INVALID")
+            continue
+        try:
+            period_identity = read_metric_period(row)
+        except ValueError as error:
+            diagnostics.append(str(error))
+            continue
+        if (period_identity.period == "FY") != annual:
+            diagnostics.append(
+                "METRIC_PERIOD_EXPECTED_FY" if annual else "METRIC_PERIOD_EXPECTED_INTERIM"
+            )
+            continue
+        valid.append((row, period_identity))
+    return valid, list(dict.fromkeys(diagnostics))
+
+
 def _annual_metric_gap_note(rows: list[object], language: str) -> str:
     messages: list[str] = []
-    for row in rows[:5]:
-        if not isinstance(row, dict) or row.get("revenue_growth") is not None:
+    valid_rows, diagnostics = _metric_period_rows(rows, annual=True)
+    for row, period_identity in valid_rows[:5]:
+        if row.get("revenue_growth") is not None:
             continue
         gap = str(row.get("comparison_gap") or "")
-        year = row.get("year", "—")
+        year = period_identity.year
         if gap.startswith("missing_"):
             missing_year = gap.removeprefix("missing_")
             if language == EN:
@@ -357,7 +382,7 @@ def _annual_metric_gap_note(rows: list[object], language: str) -> str:
                 if language == ZH_HANT
                 else f"{year} 财年收入增长缺少已验证的可比收入"
             )
-    latest = next((item for item in rows if isinstance(item, dict)), None)
+    latest = valid_rows[0][0] if valid_rows else None
     if latest is not None and latest.get("return_on_equity") is None:
         roe_gap = str(latest.get("return_on_equity_gap") or "")
         if roe_gap == "missing_equity":
@@ -384,6 +409,7 @@ def _annual_metric_gap_note(rows: list[object], language: str) -> str:
                 if language == ZH_HANT
                 else "净资产收益率无法计算：权益为零或负数，不适用"
             )
+    messages.extend(f"Metric period row skipped: {code}." for code in diagnostics)
     if not messages:
         return ""
     return (
@@ -394,10 +420,18 @@ def _annual_metric_gap_note(rows: list[object], language: str) -> str:
 
 
 def _interim_financial_snapshot(rows: list[object], language: str, currency: str) -> str:
-    latest = next((item for item in rows if isinstance(item, dict)), None)
-    if latest is None:
-        return ""
-    period = f"{latest.get('year', '')} {latest.get('period', '')}".strip()
+    valid_rows, diagnostics = _metric_period_rows(rows, annual=False)
+    latest_entry = valid_rows[0] if valid_rows else None
+    if latest_entry is None:
+        if not diagnostics:
+            return ""
+        return (
+            '<div class="callout callout-warning"><ul class="list">'
+            + "".join(f"<li>{_escape(f'Metric period row skipped: {code}.')}</li>" for code in diagnostics)
+            + "</ul></div>"
+        )
+    latest, period_identity = latest_entry
+    period = f"{period_identity.year} {period_identity.period}"
     comparison = latest.get("comparison_period")
     comparison_gap = latest.get("comparison_gap")
     headers = (
@@ -427,6 +461,11 @@ def _interim_financial_snapshot(rows: list[object], language: str, currency: str
                 "Revenue growth: prior-year comparable disclosure is missing or did not pass validation",
             )
         )
+    diagnostic_html = "".join(
+        f"<li>{_escape(f'Metric period row skipped: {code}.')}</li>"
+        for code in diagnostics
+    )
+    diagnostic_html = f'<ul class="list">{diagnostic_html}</ul>' if diagnostic_html else ""
     return (
         '<div class="callout"><strong>'
         + _escape(_pick(language, "最新季度表现", "Latest Interim Performance"))
@@ -439,6 +478,7 @@ def _interim_financial_snapshot(rows: list[object], language: str, currency: str
             )
         )
         + comparison_text
+        + diagnostic_html
         + '</div><table class="data-table interim-table"><thead><tr>'
         + "".join(f"<th>{_escape(label)}</th>" for label in headers)
         + "</tr></thead><tbody><tr>"
@@ -460,20 +500,24 @@ def _financial_section(
     financial_quality: object = None,
 ) -> str:
     english = language == EN
-    rows = metrics if isinstance(metrics, list) else []
+    raw_rows = metrics if isinstance(metrics, list) else []
+    period_rows, _ = _metric_period_rows(raw_rows, annual=True)
+    rows = [row for row, _ in period_rows]
+    period_by_metric = {id(row): identity for row, identity in period_rows}
     interim_rows = interim_metrics if isinstance(interim_metrics, list) else []
     interim_html = _interim_financial_snapshot(interim_rows, language, currency)
     coverage_html = _period_coverage_html(financial_quality, language)
+    metric_gap_note = _annual_metric_gap_note(raw_rows, language)
     if not rows:
         return _section(
             _pick(language, "财务概览", "Financial Overview"),
             coverage_html + interim_html
-            + f"<div class=\"callout callout-warning\">{_escape(_pick(language, '没有可用的标准化年度财务数据。', 'No normalized annual financial data is available.'))}</div>",
+            + f"<div class=\"callout callout-warning\">{_escape(_pick(language, '没有可用的标准化年度财务数据。', 'No normalized annual financial data is available.'))}</div>"
+            + metric_gap_note,
             section_id="financials",
         )
 
-    latest = rows[0] if isinstance(rows[0], dict) else {}
-    metric_gap_note = _annual_metric_gap_note(rows, language)
+    latest = rows[0]
     has_operating_margin = any(row.get("operating_margin") is not None for row in rows if isinstance(row, dict))
     has_free_cash_flow = any(row.get("free_cash_flow") is not None for row in rows if isinstance(row, dict))
     kpis = [("营业收入", "Revenue", format_money(latest.get("revenue"), currency))]
@@ -503,13 +547,11 @@ def _financial_section(
         + "</tr></thead><tbody>"
     )
     for row in rows[:5]:
-        if not isinstance(row, dict):
-            continue
         values = []
         for key, _, _ in columns:
             value = row.get(key)
             if key == "year":
-                values.append(str(value if value is not None else "—"))
+                values.append(str(period_by_metric[id(row)].year))
             elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
                 values.append(format_money(value, currency))
             elif key.endswith("_growth"):
@@ -594,7 +636,7 @@ def _financial_section(
     snapshot_note = ""
     if isinstance(market_snapshot, dict):
         quote_currency = str(market_snapshot.get("quote_currency") or market_snapshot.get("currency", currency))
-        snapshot_currency = str(market_snapshot.get("valuation_currency") or market_snapshot.get("reporting_currency") or currency)
+        snapshot_currency = str(market_snapshot.get("valuation_currency") or market_snapshot.get("reporting_currency") or "")
         manual_snapshot = str(market_snapshot.get("source", "")).casefold() == "manual" or str(market_snapshot.get("status", "")).upper() == "MANUAL"
         values = []
         if isinstance(market_snapshot.get("price"), (int, float)):
@@ -1082,10 +1124,11 @@ def _render_generic(
     language: str,
     level: int = 0,
     field_name: str | None = None,
+    currency: str | None = None,
 ) -> str:
     if value is None:
         return f"<span class=\"muted\">{_escape(_pick(language, '证据不足或尚未提供。', 'Insufficient evidence or not provided.'))}</span>"
-    semantic_value = format_report_semantic_value(value, field_name)
+    semantic_value = format_report_semantic_value(value, field_name, currency)
     if semantic_value is not None:
         return _escape(semantic_value)
     if isinstance(value, str):
@@ -1100,18 +1143,19 @@ def _render_generic(
         if not value:
             return f"<span class=\"muted\">{_escape(_pick(language, '暂无。', 'None.'))}</span>"
         return "<ul class=\"list\">" + "".join(
-            f"<li>{_render_generic(item, language, level + 1, field_name)}</li>"
+            f"<li>{_render_generic(item, language, level + 1, field_name, currency)}</li>"
             for item in value
         ) + "</ul>"
     if isinstance(value, dict):
         parts: list[str] = []
+        own_currency = value.get("currency", currency)
         for key, item in value.items():
             if str(key).startswith("_"):
                 continue
             label = report_field_label(key, language)
             parts.append(
                 f"<div class=\"label\">{_escape(label)}</div>"
-                f"{_render_generic(item, language, level + 1, str(key))}"
+                f"{_render_generic(item, language, level + 1, str(key), own_currency)}"
             )
         return "".join(parts) or f"<span class=\"muted\">{_escape(_pick(language, '暂无可显示内容。', 'No displayable content.'))}</span>"
     return _escape(value)

@@ -19,10 +19,14 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _EMAIL_SEARCH_PATTERN = re.compile(r"[^@\s()<>;,]+@[^@\s()<>;,]+\.[^@\s()<>;,]+")
 
 
+class SecContactConfigurationError(ValueError):
+    code = "SEC_CONTACT_CONFIGURATION_REQUIRED"
+
+
 def validate_sec_contact_email(email: str) -> str:
     normalized = email.strip()
     if not _EMAIL_PATTERN.fullmatch(normalized):
-        raise ValueError("请输入你本人或所在研究团队可正常收信的邮箱地址。")
+        raise SecContactConfigurationError("请输入你本人或所在研究团队可正常收信的邮箱地址。")
     return normalized
 
 

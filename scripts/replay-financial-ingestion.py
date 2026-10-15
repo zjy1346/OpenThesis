@@ -10,6 +10,7 @@ Raw excerpts and local paths are deliberately omitted from the output.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import hashlib
 import json
 import math
@@ -20,7 +21,7 @@ import time
 from typing import Any
 
 from openthesis.domain import Company, FilingDocument
-from openthesis.financial_compiler import FinancialFactCompiler
+from openthesis.financial_pipeline import FinancialCandidatePipeline
 from openthesis.financial_ingestion import FinancialIngestionEngine
 
 
@@ -69,6 +70,8 @@ def _fact_view(fact: Any) -> dict[str, Any]:
         "source_bbox": getattr(fact, "source_bbox", None),
         "source_column": str(getattr(fact, "source_column", "") or ""),
         "extractor_parser_version": str(getattr(fact, "parser_version", "") or ""),
+        "normalization_lineage": (asdict(fact.normalization_lineage)
+                                  if getattr(fact, "normalization_lineage", None) else None),
         "raw_excerpt_sha256": hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
         if raw_text else "",
     }
@@ -173,6 +176,28 @@ def _filings_from_manifest(value: Any, company: Company) -> tuple[list[FilingDoc
     return filings, sources
 
 
+def _verify_sources_after_parse(
+    filings: list[FilingDocument], source_manifest: list[dict[str, str]],
+) -> None:
+    """Confirm parser inputs still have their pre-parse identity and bytes."""
+
+    current_sources: list[dict[str, str]] = []
+    for filing in filings:
+        source_path = Path(filing.local_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError("replay_source_unavailable")
+        actual_hash = _sha256(source_path)
+        if actual_hash.casefold() != str(filing.content_hash).casefold():
+            raise ValueError("replay_source_changed_during_parse")
+        current_sources.append({
+            "document_id": str(filing.document_id),
+            "accession": str(filing.accession_number),
+            "sha256": actual_hash,
+        })
+    if current_sources != source_manifest:
+        raise ValueError("replay_source_manifest_changed_during_parse")
+
+
 def replay(manifest: dict[str, Any]) -> dict[str, Any]:
     """Run the local parse+compiler path without model, network, or DB access."""
 
@@ -210,12 +235,13 @@ def replay(manifest: dict[str, Any]) -> dict[str, Any]:
             return result
 
         engine.collect_candidate_batches = collect_and_capture  # type: ignore[method-assign]
-        dataset = FinancialFactCompiler().compile_from_ingestion(
+        dataset = FinancialCandidatePipeline().compile_from_ingestion(
             company,
             filings,
             engine,
             progress=progress,
         )
+    _verify_sources_after_parse(filings, source_manifest)
 
     collection = captured.get("collection")
     if collection is None:

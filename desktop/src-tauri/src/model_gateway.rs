@@ -73,7 +73,10 @@ impl ModelGateway {
         let secret_ref =
             secret_override.or_else(|| stored_secret.as_ref().map(|value| value.as_str()));
         let client = build_client(&connection, 30)?;
-        let url = endpoint_url(&connection.endpoint, provider.models_path.unwrap_or("/models"))?;
+        let url = endpoint_url(
+            &connection.endpoint,
+            provider.models_path.unwrap_or("/models"),
+        )?;
         let request = authorize(client.get(url), secret_ref)?;
         let response = request
             .send()
@@ -135,6 +138,24 @@ impl ModelGateway {
             user_prompt,
             json_mode,
             None,
+            true,
+        )
+    }
+
+    fn generate_once(
+        &self,
+        configured_model_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        json_mode: bool,
+    ) -> Result<GatewayGenerateResult, GatewayError> {
+        self.generate_with_secret(
+            configured_model_id,
+            system_prompt,
+            user_prompt,
+            json_mode,
+            None,
+            false,
         )
     }
 
@@ -145,6 +166,7 @@ impl ModelGateway {
         user_prompt: &str,
         json_mode: bool,
         secret_override: Option<&str>,
+        allow_format_fallback: bool,
     ) -> Result<GatewayGenerateResult, GatewayError> {
         if system_prompt.len() + user_prompt.len() > 7 * 1024 * 1024 {
             return Err(GatewayError::new(
@@ -210,6 +232,7 @@ impl ModelGateway {
                 system_prompt,
                 user_prompt,
                 json_mode,
+                allow_format_fallback,
             )
         }
     }
@@ -221,6 +244,27 @@ impl ModelGateway {
         user_prompt: &str,
         image_media_type: &str,
         image_base64: &str,
+    ) -> Result<GatewayGenerateResult, GatewayError> {
+        self.generate_vision_with_format(
+            configured_model_id,
+            system_prompt,
+            user_prompt,
+            image_media_type,
+            image_base64,
+            true,
+            true,
+        )
+    }
+
+    fn generate_vision_with_format(
+        &self,
+        configured_model_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        image_media_type: &str,
+        image_base64: &str,
+        json_mode: bool,
+        allow_format_fallback: bool,
     ) -> Result<GatewayGenerateResult, GatewayError> {
         if system_prompt.len() + user_prompt.len() > 512 * 1024
             || image_base64.len() > 11 * 1024 * 1024
@@ -288,15 +332,17 @@ impl ModelGateway {
         let client = build_client(&connection, timeout)?;
         let response = if model.provider_id == "ollama" {
             let url = endpoint_url(&model.endpoint, "api/chat")?;
-            let payload = json!({
+            let mut payload = json!({
                 "model": model.model_id,
                 "stream": false,
-                "format": "json",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt, "images": [image_base64]}
                 ]
             });
+            if json_mode {
+                payload["format"] = json!("json");
+            }
             post_json(&client, &url, &payload, secret_ref)?
         } else {
             let url = endpoint_url(&model.endpoint, "chat/completions")?;
@@ -310,14 +356,20 @@ impl ModelGateway {
                             "url": format!("data:{image_media_type};base64,{image_base64}")
                         }}
                     ]}
-                ],
-                "response_format": {"type": "json_object"}
+                ]
             });
+            if json_mode {
+                payload["response_format"] = json!({"type": "json_object"});
+            }
             if let Some(temperature) = model.temperature {
                 payload["temperature"] = json!(temperature);
             }
             match post_json(&client, &url, &payload, secret_ref) {
-                Err(error) if response_format_is_unsupported(&error) => {
+                Err(error)
+                    if json_mode
+                        && allow_format_fallback
+                        && response_format_is_unsupported(&error) =>
+                {
                     payload
                         .as_object_mut()
                         .expect("gateway payload is an object")
@@ -346,23 +398,10 @@ impl ModelGateway {
                     .map(str::to_string),
             )
         } else {
-            (
-                response
-                    .pointer("/choices/0/message/content")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        GatewayError::new(
-                            "MODEL_RESPONSE_INVALID",
-                            "The vision response did not contain message.content.",
-                            false,
-                        )
-                    })?
-                    .to_string(),
-                response
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            )
+            parse_openai_compatible_message(
+                &response,
+                "The vision response did not contain message.content.",
+            )?
         };
         Ok(self.result(&model, content, finish_reason))
     }
@@ -375,6 +414,7 @@ impl ModelGateway {
         system_prompt: &str,
         user_prompt: &str,
         json_mode: bool,
+        allow_format_fallback: bool,
     ) -> Result<GatewayGenerateResult, GatewayError> {
         let url = endpoint_url(&model.endpoint, "chat/completions")?;
         let mut payload = json!({
@@ -391,7 +431,9 @@ impl ModelGateway {
             payload["response_format"] = json!({"type": "json_object"});
         }
         let response = match post_json(client, &url, &payload, secret) {
-            Err(error) if json_mode && response_format_is_unsupported(&error) => {
+            Err(error)
+                if json_mode && allow_format_fallback && response_format_is_unsupported(&error) =>
+            {
                 payload
                     .as_object_mut()
                     .expect("gateway payload is an object")
@@ -400,21 +442,10 @@ impl ModelGateway {
             }
             result => result?,
         };
-        let content = response
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                GatewayError::new(
-                    "MODEL_RESPONSE_INVALID",
-                    "The provider response did not contain message.content.",
-                    false,
-                )
-            })?
-            .to_string();
-        let finish_reason = response
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let (content, finish_reason) = parse_openai_compatible_message(
+            &response,
+            "The provider response did not contain message.content.",
+        )?;
         Ok(self.result(model, content, finish_reason))
     }
 
@@ -537,6 +568,7 @@ impl ModelGateway {
                 r#"{"task":"Return {\"ok\":true}."}"#,
                 true,
                 Some(staged_secret.as_str()),
+                true,
             )
             .map(|_| ())
         };
@@ -569,19 +601,22 @@ impl ModelGateway {
                 "The model connection is disabled.",
                 false,
             );
-            let _ = self
-                .center
-                .mark_connection_status(connection_id, "disabled", Some(&error.code));
+            let _ =
+                self.center
+                    .mark_connection_status(connection_id, "disabled", Some(&error.code));
             return Err(error);
         }
         let provider = provider_registry::find(&connection.provider_id)
             .ok_or_else(|| GatewayError::configuration("Unknown provider."))?;
-        let requested_model_id = requested_model_id.map(str::trim).filter(|value| !value.is_empty());
+        let requested_model_id = requested_model_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         if let Some(model_id) = requested_model_id {
-            provider_registry::validate_model_id(model_id)
-                .map_err(GatewayError::configuration)?;
+            provider_registry::validate_model_id(model_id).map_err(GatewayError::configuration)?;
         }
-        let discovered_ollama_model = if requested_model_id.is_none() && connection.provider_id == "ollama" {
+        let discovered_ollama_model = if requested_model_id.is_none()
+            && connection.provider_id == "ollama"
+        {
             let models = self.discover_models_with_secret(connection_id, None)?;
             Some(models.into_iter().next().ok_or_else(|| GatewayError::new(
                 "MODEL_NO_INSTALLED_MODEL",
@@ -639,6 +674,8 @@ impl ModelGateway {
                     temperature: None,
                     timeout_seconds: 30,
                 },
+                capabilities: Vec::new(),
+                warnings: Vec::new(),
             });
         }
         let model_id = requested_model_id
@@ -646,13 +683,14 @@ impl ModelGateway {
             .or(discovered_ollama_model)
             .or_else(|| provider.default_test_model_id.map(str::to_string))
             .or(configured_model)
-            .ok_or_else(|| GatewayError::new(
-                "MODEL_TEST_MODEL_REQUIRED",
-                "Select or add a model before testing this custom connection.",
-                false,
-            ))?;
-        provider_registry::validate_model_id(&model_id)
-            .map_err(GatewayError::configuration)?;
+            .ok_or_else(|| {
+                GatewayError::new(
+                    "MODEL_TEST_MODEL_REQUIRED",
+                    "Select or add a model before testing this custom connection.",
+                    false,
+                )
+            })?;
+        provider_registry::validate_model_id(&model_id).map_err(GatewayError::configuration)?;
         let secret = self
             .center
             .credential_for_connection(&connection)
@@ -670,8 +708,10 @@ impl ModelGateway {
             alias: format!("{} connection test", provider.display_name),
             model_enabled: true,
             capabilities: vec!["text_chat".to_string(), "structured_json".to_string()],
-            billing_class: provider_registry::billing_class_for(&connection.provider_id, &model_id).to_string(),
-            free_source_url: provider_registry::free_source_url(&connection.provider_id, &model_id).map(str::to_string),
+            billing_class: provider_registry::billing_class_for(&connection.provider_id, &model_id)
+                .to_string(),
+            free_source_url: provider_registry::free_source_url(&connection.provider_id, &model_id)
+                .map(str::to_string),
             free_verified_at: None,
             temperature: None,
             timeout_seconds: 30,
@@ -695,6 +735,7 @@ impl ModelGateway {
                 "You are a connection test. Return JSON only.",
                 r#"{"task":"Return {\"ok\":true}."}"#,
                 true,
+                true,
             )
         };
         match result {
@@ -706,6 +747,8 @@ impl ModelGateway {
                     ok: true,
                     message: format!("Connection test succeeded with {}.", model_id),
                     meta: result.meta,
+                    capabilities: Vec::new(),
+                    warnings: Vec::new(),
                 })
             }
             Err(error) => {
@@ -722,59 +765,156 @@ impl ModelGateway {
         &self,
         configured_model_id: &str,
     ) -> Result<GatewayTestResult, GatewayError> {
-        let result: Result<GatewayGenerateResult, GatewayError> = (|| {
-            let text_result = self.generate(
-                configured_model_id,
-                "You are a connection test. Return JSON only.",
-                r#"{"task":"Return {\"ok\":true}."}"#,
-                true,
-            )?;
-            let model = self
-                .center
-                .configured_model_runtime(configured_model_id)
-                .map_err(GatewayError::configuration)?;
-            if model
-                .capabilities
-                .iter()
-                .any(|capability| capability == "vision")
-            {
-                const TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-                self.generate_vision(
-                    configured_model_id,
-                    "You are a vision connection test. Return JSON only.",
-                    r#"{"task":"Confirm that an image was received and return {\"ok\":true}."}"#,
-                    "image/png",
-                    TEST_PNG,
-                )?;
-            }
-            Ok(text_result)
-        })();
-        match result {
+        let model = self
+            .center
+            .configured_model_runtime(configured_model_id)
+            .map_err(GatewayError::configuration)?;
+        let mut capabilities = Vec::new();
+        let mut warnings = Vec::new();
+        let requested_versions = (model.configuration_version, model.connection_configuration_version,
+                                  model.credential_version);
+        let text_result = match self.generate(
+            configured_model_id,
+            "You are a connection test. Return JSON only.",
+            r#"{"task":"Return {\"ok\":true}."}"#,
+            false,
+        ) {
             Ok(result) => {
-                let _ =
-                    self.center
-                        .mark_connection_status(&result.meta.connection_id, "ready", None);
-                let _ = self.center.mark_model_health(configured_model_id, "ready");
-                Ok(GatewayTestResult {
-                    ok: true,
-                    message: "Connection and declared capabilities succeeded.".to_string(),
-                    meta: result.meta,
-                })
+                self.record_capability(configured_model_id, "text_chat", "ready", None,
+                                       probe_versions(&result.meta))?;
+                capabilities.push(GatewayCapabilityResult::ready("text_chat"));
+                result
             }
             Err(error) => {
-                if let Ok(model) = self.center.configured_model_runtime(configured_model_id) {
-                    let status = health_status_for_error(&error.code);
-                    let _ = self.center.mark_connection_status(
-                        &model.connection_id,
-                        status,
-                        Some(&error.code),
-                    );
-                    let _ = self.center.mark_model_health(configured_model_id, status);
-                }
-                Err(error)
+                self.record_capability(
+                    configured_model_id,
+                    "text_chat",
+                    "error",
+                    Some(&error),
+                    requested_versions,
+                )?;
+                return Err(self.finish_model_test_error(&model, error));
+            }
+        };
+
+        if model
+            .capabilities
+            .iter()
+            .any(|capability| capability == "structured_json")
+        {
+            if serde_json::from_str::<Value>(&text_result.content)
+                .is_ok_and(|value| value.is_object())
+            {
+                self.record_capability(configured_model_id, "structured_json", "ready", None,
+                                       probe_versions(&text_result.meta))?;
+                capabilities.push(GatewayCapabilityResult::ready("structured_json"));
+            } else {
+                let error = GatewayError::new(
+                    "MODEL_STRUCTURED_JSON_INVALID",
+                    "The text response was valid text but not a JSON object.",
+                    false,
+                );
+                self.record_capability(
+                    configured_model_id,
+                    "structured_json",
+                    "error",
+                    Some(&error),
+                    probe_versions(&text_result.meta),
+                )?;
+                capabilities.push(GatewayCapabilityResult::error(
+                    "structured_json",
+                    &error,
+                ));
+                warnings.push(error.message.clone());
             }
         }
+
+        if model
+            .capabilities
+            .iter()
+            .any(|capability| capability == "vision")
+        {
+            const TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+            match self.generate_vision(
+                configured_model_id,
+                "You are a vision connection test. Return JSON only.",
+                r#"{"task":"Confirm that an image was received and return {\"ok\":true}."}"#,
+                "image/png",
+                TEST_PNG,
+            ) {
+                Ok(result) => {
+                    self.record_capability(configured_model_id, "vision", "ready", None,
+                                           probe_versions(&result.meta))?;
+                    capabilities.push(GatewayCapabilityResult::ready("vision"));
+                }
+                Err(error) => {
+                    self.record_capability(
+                        configured_model_id,
+                        "vision",
+                        "error",
+                        Some(&error),
+                        requested_versions,
+                    )?;
+                    capabilities.push(GatewayCapabilityResult::error("vision", &error));
+                    warnings.push(error.message.clone());
+                }
+            }
+        }
+
+        let ok = capabilities.iter().all(|check| check.status == "ready");
+        self.center.mark_probe_health_for_versions(configured_model_id, "ready", None,
+            probe_versions(&text_result.meta)).map_err(GatewayError::configuration)?;
+        Ok(GatewayTestResult {
+            ok,
+            message: if ok {
+                "Connection and declared capabilities succeeded.".to_string()
+            } else {
+                format!(
+                    "Text connection succeeded; capability checks need attention: {}.",
+                    warnings.join(" ")
+                )
+            },
+            meta: text_result.meta,
+            capabilities,
+            warnings,
+        })
     }
+
+    fn record_capability(
+        &self,
+        configured_model_id: &str,
+        capability: &str,
+        status: &str,
+        error: Option<&GatewayError>,
+        versions: (i64, i64, i64),
+    ) -> Result<(), GatewayError> {
+        self.center.record_capability_check_for_versions(
+            configured_model_id,
+            capability,
+            status,
+            error.map(|value| value.code.as_str()),
+            error.and_then(|value| value.retry_after_seconds),
+            versions,
+        ).map_err(GatewayError::configuration)
+    }
+
+    fn finish_model_test_error(
+        &self,
+        model: &ConfiguredModelRuntime,
+        error: GatewayError,
+    ) -> GatewayError {
+        let status = health_status_for_error(&error.code);
+        if let Err(local_error) = self.center.mark_probe_health_for_versions(
+            &model.configured_model_id, status, Some(&error.code),
+            (model.configuration_version, model.connection_configuration_version, model.credential_version)) {
+            return GatewayError::configuration(local_error);
+        }
+        error
+    }
+}
+
+fn probe_versions(meta: &GatewayResponseMeta) -> (i64, i64, i64) {
+    (meta.model_configuration_version, meta.connection_configuration_version, meta.credential_version)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -820,6 +960,39 @@ pub struct GatewayTestResult {
     pub ok: bool,
     pub message: String,
     pub meta: GatewayResponseMeta,
+    pub capabilities: Vec<GatewayCapabilityResult>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GatewayCapabilityResult {
+    pub capability: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
+}
+
+impl GatewayCapabilityResult {
+    fn ready(capability: &str) -> Self {
+        Self {
+            capability: capability.to_string(),
+            status: "ready".to_string(),
+            error_code: None,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn error(capability: &str, error: &GatewayError) -> Self {
+        Self {
+            capability: capability.to_string(),
+            status: "error".to_string(),
+            error_code: Some(error.code.clone()),
+            retry_after_seconds: error.retry_after_seconds,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -830,6 +1003,8 @@ pub struct GatewayError {
     pub retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 impl GatewayError {
@@ -839,6 +1014,7 @@ impl GatewayError {
             message: message.into(),
             retryable,
             retry_after_seconds: None,
+            http_status: None,
         }
     }
 
@@ -1088,6 +1264,14 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             429 => "MODEL_RATE_LIMITED",
             value if value >= 500 => "MODEL_PROVIDER_UNAVAILABLE",
             _ if context_capacity => "MODEL_CONTEXT_CAPACITY",
+            400 | 422
+                if lowered_detail.contains("response_format")
+                    && ["unsupported", "not support", "unknown", "invalid"]
+                        .iter()
+                        .any(|marker| lowered_detail.contains(marker)) =>
+            {
+                "MODEL_RESPONSE_FORMAT_UNSUPPORTED"
+            }
             _ => "MODEL_HTTP_ERROR",
         };
         let retryable =
@@ -1099,6 +1283,7 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
         };
         let mut error = GatewayError::new(code, message, retryable);
         error.retry_after_seconds = retry_after_seconds;
+        error.http_status = Some(status.as_u16());
         return Err(error);
     }
     let result = serde_json::from_slice::<Value>(&body).map_err(|_| {
@@ -1117,18 +1302,53 @@ fn parse_retry_after_seconds(value: &str) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
-        .map(|seconds| seconds.clamp(1, 300))
+        .map(|seconds| seconds.max(1))
 }
 
 fn response_format_is_unsupported(error: &GatewayError) -> bool {
-    if error.code != "MODEL_HTTP_ERROR" {
-        return false;
+    error.code == "MODEL_RESPONSE_FORMAT_UNSUPPORTED"
+        && matches!(error.http_status, Some(400) | Some(422))
+}
+
+fn parse_openai_compatible_message(
+    response: &Value,
+    invalid_content_message: &str,
+) -> Result<(String, Option<String>), GatewayError> {
+    let finish_reason = response
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str);
+    let message = response
+        .pointer("/choices/0/message")
+        .and_then(Value::as_object);
+    let refusal = message
+        .and_then(|value| value.get("refusal"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let is_refusal =
+        refusal.is_some() || matches!(finish_reason, Some("refusal") | Some("content_filter"));
+    if is_refusal {
+        let content = refusal
+            .or_else(|| {
+                message
+                    .and_then(|value| value.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default()
+            .to_string();
+        let normalized_finish_reason = if finish_reason == Some("content_filter") {
+            "content_filter"
+        } else {
+            "refusal"
+        };
+        return Ok((content, Some(normalized_finish_reason.to_string())));
     }
-    let detail = error.message.to_ascii_lowercase();
-    detail.contains("response_format")
-        && ["unsupported", "not support", "unknown", "invalid"]
-            .iter()
-            .any(|marker| detail.contains(marker))
+    let content = message
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            GatewayError::new("MODEL_RESPONSE_INVALID", invalid_content_message, false)
+        })?;
+    Ok((content.to_string(), finish_reason.map(str::to_string)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1144,6 +1364,8 @@ struct GatewayCliRequest {
     image_media_type: String,
     #[serde(default)]
     image_base64: String,
+    #[serde(default)]
+    wire_contract: String,
 }
 
 fn default_json_mode() -> bool {
@@ -1154,19 +1376,28 @@ fn default_json_mode() -> bool {
 #[serde(rename_all = "snake_case")]
 struct GatewayCliResponse {
     ok: bool,
+    wire_contract: &'static str,
     result: Option<GatewayGenerateResult>,
     error: Option<GatewayError>,
 }
 
 pub fn run_model_gateway_stdio() -> i32 {
-    let response = match read_cli_request().and_then(run_cli_request) {
+    let request = read_cli_request();
+    let wire_contract = match request.as_ref().map(|value| value.operation.as_str()) {
+        Ok("generate") => "text-single-request-v1",
+        Ok("vision") => "vision-single-request-v1",
+        _ => "",
+    };
+    let response = match request.and_then(run_cli_request) {
         Ok(result) => GatewayCliResponse {
             ok: true,
+            wire_contract,
             result: Some(result),
             error: None,
         },
         Err(error) => GatewayCliResponse {
             ok: false,
+            wire_contract,
             result: None,
             error: Some(error),
         },
@@ -1214,6 +1445,20 @@ fn read_cli_request() -> Result<GatewayCliRequest, GatewayError> {
 }
 
 fn run_cli_request(request: GatewayCliRequest) -> Result<GatewayGenerateResult, GatewayError> {
+    // This contract has exactly one wire attempt. Its Python owner persists
+    // authorization, debit and intent before any compatible format fallback.
+    let required_contract = match request.operation.as_str() {
+        "generate" => "text-single-request-v1",
+        "vision" => "vision-single-request-v1",
+        _ => "",
+    };
+    if required_contract.is_empty() || request.wire_contract != required_contract {
+        return Err(GatewayError::new(
+            "MODEL_GATEWAY_PROTOCOL_ERROR",
+            "The model wire contract is incompatible.",
+            false,
+        ));
+    }
     let data_dir = std::env::var("OPENTHESIS_DATA_DIR").map_err(|_| {
         GatewayError::new(
             "MODEL_GATEWAY_CONFIGURATION_ERROR",
@@ -1227,18 +1472,20 @@ fn run_cli_request(request: GatewayCliRequest) -> Result<GatewayGenerateResult, 
         Arc::new(ModelCenter::new(db_path, platform_vault()).map_err(GatewayError::configuration)?);
     let gateway = ModelGateway::new(center);
     match request.operation.as_str() {
-        "generate" => gateway.generate(
+        "generate" => gateway.generate_once(
             &request.configured_model_id,
             &request.system_prompt,
             &request.user_prompt,
             request.json_mode,
         ),
-        "vision" => gateway.generate_vision(
+        "vision" => gateway.generate_vision_with_format(
             &request.configured_model_id,
             &request.system_prompt,
             &request.user_prompt,
             &request.image_media_type,
             &request.image_base64,
+            request.json_mode,
+            false,
         ),
         _ => Err(GatewayError::new(
             "MODEL_GATEWAY_PROTOCOL_ERROR",
@@ -1365,6 +1612,34 @@ mod tests {
         response_server(status, body, 1)
     }
 
+    fn sequenced_response_server(responses: &[(&str, &str)]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let responses: Vec<(String, String)> = responses
+            .iter()
+            .map(|(status, body)| ((*status).to_string(), (*body).to_string()))
+            .collect();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap() > 0 {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
+    }
+
     fn configured_custom(endpoint: String, secret: Option<&str>) -> (Arc<ModelCenter>, String) {
         let center = center();
         center
@@ -1434,7 +1709,12 @@ mod tests {
         );
         let (center, model_id) = configured_custom(endpoint, Some("gateway-secret"));
         let error = ModelGateway::new(center)
-            .generate(&model_id, "private system prompt", "private user prompt", true)
+            .generate(
+                &model_id,
+                "private system prompt",
+                "private user prompt",
+                true,
+            )
             .unwrap_err();
         assert_eq!(error.code, "MODEL_CONTEXT_CAPACITY");
         assert!(!error.retryable);
@@ -1461,9 +1741,9 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_accepts_only_bounded_delta_seconds() {
+    fn retry_after_preserves_server_minimum_delta_seconds() {
         assert_eq!(parse_retry_after_seconds("0"), Some(1));
-        assert_eq!(parse_retry_after_seconds("900"), Some(300));
+        assert_eq!(parse_retry_after_seconds("900"), Some(900));
         assert_eq!(parse_retry_after_seconds("tomorrow"), None);
     }
 
@@ -1497,6 +1777,311 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "MODEL_CAPABILITY_MISMATCH");
     }
+
+    fn configured_vision(endpoint: String) -> (Arc<ModelCenter>, String) {
+        let (center, model_id) = configured_custom(endpoint, None);
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: model_id.clone(),
+                connection_id: "custom-local".into(),
+                model_id: "test-model".into(),
+                alias: "Vision test model".into(),
+                enabled: true,
+                capabilities: vec![
+                    "text_chat".into(),
+                    "structured_json".into(),
+                    "vision".into(),
+                ],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+        (center, model_id)
+    }
+
+    #[test]
+    fn single_vision_wire_returns_format_rejection_without_an_internal_second_request() {
+        let (center, model_id) = configured_vision(one_response_server(
+            "400 Bad Request",
+            r#"{"error":{"message":"response_format unsupported"}}"#,
+        ));
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let error = ModelGateway::new(center)
+            .generate_vision_with_format(
+                &model_id,
+                "system",
+                "user",
+                "image/png",
+                &png,
+                true,
+                false,
+            )
+            .unwrap_err();
+        // The one-response server is closed. An implicit second POST would
+        // turn this into a transport error instead of this explicit rejection.
+        assert_eq!(error.code, "MODEL_RESPONSE_FORMAT_UNSUPPORTED");
+        assert_eq!(error.http_status, Some(400));
+    }
+
+    #[test]
+    fn single_text_wire_returns_format_rejection_without_an_internal_second_request() {
+        for (status, status_text) in [(400, "400 Bad Request"), (422, "422 Unprocessable Entity")] {
+            let endpoint = one_response_server(
+                status_text,
+                r#"{"error":{"code":"MODEL_RESPONSE_FORMAT_UNSUPPORTED","message":"response_format unsupported"}}"#,
+            );
+            let (center, model_id) = configured_custom(endpoint, None);
+            let error = ModelGateway::new(center)
+                .generate_once(&model_id, "system", "user", true)
+                .unwrap_err();
+            // The one-response server is closed. An implicit second POST would
+            // turn this into a transport error instead of this explicit rejection.
+            assert_eq!(error.code, "MODEL_RESPONSE_FORMAT_UNSUPPORTED");
+            assert_eq!(error.http_status, Some(status));
+        }
+    }
+
+    #[test]
+    fn openai_message_refusal_is_returned_when_content_is_null() {
+        let response = json!({
+            "choices": [{
+                "message": {"content": null, "refusal": "I cannot comply."},
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed = parse_openai_compatible_message(
+            &response,
+            "The provider response did not contain message.content.",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "I cannot comply.");
+        assert_eq!(parsed.1.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn openai_content_filter_preserves_empty_content_and_finish_reason() {
+        let response = json!({
+            "choices": [{
+                "message": {"content": "", "refusal": null},
+                "finish_reason": "content_filter"
+            }]
+        });
+        let parsed = parse_openai_compatible_message(
+            &response,
+            "The provider response did not contain message.content.",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "");
+        assert_eq!(parsed.1.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn openai_non_refusal_still_requires_string_content() {
+        let response = json!({
+            "choices": [{
+                "message": {"content": null},
+                "finish_reason": "stop"
+            }]
+        });
+        let error = parse_openai_compatible_message(
+            &response,
+            "The provider response did not contain message.content.",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "MODEL_RESPONSE_INVALID");
+    }
+
+    #[test]
+    fn openai_refusal_is_one_wire_and_does_not_open_format_fallback() {
+        let endpoint = one_response_server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":null,"refusal":"I cannot comply."},"finish_reason":"stop"}]}"#,
+        );
+        let (center, model_id) = configured_custom(endpoint, None);
+        let result = ModelGateway::new(center)
+            .generate(&model_id, "system", "user", true)
+            .unwrap();
+        assert_eq!(result.content, "I cannot comply.");
+        assert_eq!(result.meta.finish_reason.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn openai_vision_refusal_uses_the_same_one_wire_parser() {
+        let (center, model_id) = configured_vision(one_response_server(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":null,"refusal":"Vision declined."},"finish_reason":"refusal"}]}"#,
+        ));
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let result = ModelGateway::new(center)
+            .generate_vision(&model_id, "system", "user", "image/png", &png)
+            .unwrap();
+        assert_eq!(result.content, "Vision declined.");
+        assert_eq!(result.meta.finish_reason.as_deref(), Some("refusal"));
+    }
+
+    #[test]
+    fn text_wire_json_disabled_preserves_model_prompts_and_omits_response_format() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sender
+                .send(serde_json::from_slice::<Value>(&body).unwrap())
+                .unwrap();
+            let response =
+                r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let (center, model_id) = configured_custom(endpoint, None);
+        let result = ModelGateway::new(center)
+            .generate_once(&model_id, "complete-system", "complete-user", false)
+            .unwrap();
+        assert_eq!(result.content, r#"{"ok":true}"#);
+        let payload = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(payload["model"], "test-model");
+        assert_eq!(payload["messages"][0]["content"], "complete-system");
+        assert_eq!(payload["messages"][1]["content"], "complete-user");
+        assert!(payload.get("response_format").is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn server_error_with_format_words_is_not_a_proven_format_rejection() {
+        let (center, model_id) = configured_vision(one_response_server(
+            "500 Internal Server Error",
+            "response_format unsupported",
+        ));
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let error = ModelGateway::new(center)
+            .generate_vision_with_format(
+                &model_id,
+                "system",
+                "user",
+                "image/png",
+                &png,
+                true,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "MODEL_PROVIDER_UNAVAILABLE");
+        assert!(!response_format_is_unsupported(&error));
+    }
+
+    #[test]
+    fn legacy_vision_cli_contract_is_rejected_before_configuration_or_network() {
+        let request = GatewayCliRequest {
+            operation: "vision".into(),
+            configured_model_id: "missing".into(),
+            system_prompt: "system".into(),
+            user_prompt: "user".into(),
+            json_mode: true,
+            image_media_type: "image/png".into(),
+            image_base64: "unused".into(),
+            wire_contract: String::new(),
+        };
+        assert_eq!(
+            run_cli_request(request).unwrap_err().code,
+            "MODEL_GATEWAY_PROTOCOL_ERROR"
+        );
+    }
+
+    #[test]
+    fn legacy_text_cli_contract_is_rejected_before_configuration_or_network() {
+        let request = GatewayCliRequest {
+            operation: "generate".into(),
+            configured_model_id: "missing".into(),
+            system_prompt: "system".into(),
+            user_prompt: "user".into(),
+            json_mode: false,
+            image_media_type: String::new(),
+            image_base64: String::new(),
+            wire_contract: String::new(),
+        };
+        assert_eq!(
+            run_cli_request(request).unwrap_err().code,
+            "MODEL_GATEWAY_PROTOCOL_ERROR"
+        );
+    }
+
+    #[test]
+    fn format_disabled_vision_still_sends_the_complete_image_and_prompt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            assert!(content_length < 1024 * 1024);
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sender
+                .send(serde_json::from_slice::<Value>(&body).unwrap())
+                .unwrap();
+            let response =
+                r#"{"choices":[{"message":{"content":"{\"facts\":[]}"},"finish_reason":"stop"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let (center, model_id) = configured_vision(endpoint);
+        let png = base64::engine::general_purpose::STANDARD
+            .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let result = ModelGateway::new(center)
+            .generate_vision_with_format(
+                &model_id,
+                "entire-system",
+                "entire-user",
+                "image/png",
+                &png,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(result.content, r#"{"facts":[]}"#);
+        let payload = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(payload.get("response_format").is_none());
+        assert_eq!(payload["messages"][0]["content"], "entire-system");
+        assert_eq!(payload["messages"][1]["content"][0]["text"], "entire-user");
+        assert_eq!(
+            payload["messages"][1]["content"][1]["image_url"]["url"],
+            format!("data:image/png;base64,{png}")
+        );
+        worker.join().unwrap();
+    }
     #[test]
     fn model_test_verifies_declared_vision_with_a_second_request() {
         let endpoint = response_server(
@@ -1523,9 +2108,123 @@ mod tests {
             })
             .unwrap();
 
-        let result = ModelGateway::new(center).test_model(&model_id).unwrap();
+        let result = ModelGateway::new(center.clone()).test_model(&model_id).unwrap();
         assert!(result.ok);
         assert!(result.message.contains("declared capabilities"));
+        assert_eq!(
+            result
+                .capabilities
+                .iter()
+                .map(|check| (check.capability.as_str(), check.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("text_chat", "ready"),
+                ("structured_json", "ready"),
+                ("vision", "ready"),
+            ]
+        );
+        let checks = center.list_models().unwrap()[0].capability_checks.clone();
+        assert_eq!(checks.len(), 3);
+        assert!(checks.iter().all(|check| check.status == "ready"));
+    }
+
+    #[test]
+    fn model_test_keeps_text_ready_when_structured_json_is_not_an_object() {
+        let endpoint = one_response_server("200 OK", r#"{"choices":[{"message":{"content":"[]"},"finish_reason":"stop"}]}"#);
+        let (center, model_id) = configured_custom(endpoint, None);
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: model_id.clone(),
+                connection_id: "custom-local".into(),
+                model_id: "test-model".into(),
+                alias: "Structured check".into(),
+                enabled: true,
+                capabilities: vec!["text_chat".into(), "structured_json".into()],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+
+        let result = ModelGateway::new(center.clone()).test_model(&model_id).unwrap();
+        assert!(!result.ok);
+        assert_eq!(
+            result
+                .capabilities
+                .iter()
+                .map(|check| (check.capability.as_str(), check.status.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("text_chat", "ready"), ("structured_json", "error")]
+        );
+        let checks = center.list_models().unwrap()[0].capability_checks.clone();
+        assert_eq!(checks[0].status, "error");
+        assert_eq!(checks[0].error_code.as_deref(), Some("MODEL_STRUCTURED_JSON_INVALID"));
+        assert_eq!(checks[1].status, "ready");
+    }
+
+    #[test]
+    fn model_test_vision_failure_does_not_revoke_text_success() {
+        let endpoint = sequenced_response_server(&[
+            ("200 OK", r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#),
+            ("500 Internal Server Error", r#"{"error":{"message":"temporary provider failure"}}"#),
+        ]);
+        let (center, model_id) = configured_custom(endpoint, None);
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: model_id.clone(),
+                connection_id: "custom-local".into(),
+                model_id: "test-model".into(),
+                alias: "Vision warning".into(),
+                enabled: true,
+                capabilities: vec!["text_chat".into(), "structured_json".into(), "vision".into()],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+
+        let result = ModelGateway::new(center.clone()).test_model(&model_id).unwrap();
+        assert!(!result.ok);
+        assert!(result
+            .capabilities
+            .iter()
+            .any(|check| check.capability == "text_chat" && check.status == "ready"));
+        assert!(result
+            .capabilities
+            .iter()
+            .any(|check| check.capability == "structured_json" && check.status == "ready"));
+        let vision = result
+            .capabilities
+            .iter()
+            .find(|check| check.capability == "vision")
+            .unwrap();
+        assert_eq!(vision.status, "error");
+        assert_eq!(vision.error_code.as_deref(), Some("MODEL_PROVIDER_UNAVAILABLE"));
+        let checks = center.list_models().unwrap()[0].capability_checks.clone();
+        assert!(checks
+            .iter()
+            .any(|check| check.capability == "text_chat" && check.status == "ready"));
+        assert!(checks
+            .iter()
+            .any(|check| check.capability == "vision" && check.status == "error"));
+    }
+
+    #[test]
+    fn model_test_persists_retry_after_for_text_failure() {
+        let endpoint = response_server_with_retry_after(
+            "429 Too Many Requests",
+            r#"{"error":{"message":"rate limit"}}"#,
+            1,
+            Some("17"),
+        );
+        let (center, model_id) = configured_custom(endpoint, None);
+        let error = ModelGateway::new(center.clone()).test_model(&model_id).unwrap_err();
+        assert_eq!(error.code, "MODEL_RATE_LIMITED");
+        let checks = center.list_models().unwrap()[0].capability_checks.clone();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].capability, "text_chat");
+        assert_eq!(checks[0].status, "error");
+        assert_eq!(checks[0].retry_after_seconds, Some(17));
     }
     #[test]
     fn connection_test_uses_custom_model_without_persisting_probe() {
@@ -1613,9 +2312,3 @@ mod tests {
         assert!(is_public_ip("1.1.1.1".parse().unwrap()));
     }
 }
-
-
-
-
-
-

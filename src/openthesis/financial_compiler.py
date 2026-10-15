@@ -1,124 +1,23 @@
-"""Canonical financial-fact compiler.
+"""Deterministic compiler: frozen candidates to validated facts.
 
-The compiler is the single decision boundary between source adapters and the
-facts consumed by research.  Adapters produce candidates and evidence only;
-resolution, conflict handling, validation, coverage and AI eligibility live
-here so a service or retry path cannot accidentally create a second policy.
+No downloads, extraction, network calls or retries belong in this Module.
 """
-
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, replace
 from decimal import Decimal
-from enum import StrEnum
-import inspect
-import time
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Iterable, Sequence
 
 from .domain import CURRENT_DERIVED_VERSION, Company, EvidenceRef, FilingDocument, FinancialFact
-from .financial_ingestion import FinancialIngestionEngine
-from .market_financials import ValidationStatus
-
-
-CORE_CONCEPTS = frozenset(
-    {"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"}
+from .financial_contracts import (
+    CORE_CONCEPTS, CandidateBatch, FactCandidate, FactGroupValidation, FactValidationRecord,
+    FinancialDataset, SourceIdentity, ValidationStatus, CompilationPolicy as CompilerPolicy,
+    SourceComponentObservation,
+    candidate_batches_from_facts, concepts_cover_profile, missing_profile_concepts,
 )
-
-
-def _emit_filing_progress(
-    progress: Any,
-    stage: str,
-    current: int,
-    total: int,
-    filing: FilingDocument,
-    *,
-    status: str,
-    elapsed_seconds: float = 0.0,
-    error_code: str = "",
-) -> None:
-    """Emit stable filing states while retaining three-argument callbacks."""
-
-    if progress is None:
-        return
-    detail = {
-        "filing_id": filing.document_id,
-        "label": filing.primary_document or filing.accession_number or filing.document_id,
-        "status": status,
-        "error_code": str(error_code),
-        "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
-    }
-    try:
-        signature = inspect.signature(progress)
-        accepts_detail = any(
-            parameter.kind is inspect.Parameter.VAR_POSITIONAL
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        ) or len(signature.parameters) >= 4
-    except (TypeError, ValueError):
-        accepts_detail = True
-    if accepts_detail:
-        progress(stage, current, total, detail)
-    else:
-        progress(stage, current, total)
-
-
-def concepts_cover_profile(
-    concepts: Iterable[str], required_concepts: Iterable[str]
-) -> bool:
-    """Return whether resolved concepts satisfy a declared coverage profile.
-
-    ``total_equity`` is the canonical balance-sheet equivalent of ``equity``
-    when the issuer does not disclose a separate attributable-equity row.  The
-    alias is intentionally handled once here so service/status/cache paths
-    cannot accidentally reintroduce an industrial-only six-concept gate.
-    """
-
-    available = {str(item).strip().lower() for item in concepts if item}
-    required = {str(item).strip().lower() for item in required_concepts if item}
-    if "equity" in required and "total_equity" in available:
-        available.add("equity")
-    return required.issubset(available)
-
-
-@dataclass(frozen=True, slots=True)
-class FactCandidate:
-    """An untrusted fact emitted by one extractor and its evidence."""
-
-    fact: FinancialFact
-    evidence: tuple[EvidenceRef, ...] = ()
-    extractor: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateBatch:
-    filing: FilingDocument
-    candidates: tuple[FactCandidate, ...] = ()
-    evidence: tuple[EvidenceRef, ...] = ()
-    diagnostics: tuple[str, ...] = ()
-
-
-class FilingSource(Protocol):
-    """Discover official filings without deciding which facts are trusted."""
-
-    def fetch(
-        self, subject: Company, period_range: object
-    ) -> Sequence[FilingDocument]: ...
-
-
-class FactExtractor(Protocol):
-    """Extract candidates; accepted/resolved status is compiler-owned."""
-
-    def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch: ...
-
-
-class GapStageKind(StrEnum):
-    """Stable order for deterministic, zero-token gap resolution."""
-
-    OFFICIAL_STRUCTURED = "official_structured"
-    PDF_AST = "pdf_ast"
-    SAME_YEAR_OFFICIAL = "same_year_official"
-    MINERU = "mineru"
+from .financial_validation import FinancialValidator
+from .financial_candidate_resolution import resolve_display_rounding, resolve_issuer_presentation
+from .financial_unit_declarations import literal_money_unit, physical_unit_context
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,438 +79,6 @@ class CoveragePlanner:
             company_type,
         )
 
-
-@dataclass(frozen=True, slots=True)
-class GapResolution:
-    """Candidates found while resolving a bounded, explicit concept gap."""
-
-    candidates: tuple[FactCandidate, ...] = ()
-    evidence: tuple[EvidenceRef, ...] = ()
-    attempted_stages: tuple[str, ...] = ()
-    diagnostics: tuple[str, ...] = ()
-    cancelled: bool = False
-
-
-class GapResolver:
-    """Run fixed source stages in order; never accepts or invents facts."""
-
-    _ORDER = (
-        GapStageKind.OFFICIAL_STRUCTURED,
-        GapStageKind.PDF_AST,
-        GapStageKind.SAME_YEAR_OFFICIAL,
-        GapStageKind.MINERU,
-    )
-
-    def resolve(
-        self,
-        subject: Company,
-        filing: FilingDocument,
-        missing_concepts: Sequence[str],
-        extractors: Sequence[FactExtractor],
-        *,
-        existing_concepts: Sequence[str] = (),
-        existing_candidates: Sequence[FactCandidate] = (),
-        cancel_check: Any = None,
-        user_authorized: bool = False,
-        max_attempts: int = 1,
-    ) -> GapResolution:
-        wanted = frozenset(missing_concepts)
-        # Keep the legacy argument for API compatibility, but do not collapse
-        # candidates by concept: comparative columns can share a concept while
-        # differing in period, scope, unit, or source.
-        del existing_concepts
-
-        def candidate_identity(candidate: FactCandidate) -> tuple[Any, ...]:
-            fact = candidate.fact
-            return (
-                filing.document_id,
-                fact.accession_number or filing.accession_number,
-                fact.concept,
-                str(fact.end_date or "")[:10],
-                str(fact.start_date or fact.period_start or "")[:10],
-                str(fact.fiscal_period or "FY").upper(),
-                fact.statement or "",
-                fact.consolidated_scope or fact.scope or "unknown",
-                fact.currency or fact.unit or "",
-                str(fact.unit_scale),
-                fact.revision or "original",
-                fact.source_document or filing.primary_document,
-                fact.source_page,
-                fact.source_column or "",
-                str(candidate.extractor),
-                tuple(sorted(str(ref.evidence_id) for ref in candidate.evidence)),
-            )
-
-        found: list[FactCandidate] = []
-        seen_keys = {
-            candidate_identity(candidate) for candidate in existing_candidates
-        }
-        refs: list[EvidenceRef] = []
-        stages: list[str] = []
-        diagnostics: list[str] = []
-        previous_order = -1
-        for extractor in extractors:
-            if cancel_check is not None and cancel_check():
-                return GapResolution(tuple(found), tuple(refs), tuple(stages), tuple(diagnostics), True)
-            name = str(getattr(extractor, "name", type(extractor).__name__))
-            kind = getattr(extractor, "stage_kind", None)
-            if kind is None:
-                diagnostics.append(f"{name}:missing_stage_kind")
-                continue
-            try:
-                kind = GapStageKind(kind)
-            except ValueError:
-                diagnostics.append(f"{name}:unknown_stage_kind")
-                continue
-            order = self._ORDER.index(kind)
-            if order <= previous_order:
-                diagnostics.append("invalid_gap_stage_order")
-                continue
-            previous_order = order
-            stages.append(kind.value)
-            if kind is GapStageKind.MINERU and not user_authorized:
-                diagnostics.append("mineru_not_authorized")
-                continue
-            stage_limit = max(1, min(3, int(getattr(extractor, "max_attempts", max_attempts))))
-            for _attempt in range(stage_limit):
-                if cancel_check is not None and cancel_check():
-                    return GapResolution(tuple(found), tuple(refs), tuple(stages), tuple(diagnostics), True)
-                try:
-                    batch = extractor.extract(subject, filing)
-                except Exception as exc:  # adapters are untrusted boundaries
-                    diagnostics.append(f"{kind.value}:failed:{type(exc).__name__}")
-                    continue
-                diagnostics.extend(f"{kind.value}:{item}" for item in batch.diagnostics)
-                # Keep source-only observations for audit/report visibility
-                # even when no numeric candidate can safely be admitted.
-                refs.extend(batch.evidence)
-                for candidate in batch.candidates:
-                    key = candidate_identity(candidate)
-                    # Conflict resolution belongs to the compiler after
-                    # canonical period/scope/currency grouping.  Suppressing
-                    # a same-concept candidate here loses comparative facts.
-                    if key not in seen_keys:
-                        found.append(candidate)
-                        refs.extend(candidate.evidence)
-                        seen_keys.add(key)
-                if batch.candidates:
-                    break
-            if concepts_cover_profile((item.fact.concept for item in found), wanted):
-                break
-        if not concepts_cover_profile((item.fact.concept for item in found), wanted):
-            diagnostics.append("gap_unresolved")
-        unique_refs: dict[str, EvidenceRef] = {}
-        for ref in refs:
-            unique_refs.setdefault(ref.evidence_id, ref)
-        return GapResolution(tuple(found), tuple(unique_refs.values()), tuple(stages), tuple(diagnostics))
-
-
-@dataclass(frozen=True, slots=True)
-class StructuredFactExtractor:
-    """Adapt the existing structured-source protocol to candidate batches."""
-
-    source: Any
-    name: str = "structured-source"
-    stage_kind: GapStageKind = GapStageKind.OFFICIAL_STRUCTURED
-
-    def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch:
-        facts, refs, failure = self.source.fetch(subject, filing)
-        if failure:
-            return CandidateBatch(filing, diagnostics=(str(failure),))
-        facts = [
-            replace(fact, unit_provenance="structured_normalized")
-            if fact.unit_provenance == "unknown" and fact.concept != "reported_roe"
-            else fact
-            for fact in facts
-        ]
-        refs_by_fact = {fact.fact_id: ref for fact, ref in zip(facts, refs)}
-        candidates = tuple(
-            FactCandidate(fact, ((refs_by_fact[fact.fact_id],) if fact.fact_id in refs_by_fact else ()), self.name)
-            for fact in facts
-        )
-        return CandidateBatch(filing, candidates, tuple(refs))
-
-
-@dataclass(frozen=True, slots=True)
-class CompilerPolicy:
-    """Immutable compilation policy and adapter injection seam."""
-
-    filings: tuple[FilingDocument, ...] = ()
-    filing_source: FilingSource | None = None
-    extractors: tuple[FactExtractor, ...] = ()
-    required_concepts: frozenset[str] | None = None
-    reporting_currency: str = ""
-    fiscal_period: str = "FY"
-    scope: str = "consolidated"
-    period_range: object | None = None
-    gap_extractors: tuple[FactExtractor, ...] = ()
-    gap_user_authorized: bool = False
-    gap_max_attempts: int = 1
-
-
-@dataclass(frozen=True, slots=True)
-class FactGroupValidation:
-    identity: tuple[str, str, str, str, str]
-    status: str
-    issues: tuple[str, ...] = ()
-    covered: frozenset[str] = frozenset()
-    accepted: tuple[FinancialFact, ...] = ()
-    quarantined: tuple[FinancialFact, ...] = ()
-    role: str = "target"
-
-
-@dataclass(frozen=True, slots=True)
-class FinancialDataset:
-    """Canonical compiler output; no downstream layer needs source knowledge."""
-
-    filings: tuple[FilingDocument, ...]
-    resolved_facts: tuple[FinancialFact, ...]
-    quarantined_facts: tuple[FinancialFact, ...]
-    evidence: tuple[EvidenceRef, ...]
-    conflicts: tuple[dict[str, Any], ...]
-    validations: tuple[FactGroupValidation, ...]
-    coverage: dict[str, Any]
-    diagnostics: tuple[str, ...]
-    allow_ai: bool
-    research_facts: tuple[FinancialFact, ...] = ()
-    research_validations: tuple[FactGroupValidation, ...] = ()
-    manifests: tuple[Any, ...] = ()
-    annual_facts: tuple[FinancialFact, ...] = ()
-    interim_facts: tuple[FinancialFact, ...] = ()
-    comparator_facts: tuple[FinancialFact, ...] = ()
-
-    @property
-    def accepted_facts(self) -> tuple[FinancialFact, ...]:
-        """Compatibility alias for callers migrating from the old dataset."""
-
-        return self.resolved_facts
-
-    @property
-    def manifest(self) -> tuple[Any, ...]:
-        """Legacy spelling for collected filing manifests."""
-
-        return self.manifests
-
-    @property
-    def group_validations(self) -> tuple[Any, ...]:
-        """Compatibility projection; compiler remains the source of status."""
-
-        from .financial_ingestion import FinancialGroupValidation, FinancialValidation
-        from .market_financials import ValidationStatus
-
-        projected = []
-        for item in self.validations:
-            status_name = str(item.status)
-            status = (
-                ValidationStatus.VERIFIED
-                if status_name == ValidationStatus.VERIFIED.value
-                else ValidationStatus.REJECTED
-                if status_name in {ValidationStatus.REJECTED.value, "CONFLICTED"}
-                else ValidationStatus.READY_WITH_WARNINGS
-            )
-            projected.append(FinancialGroupValidation(
-                tuple(item.identity),
-                FinancialValidation(
-                    status, tuple(item.issues), item.covered,
-                    tuple(item.accepted), tuple(item.quarantined),
-                ),
-                item.role,
-            ))
-        return tuple(projected)
-
-    @property
-    def validation(self) -> Any:
-        """Compatibility aggregate for pre-compiler ingestion callers."""
-
-        from .financial_ingestion import FinancialValidation
-        from .market_financials import ValidationStatus
-
-        status = (
-            ValidationStatus.VERIFIED if self.allow_ai
-            else ValidationStatus.READY_WITH_WARNINGS if self.resolved_facts
-            else ValidationStatus.REJECTED
-        )
-        return FinancialValidation(
-            status,
-            tuple(self.diagnostics),
-            frozenset(item.concept for item in self.resolved_facts),
-            tuple(self.resolved_facts), tuple(self.quarantined_facts),
-        )
-
-    @property
-    def status(self) -> str:
-        if self.allow_ai:
-            return ValidationStatus.VERIFIED.value
-        return ValidationStatus.REJECTED.value if not self.resolved_facts else "INCOMPLETE"
-
-    @property
-    def capabilities(self) -> dict[str, bool]:
-        """Expose evidence capabilities instead of one pipeline-wide switch.
-
-        A missing comparator must disable growth/trend calculations, but it
-        must not erase a verified current-period balance sheet or stop
-        qualitative research that can cite disclosure evidence.
-        """
-
-        usable_groups = tuple(
-            item for item in self.research_validations
-            if item.status in {
-                ValidationStatus.VERIFIED.value,
-                ValidationStatus.READY_WITH_WARNINGS.value,
-                "PARTIAL",
-                "INCOMPLETE",
-            }
-            and item.accepted
-        )
-        annual_years = {fact.fiscal_year for fact in self.annual_facts if fact.fiscal_year}
-        current_financials = bool(self.research_facts and usable_groups)
-        return {
-            "financial_snapshot": current_financials,
-            "annual_trend": current_financials and len(annual_years) >= 2,
-            "interim_comparison": bool(self.interim_facts and self.comparator_facts),
-            "model_financial_analysis": self.allow_ai,
-            "qualitative_research": True,
-        }
-
-    def has_capability(self, name: str) -> bool:
-        return bool(self.capabilities.get(name, False))
-
-
-@dataclass(frozen=True, slots=True)
-class StaticFilingSource:
-    """Small deterministic filing source for fixtures and offline callers."""
-
-    filings: tuple[FilingDocument, ...]
-
-    def fetch(self, subject: Company, period_range: object) -> Sequence[FilingDocument]:
-        return self.filings
-
-
-@dataclass(frozen=True, slots=True)
-class InMemoryFactExtractor:
-    """Fixture adapter that still goes through candidate resolution and gating."""
-
-    batches: dict[str, CandidateBatch]
-
-    def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch:
-        return self.batches.get(filing.document_id, CandidateBatch(filing))
-
-
-@dataclass(frozen=True, slots=True)
-class MappedCandidateExtractor:
-    """Expose pre-collected batches as a typed compiler stage."""
-
-    batches: dict[str, CandidateBatch]
-    stage_kind: GapStageKind
-    name: str
-    diagnostics: tuple[str, ...] = ()
-
-    def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch:
-        batch = self.batches.get(filing.document_id, CandidateBatch(filing))
-        if not self.diagnostics:
-            return batch
-        return CandidateBatch(
-            batch.filing, batch.candidates, batch.evidence,
-            tuple((*batch.diagnostics, *self.diagnostics)),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class VisionCandidateExtractor:
-    """Candidate-only wrapper for the optional, user-authorized vision stage."""
-
-    engine: Any
-    adapter: Any
-    config: Any
-    cancel_check: Any = None
-    validation_issues_by_document: Mapping[str, Sequence[str]] | None = None
-    existing_facts_by_document: Mapping[str, Sequence[FinancialFact]] | None = None
-    stage_kind: GapStageKind = GapStageKind.MINERU
-    name: str = "vision-fallback"
-
-    def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch:
-        from .financial_ingestion import _vision_failed_pages
-
-        if self.cancel_check is not None and self.cancel_check():
-            return CandidateBatch(filing, diagnostics=("vision_cancelled",))
-        issues = (self.validation_issues_by_document or {}).get(filing.document_id, ())
-        existing_facts = (self.existing_facts_by_document or {}).get(
-            filing.document_id, ()
-        )
-        pages = _vision_failed_pages(filing, self.config, issues, existing_facts)
-        if not pages:
-            return CandidateBatch(filing, diagnostics=("vision_no_failed_pages",))
-        result = self.adapter.extract(
-            subject, filing, pages, self.config, cancel_check=self.cancel_check
-        )
-        refs_by_fact = {
-            ref.evidence_id.removeprefix("fact:"): ref
-            for ref in result.evidence
-            if ref.evidence_id.startswith("fact:")
-        }
-        candidates = tuple(
-            FactCandidate(
-                fact,
-                ((refs_by_fact[fact.fact_id],) if fact.fact_id in refs_by_fact else ()),
-                self.name,
-            )
-            for fact in result.facts
-        )
-        return CandidateBatch(
-            filing, candidates, tuple(result.evidence), tuple(result.diagnostics)
-        )
-
-
-def _prefetch_vision_batches(
-    subject: Company,
-    filings: Sequence[FilingDocument],
-    extractor: VisionCandidateExtractor,
-    *,
-    timeout_seconds: float,
-) -> dict[str, CandidateBatch]:
-    """Run authorized visual gap extraction with deterministic bounded fan-out.
-
-    The first canonical pass determines the missing filing contexts before
-    this function is called. Results are collected in filing order and then
-    passed to one compiler quality gate; a timeout, cancellation, or adapter
-    failure produces diagnostics only and is never cached as a candidate.
-    """
-
-    ordered = tuple(filings)
-    if not ordered:
-        return {}
-    worker_count = max(1, min(2, len(ordered)))
-    executor = ThreadPoolExecutor(
-        max_workers=worker_count, thread_name_prefix="financial-vision"
-    )
-    futures = {
-        filing.document_id: executor.submit(extractor.extract, subject, filing)
-        for filing in ordered
-    }
-    results: dict[str, CandidateBatch] = {}
-    deadline = time.monotonic() + max(0.01, float(timeout_seconds))
-    try:
-        for filing in ordered:
-            future = futures[filing.document_id]
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                batch = future.result(timeout=remaining)
-            except FuturesTimeoutError:
-                batch = CandidateBatch(filing, diagnostics=("vision_timeout",))
-            except Exception as exc:
-                batch = CandidateBatch(
-                    filing, diagnostics=(f"vision_failed:{type(exc).__name__}",)
-                )
-            results[filing.document_id] = batch
-    finally:
-        # Adapters receive the coordinator cancellation callback and own their
-        # remote timeout. Waiting here guarantees no executor thread survives
-        # the compiler call, while cancel_futures prevents queued work from
-        # starting after a timeout/cancellation.
-        executor.shutdown(wait=True, cancel_futures=True)
-    return results
-
-
 def _period_range_bounds(value: object) -> tuple[str | None, str | None]:
     """Normalize supported date/year windows without inventing a period."""
 
@@ -636,7 +103,6 @@ def _period_range_bounds(value: object) -> tuple[str | None, str | None]:
 
     return normalize(start, upper=False), normalize(end, upper=True)
 
-
 class FinancialFactCompiler:
     """Deep module owning candidate resolution, validation and AI eligibility."""
 
@@ -648,351 +114,62 @@ class FinancialFactCompiler:
         *,
         reporting_currency: str = "",
         required_concepts: frozenset[str] | None = None,
+        evidence: Sequence[EvidenceRef] = (),
     ) -> FinancialDataset:
         """Re-compile already extracted facts through the canonical gate.
 
-        This is the migration seam for retry/SEC compatibility paths.  It
-        creates explicit evidence associations from each fact's own
-        provenance; no caller is allowed to mark these facts accepted.
+        Compatibility adapter for retry/SEC callers. It preserves only supplied
+        evidence associations and never fills absent source, unit, or period
+        metadata. Facts with undeclared accessions remain compiler candidates
+        with explicit diagnostics instead of disappearing from the result.
         """
-        by_accession: dict[str, list[FactCandidate]] = {}
-        for fact in facts:
-            source_filing = next(
-                (item for item in filings if item.accession_number == fact.accession_number),
-                None,
-            )
-            ref = EvidenceRef(
-                f"compiler:{fact.fact_id}",
-                source_filing.document_id if source_filing is not None else "",
-                fact.source_url,
-                fact.source_document or fact.reported_concept,
-                f"page:{fact.source_page or 0}",
-                fact.raw_text,
-                fact.filed_at,
-                source_filing.content_hash if source_filing is not None else "",
-                fact.source_bbox,
-            )
-            by_accession.setdefault(fact.accession_number, []).append(
-                FactCandidate(fact, (ref,), "canonical-recompile")
-            )
-        batches = {
-            filing.document_id: CandidateBatch(
-                filing,
-                tuple(by_accession.get(filing.accession_number, ())),
-            )
-            for filing in filings
-        }
+        batches = candidate_batches_from_facts(filings, facts, evidence)
         ends = sorted({str(item.period_end)[:10] for item in filings if item.period_end})
         actual_range = (ends[0], ends[-1]) if ends else None
         return self.compile(
             subject,
-            actual_range,
+            batches,
             CompilerPolicy(
                 filings=tuple(filings),
-                extractors=(InMemoryFactExtractor(batches),),
                 required_concepts=required_concepts,
                 reporting_currency=reporting_currency or subject.reporting_currency,
                 period_range=actual_range,
             ),
         )
 
-    def compile_from_ingestion(
-        self,
-        subject: Company,
-        filings: Sequence[FilingDocument],
-        engine: Any,
-        *,
-        structured_sources: Sequence[Any] = (),
-        vision_fallback: Any = None,
-        vision_config: Any = None,
-        cancel_check: Any = None,
-        progress: Any = None,
-        reporting_currency: str = "",
-        same_year_sources: Sequence[Any] = (),
-        same_year_extractors: Sequence[FactExtractor] = (),
-    ) -> FinancialDataset:
-        """Collect all source candidates once, then apply one quality gate.
-
-        ``same_year_sources`` is deliberately separate from the primary
-        structured feed: it is an explicit, ordered gap stage and can only
-        contribute candidates after the primary structured and PDF AST
-        stages.  Callers that provide extractors directly must declare the
-        same ``SAME_YEAR_OFFICIAL`` stage kind; names are not inspected.
-        """
-
-        collection = engine.collect_candidate_batches(
-            subject,
-            filings,
-            structured_sources=structured_sources,
-            cancel_check=cancel_check,
-            progress=progress,
-        )
-        # The collector always places structured first and PDF second.  An
-        # empty structured batch is intentional: it makes PDF a deterministic
-        # fallback while ensuring every structured adapter was queried.
-        pdf = {
-            document_id: batches[1] if len(batches) > 1 else CandidateBatch(filing)
-            for document_id, batches in collection.batches_by_document.items()
-            for filing in filings if filing.document_id == document_id
-        }
-        primary = {
-            document_id: batches[0] if batches else CandidateBatch(filing)
-            for document_id, batches in collection.batches_by_document.items()
-            for filing in filings if filing.document_id == document_id
-        }
-        diagnostics = tuple(collection.diagnostics)
-        extractors: list[Any] = [
-            MappedCandidateExtractor(primary, GapStageKind.OFFICIAL_STRUCTURED, "official-structured", diagnostics),
-            MappedCandidateExtractor(pdf, GapStageKind.PDF_AST, "financial-ingestion-ast"),
-        ]
-        for extractor in same_year_extractors:
-            try:
-                stage_kind = GapStageKind(getattr(extractor, "stage_kind"))
-            except (TypeError, ValueError):
-                raise ValueError("same_year_extractor_stage_kind_required")
-            if stage_kind is not GapStageKind.SAME_YEAR_OFFICIAL:
-                raise ValueError("same_year_extractor_stage_kind_required")
-            extractors.append(extractor)
-        for source in same_year_sources:
-            extractors.append(
-                StructuredFactExtractor(
-                    source,
-                    name="same-year-official",
-                    stage_kind=GapStageKind.SAME_YEAR_OFFICIAL,
-                )
-            )
-        ends = sorted({str(item.period_end)[:10] for item in filings if item.period_end})
-        actual_range = (ends[0], ends[-1]) if ends else None
-        declared_periods = {
-            str(item.fiscal_period or "FY").strip().upper() for item in filings
-        }
-        if len(declared_periods) == 1:
-            target_fiscal_period = next(iter(declared_periods))
-        elif filings:
-            latest = max(
-                filings,
-                key=lambda item: (str(item.period_end)[:10], str(item.filed_at)),
-            )
-            target_fiscal_period = str(
-                latest.fiscal_period or "FY"
-            ).strip().upper()
-        else:
-            target_fiscal_period = "FY"
-        policy_kwargs = dict(
-            filings=tuple(filings),
-            extractors=tuple(extractors),
-            reporting_currency=reporting_currency or subject.reporting_currency,
-            period_range=actual_range,
-            fiscal_period=target_fiscal_period,
-        )
-        total_filings = len(filings)
-        filing_started_at = {
-            filing.document_id: time.monotonic() for filing in filings
-        }
-        for index, filing in enumerate(filings, start=1):
-            _emit_filing_progress(
-                progress,
-                "filing-validation",
-                index,
-                total_filings,
-                filing,
-                status="local-validating",
-                elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
-            )
-        # Resolve structured/PDF/same-year candidates first.  A local
-        # success must never trigger a network vision call, while an
-        # incomplete target group must validate the session-only vision
-        # configuration before its extractor is even constructed.
-        for index, filing in enumerate(filings, start=1):
-            _emit_filing_progress(
-                progress,
-                "filing-validation",
-                index,
-                total_filings,
-                filing,
-                status="canonical-compiling",
-                elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
-            )
-        dataset = self.compile(
-            subject,
-            actual_range,
-            CompilerPolicy(**policy_kwargs),
-        )
-        if (
-            not dataset.allow_ai
-            and vision_fallback is not None
-            and vision_config is not None
-            and bool(getattr(vision_config, "enabled", False))
-        ):
-            validate = getattr(vision_config, "validate", None)
-            if not callable(validate):
-                raise ValueError("vision_config_validation_required")
-            validate()
-            validation_issues_by_document: dict[str, tuple[str, ...]] = {}
-            existing_facts_by_document: dict[str, tuple[FinancialFact, ...]] = {}
-            visual_filings: list[FilingDocument] = []
-            for filing in filings:
-                accession = filing.accession_number
-                groups = tuple(
-                    item for item in dataset.validations
-                    if tuple(getattr(item, "identity", ()))
-                    and item.identity[0] == accession
-                )
-                validation_issues_by_document[filing.document_id] = tuple(
-                    issue for item in groups for issue in getattr(item, "issues", ())
-                )
-                existing_facts_by_document[filing.document_id] = tuple(
-                    fact for fact in dataset.resolved_facts
-                    if fact.accession_number == accession
-                )
-                if not groups or any(
-                    getattr(item.status, "value", item.status)
-                    != ValidationStatus.VERIFIED.value
-                    for item in groups
-                ):
-                    visual_filings.append(filing)
-            vision_extractor = VisionCandidateExtractor(
-                engine,
-                vision_fallback,
-                vision_config,
-                cancel_check,
-                validation_issues_by_document,
-                existing_facts_by_document,
-            )
-            for index, filing in enumerate(visual_filings, start=1):
-                _emit_filing_progress(
-                    progress,
-                    "vision-processing",
-                    index,
-                    len(visual_filings),
-                    filing,
-                    status="cloud-processing",
-                    elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
-                )
-            # Determine all filing gaps from the first canonical pass, then
-            # perform authorized page extraction with two bounded workers. The
-            # resulting candidate map is deterministic before the second,
-            # shared compiler quality gate runs.
-            vision_batches = _prefetch_vision_batches(
-                subject,
-                visual_filings,
-                vision_extractor,
-                timeout_seconds=float(getattr(vision_config, "timeout_seconds", 60.0)),
-            )
-            extractors.append(
-                MappedCandidateExtractor(
-                    vision_batches, GapStageKind.MINERU, "vision-fallback"
-                )
-            )
-            dataset = self.compile(
-                subject,
-                actual_range,
-                CompilerPolicy(
-                    **{**policy_kwargs, "extractors": tuple(extractors)},
-                    gap_user_authorized=bool(
-                        getattr(vision_config, "enabled", False)
-                        and getattr(vision_config, "consent", False)
-                    ),
-                ),
-            )
-        for index, filing in enumerate(filings, start=1):
-            groups = tuple(
-                item for item in dataset.research_validations
-                if tuple(getattr(item, "identity", ()))
-                and item.identity[0] == filing.accession_number
-                and getattr(item, "role", "target") == "target"
-            )
-            final_status = (
-                "validated"
-                if groups
-                and any(
-                    getattr(item.status, "value", item.status)
-                    == ValidationStatus.VERIFIED.value
-                    for item in groups
-                )
-                else "blocked"
-            )
-            _emit_filing_progress(
-                progress,
-                "filing-validation",
-                index,
-                total_filings,
-                filing,
-                status=final_status,
-                elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
-                error_code=("FILING_VALIDATION_BLOCKED" if final_status == "blocked" else ""),
-            )
-        return replace(dataset, manifests=collection.manifests)
-
     def compile(
         self,
         subject: Company,
-        period_range: object,
+        batches: Sequence[CandidateBatch],
         policy: CompilerPolicy,
     ) -> FinancialDataset:
-        filings = tuple(policy.filings)
+        """Validate already frozen candidates; never discover or extract."""
+        batches = tuple(batches)
+        filings = tuple(policy.filings) or tuple(batch.filing for batch in batches)
         profile = CoveragePlanner().plan(subject)
         required_concepts = policy.required_concepts or profile.required_concepts
         target_fiscal_period = (policy.fiscal_period or "FY").strip().upper()
         target_scope = (policy.scope or "consolidated").strip().lower()
-        target_currency = (
-            policy.reporting_currency or subject.reporting_currency or ""
-        ).strip().upper()
-        range_start, range_end = _period_range_bounds(
-            policy.period_range if policy.period_range is not None else period_range
-        )
-        if not filings and policy.filing_source is not None:
-            filings = tuple(policy.filing_source.fetch(subject, period_range))
-        extractors = policy.extractors
-        if not extractors and any(filing.local_path for filing in filings):
-            # Lazy import avoids the adapter/compiler cycle while making the
-            # public compiler seam usable from a FilingDocument directly.
-            from .financial_ast_adapter import PdfAstFactExtractor
-            extractors = (PdfAstFactExtractor(),)
+        target_currency = (policy.reporting_currency or subject.reporting_currency or "").strip().upper()
+        range_start, range_end = _period_range_bounds(policy.period_range)
         diagnostics: list[str] = []
         candidates: list[FactCandidate] = []
         evidence: list[EvidenceRef] = []
+        declared_sources: dict[str, SourceIdentity] = {}
         for filing in filings:
-            if not extractors:
-                diagnostics.append(f"{filing.document_id}:no_fact_extractor")
-                continue
-            # The first adapter is the primary source.  Remaining adapters are
-            # gap stages and are invoked only for concepts absent from the
-            # primary batch, so successful sources are never re-run.
-            primary = extractors[:1]
-            primary_candidates: list[FactCandidate] = []
-            for extractor in primary:
-                batch = extractor.extract(subject, filing)
-                candidates.extend(batch.candidates)
-                primary_candidates.extend(batch.candidates)
-                evidence.extend(batch.evidence)
-                evidence.extend(ref for item in batch.candidates for ref in item.evidence)
-                diagnostics.extend(
-                    f"{filing.document_id}:{message}" for message in batch.diagnostics
-                )
-            primary_concepts = {
-                item.fact.concept for item in candidates
-                if item.fact.accession_number == filing.accession_number
-            }
-            missing = {
-                concept for concept in required_concepts
-                if not concepts_cover_profile(primary_concepts, (concept,))
-            }
-            gap_stages = policy.gap_extractors or extractors[1:]
-            if missing and gap_stages:
-                gap = GapResolver().resolve(
-                    subject,
-                    filing,
-                    tuple(sorted(missing)),
-                    gap_stages,
-                    existing_concepts=tuple(primary_concepts),
-                    existing_candidates=tuple(primary_candidates),
-                    user_authorized=policy.gap_user_authorized,
-                    max_attempts=policy.gap_max_attempts,
-                )
-                candidates.extend(gap.candidates)
-                evidence.extend(gap.evidence)
-                diagnostics.extend(f"{filing.document_id}:{message}" for message in gap.diagnostics)
+            identity = SourceIdentity.from_filing(filing)
+            prior = declared_sources.setdefault(filing.document_id, identity)
+            if prior != identity:
+                raise ValueError("CANDIDATE_SOURCE_IDENTITY_CONFLICT")
+        for batch in batches:
+            if not isinstance(batch, CandidateBatch):
+                raise TypeError("FROZEN_CANDIDATE_BATCH_REQUIRED")
+            if declared_sources.get(batch.filing.document_id) != SourceIdentity.from_filing(batch.filing):
+                raise ValueError("CANDIDATE_SOURCE_IDENTITY_CONFLICT")
+            candidates.extend(batch.candidates)
+            evidence.extend(batch.evidence)
+            evidence.extend(ref for item in batch.candidates for ref in item.evidence)
+            diagnostics.extend(f"{batch.filing.document_id}:{message}" for message in batch.diagnostics)
 
         grouped: dict[tuple[str, str, str, str, str], list[FactCandidate]] = {}
         for item in candidates:
@@ -1014,12 +191,63 @@ class FinancialFactCompiler:
             )
             grouped.setdefault(identity, []).append(item)
 
-        engine = FinancialIngestionEngine()
+        validator = FinancialValidator()
         resolved: list[FinancialFact] = []
         quarantined: list[FinancialFact] = []
         validations: list[FactGroupValidation] = []
         conflicts: list[dict[str, Any]] = []
+        candidate_resolutions: list[dict[str, Any]] = []
         selected_evidence: list[EvidenceRef] = []
+        fact_records_by_id: dict[str, FactValidationRecord] = {}
+        compiler_issues_by_fact: dict[str, list[str]] = {}
+
+        def merge_fact_record(record: FactValidationRecord) -> None:
+            previous = fact_records_by_id.get(record.fact_id)
+            if previous is None:
+                fact_records_by_id[record.fact_id] = record
+                return
+            prior_components = dict(previous.components)
+            merged_components: list[tuple[str, SourceComponentObservation]] = []
+            for name, observation in record.components:
+                prior = prior_components.get(name)
+                if prior is None:
+                    merged_components.append((name, observation))
+                    continue
+                evidence_ids = tuple(dict.fromkeys((*prior.evidence_ids, *observation.evidence_ids)))
+                if (prior.value is not None and observation.value is not None
+                        and prior.value != observation.value):
+                    merged_components.append((
+                        name, SourceComponentObservation("conflict", observation.value, evidence_ids),
+                    ))
+                elif "conflict" in {prior.state, observation.state}:
+                    merged_components.append((
+                        name, SourceComponentObservation("conflict", observation.value, evidence_ids),
+                    ))
+                elif "verified" in {prior.state, observation.state}:
+                    merged_components.append((
+                        name, SourceComponentObservation("verified", observation.value, evidence_ids),
+                    ))
+                elif "observed" in {prior.state, observation.state}:
+                    merged_components.append((
+                        name, SourceComponentObservation("observed", observation.value, evidence_ids),
+                    ))
+                else:
+                    merged_components.append((
+                        name, SourceComponentObservation("unknown", observation.value, evidence_ids),
+                    ))
+            merged_dependencies = dict(previous.dependencies)
+            for name, evidence_ids in record.dependencies:
+                merged_dependencies[name] = tuple(dict.fromkeys(
+                    (*merged_dependencies.get(name, ()), *evidence_ids)
+                ))
+            fact_records_by_id[record.fact_id] = FactValidationRecord(
+                record.fact_id,
+                previous.accepted and record.accepted,
+                tuple(dict.fromkeys((*previous.issues, *record.issues))),
+                tuple(merged_components),
+                tuple(merged_dependencies.items()),
+            )
+
         filing_by_accession = {filing.accession_number: filing for filing in filings}
         subject_company_ids = {
             str(value).strip()
@@ -1029,7 +257,11 @@ class FinancialFactCompiler:
 
         for identity, items in grouped.items():
             filing = filing_by_accession.get(identity[0])
-            expected_company_id = None
+            source_evidence = tuple(
+                ref for ref in evidence
+                if filing is not None and ref.document_id == filing.document_id
+            )
+            expected_company_id = "__filing_identity_mismatch__"
             if filing is not None:
                 filing_company_id = str(filing.company_cik or "").strip()
                 expected_company_id = (
@@ -1037,78 +269,128 @@ class FinancialFactCompiler:
                     if filing_company_id and filing_company_id in subject_company_ids
                     else "__filing_identity_mismatch__"
                 )
-            by_concept: dict[str, list[FactCandidate]] = {}
-            for item in items:
-                by_concept.setdefault(item.fact.concept, []).append(item)
             chosen: list[FactCandidate] = []
             group_quarantine: list[FinancialFact] = []
-            for concept, options in by_concept.items():
+            candidate_issues: list[str] = []
+            group_has_conflict = False
+            # Prove all source observations before resolving either their
+            # numerical duplicates or a source-specific presentation role.
+            # Otherwise an invalid native row could suppress a valid source.
+            defensible_all: list[FactCandidate] = []
+            for option in items:
+                # A proof may be internally coherent but belong to an old
+                # source generation. Hash-bound original rows must also be
+                # bound to the captured official filing, not just each other.
+                # CompanyFacts has its own accession/QName proof and no PDF
+                # hash; do not invent an original-document hash for that lane.
+                bound_rows = tuple(ref for ref in option.evidence if ref.content_hash)
+                unbound_original = bool(bound_rows and (filing is None or any(
+                    ref.document_id != filing.document_id
+                    or ref.source_url != filing.source_url
+                    or ref.content_hash != filing.content_hash
+                    for ref in bound_rows
+                )))
+                option_validation = validator.validate_group(
+                    [option.fact], identity,
+                    {option.fact.fact_id: ref for ref in option.evidence},
+                    required_concepts={option.fact.concept},
+                    expected_company_id=expected_company_id,
+                    source_evidence=source_evidence,
+                ).validation
+                for record in option_validation.fact_records:
+                    merge_fact_record(record)
+                if unbound_original:
+                    group_quarantine.append(option.fact)
+                    candidate_issues.extend((*option_validation.issues, "source_document_identity_mismatch"))
+                    compiler_issues_by_fact.setdefault(option.fact.fact_id, []).append(
+                        "source_document_identity_mismatch"
+                    )
+                elif any(fact.fact_id == option.fact.fact_id for fact in option_validation.accepted):
+                    defensible_all.append(option)
+                else:
+                    group_quarantine.append(option.fact)
+                    candidate_issues.extend(option_validation.issues)
+                    compiler_issues_by_fact.setdefault(option.fact.fact_id, []).extend(
+                        option_validation.issues
+                    )
+            superseded = resolve_issuer_presentation(defensible_all, source_evidence, filing)
+            by_concept: dict[str, list[FactCandidate]] = {}
+            for option in defensible_all:
+                authority = superseded.get(option.fact.fact_id)
+                if authority is not None:
+                    group_quarantine.append(option.fact)
+                    candidate_issues.append("structured_role_contradicted_by_original_presentation")
+                    compiler_issues_by_fact.setdefault(option.fact.fact_id, []).append(
+                        "structured_role_contradicted_by_original_presentation"
+                    )
+                    candidate_resolutions.append({
+                        "identity": identity, "concept": authority.fact.concept,
+                        "policy": "original-issuer-presentation-v1",
+                        "selected_fact_id": authority.fact.fact_id,
+                        "quarantined_fact_id": option.fact.fact_id,
+                        "source_candidate_ids": (authority.fact.fact_id, option.fact.fact_id),
+                        "evidence_ids": authority.fact.classification_evidence_ids,
+                    })
+                else:
+                    by_concept.setdefault(option.fact.concept, []).append(option)
+            for concept, defensible in by_concept.items():
                 conflict_keys = {
                     (
-                        Decimal(str(option.fact.value)),
+                        # Compatibility floats may collapse distinct original
+                        # decimals (including cents above 2**53). Conflict
+                        # identity must use the retained source-normalized
+                        # amount, never reconstruct source precision from float.
+                        Decimal(option.fact.normalization_lineage.normalized_value)
+                        if option.fact.normalization_lineage is not None
+                        else Decimal(str(option.fact.value)),
+                        option.fact.start_date or option.fact.period_start,
                         option.fact.end_date,
                         (option.fact.fiscal_period or "FY").upper(),
                         option.fact.consolidated_scope or option.fact.scope or "unknown",
                         option.fact.currency or "",
-                        str(option.fact.unit_scale),
                         option.fact.statement or "",
+                        option.fact.revision,
+                        option.fact.generation_id,
                     )
-                    for option in options
+                    for option in defensible
                 }
                 if len(conflict_keys) > 1:
+                    rounding = resolve_display_rounding(defensible, filing) if filing else None
+                    if rounding is not None:
+                        chosen.append(rounding.selected)
+                        candidate_resolutions.append({
+                            "identity": identity,
+                            "concept": concept,
+                            "policy": rounding.policy,
+                            "selected_fact_id": rounding.selected.fact.fact_id,
+                            "source_candidate_ids": tuple(sorted(option.fact.fact_id for option in defensible)),
+                            "rounded_candidate_ids": rounding.rounded_candidate_ids,
+                            "observations": tuple({
+                                "fact_id": option.fact.fact_id,
+                                "raw_value": option.fact.normalization_lineage.raw_value,
+                                "scale": option.fact.normalization_lineage.scale,
+                                "normalized_value": option.fact.normalization_lineage.normalized_value,
+                            } for option in sorted(defensible, key=lambda item: item.fact.fact_id)),
+                        })
+                        continue
+                    group_has_conflict = True
                     conflicts.append(
                         {
                             "identity": identity,
                             "concept": concept,
-                            "fact_ids": tuple(option.fact.fact_id for option in options),
+                            "fact_ids": tuple(option.fact.fact_id for option in defensible),
                             "reason": "conflicting_candidate_values",
                         }
                     )
-                    group_quarantine.extend(option.fact for option in options)
-                    continue
-                if concept == "profit_before_tax" and len(options) > 1:
-                    defensible: list[FactCandidate] = []
-                    for option in options:
-                        option_refs = {
-                            option.fact.fact_id: ref for ref in option.evidence
-                        }
-                        option_validation = engine.validate_group(
-                            [option.fact],
-                            identity,
-                            option_refs,
-                            required_concepts={concept},
-                            expected_company_id=expected_company_id,
+                    group_quarantine.extend(option.fact for option in defensible)
+                    for option in defensible:
+                        compiler_issues_by_fact.setdefault(option.fact.fact_id, []).append(
+                            "conflicting_candidate_values"
                         )
-                        if any(
-                            fact.fact_id == option.fact.fact_id
-                            for fact in option_validation.validation.accepted
-                        ):
-                            defensible.append(option)
-                    if not defensible:
-                        conflicts.append(
-                            {
-                                "identity": identity,
-                                "concept": concept,
-                                "fact_ids": tuple(option.fact.fact_id for option in options),
-                                "reason": "high_impact_evidence_unproven",
-                            }
-                        )
-                        group_quarantine.extend(option.fact for option in options)
-                        continue
-                    selected_option = sorted(
-                        defensible,
-                        key=lambda option: (option.extractor, option.fact.fact_id),
-                    )[0]
-                    chosen.append(selected_option)
-                    group_quarantine.extend(
-                        option.fact
-                        for option in options
-                        if option not in defensible
-                    )
                     continue
                 # Same-value candidates are independently auditable, but one
                 # canonical fact is resolved to prevent last-write-wins drift.
-                chosen.append(sorted(options, key=lambda option: (option.extractor, option.fact.fact_id))[0])
+                chosen.append(sorted(defensible, key=lambda option: (option.extractor, option.fact.fact_id))[0])
 
             group_facts = [item.fact for item in chosen]
             refs: dict[str, EvidenceRef] = {
@@ -1116,24 +398,27 @@ class FinancialFactCompiler:
                 for item in chosen
                 for ref in item.evidence
             }
-            validation = engine.validate_group(
+            validation = validator.validate_group(
                 group_facts,
                 identity,
                 refs,
                 required_concepts=required_concepts,
                 expected_company_id=expected_company_id,
+                source_evidence=source_evidence,
             )
+            for record in validation.validation.fact_records:
+                merge_fact_record(record)
             accepted = tuple(validation.validation.accepted)
             rejected = tuple(group_quarantine) + tuple(validation.validation.quarantined)
             covered = frozenset(fact.concept for fact in accepted)
-            missing = set(required_concepts) - set(covered)
-            if "equity" in missing and "total_equity" in covered:
-                missing.remove("equity")
-            issues = list(validation.validation.issues)
+            missing = missing_profile_concepts(covered, required_concepts)
+            issues = candidate_issues + list(validation.validation.issues)
             if missing:
                 issues.append("required_profile_missing:" + ",".join(sorted(missing)))
-            if group_quarantine:
+            if group_has_conflict:
                 issues.append("candidate_conflict")
+            elif group_quarantine:
+                issues.append("candidate_validation_failed")
             # Group conflicts and validation failures quarantine only their
             # affected facts. Verified siblings keep their evidence and can
             # support the capabilities that do not depend on the missing or
@@ -1156,9 +441,19 @@ class FinancialFactCompiler:
                 selected_evidence.extend(
                     ref for fact_id, ref in refs.items() if fact_id in accepted_ids
                 )
+                selected_unit_ids = {
+                    evidence_id
+                    for fact in accepted
+                    if fact.normalization_lineage is not None
+                    for evidence_id in fact.normalization_lineage.unit_evidence_ids
+                }
+                selected_evidence.extend(
+                    ref for ref in source_evidence
+                    if ref.evidence_id in selected_unit_ids
+                )
             else:
                 status = (
-                    "CONFLICTED" if group_quarantine
+                    "CONFLICTED" if group_has_conflict
                     else ValidationStatus.REJECTED.value if rejected
                     else "INCOMPLETE"
                 )
@@ -1182,22 +477,25 @@ class FinancialFactCompiler:
                         replace(fact, validation_status=status)
                         for fact in rejected_facts
                     )
+            # A separately extracted prior-year note/ratio can share the
+            # comparative group's period without carrying the AST's usage
+            # annotation. It must not promote that whole group into a later
+            # authoritative annual filing and displace the original year.
+            source_end = str(filing.period_end or "")[:10] if filing is not None else ""
+            annotated_comparison = any(fact.usage_status == "comparator" for fact in group_facts)
+            prior_source_period = bool(source_end and identity[1][:10] < source_end
+                and identity[2].upper() == (filing.fiscal_period or "FY").upper()
+                and identity[1][5:10] == source_end[5:10]) if filing is not None else False
+            comparison_role = bool(group_facts and (
+                all(fact.usage_status == "comparator" for fact in group_facts)
+                or (annotated_comparison and prior_source_period)))
             validations.append(
                 FactGroupValidation(
                     identity, status, tuple(dict.fromkeys(issues)), covered,
                     accepted, rejected or (() if accepted else tuple(group_facts)),
-                    (
-                        "comparator"
-                        if group_facts and all(
-                            str(getattr(fact, "usage_status", "") or "").casefold()
-                            == "comparator"
-                            for fact in group_facts
-                        )
-                        else "target"
-                    ),
+                    "comparator" if comparison_role else "target",
                 )
             )
-
         def identity_has_valid_disclosure_date(identity: tuple[str, str, str, str, str]) -> bool:
             filing = filing_by_accession.get(identity[0])
             group_facts = tuple(
@@ -1316,7 +614,10 @@ class FinancialFactCompiler:
             if filing is None:
                 return 0, "", item.identity[0]
             revision = str(getattr(filing, "revision", "") or "").casefold()
-            revision_rank = 1 if revision not in {"", "original", "orig", "period_end_provisional"} else 0
+            revision_rank = 1 if revision not in {
+                "", "original", "orig", "period_end_provisional",
+                "period_end_verified", "period_header_conflict",
+            } else 0
             return revision_rank, str(getattr(filing, "filed_at", "") or ""), item.identity[0]
 
         def select_latest_per_identity(items: Iterable[FactGroupValidation], limit: int | None = None) -> tuple[FactGroupValidation, ...]:
@@ -1470,6 +771,16 @@ class FinancialFactCompiler:
         interim_facts = cohort_facts(interim_validations, "canonical_research")
         comparator_facts = cohort_facts(comparator_validations, "comparator")
         research_facts = annual_facts + interim_facts + comparator_facts
+        unit_evidence_by_id = {ref.evidence_id: ref for batch in batches for ref in batch.evidence}
+
+        def independently_declared_unit(fact: FinancialFact) -> bool:
+            lineage = fact.normalization_lineage
+            if lineage is None or not lineage.unit_evidence_ids:
+                return False
+            refs = [unit_evidence_by_id.get(key) for key in lineage.unit_evidence_ids]
+            return all(ref is not None and literal_money_unit(ref.excerpt).proves(fact.currency, lineage.scale)
+                       for ref in refs)
+
         # Compare unit declarations for the same concept across annual
         # cohorts.  Only exact order-of-magnitude changes are suspicious;
         # genuine business changes at one stable scale are not rejected.
@@ -1480,6 +791,11 @@ class FinancialFactCompiler:
                 continue
             facts_by_concept.setdefault(fact.concept, []).append(fact)
         for concept, concept_facts in facts_by_concept.items():
+            if all(independently_declared_unit(fact) for fact in concept_facts):
+                # Different annual originals can legitimately change their
+                # displayed unit. Admission has independently proven every
+                # declaration; a power-of-ten difference is not an invariant.
+                continue
             scales = sorted({Decimal(str(fact.unit_scale)) for fact in concept_facts})
             if len(scales) < 2:
                 continue
@@ -1499,15 +815,23 @@ class FinancialFactCompiler:
                     break
         if continuity_issues:
             diagnostics.append("unit_scale_continuity_failed")
-        current_scales = {
-            (fact.accession_number, fact.concept, fact.statement, fact.currency): Decimal(str(fact.unit_scale))
-            for fact in annual_facts + interim_facts
-        }
-        comparator_unit_mismatch = any(
-            current_scales.get((fact.accession_number, fact.concept, fact.statement, fact.currency))
-            not in (None, Decimal(str(fact.unit_scale)))
-            for fact in comparator_facts
-        )
+        def comparator_unit_conflicts(comparative: FinancialFact) -> bool:
+            for current in annual_facts + interim_facts:
+                if ((current.accession_number, current.concept, current.statement, current.currency) !=
+                        (comparative.accession_number, comparative.concept, comparative.statement, comparative.currency)):
+                    continue
+                if Decimal(str(current.unit_scale)) == Decimal(str(comparative.unit_scale)):
+                    continue
+                current_context = physical_unit_context(current, unit_evidence_by_id)
+                prior_context = physical_unit_context(comparative, unit_evidence_by_id)
+                if (current_context and prior_context and current_context != prior_context
+                        and independently_declared_unit(current) and independently_declared_unit(comparative)):
+                    continue
+                # Unknown/legacy context still cannot excuse an inconsistency.
+                return True
+            return False
+
+        comparator_unit_mismatch = any(comparator_unit_conflicts(fact) for fact in comparator_facts)
         if comparator_unit_mismatch:
             diagnostics.append("same_filing_comparator_unit_mismatch")
         # A comparative column is an issuer's restatement of a prior period,
@@ -1523,7 +847,7 @@ class FinancialFactCompiler:
         historical_facts_all = [
             fact for item in validations
             if not is_same_filing_comparator(item)
-            and item.status == ValidationStatus.VERIFIED.value
+            and item.status != ValidationStatus.REJECTED.value
             for fact in item.accepted
         ]
         restatement_conflicts: set[tuple[object, ...]] = set()
@@ -1552,7 +876,8 @@ class FinancialFactCompiler:
                     or comparative.accession_number == historical.accession_number
                 ):
                     continue
-                if Decimal(str(comparative.value)) == Decimal(str(historical.value)):
+                from .financial_comparatives import comparative_amounts_agree
+                if comparative_amounts_agree(comparative, historical):
                     continue
                 conflict_key = (*key, comparative.accession_number)
                 if conflict_key in restatement_conflicts:
@@ -1595,6 +920,34 @@ class FinancialFactCompiler:
             replace(fact, usage_status="quarantined") for fact in quarantined
         )
         required = set(required_concepts)
+        final_accepted_ids = {
+            fact.fact_id for item in validations for fact in item.accepted
+        }
+        final_quarantined_ids = {
+            fact.fact_id for item in validations for fact in item.quarantined
+        }
+        fact_validation_records: dict[str, dict[str, Any]] = {}
+        for fact_id, record in fact_records_by_id.items():
+            accepted_record = fact_id in final_accepted_ids and fact_id not in final_quarantined_ids
+            issues = tuple(dict.fromkeys((
+                *record.issues,
+                *compiler_issues_by_fact.get(fact_id, ()),
+            )))
+            components = record.components
+            if not accepted_record:
+                components = tuple(
+                    (
+                        name,
+                        SourceComponentObservation("observed", observation.value, observation.evidence_ids),
+                    )
+                    if observation.state == "verified"
+                    else (name, observation)
+                    for name, observation in components
+                )
+            final_record = FactValidationRecord(
+                fact_id, accepted_record, issues, components, record.dependencies,
+            )
+            fact_validation_records[fact_id] = final_record.to_dict()
         coverage = {
             "profile_id": profile.profile_id,
             "profile_reason": profile.reason,
@@ -1608,7 +961,10 @@ class FinancialFactCompiler:
             "target_period_range": (range_start, range_end),
             "target_group_count": len(target_validations),
             "target_complete_group_count": len(target_complete),
+            "fact_validation_records": fact_validation_records,
         }
+        if candidate_resolutions:
+            coverage["candidate_resolutions"] = tuple(candidate_resolutions)
         if continuity_issues:
             coverage["unit_scale_continuity_issues"] = tuple(
                 (item["concept"], item["scales"]) for item in continuity_issues

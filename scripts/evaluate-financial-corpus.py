@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from openthesis.domain import Company, FilingDocument
-from openthesis.financial_compiler import CompilerPolicy, FinancialFactCompiler
+from openthesis.financial_pipeline import CollectionPolicy, FinancialCandidatePipeline
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,9 +123,9 @@ def _evaluate_period(issuer: dict[str, Any], period: dict[str, Any]) -> dict[str
             f"{period['fiscal_year'] + 1}-04-01", period["document"], period["source_url"],
             local_path=str(path), content_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
         )
-        dataset = FinancialFactCompiler().compile(
+        dataset = FinancialCandidatePipeline().compile(
             company, (filing.period_end, filing.period_end),
-            CompilerPolicy(filings=(filing,), reporting_currency=issuer["currency"]),
+            CollectionPolicy(filings=(filing,), reporting_currency=issuer["currency"]),
         )
         actual = {fact.concept: fact.value for fact in dataset.research_facts}
         known = {key: value for key, value in expected.items() if isinstance(value, (int, float))}

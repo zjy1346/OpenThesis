@@ -17,6 +17,14 @@ const copy = {
   saved: "Saved.",
   settingsFailed: "Could not save.",
   followSystem: "Follow system",
+  officialNetworkTitle: "Official data network",
+  officialNetworkBody: "Optional official source routing.",
+  officialNetworkProxy: "HTTP CONNECT proxy",
+  officialNetworkProxyHint: "No credentials; for example http://127.0.0.1:7890.",
+  officialNetworkProfiles: "Advanced official-host network profiles",
+  officialNetworkProfilesHint: "Disabled when empty; only exact built-in official hosts and listed CIDRs are accepted.",
+  officialNetworkTlsNote: "TLS verification remains enabled; these are not provider credentials.",
+  officialNetworkProfilesInvalid: "Enter a JSON object mapping official hosts to CIDR arrays.",
 };
 
 describe("SettingsView language controls", () => {
@@ -154,5 +162,67 @@ describe("SettingsView language controls", () => {
     expect(Boolean(footer && vision && (vision.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(screen.getByLabelText("Enable vision fallback")).not.toBeChecked();
+  });
+
+  it("persists proxy and exact-host profile policy as one versioned preference", async () => {
+    const onSave = vi.fn().mockResolvedValue({});
+    render(
+      <SettingsView
+        language="en"
+        preferences={{ ui_language: "en", report_language: "en", sidebar_collapsed: "true", parallel_agents: "false" }}
+        copy={copy}
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("HTTP CONNECT proxy"), { target: { value: "http://127.0.0.1:7890" } });
+    fireEvent.change(screen.getByLabelText("Host profiles (JSON)"), { target: { value: '{"www.sec.gov":["203.0.113.0/24"]}' } });
+    expect(screen.getByText("TLS verification remains enabled; these are not provider credentials.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(Object.keys(onSave.mock.calls[0][0]).filter((key) => key === "official_network_policy")).toHaveLength(1);
+    expect(JSON.parse(onSave.mock.calls[0][0].official_network_policy)).toEqual({
+      version: "official-network-v1",
+      connect_proxy: "http://127.0.0.1:7890",
+      host_profiles: { "www.sec.gov": ["203.0.113.0/24"] },
+    });
+  });
+
+  it("resets an existing network override to the strict default when cleared", async () => {
+    const onSave = vi.fn().mockResolvedValue({});
+    render(
+      <SettingsView
+        language="en"
+        preferences={{
+          ui_language: "en", report_language: "en", sidebar_collapsed: "true", parallel_agents: "false",
+          official_network_policy: JSON.stringify({ version: "official-network-v1", connect_proxy: "http://127.0.0.1:7890", host_profiles: { "www.sec.gov": ["203.0.113.0/24"] } }),
+        }}
+        copy={copy}
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("HTTP CONNECT proxy"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("Host profiles (JSON)"), { target: { value: "{}" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(JSON.parse(onSave.mock.calls[0][0].official_network_policy)).toEqual({ version: "official-network-v1", connect_proxy: "", host_profiles: {} });
+  });
+
+  it("rejects malformed profile JSON without calling the settings backend", () => {
+    const onSave = vi.fn().mockResolvedValue({});
+    render(
+      <SettingsView
+        language="en"
+        preferences={{ ui_language: "en", report_language: "en", sidebar_collapsed: "true", parallel_agents: "false" }}
+        copy={copy}
+        onSave={onSave}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Host profiles (JSON)"), { target: { value: "{invalid" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByText("Enter a JSON object mapping official hosts to CIDR arrays.", { selector: "p[role='alert']" })).toBeVisible();
   });
 });

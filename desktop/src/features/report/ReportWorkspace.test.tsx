@@ -13,6 +13,50 @@ vi.mock("../../backend", () => ({
 }));
 
 describe("report presentation", () => {
+  it("shows an unconfirmed reporting currency without relabelling the listing currency", () => {
+    render(<ReportWorkspace copy={COPY.en} report={{ run_id: "currency", ticker: "09988.HK", company_name: "Fixture",
+      status: "partial", report_language: "en", listing_currency: "HKD", reporting_currency: "", markdown: "Body", html: "" }} />);
+    expect(screen.getByText("Listing currency: HKD")).toBeInTheDocument();
+    expect(screen.getByText("Reporting currency: Unconfirmed")).toBeInTheDocument();
+    expect(screen.queryByText("Listing and reporting currency: HKD")).not.toBeInTheDocument();
+  });
+  it("exposes saved-content revalidation without a model-retry plan or configured model", async () => {
+    const local = vi.fn(async () => undefined);
+    render(<ReportWorkspace copy={COPY.en} onRevalidateSaved={local} report={{ run_id: "local", ticker: "1211", company_name: "Fixture",
+      status: "partial", report_language: "en", markdown: "Saved body", html: "",
+      recovery_plan: { available: false, target: "model-stages", stages: [], reason: "no_retryable_stage", input_artifact_ids: [],
+        plan_hash: "local", operations: [{ code: "revalidate_saved_content", requires_provider: false, requires_confirmation: false, stages: ["base"] }] } }} />);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.revalidateSaved }));
+    await waitFor(() => expect(local).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: COPY.en.recoveryRetry })).not.toBeInTheDocument();
+  });
+  it("requires explicit consent before replacing an unknown request", async () => {
+    vi.mocked(listConfiguredModels).mockResolvedValue([{
+      configured_model_id: "m", connection_id: "c", model_id: "capable", alias: "Capable",
+      free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null,
+      enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null,
+      context_window_hint: null, temperature: null, timeout_seconds: 120, configuration_version: 3,
+    }]);
+    const resume = vi.fn(async () => undefined);
+    render(<ReportWorkspace copy={COPY.en} onRetryRecoveryStage={resume} report={{
+      run_id: "unknown", ticker: "1211", company_name: "BYD", status: "partial",
+      report_language: "en", markdown: "# Saved results", html: "",
+      recovery_plan: { target: "model-stages", stages: ["business-analyst"], reason: "base_stage_incomplete",
+        input_artifact_ids: [], plan_hash: "frozen-plan", available: true,
+        requires_new_attempt_authorization: true, unknown_stages: ["business-analyst"] },
+    }} />);
+    const button = await screen.findByRole("button", { name: COPY.en.recoveryRetry });
+    expect(button).toBeDisabled();
+    expect(screen.getByText(COPY.en.recoveryUnknownWarning)).toBeInTheDocument();
+    const consent = screen.getByRole("checkbox", { name: COPY.en.recoveryConfirmNewAttempt });
+    expect(consent.closest("label")).toHaveClass("checkbox-label");
+    fireEvent.click(consent);
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    await waitFor(() => expect(resume).toHaveBeenCalledWith("model-stages", {
+      configured_model_id: "m", connection_id: "c", configuration_version: 3, role: "primary",
+    }, "frozen-plan", true));
+  });
   it("moves the generated Chinese report preamble out of the document body", () => {
     expect(stripReportPreamble([
       "# OpenThesis 长期公司研究",
@@ -135,6 +179,11 @@ describe("report presentation", () => {
     render(<ReportWorkspace report={{ run_id: "run", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en", retryable_synthesis: true, synthesis_error_code: "MODEL_CONTEXT_CAPACITY", reproducibility: { model_configuration: { configured_model_id: "current" }, research_configuration: {}, data_snapshot: {} }, markdown: "# Report", html: "" }} copy={COPY.en} onRetrySynthesis={retry} />);
 
     expect(await screen.findByRole("combobox", { name: COPY.en.synthesisCapacityModel })).toHaveValue("large");
+    const recovery = screen.getByRole("combobox", { name: COPY.en.synthesisCapacityModel }).closest(".synthesis-capacity-recovery");
+    expect(recovery).toHaveClass("synthesis-capacity-recovery");
+    expect(recovery?.querySelector(".synthesis-capacity-explanation")).toBeInTheDocument();
+    expect(recovery?.querySelector(".synthesis-capacity-control")).toBeInTheDocument();
+    expect(recovery?.querySelector(".synthesis-capacity-action-button")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: COPY.en.retrySynthesis })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: COPY.en.synthesisCapacityRetry }));
     await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", connection_id: "c2", configuration_version: 4, role: "primary" }));

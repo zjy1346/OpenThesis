@@ -6,6 +6,7 @@ from .financials import (
     deterministic_summary,
     format_money,
     format_percent,
+    read_metric_period,
     reverse_dcf_disclaimer,
     reverse_dcf_status_text,
 )
@@ -39,6 +40,12 @@ from .report_revisions import resolve_report_artifact
 
 
 SECTION_LABELS_ZH = {
+    "management_and_capital_allocation": "管理层与资本配置",
+    "existing_growth_engines": "现有增长引擎",
+    "industry_changes_and_value_allocation": "行业变化与价值分配",
+    "source_risk_review": "原件风险初读",
+    "valuation_and_sensitivity": "估值与敏感性",
+    "evidence_and_methodology": "证据与研究方法",
     "executive_summary": "执行摘要",
     "claims": "主要结论",
     "business_model": "商业模式",
@@ -56,6 +63,12 @@ SECTION_LABELS_ZH = {
 }
 
 SECTION_LABELS_EN = {
+    "management_and_capital_allocation": "Management and Capital Allocation",
+    "existing_growth_engines": "Existing Growth Engines",
+    "industry_changes_and_value_allocation": "Industry Changes and Value Allocation",
+    "source_risk_review": "Source Risk Pre-review",
+    "valuation_and_sensitivity": "Valuation and Sensitivity",
+    "evidence_and_methodology": "Evidence and Methodology",
     "executive_summary": "Executive Summary",
     "claims": "Key Claims",
     "business_model": "Business Model",
@@ -75,6 +88,9 @@ SECTION_LABELS_EN = {
 # Backward-compatible export used by integrations.
 SECTION_LABELS = SECTION_LABELS_ZH
 SECTION_LABELS_HANT = {
+    "management_and_capital_allocation": "管理層與資本配置", "existing_growth_engines": "現有增長引擎",
+    "industry_changes_and_value_allocation": "行業變化與價值分配", "source_risk_review": "原件風險初讀", "valuation_and_sensitivity": "估值與敏感性",
+    "evidence_and_methodology": "證據與研究方法",
     "executive_summary": "\u57f7\u884c\u6458\u8981", "claims": "\u4e3b\u8981\u7d50\u8ad6", "business_model": "\u5546\u696d\u6a21\u5f0f",
     "financial_quality": "\u8ca1\u52d9\u54c1\u8cea", "balance_sheet": "\u8cc7\u7522\u8ca0\u50b5\u8868", "competitive_position": "\u7af6\u722d\u5730\u4f4d",
     "growth_opportunities": "\u589e\u9577\u6a5f\u6703", "counterarguments": "\u53cd\u65b9\u89c0\u9ede", "scenarios": "\u9577\u671f\u7d93\u71df\u60c5\u5883",
@@ -199,12 +215,13 @@ def _render_value(
     language: str = "zh-CN",
     level: int = 0,
     field_name: str | None = None,
+    currency: str | None = None,
 ) -> list[str]:
     english = normalize_language(language) == EN
     labels = SECTION_LABELS_EN if english else SECTION_LABELS_HANT if normalize_language(language) == ZH_HANT else SECTION_LABELS_ZH
     if value is None:
         return [_locale_text(language, "证据不足或尚未提供。", "證據不足或尚未提供。", "Insufficient evidence or not provided.")]
-    semantic_value = format_report_semantic_value(value, field_name)
+    semantic_value = format_report_semantic_value(value, field_name, currency)
     if semantic_value is not None:
         return [semantic_value]
     if isinstance(value, str):
@@ -220,7 +237,7 @@ def _render_value(
             return [_locale_text(language, "暂无。", "暫無。", "None.")]
         lines: list[str] = []
         for item in value:
-            rendered = _render_value(item, language, level + 1, field_name)
+            rendered = _render_value(item, language, level + 1, field_name, currency)
             if not rendered:
                 continue
             if rendered[0].lstrip().startswith("- "):
@@ -233,6 +250,7 @@ def _render_value(
         return lines or [_locale_text(language, "暂无可显示内容。", "暫無可顯示內容。", "No displayable content.")]
     if isinstance(value, dict):
         lines = []
+        own_currency = value.get("currency", currency)
         for key, item in value.items():
             if str(key).startswith("_"):
                 continue
@@ -241,7 +259,7 @@ def _render_value(
                 label = growth_field_label(str(key), language)
             if label is None:
                 label = report_field_label(key, language)
-            rendered = _render_value(item, language, level + 1, str(key))
+            rendered = _render_value(item, language, level + 1, str(key), own_currency)
             if not rendered:
                 continue
             if isinstance(item, (dict, list)):
@@ -512,11 +530,28 @@ def _financial_metric_gap_notes(metrics: list[object], language: str) -> list[st
     english = normalize_language(language) == EN
     traditional = normalize_language(language) == ZH_HANT
     lines: list[str] = []
-    for row in metrics[:5]:
-        if not isinstance(row, dict) or row.get("revenue_growth") is not None:
+    valid_metrics: list[dict[str, Any]] = []
+    metric_periods: dict[int, Any] = {}
+    diagnostics: list[str] = []
+    for row in metrics:
+        if not isinstance(row, dict):
+            diagnostics.append("METRIC_PERIOD_INVALID")
+            continue
+        try:
+            period_identity = read_metric_period(row)
+        except ValueError as error:
+            diagnostics.append(str(error))
+            continue
+        if period_identity.period != "FY":
+            diagnostics.append("METRIC_PERIOD_EXPECTED_FY")
+            continue
+        valid_metrics.append(row)
+        metric_periods[id(row)] = period_identity
+    for row in valid_metrics[:5]:
+        if row.get("revenue_growth") is not None:
             continue
         gap = str(row.get("comparison_gap") or "")
-        year = row.get("year", "—")
+        year = metric_periods[id(row)].year
         if gap.startswith("missing_"):
             missing_year = gap.removeprefix("missing_")
             message = (
@@ -538,7 +573,7 @@ def _financial_metric_gap_notes(metrics: list[object], language: str) -> list[st
             continue
         lines.append(f"- {message}")
 
-    latest = next((row for row in metrics if isinstance(row, dict)), None)
+    latest = valid_metrics[0] if valid_metrics else None
     if latest is not None and latest.get("return_on_equity") is None:
         reasons = {
             "missing_net_income": ("net income is missing", "缺少淨利潤資料", "缺少净利润数据"),
@@ -555,6 +590,10 @@ def _financial_metric_gap_notes(metrics: list[object], language: str) -> list[st
                 else f"净资产收益率无法计算：{reason[2]}"
             )
             lines.append(f"- {message}")
+    lines.extend(
+        f"- Metric period row skipped: {code}."
+        for code in dict.fromkeys(diagnostics)
+    )
     return lines
 
 
@@ -661,20 +700,36 @@ def _render_markdown_projection(
                     "",
                 ]
             )
-            gap_notes = _financial_metric_gap_notes(metrics, language)
-            if gap_notes:
-                lines.extend([_pick(language, "## 财务数据缺口", "## Financial Data Gaps"), "", *gap_notes, ""])
             content = deterministic.get("content", {})
             interim_metrics = content.get("interim_metrics")
-            latest_interim = (
-                next((item for item in interim_metrics if isinstance(item, dict)), None)
-                if isinstance(interim_metrics, list)
-                else None
+            latest_interim: tuple[dict[str, Any], Any] | None = None
+            interim_period_diagnostics: list[str] = []
+            for item in (interim_metrics if isinstance(interim_metrics, list) else ()):
+                if not isinstance(item, dict):
+                    interim_period_diagnostics.append("METRIC_PERIOD_INVALID")
+                    continue
+                try:
+                    period_identity = read_metric_period(item)
+                except ValueError as error:
+                    interim_period_diagnostics.append(str(error))
+                    continue
+                if period_identity.period == "FY":
+                    interim_period_diagnostics.append("METRIC_PERIOD_EXPECTED_INTERIM")
+                    continue
+                if latest_interim is None:
+                    latest_interim = (item, period_identity)
+            gap_notes = _financial_metric_gap_notes(metrics, language)
+            gap_notes.extend(
+                f"- Metric period row skipped: {code}."
+                for code in dict.fromkeys(interim_period_diagnostics)
             )
+            if gap_notes:
+                lines.extend([_pick(language, "## 财务数据缺口", "## Financial Data Gaps"), "", *gap_notes, ""])
             if latest_interim:
-                period = f"{latest_interim.get('year', '')} {latest_interim.get('period', '')}".strip()
-                comparison = str(latest_interim.get("comparison_period") or "")
-                comparison_gap = str(latest_interim.get("comparison_gap") or "")
+                interim_row, period_identity = latest_interim
+                period = f"{period_identity.year} {period_identity.period}"
+                comparison = str(interim_row.get("comparison_period") or "")
+                comparison_gap = str(interim_row.get("comparison_gap") or "")
                 currency = str(content.get("currency", "USD"))
                 lines.extend(
                     [
@@ -688,19 +743,19 @@ def _render_markdown_projection(
                         "",
                         _pick(
                             language,
-                            f"- 营业收入：{format_money(latest_interim.get('revenue'), currency)}",
-                            f"- Revenue: {format_money(latest_interim.get('revenue'), currency)}",
+                            f"- 营业收入：{format_money(interim_row.get('revenue'), currency)}",
+                            f"- Revenue: {format_money(interim_row.get('revenue'), currency)}",
                         ),
                         _pick(
                             language,
                             (
-                                f"- 同期收入增长：{format_percent(latest_interim.get('revenue_growth'))}"
+                                f"- 同期收入增长：{format_percent(interim_row.get('revenue_growth'))}"
                                 + (f"（对比 {comparison}）" if comparison else "")
                                 if not comparison_gap
                                 else "- 同期收入增长：缺少或未通过校验的上年同期披露"
                             ),
                             (
-                                f"- Revenue growth: {format_percent(latest_interim.get('revenue_growth'))}"
+                                f"- Revenue growth: {format_percent(interim_row.get('revenue_growth'))}"
                                 + (f" (versus {comparison})" if comparison else "")
                                 if not comparison_gap
                                 else "- Revenue growth: prior-year comparable disclosure is missing or did not pass validation"
@@ -708,13 +763,17 @@ def _render_markdown_projection(
                         ),
                         _pick(
                             language,
-                            f"- 净利润：{format_money(latest_interim.get('net_income'), currency)}",
-                            f"- Net income: {format_money(latest_interim.get('net_income'), currency)}",
+                            (f"- 归母净利润：{format_money(interim_row.get('parent_net_income'), currency)}"
+                             if interim_row.get('net_income') is None and interim_row.get('parent_net_income') is not None
+                             else f"- 净利润：{format_money(interim_row.get('net_income'), currency)}"),
+                            (f"- Profit attributable to owners: {format_money(interim_row.get('parent_net_income'), currency)}"
+                             if interim_row.get('net_income') is None and interim_row.get('parent_net_income') is not None
+                             else f"- Net income: {format_money(interim_row.get('net_income'), currency)}"),
                         ),
                         _pick(
                             language,
-                            f"- 经营现金流：{format_money(latest_interim.get('operating_cash_flow'), currency)}",
-                            f"- Operating cash flow: {format_money(latest_interim.get('operating_cash_flow'), currency)}",
+                            f"- 经营现金流：{format_money(interim_row.get('operating_cash_flow'), currency)}",
+                            f"- Operating cash flow: {format_money(interim_row.get('operating_cash_flow'), currency)}",
                         ),
                         "",
                     ]
@@ -834,7 +893,7 @@ def _render_markdown_projection(
             if isinstance(snapshot, dict):
                 values: list[str] = []
                 quote_currency = str(snapshot.get("quote_currency") or snapshot.get("currency", ""))
-                valuation_currency = str(snapshot.get("valuation_currency") or snapshot.get("reporting_currency") or quote_currency)
+                valuation_currency = str(snapshot.get("valuation_currency") or snapshot.get("reporting_currency") or "")
                 manual_snapshot = str(snapshot.get("source", "")).casefold() == "manual" or str(snapshot.get("status", "")).upper() == "MANUAL"
                 price_label = ("Manual price" if manual_snapshot else "Price") if english else ("手動價格" if traditional and manual_snapshot else "價格" if traditional else "手动价格" if manual_snapshot else "价格")
                 cap_label = ("Manual market cap" if manual_snapshot else "Market cap") if english else ("手動市值" if traditional and manual_snapshot else "市值" if traditional else "手动市值" if manual_snapshot else "市值")

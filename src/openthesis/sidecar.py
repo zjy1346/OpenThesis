@@ -14,7 +14,7 @@ from .service import (
     ServiceConfigurationError,
     _FinancialReportRefreshError,
 )
-from .application_services import ReportReadError
+from .application.reports import ReportReadError
 
 
 class JsonLineServer:
@@ -89,6 +89,7 @@ class JsonLineServer:
                 query,
                 market=market,
                 limit=params.get("limit", 15),
+                request_id=params.get("request_id", ""),
             )
         if method == "ot.validate":
             return self.service.validate_ot_draft(params.get("draft"))
@@ -178,6 +179,11 @@ class JsonLineServer:
             if model is not None and not isinstance(model, dict):
                 raise ValueError("model must be an object")
             return self.service.retry_research_model_stages(run_id, model)
+        if method == "research.revalidate_saved":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run_id is required")
+            return self.service.revalidate_saved_research(run_id)
         if method == "research.retry_growth":
             run_id = params.get("run_id")
             model = params.get("model")
@@ -189,6 +195,7 @@ class JsonLineServer:
             target = params.get("target")
             model = params.get("model")
             plan_hash = params.get("plan_hash")
+            confirm_new_attempt = params.get("confirm_new_attempt", False)
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
             if not isinstance(target, str) or not target:
@@ -197,6 +204,11 @@ class JsonLineServer:
                 raise ValueError("model must be an object")
             if plan_hash is not None and not isinstance(plan_hash, str):
                 raise ValueError("plan_hash must be a string")
+            if type(confirm_new_attempt) is not bool:
+                raise ValueError("confirm_new_attempt must be a boolean")
+            if confirm_new_attempt:
+                return self.service.retry_research_stage(run_id, target, model, plan_hash,
+                                                        confirm_new_attempt=True)
             return self.service.retry_research_stage(run_id, target, model, plan_hash)
         if method == "research.retry_financials":
             run_id = params.get("run_id")

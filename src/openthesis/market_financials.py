@@ -5,11 +5,11 @@ import re
 import unicodedata
 from datetime import date, timedelta
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Iterable
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .financial_contracts import FinancialValidation, ValidationStatus
 from .financial_taxonomy import FINANCIAL_LABEL_ALIASES, capex_component_kind
 
 
@@ -19,11 +19,6 @@ class FinancialExtractionError(RuntimeError):
 
 PARSER_VERSION = "financial-ingestion-v2"
 
-
-class ValidationStatus(StrEnum):
-    VERIFIED = "VERIFIED"
-    READY_WITH_WARNINGS = "READY_WITH_WARNINGS"
-    REJECTED = "REJECTED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,46 +33,6 @@ class StatementContext:
     source_page: int
     continuation_pages_left: int = 0
 
-
-@dataclass(frozen=True, slots=True)
-class FinancialValidation:
-    status: ValidationStatus
-    issues: tuple[str, ...]
-    covered_concepts: frozenset[str]
-    accepted: tuple[FinancialFact, ...] = ()
-    quarantined: tuple[FinancialFact, ...] = ()
-
-    @property
-    def allow_ai(self) -> bool:
-        return self.status in {ValidationStatus.VERIFIED, ValidationStatus.READY_WITH_WARNINGS}
-
-    @property
-    def quality_class(self) -> str:
-        """Classify the failure boundary without flattening warnings.
-
-        Coverage warnings mean that individual fields are unavailable while
-        the accepted sibling facts remain auditable.  Other issues invalidate
-        the statement/group as a whole; an empty group means the source file
-        produced no usable statement facts.
-        """
-        coverage = {
-            "income_statement_core_missing",
-            "cash_flow_core_missing",
-            "balance_sheet_core_missing",
-            "core_coverage_insufficient",
-        }
-        if not self.covered_concepts and not self.accepted:
-            return "file_unavailable"
-        if any(issue not in coverage for issue in self.issues):
-            return "statement_unavailable" if self.status is ValidationStatus.REJECTED else "warning"
-        if self.issues:
-            return "field_missing"
-        return "verified"
-
-    @property
-    def category(self) -> str:
-        """Backward-compatible alias for callers that use category wording."""
-        return self.quality_class
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +397,7 @@ def _parse_financial_pages_legacy(
             unit_provenance=candidate.unit_provenance,
         )
         evidence = EvidenceRef(
-            evidence_id=f"fact:{digest}",
+            evidence_id=f"fact:market:{digest}",
             document_id=filing.document_id,
             source_url=filing.source_url,
             title=f"{filing.form_type} {fiscal_year} · {candidate.label}",
@@ -985,7 +940,7 @@ def parse_financial_pages(
             unit_provenance=candidate.unit_provenance,
         )
         evidence = EvidenceRef(
-            evidence_id=f"fact:{digest}",
+            evidence_id=f"fact:market:{digest}",
             document_id=filing.document_id,
             source_url=filing.source_url,
             title=f"{filing.form_type} {fiscal_year} / {candidate.label}",
@@ -997,38 +952,6 @@ def parse_financial_pages(
         found[definition.concept] = (fact, evidence)
     ordered = [found[item.concept] for item in CONCEPT_PATTERNS if item.concept in found]
     return [item[0] for item in ordered], [item[1] for item in ordered]
-
-
-def validate_financial_facts(facts: list[FinancialFact]) -> FinancialValidation:
-    """Validate independently by period/scope/currency; quarantine bad groups."""
-    groups: dict[tuple[int, str, str, str], list[FinancialFact]] = {}
-    for fact in facts:
-        key = (fact.fiscal_year, (fact.fiscal_period or "FY").upper(), fact.consolidated_scope or fact.scope or "unknown", fact.currency or fact.unit)
-        groups.setdefault(key, []).append(fact)
-    core = {"revenue", "net_income", "assets", "liabilities", "equity", "operating_cash_flow"}
-    accepted: list[FinancialFact] = []
-    quarantined: list[FinancialFact] = []
-    issues: list[str] = []
-    for key, group in groups.items():
-        group_issues = financial_quality_issues(group)
-        covered = {fact.concept for fact in group}
-        if len(covered & core) < 3:
-            group_issues = [*group_issues, "core_coverage_insufficient"]
-        if group_issues:
-            quarantined.extend(group)
-            issues.extend(f"{key[0]}-{key[1]}:{issue}" for issue in group_issues)
-        else:
-            accepted.extend(group)
-    covered = frozenset(fact.concept for fact in accepted)
-    if not accepted:
-        normalized_issues = list(issues or ["core_coverage_insufficient"])
-        if any("core_coverage_insufficient" in issue for issue in normalized_issues) and "core_coverage_insufficient" not in normalized_issues:
-            normalized_issues.append("core_coverage_insufficient")
-        return FinancialValidation(ValidationStatus.REJECTED, tuple(normalized_issues), covered, (), tuple(quarantined))
-    status = ValidationStatus.VERIFIED if len(covered & core) >= len(core) else ValidationStatus.READY_WITH_WARNINGS
-    for fact in accepted:
-        fact.validation_status = status.value
-    return FinancialValidation(status, tuple(issues), covered, tuple(accepted), tuple(quarantined))
 
 
 # Unit recognition intentionally operates on the local page/header text only.

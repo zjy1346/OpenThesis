@@ -1,6 +1,7 @@
 import type {
   BootstrapResult,
   Company,
+  CompanySearchResponse,
   Language,
   Market,
   ModelSelection,
@@ -44,6 +45,7 @@ export const BACKEND_METHODS = [
   "research.market_snapshot",
   "research.retry_growth",
   "research.retry_stage",
+  "research.revalidate_saved",
   "research.retry_model_stages",
   "research.retry_financials",
   "research.refresh_financial_report",
@@ -63,9 +65,9 @@ type EmptyParams = Record<string, never>;
 export type BackendParams = {
   "app.bootstrap": EmptyParams;
   "settings.update": {
-    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market">>;
+    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy">>;
   };
-  "company.search": { query: string; market: Market };
+  "company.search": { query: string; market: Market; request_id?: string };
   "packs.install": { filename: string; data_base64: string };
   "ot.validate": { draft: OtDraft };
   "ot.compile": { draft: OtDraft };
@@ -84,7 +86,8 @@ export type BackendParams = {
   "research.start": ResearchRequest;
   "research.market_snapshot": { company: Company; valuation?: ResearchRequest["valuation"] };
   "research.retry_growth": { run_id: string; model: ModelSelection };
-  "research.retry_stage": { run_id: string; target: string; model?: ModelSelection; plan_hash: string };
+  "research.retry_stage": { run_id: string; target: string; model?: ModelSelection; plan_hash: string; confirm_new_attempt?: boolean };
+  "research.revalidate_saved": { run_id: string };
   "research.retry_model_stages": { run_id: string; model?: ModelSelection };
   "research.retry_financials": { run_id: string };
   "research.refresh_financial_report": { run_id: string; language?: Language };
@@ -100,7 +103,7 @@ export type BackendParams = {
 export type BackendResult = {
   "app.bootstrap": BootstrapResult;
   "settings.update": Preferences;
-  "company.search": Company[];
+  "company.search": CompanySearchResponse;
   "packs.install": ResearchPackSummary;
   "ot.validate": OtValidationResult;
   "ot.compile": OtCompileResult;
@@ -116,6 +119,7 @@ export type BackendResult = {
   "research.market_snapshot": MarketSnapshotPreview;
   "research.retry_growth": ResearchReport;
   "research.retry_stage": ResearchReport;
+  "research.revalidate_saved": ResearchReport;
   "research.retry_model_stages": ResearchReport;
   "research.retry_financials": ResearchReport;
   "research.refresh_financial_report": ResearchReport;

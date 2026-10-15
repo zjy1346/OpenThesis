@@ -9,17 +9,17 @@ and UI paths.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Sequence
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
-from .financial_ingestion import (
-    _PDF_PARSER_VERSION,
-    FinancialProfile,
-    build_financial_profile,
+from .financial_contracts import PDF_PARSER_VERSION as _PDF_PARSER_VERSION
+from .financial_profile import (
+    FinancialProfile, build_financial_profile,
 )
+from .research_source_context import repair_observations_from_canonical
 
 
 FINANCIAL_ADMISSION_CONTRACT_VERSION = "financial-admission-v1"
@@ -66,6 +66,8 @@ class FinancialResearchView:
     diagnostics: tuple[str, ...]
     readiness: ResearchReadiness
     admission_contract_version: str = FINANCIAL_ADMISSION_CONTRACT_VERSION
+    canonical_dataset: Any = field(default=None, compare=False, repr=False)
+    publishable_accessions: tuple[str, ...] = ()
 
     @property
     def capability_map(self) -> dict[str, bool]:
@@ -101,13 +103,15 @@ class FinancialAdmission:
         evidence: Sequence[EvidenceRef] = (),
         requested_annual_count: int | None = None,
         research_as_of: str | None = None,
+        parsing_observations: Sequence[dict[str, Any]] = (),
     ) -> FinancialResearchView:
         facts = tuple(getattr(canonical, "research_facts", ()) or ())
         quarantined_facts = tuple(getattr(canonical, "quarantined_facts", ()) or ())
         stale_pdf_facts = tuple(
             fact for fact in facts
-            if fact.parser_version.startswith("financial-ingestion-ast")
-            and fact.parser_version != _PDF_PARSER_VERSION
+            if (fact.parser_version.startswith("financial-ingestion-ast")
+                and fact.parser_version != _PDF_PARSER_VERSION)
+            or fact.parser_version in {"sec-companyfacts-v1", "sec-companyfacts-v2", "sec-companyfacts-v3"}
         )
         if stale_pdf_facts:
             stale_ids = {fact.fact_id for fact in stale_pdf_facts}
@@ -125,10 +129,15 @@ class FinancialAdmission:
             manifests=canonical_manifests,
             requested_annual_count=requested_annual_count,
             research_as_of=research_as_of,
+            parsing_observations=parsing_observations,
         )
+        profile = replace(profile, disclosure_facts=tuple(
+            getattr(canonical, "supplemental_facts", ()) or ()),
+            repair_observations=tuple(repair_observations_from_canonical(canonical)),
+            source_evidence=tuple(evidence or getattr(canonical, "evidence", ()) or ()))
         capabilities = dict(getattr(canonical, "capabilities", {}) or {})
         growth_fields = (
-            "revenue_growth", "operating_income_growth", "net_income_growth",
+            "revenue_growth", "operating_income_growth", "net_income_growth", "parent_net_income_growth",
             "operating_cash_flow_growth",
         )
         capabilities["financial_snapshot"] = bool(
@@ -180,6 +189,7 @@ class FinancialAdmission:
             diagnostics=diagnostics,
             readiness=readiness,
             admission_contract_version=FINANCIAL_ADMISSION_CONTRACT_VERSION,
+            canonical_dataset=canonical,
         )
 
     def admit_facts(

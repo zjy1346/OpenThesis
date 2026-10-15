@@ -7,16 +7,22 @@ import re
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .domain import (
+    Company, EvidenceRef, FilingDocument, FinancialFact,
+    FinancialNormalizationLineage,
+)
 from .download_safety import UnsafeDisclosurePayload, store_immutable_payload
+from .financial_contracts import QuantityKind, SourceAmount, exact_decimal_arithmetic
 
 
 SEC_DATA_BASE = "https://data.sec.gov"
@@ -24,11 +30,42 @@ SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_TICKERS_EXCHANGE_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 
+
+def _validate_managed_sec_url(url):
+    from .resilience.strategies import RecoveryError
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        valid_port = parsed.port in (None, 443)
+    except ValueError:
+        valid_port = False
+    if (parsed.scheme != "https" or parsed.hostname not in {"sec.gov", "www.sec.gov", "data.sec.gov"}
+            or parsed.username or parsed.password or not valid_port):
+        raise RecoveryError("OFFICIAL_SOURCE_REDIRECT_UNSAFE")
+
+
+class _ManagedSecRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, newurl):
+        from .resilience.remote import before_remote_request
+        _validate_managed_sec_url(newurl)
+        redirected = super().redirect_request(request, response, code, message, headers, newurl)
+        if redirected is not None:
+            before_remote_request()
+        return redirected
+
 _ANNUAL_FORMS = frozenset({
     "10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A",
 })
 _MIN_ANNUAL_DURATION_DAYS = 350
 _MAX_ANNUAL_DURATION_DAYS = 380
+
+
+def _sec_input_unit_evidence_id(
+    cik: str, namespace: str, tag: str, unit: str, accession: str, end_date: str,
+) -> str:
+    """Stable, inspectable identity for a CompanyFacts formula input unit."""
+    return (
+        f"unit:sec-input:{cik}:{namespace}:{tag}:{unit}:{accession}:{end_date}"
+    )
 
 
 def _normalize_sec_exchange(value: object) -> str:
@@ -120,18 +157,22 @@ CONCEPT_MAP: dict[str, tuple[str, ...]] = {
         "SalesRevenueNet",
     ),
     "operating_income": ("OperatingIncomeLoss",),
-    "net_income": ("NetIncomeLoss", "ProfitLoss"),
+    "net_income": ("ProfitLoss",),
+    "parent_net_income": ("NetIncomeLoss",),
+    "ordinary_shareholder_net_income": ("NetIncomeLossAvailableToCommonStockholdersBasic",),
+    "minority_interest_profit": ("NetIncomeLossAttributableToNoncontrollingInterest",),
     "operating_cash_flow": ("NetCashProvidedByUsedInOperatingActivities",),
-    "capital_expenditure": (
+    "capital_expenditure": ("PaymentsToAcquireProductiveAssets",),
+    "capital_expenditure_ppe": (
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsForAdditionsToPropertyPlantAndEquipment",
     ),
+    "capital_expenditure_intangible": ("PaymentsToAcquireIntangibleAssets",),
     "assets": ("Assets",),
     "liabilities": ("Liabilities",),
-    "equity": (
-        "StockholdersEquity",
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-    ),
+    "equity": ("StockholdersEquity",),
+    "total_equity": ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",),
+    "minority_interest_equity": ("MinorityInterest",),
     "cash": (
         "CashAndCashEquivalentsAtCarryingValue",
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
@@ -150,29 +191,26 @@ CONCEPT_MAP: dict[str, tuple[str, ...]] = {
 IFRS_CONCEPT_MAP: dict[str, tuple[str, ...]] = {
     "revenue": (
         "Revenue",
-        "RevenueAndOperatingIncome",
         "RevenueFromContractWithCustomerExcludingAssessedTax",
     ),
-    "net_income": (
-        "ProfitLossAttributableToOwnersOfParent",
-        "ProfitLossAttributableToOrdinaryEquityHoldersOfParentEntity",
-        "ProfitLoss",
-    ),
+    "net_income": ("ProfitLoss",),
+    "parent_net_income": ("ProfitLossAttributableToOwnersOfParent",),
+    "ordinary_shareholder_net_income": ("ProfitLossAttributableToOrdinaryEquityHoldersOfParentEntity",),
     "operating_income": (
         "ProfitLossFromOperatingActivities",
         "OperatingProfitLoss",
     ),
     "operating_cash_flow": (
         "CashFlowsFromUsedInOperatingActivities",
-        "CashFlowsFromUsedInOperations",
     ),
-    "capital_expenditure": (
+    "operating_cash_flow_before_tax": ("CashFlowsFromUsedInOperations",),
+    "capital_expenditure_ppe": (
         "PurchaseOfPropertyPlantAndEquipment",
         "PaymentsToAcquirePropertyPlantAndEquipment",
     ),
     "assets": ("Assets",),
     "liabilities": ("Liabilities",),
-    "equity": ("EquityAttributableToOwnersOfParent", "Equity"),
+    "equity": ("EquityAttributableToOwnersOfParent",),
     "total_equity": ("Equity",),
 }
 
@@ -182,16 +220,23 @@ IFRS_CONCEPT_MAP: dict[str, tuple[str, ...]] = {
 SEC_STATEMENT_BY_CONCEPT: dict[str, str] = {
     "revenue": "income_statement",
     "net_income": "income_statement",
+    "parent_net_income": "income_statement",
+    "ordinary_shareholder_net_income": "income_statement",
+    "minority_interest_profit": "income_statement",
     "operating_income": "income_statement",
     "profit_before_tax": "income_statement",
     "profit_after_tax": "income_statement",
     "gross_profit": "income_statement",
     "operating_cash_flow": "cash_flow",
+    "operating_cash_flow_before_tax": "cash_flow",
     "capital_expenditure": "cash_flow",
+    "capital_expenditure_ppe": "cash_flow",
+    "capital_expenditure_intangible": "cash_flow",
     "assets": "balance_sheet",
     "liabilities": "balance_sheet",
     "equity": "balance_sheet",
     "total_equity": "balance_sheet",
+    "minority_interest_equity": "balance_sheet",
     "reported_roe": "summary",
 }
 
@@ -350,9 +395,14 @@ class SecClient:
         self.discovery_diagnostics: tuple[str, ...] = ()
 
     def _request_bytes(self, url: str) -> bytes:
+        from .resilience.remote import before_remote_request, current_remote_context, managed_remote_failure
+        managed = current_remote_context() is not None
+        if managed:
+            _validate_managed_sec_url(url)
+        attempts = 1 if managed else self.max_attempts
         deadline = time.monotonic() + self.request_deadline_seconds
         last_error: Exception | None = None
-        for attempt in range(self.max_attempts):
+        for attempt in range(attempts):
             elapsed = time.monotonic() - self._last_request
             if elapsed < self.min_interval:
                 time.sleep(self.min_interval - elapsed)
@@ -368,13 +418,19 @@ class SecClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                with urllib.request.urlopen(request, timeout=min(30.0, remaining)) as response:
+                before_remote_request()
+                opener = self._open_managed if managed else urllib.request.urlopen
+                with opener(request, timeout=min(30.0, remaining)) as response:
                     declared = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
                     if declared and int(declared) > self.max_response_bytes:
                         raise SecClientError("SEC_RESPONSE_TOO_LARGE")
                     chunks: list[bytes] = []
                     total = 0
                     while True:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("SEC request deadline exceeded while reading")
+                        if managed:
+                            current_remote_context().checkpoint()
                         chunk = response.read(min(64 * 1024, self.max_response_bytes - total + 1))
                         if not chunk:
                             return b"".join(chunks)
@@ -383,8 +439,10 @@ class SecClient:
                             raise SecClientError("SEC_RESPONSE_TOO_LARGE")
                         chunks.append(chunk)
             except urllib.error.HTTPError as exc:
+                if managed:
+                    raise managed_remote_failure(exc) from exc
                 last_error = exc
-                if exc.code not in {429, 503} or attempt + 1 >= self.max_attempts:
+                if exc.code not in {429, 503} or attempt + 1 >= attempts:
                     break
                 retry_after = _retry_after_seconds(exc.headers.get("Retry-After", ""))
                 delay = retry_after if retry_after is not None else min(8.0, 0.5 * (2 ** attempt))
@@ -393,8 +451,10 @@ class SecClient:
                     break
                 time.sleep(delay)
             except (urllib.error.URLError, TimeoutError) as exc:
+                if managed:
+                    raise managed_remote_failure(exc) from exc
                 last_error = exc
-                if attempt + 1 >= self.max_attempts:
+                if attempt + 1 >= attempts:
                     break
                 delay = min(8.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.1)
                 if time.monotonic() + delay >= deadline:
@@ -404,18 +464,22 @@ class SecClient:
                 self._last_request = time.monotonic()
         raise SecClientError(f"SEC 请求失败：{url}\n{last_error or 'request deadline exceeded'}") from last_error
 
+    @staticmethod
+    def _open_managed(request, *, timeout):
+        return urllib.request.build_opener(_ManagedSecRedirectHandler()).open(request, timeout=timeout)
+
     def _get_json(self, url: str, cache_name: str | None = None) -> dict[str, Any]:
         cache_path = self.cache_dir / cache_name if cache_name else None
         if cache_path and cache_path.exists():
             age_seconds = time.time() - cache_path.stat().st_mtime
             if age_seconds < 24 * 60 * 60:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
+                return json.loads(cache_path.read_text(encoding="utf-8"), parse_float=Decimal)
         payload = self._request_bytes(url)
         if cache_path:
             temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
             temporary.write_bytes(payload)
             temporary.replace(cache_path)
-        return json.loads(payload.decode("utf-8"))
+        return json.loads(payload.decode("utf-8"), parse_float=Decimal)
     def search_companies(self, query: str, limit: int = 15) -> list[Company]:
         query = query.strip().casefold().replace("/", "-").replace(".", "-")
         if not query:
@@ -687,7 +751,7 @@ class SecClient:
                 source_url = f"{SEC_ARCHIVES_BASE}/{cik_plain}/{accession_plain}/"
                 fact_key = (
                     f"{company.cik}|{normalized}|{row.get('fy')}|{row.get('end')}|"
-                    f"{row.get('filed')}|{row.get('val')}"
+                    f"{row.get('filed')}|{float(row.get('val'))}"
                 )
                 key = (normalized, str(row.get("end", "")), accession, reported)
                 if key in seen:
@@ -709,9 +773,27 @@ class SecClient:
                     if len(unit_code) != 3 or not unit_code.isalpha():
                         continue
                     currency = unit_code
+                fact_id = hashlib.sha256(fact_key.encode()).hexdigest()[:24]
+                raw_value = str(row.get("val", ""))
+                unit_evidence_id = "unit:" + hashlib.sha256(
+                    f"sec-companyfacts|{company.cik}|{namespace_name}|{reported}|"
+                    f"{preferred_unit}|{accession}|{row.get('end')}".encode("utf-8")
+                ).hexdigest()[:24]
+                try:
+                    lineage = SourceAmount(
+                        raw_value,
+                        "1",
+                        QuantityKind.SHARES if is_share_fact else QuantityKind.MONEY,
+                        currency,
+                        (unit_evidence_id,),
+                    ).normalize()
+                except ValueError:
+                    # Preserve the source fact as an audit candidate; the
+                    # current parser contract will quarantine it at admission.
+                    lineage = None
                 facts.append(
                     FinancialFact(
-                        fact_id=hashlib.sha256(fact_key.encode()).hexdigest()[:24],
+                        fact_id=fact_id,
                         company_cik=company.cik,
                         concept=normalized,
                         reported_concept=reported,
@@ -737,8 +819,9 @@ class SecClient:
                         revision="original",
                         source_document=f"SEC CompanyFacts {namespace_name}:{reported}",
                         raw_text=f"{namespace_name}:{reported}={row.get('val')} {preferred_unit}",
-                        parser_version="sec-companyfacts-v2",
+                        parser_version="sec-companyfacts-v4",
                         validation_status="ready_with_warnings",
+                        normalization_lineage=lineage,
                     )
                 )
         # Some US-GAAP issuers do not publish a scalar ``Liabilities`` fact.
@@ -793,13 +876,22 @@ class SecClient:
                         selected[key] = (tag, row, preferred_unit)
             return selected
 
-        formula_candidates: dict[tuple[str, str, int, str, str, str, str], list[tuple[float, str, tuple[tuple[str, float], ...], dict[str, Any], str]]] = {}
+        formula_candidates: dict[
+            tuple[str, str, int, str, str, str, str],
+            list[tuple[Decimal, str, tuple[tuple[str, Decimal], ...], dict[str, Any], str]],
+        ] = {}
         for formula_tags in _LIABILITY_DERIVATION_TAGS:
             rows_by_tag = [annual_rows((tag,)) for tag in formula_tags]
             common_keys = set(rows_by_tag[0]).intersection(*rows_by_tag[1:])
             for key in common_keys:
-                inputs = tuple((rows_by_tag[index][key][0], float(rows_by_tag[index][key][1]["val"])) for index in range(len(rows_by_tag)))
-                value = inputs[0][1] - inputs[1][1] if len(inputs) == 2 and formula_tags[0].startswith("LiabilitiesAnd") else sum(item[1] for item in inputs)
+                inputs = tuple(
+                    (rows_by_tag[index][key][0], Decimal(str(rows_by_tag[index][key][1]["val"])))
+                    for index in range(len(rows_by_tag))
+                )
+                value = exact_decimal_arithmetic(
+                    tuple(item[1] for item in inputs),
+                    "subtract" if len(inputs) == 2 and formula_tags[0].startswith("LiabilitiesAnd") else "sum",
+                )
                 formula = (
                     f"{inputs[0][0]} - {inputs[1][0]}"
                     if len(inputs) == 2 and formula_tags[0].startswith("LiabilitiesAnd")
@@ -825,14 +917,16 @@ class SecClient:
                 continue
             total_item = total_equity_rows.get(key)
             if total_item is not None:
-                parent_value = float(parent_item[1]["val"])
-                nci_value = float(nci_item[1]["val"])
-                total_value = float(total_item[1]["val"])
-                if not self._values_reconcile(parent_value + nci_value, total_value):
+                parent_value = Decimal(str(parent_item[1]["val"]))
+                nci_value = Decimal(str(nci_item[1]["val"]))
+                total_value = Decimal(str(total_item[1]["val"]))
+                if not self._values_reconcile(
+                    exact_decimal_arithmetic((parent_value, nci_value)), total_value,
+                ):
                     continue
-            balance_value = float(balance_item[1]["val"])
-            parent_value = float(parent_item[1]["val"])
-            nci_value = float(nci_item[1]["val"])
+            balance_value = Decimal(str(balance_item[1]["val"]))
+            parent_value = Decimal(str(parent_item[1]["val"]))
+            nci_value = Decimal(str(nci_item[1]["val"]))
             inputs = (
                 (balance_item[0], balance_value),
                 (parent_item[0], parent_value),
@@ -841,7 +935,7 @@ class SecClient:
             formula = f"{balance_item[0]} - {parent_item[0]} - {nci_item[0]}"
             formula_candidates.setdefault(key, []).append(
                 (
-                    balance_value - parent_value - nci_value,
+                    exact_decimal_arithmetic((balance_value, parent_value, nci_value), "subtract"),
                     formula,
                     inputs,
                     balance_item[1],
@@ -849,43 +943,10 @@ class SecClient:
                 )
             )
 
-        # A separate conservative path covers issuers whose CompanyFacts
-        # history consistently contains parent stockholders' equity but no
-        # NCI concept at all.  A single missing NCI row is not evidence of
-        # zero, so require at least two distinct FY accessions and reject the
-        # path when either NCI or total-equity-with-NCI appears anywhere in
-        # the issuer payload.  This is the common fully-owned-subsidiary
-        # presentation used by AMZN-like filers, while mixed/NCI filers stay
-        # quarantined unless an explicit complete formula is available.
-        parent_balance_keys = set(parent_rows).intersection(balance_rows)
-        parent_balance_years = {key[2] for key in parent_balance_keys}
-        if (
-            not nci_rows
-            and not total_equity_rows
-            and len(parent_balance_years) >= 2
-        ):
-            history_note = f"issuer-wide no reported NCI across {len(parent_balance_years)} FY periods"
-            for key in parent_balance_keys:
-                parent_item = parent_rows[key]
-                balance_item = balance_rows[key]
-                balance_value = float(balance_item[1]["val"])
-                parent_value = float(parent_item[1]["val"])
-                derived_value = balance_value - parent_value
-                if derived_value < 0:
-                    continue
-                inputs = (
-                    (balance_item[0], balance_value),
-                    (parent_item[0], parent_value),
-                )
-                formula_candidates.setdefault(key, []).append(
-                    (
-                        derived_value,
-                        f"{balance_item[0]} - {parent_item[0]} ({history_note})",
-                        inputs,
-                        balance_item[1],
-                        balance_item[2],
-                    )
-                )
+        # Absence of a tag in any number of years is not proof of zero NCI.
+        # Only explicit, semantically complete reported inputs above can
+        # establish consolidated liabilities. Native filing rows remain an
+        # independent source for issuers whose structured payload is incomplete.
 
         for key, candidates in formula_candidates.items():
             if key in official_liability_keys:
@@ -894,9 +955,12 @@ class SecClient:
             if not values:
                 continue
             # Compare only semantically equivalent true-liability paths.
-            if not all(self._values_reconcile(values[0], value) for value in values[1:]):
+            if not all(
+                self._values_reconcile(values[0], value)
+                for value in values[1:]
+            ):
                 continue
-            def formula_priority(candidate: tuple[float, str, tuple[tuple[str, float], ...], dict[str, Any], str]) -> tuple[int, str]:
+            def formula_priority(candidate: tuple[Decimal, str, tuple[tuple[str, Decimal], ...], dict[str, Any], str]) -> tuple[int, str]:
                 formula = candidate[1]
                 if "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest" in formula:
                     return (0, formula)
@@ -908,8 +972,33 @@ class SecClient:
             accession = str(row.get("accn", ""))
             accession_plain = accession.replace("-", "")
             source_url = f"{SEC_ARCHIVES_BASE}/{str(int(company.cik))}/{accession_plain}/"
-            input_text = ", ".join(f"{tag}={input_value:g}" for tag, input_value in inputs)
+            input_text = ", ".join(f"{tag}={input_value}" for tag, input_value in inputs)
             fact_key = f"{company.cik}|liabilities|derived|{key}|{formula}|{value}"
+            input_lineages = tuple(
+                SourceAmount(
+                    str(input_value), "1", QuantityKind.MONEY, preferred_unit.upper(),
+                    (_sec_input_unit_evidence_id(
+                        company.cik, "us-gaap", tag, preferred_unit, accession,
+                        str(row.get("end", "")),
+                    ),),
+                ).normalize()
+                for tag, input_value in inputs
+            )
+            unit_evidence_ids = tuple(dict.fromkeys(
+                evidence_id
+                for input_lineage in input_lineages
+                for evidence_id in input_lineage.unit_evidence_ids
+            ))
+            operation = "subtract" if " - " in formula else "sum"
+            lineage = FinancialNormalizationLineage(
+                raw_value="", scale="1", normalized_value=str(value),
+                quantity_kind=QuantityKind.MONEY.value,
+                currency=preferred_unit.upper(),
+                unit_evidence_ids=unit_evidence_ids,
+                method="sec-xbrl-arithmetic-v1",
+                value_transform=operation,
+                inputs=input_lineages,
+            )
             facts.append(
                 FinancialFact(
                     fact_id=hashlib.sha256(fact_key.encode()).hexdigest()[:24],
@@ -938,23 +1027,28 @@ class SecClient:
                     revision="original",
                     source_document="SEC CompanyFacts us-gaap:derived-liabilities",
                     raw_text=f"derived liabilities = {formula} = {value:g}; inputs: {input_text}",
-                    parser_version="sec-companyfacts-v2",
+                    parser_version="sec-companyfacts-v4",
                     validation_status="ready_with_warnings",
+                    normalization_lineage=lineage,
                 )
             )
         return facts
 
     @staticmethod
-    def _values_reconcile(left: float, right: float) -> bool:
-        """Return whether two same-semantic XBRL values agree after rounding."""
-        return abs(left - right) <= max(1.0, max(abs(left), abs(right)) * 0.01)
+    def _values_reconcile(left: Decimal, right: Decimal) -> bool:
+        """CompanyFacts supplies normalized values, not a rounding certificate.
+
+        Independent complete formulas must agree exactly. A percent epsilon
+        or conversion to float cannot substitute for original display precision.
+        """
+        return left.is_finite() and right.is_finite() and left == right
 
     @staticmethod
     def _period_kind_for_concept(normalized: str) -> str:
         """Map standardized statement concepts to XBRL duration semantics."""
 
         if normalized in {
-            "assets", "liabilities", "equity", "total_equity", "cash",
+            "assets", "liabilities", "equity", "total_equity", "minority_interest_equity", "cash",
             "accounts_receivable", "inventory", "shares_outstanding",
         }:
             return "instant"
@@ -1057,37 +1151,70 @@ class SecFinancialSourceAdapter:
     def __init__(self, client: SecClient):
         self.client = client
         self._facts: dict[str, list[FinancialFact]] = {}
+        self._failure_diagnostics: dict[str, str] = {}
+
+    def with_recovery_source(self, wrap):
+        """Capture the remote owner without carrying prior transient failures."""
+        return type(self)(wrap(self.client))
+
+    def _company_facts_for(
+        self, company: Company
+    ) -> tuple[list[FinancialFact] | None, str | None]:
+        """Fetch CompanyFacts at most once per CIK for this adapter lifetime."""
+        cache_key = company.cik
+        failure = self._failure_diagnostics.get(cache_key)
+        if failure is not None:
+            return None, failure
+        if cache_key not in self._facts:
+            try:
+                self._facts[cache_key] = self.client.get_company_facts(company)
+            except Exception as exc:
+                # Keep only a bounded diagnostic; the exception may contain
+                # credentials or other request-specific sensitive details.
+                failure = f"sec_structured_source_failed:{type(exc).__name__}"
+                self._failure_diagnostics[cache_key] = failure
+                return None, failure
+        return self._facts[cache_key], None
 
     def fetch(
         self, company: Company, filing: FilingDocument
     ) -> tuple[list[FinancialFact], list[EvidenceRef], str | None]:
-        mapped = SEC_HK_ISSUERS.get(company.ticker.upper())
-        if mapped is None:
-            return [], [], "sec_structured_source_not_mapped"
-        sec_cik, sec_ticker, currency, standard = mapped
-        sec_company = Company(
-            cik=sec_cik.zfill(10), ticker=sec_ticker, name=company.name,
-            exchange="SEC", issuer_id=sec_ticker, market="US",
-            security_id=sec_cik.zfill(10), listing_currency=currency,
-            reporting_currency=currency, accounting_standard=standard,
-        )
-        try:
-            cache_key = sec_company.cik
-            if cache_key not in self._facts:
-                self._facts[cache_key] = self.client.get_company_facts(sec_company)
+        if (company.market or "").upper() == "US":
+            cached_facts, failure = self._company_facts_for(company)
+            if failure is not None:
+                return [], [], failure
             selected = [
-                fact for fact in self._facts[cache_key]
-                if fact.end_date == filing.period_end
+                fact for fact in cached_facts or []
+                if fact.company_cik == company.cik
+                and fact.accession_number == filing.accession_number
+            ]
+        else:
+            mapped = SEC_HK_ISSUERS.get(company.ticker.upper())
+            if mapped is None:
+                return [], [], "sec_structured_source_not_mapped"
+            sec_cik, sec_ticker, currency, standard = mapped
+            sec_company = Company(
+                cik=sec_cik.zfill(10), ticker=sec_ticker, name=company.name,
+                exchange="SEC", issuer_id=sec_ticker, market="US",
+                security_id=sec_cik.zfill(10), listing_currency=currency,
+                reporting_currency=currency, accounting_standard=standard,
+            )
+            cached_facts, failure = self._company_facts_for(sec_company)
+            if failure is not None:
+                return [], [], failure
+            selected = [
+                fact for fact in cached_facts or []
+                if fact.company_cik == sec_company.cik
+                and fact.end_date == filing.period_end
                 and (fact.fiscal_period or "FY").upper() == (filing.fiscal_period or "FY").upper()
                 and fact.currency.upper() == currency.upper()
             ]
-        except Exception as exc:
-            return [], [], f"sec_structured_source_failed:{type(exc).__name__}"
         if not selected:
             return [], [], "sec_structured_period_not_found"
-        refs = [
-            EvidenceRef(
-                evidence_id=f"sec:{fact.fact_id}",
+        refs: list[EvidenceRef] = []
+        for fact in selected:
+            refs.append(EvidenceRef(
+                evidence_id=f"fact:{fact.fact_id}",
                 document_id=filing.document_id,
                 source_url=fact.source_url,
                 title=f"SEC CompanyFacts {fact.reported_concept}",
@@ -1096,7 +1223,39 @@ class SecFinancialSourceAdapter:
                 published_at=fact.filed_at,
                 content_hash="",
                 bbox=None,
-            )
-            for fact in selected
-        ]
+            ))
+            lineage = fact.normalization_lineage
+            if lineage is None:
+                continue
+            for evidence_id in lineage.unit_evidence_ids:
+                input_parts = evidence_id.split(":")
+                if len(input_parts) == 8 and input_parts[:2] == ["unit", "sec-input"]:
+                    _prefix, _kind, _cik, namespace, tag, unit, accession, end_date = input_parts[:8]
+                    locator = (
+                        f"xbrl:{namespace}/{tag}/units/{unit}/"
+                        f"accession/{accession}/end/{end_date}"
+                    )
+                    excerpt = (
+                        f"CompanyFacts formula input unit: {tag}={unit}; "
+                        f"derived row: {fact.raw_text}"
+                    )
+                else:
+                    locator = (
+                        "xbrl:" + fact.source_document.removeprefix("SEC CompanyFacts ").replace(" ", "/")
+                        + f"/units/{fact.unit}"
+                    )
+                    excerpt = (
+                        f"CompanyFacts raw value={lineage.raw_value}; "
+                        f"unit={fact.unit}; scale={lineage.scale}"
+                    )
+                refs.append(EvidenceRef(
+                    evidence_id=evidence_id,
+                    document_id=filing.document_id,
+                    source_url=fact.source_url,
+                    title=f"SEC CompanyFacts XBRL unit {fact.unit}",
+                    locator=locator,
+                    excerpt=excerpt,
+                    published_at=fact.filed_at,
+                    content_hash="",
+                ))
         return selected, refs, None

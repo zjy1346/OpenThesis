@@ -119,7 +119,7 @@ function Invoke-JsonProbe {
             throw "$Label probe returned no response (exit_code=$exitStatus)."
         }
         try {
-            return (Get-Content -LiteralPath $ProbeFiles.Output -Raw | ConvertFrom-Json -ErrorAction Stop)
+            return (Get-Content -LiteralPath $ProbeFiles.Output -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop)
         } catch {
             throw "$Label probe returned invalid JSON (exit_code=$exitStatus)."
         }
@@ -144,6 +144,8 @@ function Start-PersistentSidecar {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
+    # Sidecar stdout is a UTF-8 protocol; do not inherit the host code page.
+    $startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
     $startInfo.RedirectStandardError = $true
     $startInfo.EnvironmentVariables["OPENTHESIS_DATA_DIR"] = $DataDirectory
     $process = New-Object System.Diagnostics.Process

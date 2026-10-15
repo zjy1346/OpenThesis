@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, Callable
 
 from .domain import ResearchArtifact, ResearchRun
 from .i18n import EN, ZH_HANT, normalize_language
 from .storage import Storage
+from .storage_comparison import ComparisonError
+from .research_continuity import StageAttempt, StageOutcome
 
 
-def _final_report(artifacts: list[dict[str, Any]]) -> dict[str, Any]:
-    for artifact in reversed(artifacts):
-        if artifact["artifact_type"] == "research-report":
-            content = artifact["content"]
-            report = content.get("report", content)
-            return report if isinstance(report, dict) else {"narrative": str(report)}
-    return {}
+def _final_report(content: dict[str, Any]) -> dict[str, Any]:
+    report = content.get("report", content)
+    if not isinstance(report, dict) or not report:
+        raise ComparisonError("COMPARISON_REPORT_UNAVAILABLE")
+    return report
 
 
 def _claim_texts(report: dict[str, Any]) -> set[str]:
@@ -36,11 +36,15 @@ def compare_research_runs(
     primary: ResearchRun,
     secondary: ResearchRun,
     language: str = "zh-CN",
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    stage_id: str = "model-comparison",
 ) -> ResearchArtifact:
     locale = normalize_language(language)
     english = locale == EN
-    left = _final_report(storage.get_artifacts(primary.run_id))
-    right = _final_report(storage.get_artifacts(secondary.run_id))
+    snapshot = storage.get_comparison_snapshot(primary.run_id, secondary.run_id)
+    left = _final_report(snapshot["primary"]["report_payload"])
+    right = _final_report(snapshot["secondary"]["report_payload"])
     left_claims = _claim_texts(left)
     right_claims = _claim_texts(right)
     ignored = {"claims", "structured_output_valid"}
@@ -60,16 +64,11 @@ def compare_research_runs(
             }
         )
     content = {
-        "primary": {
-            "run_id": primary.run_id,
-            "provider": primary.provider_id,
-            "model": primary.model_id,
-        },
-        "secondary": {
-            "run_id": secondary.run_id,
-            "provider": secondary.provider_id,
-            "model": secondary.model_id,
-        },
+        role: {key: snapshot[role][key] for key in
+               ("run_id", "provider", "model", "revision_id", "generation", "content_sha256")}
+        for role in ("primary", "secondary")
+    }
+    content.update({
         "common_claims": sorted(left_claims & right_claims),
         "primary_only_claims": sorted(left_claims - right_claims),
         "secondary_only_claims": sorted(right_claims - left_claims),
@@ -83,7 +82,7 @@ def compare_research_runs(
             if locale == ZH_HANT
             else "确定性结构比较；相同文本不代表事实正确，文本不同也不自动代表实质冲突。"
         ),
-    }
+    })
     identity = json.dumps(content, ensure_ascii=False, sort_keys=True).encode()
     artifact = ResearchArtifact(
         artifact_id=(
@@ -94,8 +93,12 @@ def compare_research_runs(
         artifact_type="model-comparison",
         title=("Two-model Research Differences" if english else "雙模型研究分歧" if locale == ZH_HANT else "双模型研究分歧"),
         content=content,
-        model_id=f"{primary.model_id} vs {secondary.model_id}",
+        model_id=f"{snapshot['primary']['model']} vs {snapshot['secondary']['model']}",
         agent_id="deterministic-comparator",
     )
-    storage.save_artifact(artifact)
+    attempt = StageAttempt(primary.run_id, stage_id, StageOutcome.COMPLETE,
+        diagnostics={"comparison_artifact_id": artifact.artifact_id,
+                     "primary_revision_id": snapshot["primary"]["revision_id"],
+                     "secondary_revision_id": snapshot["secondary"]["revision_id"]})
+    storage.save_comparison_artifact(artifact, snapshot, attempt, cancel_check=cancel_check)
     return artifact

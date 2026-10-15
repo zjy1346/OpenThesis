@@ -11,7 +11,15 @@ export type Preferences = {
   research_market?: Market;
   /** Serialized VisionFallbackPolicy returned by the settings store. */
   vision_fallback_policy?: string;
+  /** Serialized official-network policy returned by the settings store. */
+  official_network_policy?: string;
   [key: string]: string | undefined;
+};
+
+export type OfficialNetworkPolicy = {
+  version: "official-network-v1";
+  connect_proxy: string;
+  host_profiles: Record<string, string[]>;
 };
 
 export type Company = {
@@ -27,6 +35,9 @@ export type Company = {
   accounting_standard?: string;
   industry?: string;
   industry_support?: "standard" | "financial_beta";
+  identity_state?: "official_verified" | "cached_verified" | "unresolved_code";
+  identity_source?: string;
+  identity_verified_at?: string;
   source_url?: string;
   research_readiness?: {
     recommended: boolean;
@@ -37,6 +48,23 @@ export type Company = {
 };
 
 export type Market = "US" | "CN_A" | "HK";
+
+export type CompanySearchState = "ready" | "empty" | "degraded" | "unavailable";
+
+export type CompanySearchDiagnostic = {
+  code: string;
+  diagnostic_id: string;
+};
+
+export type CompanySearchResponse = {
+  contract: "openthesis.company-search.v2";
+  request_id: string;
+  query: string;
+  market: Market;
+  state: CompanySearchState;
+  companies: Company[];
+  diagnostics: CompanySearchDiagnostic[];
+};
 
 export type MarketProfile = {
   market: Market;
@@ -196,6 +224,18 @@ export type ConfiguredModelSummary = {
   temperature: number | null;
   timeout_seconds: number;
   configuration_version: number;
+  connection_enabled?: boolean;
+  credential_available?: boolean;
+  capability_checks?: {
+    capability: "text_chat" | "structured_json" | "vision";
+    status: "ready" | "error" | "unverified";
+    checked_at: number;
+    error_code: string | null;
+    retry_after_seconds: number | null;
+    model_configuration_version: number;
+    connection_configuration_version: number;
+    credential_version: number;
+  }[];
 };
 
 export type DiscoveredModel = {
@@ -471,6 +511,11 @@ export type ResearchReport = {
     input_artifact_ids: string[];
     plan_hash: string;
     available: boolean;
+    requires_new_attempt_authorization?: boolean;
+    unknown_stages?: string[];
+    request_in_progress?: boolean;
+    operations?: { code: string; stages: string[]; requires_provider: boolean;
+      requires_confirmation: boolean; possible_duplicate_charge?: boolean }[];
   };
   attempt_complete?: boolean;
   research_complete?: boolean;

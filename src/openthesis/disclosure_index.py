@@ -9,6 +9,7 @@ replaced file from reusing stale text.
 from __future__ import annotations
 
 from collections import OrderedDict
+from hashlib import sha256
 from pathlib import Path
 from threading import RLock
 from typing import Sequence
@@ -17,23 +18,30 @@ from typing import Sequence
 _MAX_DOCUMENTS = 24
 _MAX_TEXT_CHARACTERS = 16_000_000
 _LOCK = RLock()
-_PAGE_TEXT: "OrderedDict[tuple[str, int, int], tuple[str, ...]]" = OrderedDict()
+_TEXT_READER_VERSION = "native-pdf-text-v2"
+_PAGE_TEXT: "OrderedDict[tuple, tuple[str, ...]]" = OrderedDict()
 _PAGE_TEXT_CHARACTERS = 0
 
 
-def _identity(path: str | Path) -> tuple[str, int, int]:
+def _identity(path: str | Path) -> tuple | None:
     target = Path(path)
     try:
         stat = target.stat()
-        return str(target.resolve()), int(stat.st_size), int(stat.st_mtime_ns)
+        digest = sha256()
+        with target.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return str(target.resolve()), int(stat.st_size), int(stat.st_mtime_ns), digest.hexdigest(), _TEXT_READER_VERSION
     except OSError:
-        return str(target), -1, -1
+        return None
 
 
 def remember_page_texts(path: str | Path, pages: Sequence[str]) -> tuple[str, ...]:
     global _PAGE_TEXT_CHARACTERS
     identity = _identity(path)
     value = tuple(str(item or "") for item in pages)
+    if identity is None:
+        return value
     character_count = sum(len(item) for item in value)
     with _LOCK:
         previous = _PAGE_TEXT.pop(identity, ())
@@ -53,6 +61,8 @@ def remember_page_texts(path: str | Path, pages: Sequence[str]) -> tuple[str, ..
 
 def cached_page_texts(path: str | Path) -> tuple[str, ...] | None:
     identity = _identity(path)
+    if identity is None:
+        return None
     with _LOCK:
         value = _PAGE_TEXT.get(identity)
         if value is not None:

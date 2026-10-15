@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
+import json
 import math
 import re
 from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
+from .research_coverage import has_analysis
+from .research_numeric_assertions import written_percentage_matches
 
 
 _VALID_VALUATION_STATES = frozenset({"ok", "extreme_assumption"})
@@ -38,7 +42,52 @@ _NEGATED = re.compile(
     r"no\s+(?:reliable|verified|valid))",
     re.IGNORECASE,
 )
-_PERCENT = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
+_PERCENT = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*[%％]")
+_RATE_LABELS = {
+    "discount_rate": re.compile(r"\b(?:discount\s+rate|WACC)\b|折[现現]率", re.I),
+    "terminal_growth": re.compile(r"\bterminal\s+growth(?:\s+rate)?\b|永[续續][增長长率]+|终[值期]增[长長]率|終[值期]增[长長]率", re.I),
+    "implied_fcf_growth": re.compile(r"\b(?:implied\s+(?:annual\s+)?(?:FCF\s+)?growth|(?:annual\s+)?FCF\s+growth)\b|(?:自由[现現]金流)(?:年)?(?:增[长長]|增速)(?:率)?|(?:隐含|隱含)(?:年)?增[长長](?:率)?", re.I),
+}
+_METADATA = frozenset({"evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
+    "claim_ids", "input_claim_ids", "claim_id", "source_ids", "source_url", "document_id",
+    "title", "label", "name", "kind", "type", "confidence", "severity", "role"})
+_ABSENT = object()
+
+
+def _rate_field(text: str, amount: re.Match[str]) -> str | None:
+    """Bind explicit labels to one quantity, never to any matching parameter.
+
+    This only classifies captured prose; it never edits a sentence. Unlabelled
+    or conflicting quantities stay unverified, not inferred from magnitude.
+    """
+    preceding = []
+    following = []
+    for field, pattern in _RATE_LABELS.items():
+        for label in pattern.finditer(text):
+            if label.end() <= amount.start():
+                between = text[label.end():amount.start()]
+                if len(between) <= 80 and not _PERCENT.search(between) and not re.search(r"[;；。!?]|\.(?=\s|$)", between):
+                    preceding.append((label.end(), field))
+            elif label.start() >= amount.end():
+                between = text[amount.end():label.start()]
+                if len(between) <= 25 and not re.search(r"[,;；。.!?]|\band\b|以及|及|和|而", between, re.I):
+                    following.append((label.start(), field))
+    before = max(preceding, default=None)
+    after = min(following, default=None)
+    if after is not None:
+        # In "discount rate 10% annual FCF growth", both labels could govern
+        # one token; do not choose whichever number makes the claim pass.
+        if before is not None and before[1] != after[1]:
+            return None
+        return after[1]
+    if before is not None:
+        return before[1]
+    prefix = text[:amount.start()]
+    cue = list(_VALUATION_ASSERTION.finditer(prefix))
+    if cue and not _PERCENT.search(prefix[cue[-1].end():]) and re.search(
+        r"implies?|implied|隐含|隱含", cue[-1].group(), re.I):
+        return "implied_fcf_growth"
+    return None
 _MONEY = re.compile(
     r"(?:[$¥￥]|\b(?:HKD|CNY|RMB|USD|EUR|GBP|JPY)\b|"
     r"港幣|港币|人民幣|人民币|美元|歐元|欧元)\s*[-+]?\d[\d,.]*(?:\s*(?:億|亿|萬|万|B|M|K|T))?",
@@ -80,25 +129,39 @@ def _sentence_is_negated(sentence: str, cue: re.Match[str]) -> bool:
     return bool(_NEGATED.search(before))
 
 
+def _assertion_context(text: str, cue: re.Match[str]) -> tuple[str, int]:
+    """Read the governing sentence for classification, never render a slice."""
+    boundaries = [match.end() for match in re.finditer(r"[。！？!?；;\n]|\.(?=\s|$)", text)]
+    left = max((position for position in boundaries if position <= cue.start()), default=0)
+    right = min((position for position in boundaries if position >= cue.end()), default=len(text))
+    return text[left:right], left
+
+
 def _is_unsupported_assertion(sentence: str, valuation: dict[str, Any] | None) -> bool:
-    if _MARGIN_OF_SAFETY.search(sentence) and not _MARGIN_LIMITATION.search(sentence):
+    for margin in _MARGIN_OF_SAFETY.finditer(sentence):
         # Reverse DCF alone is not an intrinsic-value estimate. Until a typed,
         # source-backed margin-of-safety field exists, the model may not assert
         # either a wide or narrow margin as though the engine computed it.
-        return True
-    cue = _VALUATION_ASSERTION.search(sentence)
-    if cue and not _sentence_is_negated(sentence, cue):
-        percentages = [float(match.group(1)) / 100 for match in _PERCENT.finditer(sentence)]
-        money = _MONEY.search(sentence)
+        context, _ = _assertion_context(sentence, margin)
+        if not _MARGIN_LIMITATION.search(context):
+            return True
+    for cue in _VALUATION_ASSERTION.finditer(sentence):
+        context, offset = _assertion_context(sentence, cue)
+        local_cue = _VALUATION_ASSERTION.search(context, cue.start() - offset)
+        if _sentence_is_negated(context, local_cue):
+            continue
+        percentages = list(_PERCENT.finditer(context))
+        money = _MONEY.search(context)
         if not _valuation_is_usable(valuation):
             if percentages or money or "dcf" in cue.group(0).casefold():
                 return True
         elif percentages:
-            expected = float(valuation["implied_fcf_growth"])
             # The public-facing deterministic calculation is the only source
             # for a market-implied growth rate. Do not accept model-created
             # ranges or alternative point estimates as if independently solved.
-            if any(abs(item - expected) > 0.015 for item in percentages):
+            if any((field := _rate_field(context, item)) is None
+                   or not written_percentage_matches(item.group(1), valuation.get(field))
+                   for item in percentages):
                 return True
         elif money:
             return True
@@ -110,67 +173,19 @@ def _is_unsupported_assertion(sentence: str, valuation: dict[str, Any] | None) -
     return False
 
 
-def _unsupported_clause_start(
-    text: str, valuation: dict[str, Any] | None
-) -> int | None:
-    """Locate a removable valuation clause without discarding prior prose.
-
-    Punctuation is not a reliable sentence boundary in model output.  When a
-    high-risk assertion follows supported analysis without a period, quarantine
-    from the assertion cue onward rather than deleting the whole paragraph.
-    """
-    cue = _VALUATION_ASSERTION.search(text)
-    if cue and not _sentence_is_negated(text, cue):
-        percentages = [float(match.group(1)) / 100 for match in _PERCENT.finditer(text)]
-        money = _MONEY.search(text)
-        unsupported = False
-        if not _valuation_is_usable(valuation):
-            unsupported = bool(percentages or money or "dcf" in cue.group(0).casefold())
-        elif percentages:
-            expected = float(valuation["implied_fcf_growth"])
-            unsupported = any(abs(item - expected) > 0.015 for item in percentages)
-        elif money:
-            unsupported = True
-        if unsupported:
-            return cue.start()
-
-    conversion = _CURRENCY_CONVERSION.search(text)
-    if (
-        conversion
-        and _CURRENCY_MARKER.search(text)
-        and re.search(r"\d", text[conversion.start():])
-    ):
-        return conversion.start()
-    return None
-
-
-def _sanitize_text(value: str, valuation: dict[str, Any] | None) -> tuple[str, int]:
-    pieces = re.split(r"(?<=[。！？!?；;\n])|(?<=[.!?])(?=\s+[A-Z])", value)
-    kept: list[str] = []
-    removed = 0
-    for piece in pieces:
-        if _MARGIN_OF_SAFETY.search(piece) and not _MARGIN_LIMITATION.search(piece):
-            removed += 1
-            continue
-        unsafe_start = _unsupported_clause_start(piece, valuation)
-        if piece and unsafe_start is not None:
-            safe_prefix = piece[:unsafe_start]
-            if safe_prefix:
-                kept.append(safe_prefix)
-            removed += 1
-        else:
-            kept.append(piece)
-    return "".join(kept), removed
-
-
-def _sanitize_value(value: Any, valuation: dict[str, Any] | None) -> tuple[Any, int]:
+def _sanitize_value(value: Any, valuation: dict[str, Any] | None,
+                    *, path: str, rejected: list[dict[str, str]]) -> tuple[Any, int]:
     if isinstance(value, str):
-        return _sanitize_text(value, valuation)
+        if _is_unsupported_assertion(value, valuation):
+            rejected.append({"path": path, "reason": "unsupported_valuation_assertion",
+                             "content_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()})
+            return _ABSENT, 1
+        return value, 0
     if isinstance(value, list):
         sanitized: list[Any] = []
         removed = 0
-        for item in value:
-            safe_item, count = _sanitize_value(item, valuation)
+        for index, item in enumerate(value):
+            safe_item, count = _sanitize_value(item, valuation, path=f"{path}[{index}]", rejected=rejected)
             removed += count
             if isinstance(item, dict) and any(
                 field in item for field in ("text", "conclusion", "argument")
@@ -179,44 +194,25 @@ def _sanitize_value(value: Any, valuation: dict[str, Any] | None) -> tuple[Any, 
                 for field in ("text", "conclusion", "argument")
             ):
                 continue
-            if safe_item not in (None, "", [], {}):
+            if safe_item is not _ABSENT and safe_item not in (None, "", [], {}):
                 sanitized.append(safe_item)
         return sanitized, removed
     if isinstance(value, tuple):
-        safe, removed = _sanitize_value(list(value), valuation)
+        safe, removed = _sanitize_value(list(value), valuation, path=path, rejected=rejected)
         return tuple(safe), removed
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         removed = 0
         for key, item in value.items():
-            safe_item, count = _sanitize_value(item, valuation)
+            if key in _METADATA:
+                sanitized[key] = deepcopy(item)
+                continue
+            safe_item, count = _sanitize_value(item, valuation, path=f"{path}.{key}" if path else str(key), rejected=rejected)
             removed += count
-            if safe_item not in (None, "", [], {}):
+            if safe_item is not _ABSENT and safe_item not in (None, "", [], {}):
                 sanitized[key] = safe_item
         return sanitized, removed
     return value, 0
-
-
-def _section_needs_quarantine(value: Any, valuation: dict[str, Any] | None) -> bool:
-    if isinstance(value, str):
-        pieces = re.split(r"(?<=[。！？!?；;\n])|(?<=[.!?])(?=\s+[A-Z])", value)
-        return any(_is_unsupported_assertion(piece, valuation) for piece in pieces)
-    if isinstance(value, dict):
-        numeric_market_fields = {
-            "implied_growth", "implied_fcf_growth", "required_growth",
-            "implied_revenue_growth", "current_price", "share_price",
-            "equity_market_value", "market_cap", "enterprise_value",
-        }
-        if any(
-            str(key).casefold() in numeric_market_fields
-            and item not in (None, "", [], {})
-            for key, item in value.items()
-        ):
-            return True
-        return any(_section_needs_quarantine(item, valuation) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_section_needs_quarantine(item, valuation) for item in value)
-    return False
 
 
 def _localized_summary(available: bool, language: str, status: str = "") -> str:
@@ -248,14 +244,30 @@ def enforce_valuation_consistency(
     """
 
     sanitized = deepcopy(report) if isinstance(report, dict) else {}
+    try:
+        encoded = json.dumps(sanitized, sort_keys=True, ensure_ascii=False, allow_nan=False,
+                             separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return {}, {"schema": "valuation-content-proof-v2-whole-leaves", "input_sha256": None,
+                    "valuation_available": False, "valuation_status": "unavailable",
+                    "quarantined_count": 1, "quarantined_paths": ["$"],
+                    "quarantined_nodes": [{"path": "$", "reason": "invalid_json_value"}]}
+    rejected: list[dict[str, str]] = []
     valuation_value = valuation if isinstance(valuation, dict) else None
     usable = _valuation_is_usable(valuation_value)
     original_section = sanitized.get("implied_expectations")
-    had_section_content = original_section not in (None, "", [], {})
-    section: dict[str, Any] = {"summary": _localized_summary(
+    source_analysis, _ = _sanitize_value(original_section,
+        valuation_value if usable else None, path="implied_expectations", rejected=rejected)
+    # Preserve source-backed prose and links. Quantitative valuation fields
+    # have one owner: the deterministic engine, not the model's copy.
+    section = _valuation_analysis_only(source_analysis, path="implied_expectations", rejected=rejected)
+    had_analysis = has_analysis(section)
+    if isinstance(section.get("summary"), str):
+        section["analysis"] = section.pop("summary")
+    section.update({"summary": _localized_summary(
         usable, language,
         str(valuation_value.get("status", "")) if usable and valuation_value else "",
-    )}
+    ), "role": "verified_analysis" if had_analysis else "notice"})
     if usable and valuation_value:
         fields = {
             "implied_growth": valuation_value.get("implied_fcf_growth"),
@@ -269,19 +281,64 @@ def enforce_valuation_consistency(
         section.update({key: item for key, item in fields.items() if item not in (None, "")})
     sanitized["implied_expectations"] = section
 
-    removed_paths: list[str] = []
-    removed_count = int(_section_needs_quarantine(original_section, valuation_value if usable else None))
+    sensitivity_section = sanitized.get("valuation_and_sensitivity")
+    if sensitivity_section is None and isinstance(original_section, dict):
+        sensitivity_section = original_section.get("valuation_and_sensitivity")
+    if sensitivity_section is not None:
+        safe_sensitivity, _ = _sanitize_value(
+            sensitivity_section, valuation_value if usable else None,
+            path="valuation_and_sensitivity", rejected=rejected,
+        )
+        projected = _valuation_analysis_only(safe_sensitivity, path="valuation_and_sensitivity", rejected=rejected)
+        projected["role"] = "verified_analysis" if has_analysis(projected) else "notice"
+        if usable and isinstance(valuation_value.get("sensitivity"), list):
+            projected["sensitivity"] = deepcopy(valuation_value["sensitivity"])
+            if valuation_value.get("currency"):
+                projected["currency"] = valuation_value["currency"]
+        sanitized["valuation_and_sensitivity"] = projected
     for key, value in list(sanitized.items()):
-        if key == "implied_expectations":
+        if key in {"implied_expectations", "valuation_and_sensitivity"}:
             continue
-        safe_value, count = _sanitize_value(value, valuation_value if usable else None)
-        if count:
-            removed_paths.append(str(key))
-            removed_count += count
-        sanitized[key] = safe_value
+        safe_value, _ = _sanitize_value(value, valuation_value if usable else None,
+                                           path=str(key), rejected=rejected)
+        if safe_value is _ABSENT:
+            del sanitized[key]
+        else:
+            sanitized[key] = safe_value
     return sanitized, {
         "valuation_available": usable,
         "valuation_status": str(valuation_value.get("status", "unavailable")) if valuation_value else "unavailable",
-        "quarantined_count": removed_count,
-        "quarantined_paths": removed_paths + (["implied_expectations"] if removed_count else []),
+        "schema": "valuation-content-proof-v2-whole-leaves",
+        "input_sha256": hashlib.sha256(encoded).hexdigest(),
+        "quarantined_count": len(rejected),
+        "quarantined_paths": list(dict.fromkeys(item["path"] for item in rejected)),
+        "quarantined_nodes": rejected,
     }
+
+
+def _valuation_analysis_only(value: Any, *, path: str, rejected: list[dict[str, str]]) -> dict[str, Any]:
+    """Keep explanatory structure and citations, never model-computed amounts."""
+    quantitative = frozenset({
+        "implied_growth", "implied_fcf_growth", "required_growth", "implied_revenue_growth",
+        "current_price", "share_price", "equity_market_value", "equity_value", "market_cap",
+        "enterprise_value", "valuation", "valuation_range", "discount_rate", "wacc",
+        "terminal_growth", "terminal_growth_rate", "horizon_years", "currency", "as_of",
+        "sensitivity", "valuation_and_sensitivity", "fcf_growth", "base_free_cash_flow",
+    })
+
+    def retain(item: Any, location: str) -> Any:
+        if isinstance(item, dict):
+            kept = {}
+            for key, child in item.items():
+                if str(key).casefold() in quantitative:
+                    if child not in (None, "", [], {}):
+                        rejected.append({"path": f"{location}.{key}", "reason": "engine_owned_valuation_field"})
+                elif not str(key).startswith("_"):
+                    kept[key] = retain(child, f"{location}.{key}")
+            return kept
+        if isinstance(item, (list, tuple)):
+            return [retain(child, f"{location}[{index}]") for index, child in enumerate(item)]
+        return deepcopy(item)
+
+    kept = retain(value, path) if value is not _ABSENT else None
+    return kept if isinstance(kept, dict) else {"analysis": kept} if kept else {}

@@ -27,6 +27,15 @@ CHECKPOINT_SCHEMA_VERSION = "financial-window-checkpoint-v1"
 EXHAUSTED_SCHEMA_VERSION = "financial-window-exhausted-v1"
 
 
+class WorkerIsolationUnavailable(RuntimeError):
+    """A host failure, never a deterministic failure of a financial source."""
+
+    code = "PDF_WORKER_START_FAILED"
+
+    def __init__(self):
+        super().__init__("PDF worker process start/isolation unavailable")
+
+
 @dataclass(frozen=True, slots=True)
 class CheckpointKey:
     document_hash: str
@@ -263,6 +272,8 @@ def run_checkpointed_windows(
     timeout_seconds: float | None = None,
     input_fingerprint: str | None = None,
     deterministic_failure: Callable[[Exception], bool] | None = None,
+    on_failure: Callable[[PdfWindow, Exception], None] | None = None,
+    deadline: float | None = None,
 ) -> tuple[WindowCheckpoint, ...]:
     """Resume successful windows and retry only failed windows deterministically.
 
@@ -282,6 +293,10 @@ def run_checkpointed_windows(
     current_context: dict[str, Any] = {}
     retry_limit = max(0, int(max_retries))
     for position, window in enumerate(ordered, start=1):
+        if deadline is not None and time.monotonic() >= deadline:
+            if progress is not None:
+                progress(position - 1, len(ordered), "budget_exhausted_resumable")
+            break
         if cancel_check is not None and cancel_check():
             break
         cached = store.load(key, window.index, expected_pages=window.pages)
@@ -296,8 +311,12 @@ def run_checkpointed_windows(
             if cancel_check is not None and cancel_check():
                 break
             try:
+                remaining = deadline - time.monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("document budget exhausted; checkpoints remain resumable")
+                worker_timeout = (min(timeout_seconds, remaining) if timeout_seconds is not None else remaining) if remaining is not None else timeout_seconds
                 produced = _invoke_worker(
-                    worker, window, timeout_seconds, current_context, cancel_check
+                    worker, window, worker_timeout, current_context, cancel_check
                 )
                 facts, evidence, context = produced
                 checkpoint = WindowCheckpoint(
@@ -312,7 +331,13 @@ def run_checkpointed_windows(
                 break
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, WorkerIsolationUnavailable):
+                    # Retrying the same denied host operation cannot repair a
+                    # document. Leave it resumable after the host is restored.
+                    break
         if last_error is not None:
+            if on_failure is not None:
+                on_failure(window, last_error)
             if deterministic_failure is not None and deterministic_failure(last_error):
                 store.save_exhausted(
                     key,
@@ -385,11 +410,11 @@ def _invoke_worker(
     # while the worker is still alive and keeps the timeout/cancel boundary.
     try:
         result_receiver, result_sender = mp_context.Pipe(duplex=False)
-    except (OSError, RuntimeError):
-        # Sandboxed or resource-constrained hosts can deny creation of the
-        # Windows pipe before process.start() is reached. Preserve the same
-        # worker and caller-side quality checks through the synchronous path.
-        return run_synchronously()
+    except (OSError, RuntimeError) as exc:
+        # A requested hard deadline must remain a hard deadline. Running this
+        # same native worker in the parent loses both termination and cancel.
+        # Preserve checkpoints and let the caller expose a host recovery action.
+        raise WorkerIsolationUnavailable() from exc
     process = None
     try:
         process = mp_context.Process(
@@ -400,15 +425,8 @@ def _invoke_worker(
         process.daemon = True
         try:
             process.start()
-        except (OSError, RuntimeError):
-            # Resource-constrained hosts (and frozen Windows launchers with a
-            # temporarily unavailable spawn context) still need a quality-
-            # preserving path.  Run the same worker synchronously instead of
-            # returning an apparently parsed-but-empty window.  The caller's
-            # normal compiler/quality gate remains in force.
-            result_sender.close()
-            result_receiver.close()
-            return run_synchronously()
+        except (OSError, RuntimeError) as exc:
+            raise WorkerIsolationUnavailable() from exc
         result_sender.close()
         deadline = time.monotonic() + max(0.01, float(timeout_seconds))
         kind: str | None = None

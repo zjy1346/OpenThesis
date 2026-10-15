@@ -1,4 +1,5 @@
 mod backend;
+mod atomic_export;
 mod credentials;
 mod model_center;
 mod model_gateway;
@@ -123,7 +124,8 @@ async fn export_report(
             .into_path()
             .map_err(|_| "the selected export location is unavailable".to_string())?;
         let content = content_for_export(&path, &markdown, &html);
-        std::fs::write(path, content).map_err(|_| "the report could not be written".to_string())?;
+        atomic_export::write_export(&path, content.as_bytes())
+            .map_err(|_| "the report could not be written".to_string())?;
         Ok(true)
     })
     .await
@@ -155,7 +157,8 @@ async fn export_financial_diagnostics(
         if path.extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).as_deref() != Some("json") {
             return Err("diagnostic exports must use the .json extension".to_string());
         }
-        std::fs::write(path, data_json).map_err(|_| "the diagnostics could not be written".to_string())?;
+        atomic_export::write_export(&path, data_json.as_bytes())
+            .map_err(|_| "the diagnostics could not be written".to_string())?;
         Ok(true)
     })
     .await
@@ -208,7 +211,7 @@ async fn export_ot(
         if path.extension().and_then(|value| value.to_str()) != Some("ot") {
             return Err("OT packages must use the .ot extension".to_string());
         }
-        std::fs::write(path, bytes)
+        atomic_export::write_export(&path, &bytes)
             .map_err(|_| "the OT package could not be written".to_string())?;
         Ok(true)
     })

@@ -395,6 +395,12 @@ UI_EN: Final[dict[str, str]] = {
     "基础分析 Agent 已完成 {completed}/3：{agent_id}": (
         "Base analysis agent complete {completed}/3: {agent_id}"
     ),
+    "基础分析 Agent 已完成 {completed}/{total}：{agent_id}": (
+        "Base analysis agent complete {completed}/{total}: {agent_id}"
+    ),
+    "基础分析 Agent 未完成 {completed}/{total}：{agent_id}；继续保留其他阶段": (
+        "Base analysis agent incomplete {completed}/{total}: {agent_id}; retaining other stages"
+    ),
     "基础研究档案完成": "Base research dossier complete",
     "正在研究公司与行业增长机会": (
         "Researching company and industry growth opportunities"
@@ -727,6 +733,12 @@ UI_HANT_EXPLICIT: Final[dict[str, str]] = {
 }
 
 UI_HANT: Final[dict[str, str]] = UI_HANT_EXPLICIT
+UI_HANT.update({
+    "基础分析 Agent 已完成 {completed}/{total}：{agent_id}":
+        "基礎分析 Agent 已完成 {completed}/{total}：{agent_id}",
+    "基础分析 Agent 未完成 {completed}/{total}：{agent_id}；继续保留其他阶段":
+        "基礎分析 Agent 未完成 {completed}/{total}：{agent_id}；繼續保留其他階段",
+})
 UI_HANT.update({
     "\u8bbe\u7f6e": "\u8a2d\u5b9a",
     "\u7b80\u4f53\u4e2d\u6587": "\u7c21\u9ad4\u4e2d\u6587",
