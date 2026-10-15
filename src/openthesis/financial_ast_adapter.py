@@ -9,15 +9,15 @@ compiler owns resolution, conflicts and acceptance.
 from __future__ import annotations
 
 from .domain import Company, FilingDocument
-from .financial_compiler import (
+from .financial_contracts import (
     CORE_CONCEPTS,
     CandidateBatch,
-    CompilerPolicy,
     FactCandidate,
     FinancialDataset,
-    FinancialFactCompiler,
     GapStageKind,
+    fact_row_evidence_ids,
 )
+from .financial_pipeline import CollectionPolicy as CompilerPolicy, FinancialCandidatePipeline
 from .financial_ingestion import FinancialIngestionEngine, _manifest_for
 
 
@@ -37,15 +37,23 @@ class PdfAstFactExtractor:
         facts, refs = self.engine.extract_pdf_candidates(
             filing.local_path, subject, filing, manifest
         )
+        refs_by_id: dict[str, list] = {}
+        for ref in refs:
+            refs_by_id.setdefault(ref.evidence_id, []).append(ref)
         candidates = tuple(
             FactCandidate(
                 fact,
-                ((ref,) if ref is not None else ()),
+                tuple(
+                    ref for evidence_id in fact_row_evidence_ids(fact)
+                    for ref in refs_by_id.get(evidence_id, ())
+                ),
                 self.name,
             )
-            for fact, ref in zip(facts, refs)
+            for fact in facts
         )
-        return CandidateBatch(filing, candidates, tuple(refs))
+        diagnostics = ("PERIOD_DECLARATION_NOT_FOUND",) if any(
+            ref.evidence_id.startswith("period-gap:") for ref in refs) else ()
+        return CandidateBatch(filing, candidates, tuple(refs), diagnostics)
 
 
 def compile_local_pdf(
@@ -55,7 +63,7 @@ def compile_local_pdf(
     required_concepts: frozenset[str] = CORE_CONCEPTS,
 ) -> FinancialDataset:
     """Compile one local filing through the formal AST and one quality gate."""
-    return FinancialFactCompiler().compile(
+    return FinancialCandidatePipeline().compile(
         subject,
         (filing.period_end, filing.period_end),
         CompilerPolicy(

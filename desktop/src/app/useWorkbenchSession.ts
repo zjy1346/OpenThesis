@@ -12,6 +12,7 @@ import {
   retryResearchSynthesis,
   retryResearchGrowth,
   retryResearchStage,
+  revalidateSavedResearch,
   refreshFinancialReport as refreshFinancialReportBackend,
   startResearchFinancialRetry,
   startResearchFinancialRebuild,
@@ -382,11 +383,20 @@ export function useWorkbenchSession() {
     target: RecoveryStageTarget,
     model: ResearchRequest["model"],
     planHash: string,
+    confirmNewAttempt = false,
   ) => {
     if (!report) throw new Error("report is unavailable");
     if (!model) throw new Error("a model selection is required");
     setError(null);
-    const next = await retryResearchStage(report.run_id, target, model, planHash);
+    const next = await retryResearchStage(report.run_id, target, model, planHash, confirmNewAttempt);
+    if (selectedReportRun.current === next.run_id) commitReport(next);
+    setBootstrap(await bootstrapBackend());
+  };
+
+  const revalidateSaved = async () => {
+    if (!report) throw new Error("report is unavailable");
+    setError(null);
+    const next = await revalidateSavedResearch(report.run_id);
     if (selectedReportRun.current === next.run_id) commitReport(next);
     setBootstrap(await bootstrapBackend());
   };
@@ -450,6 +460,7 @@ export function useWorkbenchSession() {
     retrySynthesis,
     retryGrowth,
     retryRecoveryStage,
+    revalidateSaved,
     retryFinancials,
     rebuildFinancials,
     refreshFinancialReport,

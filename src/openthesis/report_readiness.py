@@ -6,6 +6,7 @@ import re
 from typing import Any, Iterable
 
 from .i18n import EN, ZH_HANT, normalize_language
+from .research_coverage import CONTRACT_VERSION, ResearchCoverage, ResearchCoverageContract, has_analysis
 
 
 REQUIRED_REPORT_SECTIONS = (
@@ -119,7 +120,7 @@ def section_has_substance(section: str, value: Any) -> bool:
             )
             for item in value
         )
-    return _has_semantic_content(value, parent_key=section)
+    return has_analysis(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,9 +132,15 @@ class ReportReadiness:
     missing_stages: tuple[str, ...]
     issues: tuple[str, ...]
     recovery_action: str
+    coverage: ResearchCoverage | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        if self.coverage is None:
+            result.pop("coverage")
+        else:
+            result["coverage"] = self.coverage.to_dict()
+        return result
 
 
 def assess_report_readiness(
@@ -144,6 +151,7 @@ def assess_report_readiness(
     financial_evidence_count: int | None = None,
     allow_complete: bool = True,
     failed: bool = False,
+    coverage: ResearchCoverage | None = None,
 ) -> ReportReadiness:
     """Assess report substance, verification, and prerequisite-stage coverage.
 
@@ -175,6 +183,8 @@ def assess_report_readiness(
         issues.append("verification_not_passed")
     if financial_evidence_count is not None and financial_evidence_count <= 0:
         issues.append("no_verified_financial_source_evidence")
+    if coverage is not None and not coverage.complete:
+        issues.append("research_obligations_incomplete:" + ",".join(coverage.gaps))
 
     if failed:
         state = "failed"
@@ -196,6 +206,7 @@ def assess_report_readiness(
         missing_stages=missing_stage_values,
         issues=tuple(issues),
         recovery_action=recovery,
+        coverage=coverage,
     )
 
 
@@ -311,6 +322,7 @@ def readiness_for_report_artifact(
     content = artifact.get("content")
     if not isinstance(content, dict):
         content = {}
+    artifacts = tuple(artifacts)
     readiness = content.get("readiness")
     if isinstance(readiness, dict):
         readiness = dict(readiness)
@@ -319,8 +331,58 @@ def readiness_for_report_artifact(
         if not isinstance(verification, dict):
             verification = {}
         readiness = verification.get("report_readiness")
+    current_contract = content.get("research_coverage_contract")
+    if current_contract is not None and not isinstance(readiness, dict):
+        # A current artifact remains current even if optional cached metadata
+        # was lost. Never downgrade its obligations to the legacy contract.
+        readiness = {}
     if isinstance(readiness, dict):
         readiness = dict(readiness)
+        coverage_value = readiness.get("coverage")
+        has_recorded_coverage = "coverage" in readiness
+        if "coverage" in readiness or current_contract is not None:
+            # Current reports are re-evaluated from the immutable local snapshot.
+            # Persisted `complete` and model-written obligation flags are not proof.
+            sources = {}
+            metrics = ()
+            valuation = None
+            company = None
+            financial_period_coverage = None
+            for item in artifacts:
+                item_type = item.get("artifact_type") if isinstance(item, dict) else getattr(item, "artifact_type", "")
+                payload = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+                if not isinstance(payload, dict):
+                    continue
+                if item_type == "deterministic-financial-summary":
+                    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), (list, tuple)) else ()
+                    company = payload.get("company")
+                    financial_period_coverage = (payload.get("financial_quality") or {}).get("period_coverage")
+                    evidence = payload.get("evidence")
+                    sources = {str(record["evidence_id"]): record for record in evidence
+                               if isinstance(record, dict) and record.get("evidence_id")} if isinstance(evidence, list) else {}
+                elif item_type == "deterministic-valuation":
+                    valuation = payload
+            verification = content.get("verification")
+            coverage = ResearchCoverageContract().assess(
+                content.get("report", content), verification,
+                evidence_records=sources, metrics=metrics, valuation=valuation, company=company,
+                financial_period_coverage=financial_period_coverage,
+            )
+            mode = str(content.get("mode", ""))
+            readiness = assess_report_readiness(
+                content.get("report", content), verification,
+                missing_stages=() if mode == "ot-workflow" else missing_research_stages(artifacts),
+                financial_evidence_count=financial_source_evidence_count(artifacts),
+                allow_complete=mode in {"synthesized", "ot-workflow"}, coverage=coverage,
+            ).to_dict()
+            recorded_version = coverage_value.get("contract_version") if isinstance(coverage_value, dict) else None
+            if (has_recorded_coverage and recorded_version != CONTRACT_VERSION
+                    or current_contract not in (None, CONTRACT_VERSION)):
+                readiness["complete"] = False
+                if readiness["state"] == "complete":
+                    readiness["state"] = "substantive_partial"
+                readiness["issues"] = (*readiness["issues"], "research_coverage_contract_invalid")
+                readiness["recovery_action"] = "complete_missing_or_unverified_sections"
         status = str(run_status).casefold()
         if failed or status == "failed":
             readiness["state"] = "failed"

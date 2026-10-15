@@ -17,10 +17,22 @@ class ProviderError(RuntimeError):
         retryable: bool = False,
         code: str = "MODEL_ERROR",
         retry_after_seconds: int | float | None = None,
+        http_status: int | None = None,
+        response_received: bool = False,
+        processing_phase: str = "",
+        content_path: str = "",
+        safe_receipt: dict | None = None,
+        diagnostic_trace_id: str = "",
     ):
         self.retryable = retryable
         self.code = code
         self.retry_after_seconds = retry_after_seconds
+        self.http_status = http_status
+        self.response_received = response_received
+        self.processing_phase = processing_phase
+        self.content_path = content_path
+        self.safe_receipt = safe_receipt
+        self.diagnostic_trace_id = diagnostic_trace_id
         super().__init__(message)
 
 
@@ -34,6 +46,7 @@ class ProviderHTTPError(ProviderError):
             f"模型接口返回 HTTP {status_code}：{self.detail}",
             retryable=status_code in {408, 409, 425, 429} or status_code >= 500,
             code=f"MODEL_HTTP_{status_code}",
+            http_status=status_code,
         )
 
 
@@ -125,19 +138,45 @@ def _parse_model_json(text: str) -> dict[str, Any]:
             text = text[:-3]
         text = text.strip()
     parse_error_class: str | None = None
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_json_key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise ValueError("non_finite_json_number")
+
+    def parse(value):
+        return json.loads(value, object_pairs_hook=unique_object, parse_constant=reject_constant)
+
     try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
+        result = parse(text)
+    except ValueError as exc:
+        if not isinstance(exc, json.JSONDecodeError):
+            return {"narrative": text, "structured_output_valid": False, "_response_error": str(exc)}
         parse_error_class = "invalid_json"
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
             try:
-                result = json.loads(text[start : end + 1])
-            except json.JSONDecodeError:
-                result = {"narrative": text, "structured_output_valid": False}
+                result = parse(text[start : end + 1])
+            except ValueError as inner:
+                from .research_execution.model_output import recover_closed_json
+                partial, issues = recover_closed_json(text)
+                result = ({**partial, "structured_output_valid": True, "_output_incomplete": True,
+                           "_output_normalization_issues": list(issues)} if partial else
+                          {"narrative": text, "structured_output_valid": False})
+                if not isinstance(inner, json.JSONDecodeError):
+                    result["_response_error"] = str(inner)
         else:
-            result = {"narrative": text, "structured_output_valid": False}
+            from .research_execution.model_output import recover_closed_json
+            partial, issues = recover_closed_json(text)
+            result = ({**partial, "structured_output_valid": True, "_output_incomplete": True,
+                       "_output_normalization_issues": list(issues)} if partial else
+                      {"narrative": text, "structured_output_valid": False})
     if not isinstance(result, dict):
         return {
             "result": result,
@@ -163,6 +202,16 @@ class RustModelGatewayProvider:
         configured_path = gateway_path or os.environ.get("OPENTHESIS_MODEL_GATEWAY_PATH", "")
         self.gateway_path = Path(configured_path) if configured_path else None
         self._cancel_check: Callable[[], bool] | None = None
+        self._request_deadline: float | None = None
+
+    def for_request_budget(self, deadline: float, cancel_check=None):
+        """Isolated transport budget, without mutating shared model settings."""
+        scoped = RustModelGatewayProvider(self.config, gateway_path=self.gateway_path)
+        scoped._request_deadline = deadline
+        original_cancel = self._cancel_check
+        scoped._cancel_check = lambda: bool((original_cancel and original_cancel())
+                                            or (cancel_check and cancel_check()))
+        return scoped
 
     def set_cancel_check(self, cancel_check: Callable[[], bool] | None) -> None:
         """Attach the run-scoped cancellation signal without changing prompts."""
@@ -183,12 +232,19 @@ class RustModelGatewayProvider:
         *,
         json_mode: bool = True,
     ) -> dict[str, Any]:
+        return self.generate_once(system_prompt, user_prompt, json_mode=json_mode)
+
+    def generate_once(
+        self, system_prompt: str, user_prompt: str, *, json_mode: bool = True,
+    ) -> dict[str, Any]:
+        """Exactly one text wire attempt; its owner journals any compensation."""
         request = {
             "operation": "generate",
             "configured_model_id": self.config.configured_model_id,
             "system_prompt": str(system_prompt),
             "user_prompt": str(user_prompt),
             "json_mode": bool(json_mode),
+            "wire_contract": "text-single-request-v1",
         }
         return self._invoke_gateway(request)
 
@@ -198,6 +254,17 @@ class RustModelGatewayProvider:
         user_prompt: str,
         image_png: bytes,
     ) -> dict[str, Any]:
+        return self.generate_vision_once(system_prompt, user_prompt, image_png)
+
+    def generate_vision_once(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_png: bytes,
+        *,
+        json_mode: bool = True,
+    ) -> dict[str, Any]:
+        """Exactly one Rust wire attempt; format fallback belongs to its owner."""
         import base64
 
         if not image_png or len(image_png) > 8 * 1024 * 1024 or not image_png.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -210,7 +277,8 @@ class RustModelGatewayProvider:
             "configured_model_id": self.config.configured_model_id,
             "system_prompt": str(system_prompt),
             "user_prompt": str(user_prompt),
-            "json_mode": True,
+            "json_mode": bool(json_mode),
+            "wire_contract": "vision-single-request-v1",
             "image_media_type": "image/png",
             "image_base64": base64.b64encode(image_png).decode("ascii"),
         }
@@ -227,6 +295,10 @@ class RustModelGatewayProvider:
                 code="MODEL_GATEWAY_PROTOCOL_ERROR",
             )
         timeout_seconds = max(5, min(600, int(self.config.timeout_seconds))) + 20
+        if self._request_deadline is not None:
+            timeout_seconds = min(timeout_seconds, self._request_deadline - time.monotonic())
+            if timeout_seconds <= 0:
+                raise ProviderError("模型请求预算已耗尽。", retryable=True, code="MODEL_TIMEOUT")
         options: dict[str, Any] = {
             "args": [str(path), "--model-gateway"],
             "input": encoded,
@@ -262,6 +334,7 @@ class RustModelGatewayProvider:
             raise ProviderError(
                 "模型网关响应超过大小限制。",
                 code="MODEL_GATEWAY_PROTOCOL_ERROR",
+                response_received=True, processing_phase="gateway_decode", content_path="$.wire",
             )
         try:
             response = json.loads(completed.stdout.decode("utf-8"))
@@ -270,7 +343,17 @@ class RustModelGatewayProvider:
                 "模型网关返回了无效响应。",
                 retryable=completed.returncode != 0,
                 code="MODEL_GATEWAY_PROTOCOL_ERROR",
+                response_received=True, processing_phase="gateway_decode", content_path="$.wire",
             ) from exc
+        if request.get("wire_contract") and (
+            not isinstance(response, dict)
+            or response.get("wire_contract") != request["wire_contract"]
+        ):
+            raise ProviderError(
+                "模型网关协议不匹配，请使用与当前核心配套的桌面版本。",
+                code="MODEL_GATEWAY_PROTOCOL_ERROR",
+                response_received=True, processing_phase="gateway_identity", content_path="$.wire.wire_contract",
+            )
         if not isinstance(response, dict) or not response.get("ok"):
             error = response.get("error") if isinstance(response, dict) else None
             error = error if isinstance(error, dict) else {}
@@ -279,7 +362,7 @@ class RustModelGatewayProvider:
             retry_after = error.get("retry_after_seconds")
             try:
                 retry_after_seconds = (
-                    max(1, min(300, int(retry_after)))
+                    max(1, int(retry_after))
                     if retry_after is not None and code == "MODEL_RATE_LIMITED"
                     else None
                 )
@@ -290,6 +373,7 @@ class RustModelGatewayProvider:
                 retryable=bool(error.get("retryable", False)),
                 code=code,
                 retry_after_seconds=retry_after_seconds,
+                http_status=error.get("http_status") if type(error.get("http_status")) is int else None,
             )
         payload = response.get("result")
         if not isinstance(payload, dict):
@@ -298,16 +382,23 @@ class RustModelGatewayProvider:
                 code="MODEL_GATEWAY_PROTOCOL_ERROR",
             )
         content = str(payload.get("content", ""))
-        result = _parse_model_json(content)
-        meta = payload.get("meta")
-        result["_response_meta"] = dict(meta) if isinstance(meta, dict) else {}
+        from .research_execution.responses import gateway_received_response
+        result = gateway_received_response(content, payload.get("meta"), _parse_model_json,
+            expected_model_id=self.config.configured_model_id,
+            expected_connection_id=self.config.connection_id)
+        finish_reason = result["_response_meta"].get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason.casefold() in {"refusal", "content_filter"}:
+            # A safety refusal may be empty or even syntactically valid JSON.
+            # It is neither accepted research nor permission to retry the task.
+            result["structured_output_valid"] = False
+            result["_response_error"] = "provider_refusal"
         return result
 
     def _run_cancellable_gateway(
         self,
         args: list[str],
         encoded: bytes,
-        timeout_seconds: int,
+        timeout_seconds: float,
         creationflags: int,
     ) -> subprocess.CompletedProcess[bytes]:
         """Supervise the gateway so cancel and hard-timeout terminate it."""

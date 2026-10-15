@@ -1,18 +1,31 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import replace, asdict, dataclass
+import re
+import math
+from concurrent.futures import CancelledError
 from pathlib import Path
-from typing import Any, Iterator, Sequence, TYPE_CHECKING
+from typing import Any, Iterator, Sequence, TYPE_CHECKING, Callable, Mapping
+from .financial_contracts import PDF_PARSER_VERSION
+from .financial_xbrl_semantics import INLINE_PARSER_VERSION
+from .storage_research_publication import (
+    INPUT_FIELDS, ResearchPublicationConflict, ResearchPublicationSnapshot, bind_stage_heads,
+    capture_snapshot, input_digest, validate_snapshot,
+)
+from .resilience.payloads import load_payload, store_payload, strict_loads
 
 from .domain import (
     Company,
     CURRENT_DERIVED_VERSION,
     FilingDocument,
     FinancialFact,
+    FinancialDimension,
+    FinancialNormalizationLineage,
     ResearchArtifact,
     ResearchRun,
     RunStatus,
@@ -24,7 +37,27 @@ if TYPE_CHECKING:
     from .research_continuity import StageAttempt
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 19
+
+
+class StorageSchemaError(RuntimeError):
+    """Do not let an older binary silently write a newer database schema."""
+
+
+class StorageCorruptionError(RuntimeError):
+    """A persisted financial fact cannot be safely reconstructed."""
+
+
+@dataclass(frozen=True, slots=True)
+class StorageReadResult:
+    records: tuple[dict[str, Any], ...]
+    issues: tuple[dict[str, str], ...] = ()
+
+
+def _storage_issue(exc: Exception, path: str, row_id: str, *, artifact: bool = False) -> dict[str, str]:
+    supplied = str(exc) if isinstance(exc, (ValueError, StorageCorruptionError)) else ""
+    code = supplied if re.fullmatch(r"(?:RECOVERY_PAYLOAD|FINANCIAL_FACT|FINANCIAL_CANDIDATE)_[A-Z0-9_]{1,70}", supplied) else "STORAGE_ROW_INVALID"
+    return {"code": code, "path": path, "artifact_id" if artifact else "row_id": row_id}
 
 # One immutable description of the derived-data inputs.  Source records are
 # never migrated in place; a changed input contract makes current reads miss
@@ -32,10 +65,13 @@ SCHEMA_VERSION = 13
 DERIVED_PIPELINE_CONTRACT = {
     "version": "financial-derived-pipeline-v1",
     "disclosure_identity": "disclosure-identity-v1",
-    "parser": "financial-ingestion-ast-v9",
+    "parser": PDF_PARSER_VERSION,
+    "inline_parser": INLINE_PARSER_VERSION,
+    "structured_parser": "sec-companyfacts-v4",
+    "structured_derivation": "exact-explicit-inputs-v2",
     "rules": "financial-rules-v1",
     "facts": CURRENT_DERIVED_VERSION,
-    "validation": "financial-validation-v1",
+    "validation": "financial-validation-v6",
     "report_projection": "report-projection-v1",
 }
 
@@ -49,7 +85,46 @@ class Storage:
         self.packs_dir = self.data_dir / "research-packs"
         self.packs_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "openthesis.db"
+        self.migration_backup: Path | None = self._prepare_schema_upgrade()
         self._initialize()
+
+    def _prepare_schema_upgrade(self) -> Path | None:
+        """Validate and online-backup an existing DB before any schema write.
+
+        Online Backup includes committed WAL data. Originals and artifacts are
+        not rewritten, and backups are never replaced by a later startup.
+        """
+        if not self.db_path.exists():
+            return None
+        source = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            source.execute("PRAGMA query_only = ON")
+            check = source.execute("PRAGMA quick_check").fetchall()
+            if check != [("ok",)]:
+                raise StorageSchemaError("STORAGE_INTEGRITY_CHECK_FAILED")
+            exists = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'").fetchone()
+            row = source.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone() if exists else None
+            try:
+                version = int(row[0]) if row else 0
+            except (ValueError, TypeError) as exc:
+                raise StorageSchemaError("STORAGE_SCHEMA_VERSION_INVALID") from exc
+            if version > SCHEMA_VERSION:
+                raise StorageSchemaError("STORAGE_SCHEMA_NEWER_THAN_BINARY")
+            if version == SCHEMA_VERSION:
+                return None
+            directory = self.data_dir / "backups"
+            directory.mkdir(parents=True, exist_ok=True)
+            backup_path = directory / f"pre-schema-{version}-to-{SCHEMA_VERSION}-{uuid.uuid4().hex}.db"
+            target = sqlite3.connect(backup_path)
+            try:
+                source.backup(target)
+                if target.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise StorageSchemaError("STORAGE_BACKUP_INTEGRITY_FAILED")
+            finally:
+                target.close()
+            return backup_path
+        finally:
+            source.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -180,6 +255,9 @@ class Storage:
                     usage_status TEXT NOT NULL DEFAULT 'audit_only',
                     provenance_status TEXT NOT NULL DEFAULT 'unresolved',
                     derived_version TEXT NOT NULL DEFAULT 'legacy',
+                    normalization_lineage_json TEXT,
+                    classification_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    dimensions_json TEXT NOT NULL DEFAULT '[]',
                     FOREIGN KEY(company_cik) REFERENCES companies(cik)
                 );
 
@@ -368,6 +446,12 @@ class Storage:
                     FOREIGN KEY(run_id) REFERENCES research_runs(run_id),
                     FOREIGN KEY(revision_id) REFERENCES report_revisions(revision_id)
                 );
+                CREATE TABLE IF NOT EXISTS report_revision_contexts (
+                    revision_id TEXT PRIMARY KEY,
+                    context_json TEXT NOT NULL,
+                    context_sha256 TEXT NOT NULL,
+                    FOREIGN KEY(revision_id) REFERENCES report_revisions(revision_id)
+                );
 
                 CREATE TABLE IF NOT EXISTS thesis_versions (
                     thesis_version_id TEXT PRIMARY KEY,
@@ -411,6 +495,8 @@ class Storage:
                 {
                     "revision": "TEXT NOT NULL DEFAULT 'original'",
                     "supersedes_document_id": "TEXT NOT NULL DEFAULT ''",
+                    "period_metadata_status": "TEXT NOT NULL DEFAULT ''",
+                    "period_metadata_diagnostic": "TEXT NOT NULL DEFAULT ''",
                 },
             )
             self._ensure_columns(
@@ -438,6 +524,9 @@ class Storage:
                     "usage_status": "TEXT NOT NULL DEFAULT 'audit_only'",
                     "provenance_status": "TEXT NOT NULL DEFAULT 'unresolved'",
                     "derived_version": "TEXT NOT NULL DEFAULT 'legacy'",
+                    "normalization_lineage_json": "TEXT",
+                    "classification_evidence_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                    "dimensions_json": "TEXT NOT NULL DEFAULT '[]'",
                 },
             )
             self._ensure_columns(
@@ -454,6 +543,30 @@ class Storage:
                 },
             )
             self._backfill_active_fact_generations(db)
+            from .resilience.repository import SCHEMA_STATEMENTS
+
+            for statement in SCHEMA_STATEMENTS:
+                db.execute(statement)
+            self._ensure_columns(db, "recovery_actions", {
+                "response_received": "INTEGER NOT NULL DEFAULT 0",
+                "response_receipt_json": "TEXT",
+            })
+            from .research_execution.durable import SCHEMA_STATEMENTS as STAGE_SCHEMA_STATEMENTS
+            for statement in STAGE_SCHEMA_STATEMENTS:
+                db.execute(statement)
+            from .research_execution.requests import SCHEMA_STATEMENTS as REQUEST_SCHEMA_STATEMENTS
+            for statement in REQUEST_SCHEMA_STATEMENTS:
+                db.execute(statement)
+            self._ensure_columns(db, "model_request_journal", {
+                "response_received": "INTEGER NOT NULL DEFAULT 0",
+                "receipt_json": "TEXT",
+                "diagnostic_trace_id": "TEXT NOT NULL DEFAULT ''",
+                "candidate_schema": "TEXT NOT NULL DEFAULT 'legacy'",
+                "purpose": "TEXT NOT NULL DEFAULT ''",
+                "authorization_id": "TEXT NOT NULL DEFAULT ''",
+                "supersedes_json": "TEXT NOT NULL DEFAULT '[]'",
+            })
+            self._ensure_columns(db, "research_stage_attempts", {"action_id": "TEXT NOT NULL DEFAULT ''"})
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -605,8 +718,8 @@ class Storage:
                     document_id, company_cik, accession_number, form_type,
                     fiscal_period, period_end, filed_at, primary_document,
                     source_url, local_path, content_hash, ingested_at,
-                    revision, supersedes_document_id
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    revision, supersedes_document_id, period_metadata_status, period_metadata_diagnostic
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -624,6 +737,8 @@ class Storage:
                         filing.ingested_at,
                         filing.revision,
                         filing.supersedes_document_id,
+                        filing.period_metadata_status,
+                        filing.period_metadata_diagnostic,
                     )
                     for filing in filings
                 ],
@@ -832,7 +947,8 @@ class Storage:
         safe_hashes = [str(value) for value in page_hashes]
         safe_page_numbers = [int(value) for value in page_numbers]
         with self.connect() as db:
-            db.execute(
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
                 """
                 INSERT INTO vision_task_journal(
                     task_key, company_cik, document_id, provider, remote_task_id,
@@ -851,6 +967,14 @@ class Storage:
                     status=excluded.status,
                     error_code=excluded.error_code,
                     updated_at=excluded.updated_at
+                WHERE vision_task_journal.company_cik=excluded.company_cik
+                  AND vision_task_journal.document_id=excluded.document_id
+                  AND vision_task_journal.provider=excluded.provider
+                  AND vision_task_journal.page_hashes_json=excluded.page_hashes_json
+                  AND vision_task_journal.page_numbers_json=excluded.page_numbers_json
+                  AND (vision_task_journal.remote_task_id=''
+                       OR excluded.remote_task_id=''
+                       OR vision_task_journal.remote_task_id=excluded.remote_task_id)
                 """,
                 (
                     task_key,
@@ -865,6 +989,8 @@ class Storage:
                     updated_at,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("VISION_TASK_IDENTITY_CONFLICT")
             row = db.execute(
                 "SELECT * FROM vision_task_journal WHERE task_key = ?", (task_key,)
             ).fetchone()
@@ -872,6 +998,38 @@ class Storage:
         payload["page_hashes"] = json.loads(payload.pop("page_hashes_json"))
         payload["page_numbers"] = json.loads(payload.pop("page_numbers_json"))
         return payload
+
+    def claim_vision_task(
+        self, task_key: str, *, company_cik: str, document_id: str,
+        provider: str, page_hashes: Sequence[str], page_numbers: Sequence[int] = (),
+    ) -> bool:
+        """Atomically persist intent before POST; unknown outcomes never reset.
+
+        Only an explicit remote rejection with no task id permits another
+        claim. A crashed submitting worker cannot prove rejection merely by
+        losing its lease, so elapsed time is deliberately not a reset rule.
+        """
+        if not all(isinstance(value, str) and value for value in
+                   (task_key, company_cik, document_id, provider)):
+            raise ValueError("VISION_TASK_IDENTITY_INVALID")
+        hashes = json.dumps([str(value) for value in page_hashes], separators=(",", ":"))
+        numbers = json.dumps([int(value) for value in page_numbers], separators=(",", ":"))
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute("""INSERT OR IGNORE INTO vision_task_journal(
+                task_key,company_cik,document_id,provider,page_hashes_json,page_numbers_json,
+                status,updated_at) VALUES(?,?,?,?,?,?,'submitting',?)""",
+                (task_key, company_cik, document_id, provider, hashes, numbers, now))
+            if cursor.rowcount:
+                return True
+            cursor = db.execute("""UPDATE vision_task_journal
+                SET status='submitting',error_code='',updated_at=?
+                WHERE task_key=? AND company_cik=? AND document_id=? AND provider=?
+                  AND page_hashes_json=? AND page_numbers_json=?
+                  AND status='rejected' AND remote_task_id=''""",
+                (now, task_key, company_cik, document_id, provider, hashes, numbers))
+            return cursor.rowcount == 1
 
     def get_vision_task(self, task_key: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -967,6 +1125,11 @@ class Storage:
         source_hashes: dict[str, str] | None = None,
         complete_accessions: set[str] | frozenset[str] | None = None,
         candidate_diagnostics: list[str] | tuple[str, ...] = (),
+        expected_generations: dict[str, str] | None = None,
+        source_failures: Sequence[Any] = (),
+        cancel_check: Callable[[], bool] | None = None,
+        fact_validation_records: Mapping[str, Any] | None = None,
+        parsing_observations: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any] | None:
         """Atomically replace facts, evidence, and validation decisions.
 
@@ -975,7 +1138,31 @@ class Storage:
         to the supplied accessions so prior research history is never deleted.
         """
         unique = sorted({value for value in accession_numbers if value})
+        if expected_generations is not None and (
+            not generation_id or not set(unique).issubset(expected_generations)
+            or any(not isinstance(key, str) or not key or not isinstance(value, str)
+                   for key, value in expected_generations.items())
+        ):
+            raise ValueError("FINANCIAL_PUBLICATION_SNAPSHOT_INVALID")
         with self.connect() as db:
+            # A read-then-write on two deferred transactions is not CAS. Hold
+            # SQLite's write lock while checking heads and publishing all rows.
+            db.execute("BEGIN IMMEDIATE")
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("financial publication cancelled")
+            if generation_id and db.execute(
+                "SELECT 1 FROM financial_ingestion_candidates WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone() is not None:
+                raise ValueError("FINANCIAL_GENERATION_ALREADY_EXISTS")
+            changed_generations = []
+            if expected_generations is not None:
+                for accession, expected in expected_generations.items():
+                    row = db.execute("SELECT generation_id FROM financial_active_generations "
+                                     "WHERE company_cik=? AND accession_number=?",
+                                     (company_cik, accession)).fetchone()
+                    if str(row[0] if row else "") != expected:
+                        changed_generations.append(accession)
             promotable = set(unique)
             accession_states: dict[str, str] = {item: "promoted" for item in unique}
             normalized_hashes = {
@@ -1007,19 +1194,145 @@ class Storage:
                         "accepted_fact_ids": [fact.fact_id for fact in getattr(validation, "accepted", ())],
                         "quarantined_fact_ids": [fact.fact_id for fact in getattr(validation, "quarantined", ())],
                     })
+
+                candidate_facts = (
+                    *accepted_facts, *(quarantined_facts or ()), *audit_facts,
+                )
+                candidate_fact_ids = {str(fact.fact_id) for fact in candidate_facts}
+                validation_payload: dict[str, dict[str, Any]] = {}
+                if fact_validation_records is not None:
+                    if not isinstance(fact_validation_records, Mapping):
+                        raise ValueError("FINANCIAL_FACT_VALIDATION_RECORDS_INVALID")
+                    for supplied_id, raw_record in fact_validation_records.items():
+                        if not isinstance(supplied_id, str) or not supplied_id:
+                            raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                        # Records are intentionally scoped to facts in this
+                        # candidate archive; unrelated compiler records are ignored.
+                        if supplied_id not in candidate_fact_ids:
+                            continue
+                        to_dict = getattr(raw_record, "to_dict", None)
+                        record = to_dict() if callable(to_dict) else raw_record
+                        if not isinstance(record, Mapping):
+                            raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                        record_id = record.get("fact_id", supplied_id)
+                        accepted = record.get("accepted")
+                        issues = record.get("issues")
+                        components = record.get("components")
+                        dependencies = record.get("dependencies")
+                        if (
+                            record_id != supplied_id
+                            or type(accepted) is not bool
+                            or not isinstance(issues, (list, tuple))
+                            or any(not isinstance(item, str) for item in issues)
+                            or not isinstance(components, Mapping)
+                            or not isinstance(dependencies, Mapping)
+                        ):
+                            raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                        clean_components: dict[str, dict[str, Any]] = {}
+                        for name, observation in components.items():
+                            if not isinstance(name, str) or not name or not isinstance(observation, Mapping):
+                                raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                            state = observation.get("state")
+                            evidence_ids = observation.get("evidence_ids")
+                            if (
+                                not isinstance(state, str)
+                                or state not in {"observed", "unknown", "conflict", "verified"}
+                                or "value" not in observation
+                                or not isinstance(evidence_ids, (list, tuple))
+                                or any(not isinstance(item, str) for item in evidence_ids)
+                            ):
+                                raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                            clean_components[name] = {
+                                "state": state,
+                                "value": observation.get("value"),
+                                "evidence_ids": list(evidence_ids),
+                            }
+                        clean_dependencies: dict[str, list[str]] = {}
+                        for name, ids in dependencies.items():
+                            if (
+                                not isinstance(name, str) or not name
+                                or not isinstance(ids, (list, tuple))
+                                or any(not isinstance(item, str) for item in ids)
+                            ):
+                                raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID")
+                            clean_dependencies[name] = list(ids)
+                        normalized_record = {
+                            "fact_id": supplied_id,
+                            "accepted": accepted,
+                            "issues": list(issues),
+                            "components": clean_components,
+                            "dependencies": clean_dependencies,
+                        }
+                        try:
+                            json.dumps(normalized_record, ensure_ascii=False, allow_nan=False)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID") from exc
+                        validation_payload[supplied_id] = normalized_record
+
+                observation_payload: list[dict[str, str]] = []
+                if not isinstance(parsing_observations, (list, tuple)):
+                    raise ValueError("FINANCIAL_PARSING_OBSERVATIONS_INVALID")
+                for raw_observation in parsing_observations:
+                    if not isinstance(raw_observation, Mapping):
+                        raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+                    accession = raw_observation.get("accession_number")
+                    period_end = raw_observation.get("period_end")
+                    fiscal_period = raw_observation.get("fiscal_period")
+                    source_hash = raw_observation.get("source_hash")
+                    if any(not isinstance(value, str) or not value for value in (
+                        accession, period_end, fiscal_period, source_hash,
+                    )):
+                        raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+                    expected_hash = normalized_hashes.get(accession, "")
+                    if (
+                        accession not in unique or not expected_hash
+                        or expected_hash != source_hash.casefold()
+                        or not any(
+                            fact.accession_number == accession
+                            and fact.end_date == period_end
+                            and fact.fiscal_period == fiscal_period
+                            for fact in candidate_facts
+                        )
+                    ):
+                        raise ValueError("FINANCIAL_PARSING_OBSERVATION_BINDING_INVALID")
+                    observation_payload.append({
+                        "accession_number": accession,
+                        "period_end": period_end,
+                        "fiscal_period": fiscal_period,
+                        "source_hash": source_hash.casefold(),
+                    })
+                observed_accessions = {
+                    item["accession_number"] for item in observation_payload
+                }
                 candidate_payload = {
                     "accepted_facts": [fact.to_dict() for fact in accepted_facts],
                     "quarantined_facts": [fact.to_dict() for fact in (quarantined_facts or ())],
                     "audit_facts": [fact.to_dict() for fact in audit_facts],
                     "evidence": [item.to_dict() for item in evidence],
                     "validation_groups": group_payload,
+                    "source_failures": [asdict(item) for item in source_failures],
+                    "fact_validation_records": validation_payload,
+                    "parsing_observations": observation_payload,
                 }
                 diagnostics = list(dict.fromkeys(str(item) for item in candidate_diagnostics if item))
 
+                if changed_generations:
+                    # Preserve the candidate, but none of its dependent input
+                    # cohort may replace a newer publication. A rejected CAS
+                    # is not a repaired report and does not overwrite heads.
+                    promotable.clear()
+                    accession_states = {item: "stale_generation" for item in unique}
+                    diagnostics.extend(f"{item}:financial_generation_changed" for item in sorted(changed_generations))
+
                 for accession in unique:
+                    if changed_generations:
+                        continue
                     if complete_accessions is not None and accession not in complete_accessions:
                         accession_states[accession] = "incomplete"
-                        diagnostics.append(f"{accession}:candidate_parse_incomplete")
+                        incomplete_kind = (
+                            "admission" if accession in observed_accessions else "parse"
+                        )
+                        diagnostics.append(f"{accession}:candidate_{incomplete_kind}_incomplete")
                         promotable.discard(accession)
                         continue
 
@@ -1069,13 +1382,14 @@ class Storage:
                         )
 
                 candidate_state = (
-                    "promoted" if len(promotable) == len(unique)
+                    "stale_generation" if changed_generations
+                    else "promoted" if len(promotable) == len(unique)
                     else "partially_promoted" if promotable
                     else "investigate" if "investigate" in accession_states.values()
                     else "incomplete"
                 )
                 db.execute(
-                        "INSERT OR REPLACE INTO financial_ingestion_candidates("
+                        "INSERT INTO financial_ingestion_candidates("
                     "generation_id, company_cik, created_at, parser_version, "
                         "source_hashes_json, accessions_json, state, diagnostics_json, candidate_json"
                     ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1114,7 +1428,18 @@ class Storage:
                 evidence = [item for item in evidence if str(getattr(item, "document_id", "")) in document_ids]
                 unique = sorted(promotable)
 
+            prior_facts = []
+            if generation_id:
+                for accession in unique:
+                    prior_facts.extend(self._fact_row(row) for row in db.execute(
+                        "SELECT * FROM financial_facts WHERE company_cik=? AND accession_number=? "
+                        "AND usage_status='canonical_research' AND provenance_status='verified' "
+                        "AND COALESCE(validation_status, '')<>'REJECTED'",
+                        (company_cik, accession)))
+
             for accession in unique:
+                if cancel_check is not None and cancel_check():
+                    raise CancelledError("financial publication cancelled")
                 # Evidence is keyed by filing document rather than accession.
                 # Resolve the document ids before replacing parser output so a
                 # reparse cannot leave excerpts from an older, richer parse.
@@ -1232,6 +1557,28 @@ class Storage:
                     ),
                 )
             self._clear_rebuild_marker_if_fully_rebuilt(db)
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("financial publication cancelled")
+            if generation_id and prior_facts:
+                # The correction record and promoted financial facts share
+                # this transaction. A lost CAS or cancellation revokes nothing.
+                from .report_content import financial_correction_invalidation
+                for run_row in db.execute("SELECT run_id FROM research_runs WHERE company_cik=?", (company_cik,)):
+                    run_id = str(run_row[0])
+                    artifacts = [dict(row) for row in db.execute(
+                        "SELECT artifact_id,run_id,artifact_type,agent_id,payload_json FROM artifacts "
+                        "WHERE run_id=? ORDER BY rowid", (run_id,))]
+                    for artifact_row in artifacts:
+                        artifact_row["content"] = load_payload(db, artifact_row.pop("payload_json"))
+                    invalidation = financial_correction_invalidation(artifacts, run_id=run_id,
+                        company_cik=company_cik, old_facts=prior_facts, accepted_facts=accepted_facts,
+                        validation_records=validation_payload, source_hashes=normalized_hashes,
+                        generation_id=generation_id)
+                    if invalidation is not None:
+                        self._save_artifact_db(db, ResearchArtifact(
+                            run_id + ":content-invalidation:" + invalidation["record_sha256"][:20], run_id,
+                            "trusted-content-invalidation", "Source-confirmed financial correction",
+                            invalidation, agent_id="trusted-financial-publication", created_at=utc_now_iso()))
         if generation_id:
             return {
                 "generation_id": generation_id,
@@ -1268,7 +1615,7 @@ class Storage:
         return replace(
             fact,
             extraction_status="extracted",
-            usage_status="canonical_research",
+            usage_status="comparator" if fact.usage_status == "comparator" else "canonical_research",
             provenance_status="verified",
             derived_version=CURRENT_DERIVED_VERSION,
         )
@@ -1285,8 +1632,9 @@ class Storage:
                  currency, unit_scale, unit_provenance, revision, source_document, source_page,
                  source_bbox_json, source_column, raw_text, parser_version, validation_status
                 , extraction_status, usage_status, provenance_status, derived_version,
-                generation_id
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                generation_id, normalization_lineage_json,
+                classification_evidence_ids_json, dimensions_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1326,6 +1674,17 @@ class Storage:
                     fact.provenance_status,
                     fact.derived_version,
                      fact.generation_id,
+                    json.dumps(
+                        fact.to_dict()["normalization_lineage"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ) if fact.normalization_lineage is not None else None,
+                    json.dumps(
+                        list(fact.classification_evidence_ids),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(fact.to_dict()["dimensions"], ensure_ascii=False, separators=(",", ":")),
                 )
                 for fact in facts
             ],
@@ -1334,20 +1693,23 @@ class Storage:
     def get_facts(self, cik: str) -> list[dict[str, Any]]:
         return self.get_financial_research_snapshot(cik)["facts"]
 
-    def get_financial_research_snapshot(self, cik: str) -> dict[str, Any]:
-        """Capture facts and active generation pointers in one read view."""
+    def get_financial_research_snapshot(self, cik: str, *, include_evidence: bool = False) -> dict[str, Any]:
+        """Capture active rows, pointers and optionally their proofs in one view."""
         with self.connect() as db:
             db.execute("BEGIN")
-            generations = {
-                str(row["accession_number"]): str(row["generation_id"])
-                for row in db.execute(
-                    "SELECT accession_number, generation_id "
-                    "FROM financial_active_generations WHERE company_cik = ?",
-                    (cik,),
-                ).fetchall()
-            }
-            rows = db.execute(
-                """
+            return self._financial_research_snapshot_db(db, cik, include_evidence=include_evidence)
+
+    def _financial_research_snapshot_db(self, db: sqlite3.Connection, cik: str, *,
+                                        include_evidence: bool = False) -> dict[str, Any]:
+        generations = {
+            str(row["accession_number"]): str(row["generation_id"])
+            for row in db.execute(
+                "SELECT accession_number, generation_id "
+                "FROM financial_active_generations WHERE company_cik = ?", (cik,),
+            ).fetchall()
+        }
+        rows = db.execute(
+            """
                 SELECT f.* FROM financial_facts f
                 LEFT JOIN security_listings l ON l.security_id = f.company_cik
                 LEFT JOIN financial_active_generations g
@@ -1361,17 +1723,204 @@ class Storage:
                   AND COALESCE(f.consolidated_scope, 'consolidated') = 'consolidated'
                   AND (
                       l.reporting_currency IS NULL
+                      OR TRIM(COALESCE(l.reporting_currency, '')) = ''
                       OR COALESCE(f.currency, '') = ''
                       OR UPPER(f.currency) = UPPER(l.reporting_currency)
                   )
                 ORDER BY fiscal_year DESC, concept
-                """,
-                (cik, CURRENT_DERIVED_VERSION),
-            ).fetchall()
-        return {
-            "facts": [self._fact_row(row) for row in rows],
+            """, (cik, CURRENT_DERIVED_VERSION),
+        ).fetchall()
+        # Internal preparers revalidate these active audit rows before model
+        # use. They stay outside get_facts and the consolidated metric lane.
+        # Inactive/candidate generations never enter this same-transaction view.
+        disclosures = db.execute(
+            """SELECT f.* FROM financial_facts f
+               JOIN financial_active_generations g
+                 ON g.company_cik = f.company_cik AND g.accession_number = f.accession_number
+                    AND g.generation_id = f.generation_id
+               WHERE f.company_cik = ? AND f.derived_version = ?
+                 AND f.usage_status = 'audit_only' AND f.validation_status <> 'REJECTED'
+                 AND (f.dimensions_json <> '[]' OR f.concept = 'shares_outstanding')
+               ORDER BY f.fiscal_year DESC, f.concept, f.fact_id""",
+            (cik, CURRENT_DERIVED_VERSION),
+        ).fetchall()
+        issues = []
+        # Older accepted-write code flattened comparator usage into canonical
+        # usage. Recover only an unambiguous, usable role from the existing
+        # same-transaction validation ledger; amounts/provenance are untouched
+        # and the preparer still revalidates the original evidence afterward.
+        ledger_roles: dict[tuple, set[str]] = {}
+        for group in db.execute("""SELECT accession_number,period_end,fiscal_period,
+                consolidated_scope,currency,role FROM financial_validation_groups
+                WHERE company_cik=? AND derived_version=? AND status IN ('VERIFIED','READY_WITH_WARNINGS')""",
+                (cik, CURRENT_DERIVED_VERSION)).fetchall():
+            identity = tuple(group[key] for key in ("accession_number", "period_end", "fiscal_period",
+                                                    "consolidated_scope", "currency"))
+            ledger_roles.setdefault(identity, set()).add(group["role"])
+        def read_facts(items, bucket):
+            accepted = []
+            for row in items:
+                try:
+                    fact = self._fact_row(row)
+                    identity = tuple(fact[key] for key in ("accession_number", "end_date", "fiscal_period",
+                                                          "consolidated_scope", "currency"))
+                    if fact["usage_status"] == "canonical_research" and ledger_roles.get(identity) == {"comparator"}:
+                        fact["usage_status"] = "comparator"
+                    accepted.append(fact)
+                except (ValueError, TypeError, StorageCorruptionError) as exc:
+                    issues.append(_storage_issue(exc, bucket + "/" + str(row["fact_id"]), str(row["fact_id"])))
+            return accepted
+        try:
+            observations = self._candidate_parsing_observations_db(db, cik, issues=issues)
+        except (ValueError, TypeError, StorageCorruptionError) as exc:
+            observations = []
+            issues.append(_storage_issue(exc, "parsing_observations", cik))
+        snapshot = {
+            "facts": read_facts(rows, "financial_facts"),
+            "supplemental_facts": read_facts(disclosures, "supplemental_facts"),
             "generations": generations,
+            "parsing_observations": observations,
+            "storage_issues": issues,
         }
+        if include_evidence:
+            refs = db.execute("""SELECT e.* FROM financial_evidence e
+                JOIN filings f ON f.document_id=e.document_id
+                WHERE f.company_cik=? ORDER BY e.evidence_id""", (cik,)).fetchall()
+            snapshot["evidence"] = []
+            for row in refs:
+                try:
+                    snapshot["evidence"].append(self._financial_evidence_row(row))
+                except (ValueError, TypeError) as exc:
+                    issues.append(_storage_issue(exc, "financial_evidence/" + str(row["evidence_id"]), str(row["evidence_id"])))
+        return snapshot
+
+    @staticmethod
+    def _candidate_parsing_observations_db(
+        db: sqlite3.Connection, cik: str, *, issues: list[dict[str, str]] | None = None,
+    ) -> list[dict[str, str]]:
+        """Return source-current parse observations without admitting candidates."""
+        current_filings: dict[str, tuple[str, str, str]] = {}
+        for row in db.execute(
+            "SELECT accession_number, content_hash, period_end, fiscal_period FROM filings "
+            "WHERE company_cik = ? ORDER BY ingested_at DESC, document_id DESC",
+            (cik,),
+        ).fetchall():
+            accession = str(row["accession_number"] or "")
+            if accession and accession not in current_filings:
+                current_filings[accession] = (
+                    str(row["content_hash"] or "").casefold(),
+                    str(row["period_end"] or ""),
+                    str(row["fiscal_period"] or ""),
+                )
+
+        resolved: set[str] = set()
+        observations: list[dict[str, str]] = []
+        candidates = db.execute(
+            "SELECT generation_id, state, source_hashes_json, candidate_json "
+            "FROM financial_ingestion_candidates WHERE company_cik = ? "
+            "ORDER BY created_at DESC, generation_id DESC",
+            (cik,),
+        ).fetchall()
+        healthy_candidates = []
+        for candidate in candidates:
+            try:
+                hashes = strict_loads(candidate["source_hashes_json"] or "{}")
+                payload = strict_loads(candidate["candidate_json"] or "{}")
+                if not isinstance(hashes, dict) or not isinstance(payload, dict):
+                    raise ValueError("FINANCIAL_CANDIDATE_OBSERVATION_ARCHIVE_SHAPE_INVALID")
+                observations_payload = payload.get("parsing_observations", [])
+                if not isinstance(observations_payload, list):
+                    raise ValueError("FINANCIAL_CANDIDATE_PARSING_OBSERVATIONS_SHAPE_INVALID")
+                for observation in observations_payload:
+                    if not isinstance(observation, dict) or any(
+                        not isinstance(observation.get(key), str) or not observation.get(key)
+                        for key in ("accession_number", "period_end", "fiscal_period", "source_hash")
+                    ):
+                        raise ValueError("FINANCIAL_CANDIDATE_PARSING_OBSERVATION_SHAPE_INVALID")
+                for bucket in ("accepted_facts", "quarantined_facts", "audit_facts"):
+                    facts_payload = payload.get(bucket, ())
+                    if not isinstance(facts_payload, list) or any(not isinstance(item, dict) for item in facts_payload):
+                        raise ValueError("FINANCIAL_CANDIDATE_FACTS_SHAPE_INVALID")
+                healthy_candidates.append(candidate)
+            except (ValueError, TypeError, StorageCorruptionError) as exc:
+                if issues is not None:
+                    issues.append(_storage_issue(exc, "financial_ingestion_candidates/" + candidate["generation_id"], candidate["generation_id"]))
+        for candidate in healthy_candidates:
+            if str(candidate["state"] or "") == "stale_generation":
+                continue
+            try:
+                source_hashes = strict_loads(candidate["source_hashes_json"] or "{}")
+                payload = strict_loads(candidate["candidate_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StorageCorruptionError(
+                    "FINANCIAL_CANDIDATE_OBSERVATION_ARCHIVE_JSON_INVALID"
+                ) from exc
+            if not isinstance(source_hashes, dict) or not isinstance(payload, dict):
+                raise StorageCorruptionError(
+                    "FINANCIAL_CANDIDATE_OBSERVATION_ARCHIVE_SHAPE_INVALID"
+                )
+            # Candidate archives written before parse observations existed
+            # remain valid; absence means there is no archived observation.
+            raw_observations = payload.get("parsing_observations", [])
+            if not isinstance(raw_observations, list):
+                raise StorageCorruptionError(
+                    "FINANCIAL_CANDIDATE_PARSING_OBSERVATIONS_SHAPE_INVALID"
+                )
+            fact_identities: set[tuple[str, str, str]] = set()
+            for bucket in ("accepted_facts", "quarantined_facts", "audit_facts"):
+                raw_facts = payload.get(bucket, [])
+                if not isinstance(raw_facts, list):
+                    raise StorageCorruptionError(
+                        "FINANCIAL_CANDIDATE_FACTS_SHAPE_INVALID"
+                    )
+                for fact in raw_facts:
+                    if not isinstance(fact, dict):
+                        raise StorageCorruptionError(
+                            "FINANCIAL_CANDIDATE_FACT_SHAPE_INVALID"
+                        )
+                    if all(isinstance(fact.get(key), str) and fact.get(key) for key in (
+                        "accession_number", "end_date", "fiscal_period",
+                    )):
+                        fact_identities.add((
+                            fact["accession_number"], fact["end_date"], fact["fiscal_period"],
+                        ))
+            archive_observations: list[dict[str, str]] = []
+            for raw in raw_observations:
+                if not isinstance(raw, dict) or any(
+                    not isinstance(raw.get(key), str) or not raw.get(key)
+                    for key in ("accession_number", "period_end", "fiscal_period", "source_hash")
+                ):
+                    raise StorageCorruptionError(
+                        "FINANCIAL_CANDIDATE_PARSING_OBSERVATION_SHAPE_INVALID"
+                    )
+                accession = raw["accession_number"]
+                if accession in resolved:
+                    continue
+                current = current_filings.get(accession)
+                if current is None:
+                    continue
+                archive_hash = str(source_hashes.get(accession, "")).casefold()
+                source_hash = raw["source_hash"].casefold()
+                if (
+                    not current[0] or archive_hash != current[0] or source_hash != current[0]
+                    or raw["period_end"] != current[1]
+                    or raw["fiscal_period"] != current[2]
+                    or (accession, raw["period_end"], raw["fiscal_period"]) not in fact_identities
+                ):
+                    continue
+                archive_observations.append({
+                    "accession_number": accession,
+                    "period_end": raw["period_end"],
+                    "fiscal_period": raw["fiscal_period"],
+                    "source_hash": source_hash,
+                })
+            if archive_observations:
+                resolved.update(item["accession_number"] for item in archive_observations)
+                observations.extend(archive_observations)
+        observations.sort(key=lambda item: (
+            item["accession_number"], item["period_end"], item["fiscal_period"], item["source_hash"],
+        ))
+        return observations
 
     def get_facts_audit(self, cik: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -1385,6 +1934,89 @@ class Storage:
                 (cik,),
             ).fetchall()
         result = [self._fact_row(row) for row in rows]
+        validation_by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+        candidate_payloads: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            generation_id = str(candidate["generation_id"] or "")
+            try:
+                payload = json.loads(candidate["candidate_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StorageCorruptionError(
+                    "FINANCIAL_CANDIDATE_ARCHIVE_JSON_INVALID"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise StorageCorruptionError("FINANCIAL_CANDIDATE_ARCHIVE_SHAPE_INVALID")
+            candidate_payloads[generation_id] = payload
+            candidate_fact_ids: set[str] = set()
+            for bucket in ("accepted_facts", "quarantined_facts", "audit_facts"):
+                fact_items = payload.get(bucket)
+                if not isinstance(fact_items, list):
+                    raise StorageCorruptionError("FINANCIAL_CANDIDATE_FACTS_SHAPE_INVALID")
+                for raw in fact_items:
+                    if (
+                        not isinstance(raw, dict)
+                        or not isinstance(raw.get("fact_id"), str)
+                        or not raw.get("fact_id")
+                    ):
+                        raise StorageCorruptionError("FINANCIAL_CANDIDATE_FACT_SHAPE_INVALID")
+                    candidate_fact_ids.add(raw["fact_id"])
+            records = payload.get("fact_validation_records", {})
+            if not isinstance(records, dict):
+                raise StorageCorruptionError(
+                    "FINANCIAL_FACT_VALIDATION_RECORDS_SHAPE_INVALID"
+                )
+            for fact_id, raw_record in records.items():
+                if not isinstance(fact_id, str) or not fact_id:
+                    raise StorageCorruptionError(
+                        "FINANCIAL_FACT_VALIDATION_RECORDS_SHAPE_INVALID"
+                    )
+                if fact_id not in candidate_fact_ids:
+                    continue
+                if not isinstance(raw_record, dict):
+                    raise StorageCorruptionError(
+                        "FINANCIAL_FACT_VALIDATION_RECORD_SHAPE_INVALID"
+                    )
+                accepted = raw_record.get("accepted")
+                issues = raw_record.get("issues")
+                components = raw_record.get("components")
+                dependencies = raw_record.get("dependencies")
+                if (
+                    raw_record.get("fact_id") != fact_id
+                    or type(accepted) is not bool
+                    or not isinstance(issues, list)
+                    or any(not isinstance(item, str) for item in issues)
+                    or not isinstance(components, dict)
+                    or not isinstance(dependencies, dict)
+                ):
+                    raise StorageCorruptionError(
+                        "FINANCIAL_FACT_VALIDATION_RECORD_SHAPE_INVALID"
+                    )
+                for name, observation in components.items():
+                    if (
+                        not isinstance(name, str) or not name or not isinstance(observation, dict)
+                        or not isinstance(observation.get("state"), str)
+                        or observation.get("state") not in {"observed", "unknown", "conflict", "verified"}
+                        or "value" not in observation
+                        or not isinstance(observation.get("evidence_ids"), list)
+                        or any(not isinstance(item, str) for item in observation.get("evidence_ids", ()))
+                    ):
+                        raise StorageCorruptionError(
+                            "FINANCIAL_FACT_VALIDATION_RECORD_SHAPE_INVALID"
+                        )
+                if any(
+                    not isinstance(name, str) or not name or not isinstance(ids, list)
+                    or any(not isinstance(item, str) for item in ids)
+                    for name, ids in dependencies.items()
+                ):
+                    raise StorageCorruptionError(
+                        "FINANCIAL_FACT_VALIDATION_RECORD_SHAPE_INVALID"
+                    )
+                validation_by_identity[(fact_id, generation_id)] = dict(raw_record)
+        for item in result:
+            identity = (str(item.get("fact_id", "")), str(item.get("generation_id", "")))
+            record = validation_by_identity.get(identity)
+            if record is not None:
+                item["fact_validation_record"] = record
         seen = {
             (str(item.get("fact_id", "")), str(item.get("generation_id", "")))
             for item in result
@@ -1393,25 +2025,33 @@ class Storage:
         # reads. Keep their facts inspectable through the audit view without
         # materializing or overwriting the currently active generation.
         for candidate in candidates:
-            try:
-                payload = json.loads(candidate["candidate_json"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
             generation_id = str(candidate["generation_id"] or "")
+            payload = candidate_payloads[generation_id]
             for bucket, usage_status in (
                 ("accepted_facts", "candidate_audit"),
                 ("quarantined_facts", "quarantined"),
                 ("audit_facts", "audit_only"),
             ):
-                fact_items = payload.get(bucket, [])
-                if not isinstance(fact_items, list):
-                    continue
+                fact_items = payload[bucket]
                 for raw in fact_items:
-                    if not isinstance(raw, dict):
-                        continue
                     fact = dict(raw)
+                    lineage_payload = fact.get("normalization_lineage")
+                    if lineage_payload is not None and not self._valid_lineage_payload(
+                        lineage_payload
+                    ):
+                        raise StorageCorruptionError(
+                            "FINANCIAL_FACT_NORMALIZATION_LINEAGE_SHAPE_INVALID"
+                        )
+                    classification_ids = fact.get("classification_evidence_ids", [])
+                    if (
+                        not isinstance(classification_ids, (list, tuple))
+                        or any(not isinstance(item, str) for item in classification_ids)
+                    ):
+                        raise StorageCorruptionError(
+                            "FINANCIAL_FACT_CLASSIFICATION_EVIDENCE_SHAPE_INVALID"
+                        )
+                    fact["classification_evidence_ids"] = tuple(classification_ids)
+                    fact["dimensions"] = self._dimension_payload(fact.get("dimensions", []))
                     fact_id = str(fact.get("fact_id", ""))
                     if not fact_id:
                         continue
@@ -1422,6 +2062,9 @@ class Storage:
                     seen.add(identity)
                     fact["generation_id"] = fact_generation
                     fact["usage_status"] = usage_status
+                    validation_record = validation_by_identity.get(identity)
+                    if validation_record is not None:
+                        fact["fact_validation_record"] = validation_record
                     if bucket == "quarantined_facts":
                         fact["validation_status"] = "REJECTED"
                     fact.setdefault("source_bbox", None)
@@ -1437,6 +2080,45 @@ class Storage:
         return result
 
     @staticmethod
+    def _dimension_payload(payload: Any) -> tuple[dict[str, Any], ...]:
+        """One shape contract for active rows and persisted candidate audits."""
+        try:
+            if not isinstance(payload, list) or len(payload) > 32:
+                raise ValueError("dimension_shape")
+            parsed = tuple(FinancialDimension.from_value(value) for value in payload)
+            if len({value.axis for value in parsed}) != len(parsed):
+                raise ValueError("duplicate_dimension")
+        except (TypeError, ValueError) as exc:
+            raise StorageCorruptionError("FINANCIAL_FACT_DIMENSIONS_INVALID") from exc
+        return tuple(asdict(value) for value in parsed)
+
+    @staticmethod
+    def _valid_lineage_payload(payload: Any) -> bool:
+        def valid_node(node: Any) -> bool:
+            if not isinstance(node, dict):
+                return False
+            string_fields = (
+                "raw_value", "scale", "normalized_value", "quantity_kind", "currency",
+            )
+            if any(not isinstance(node.get(field), str) for field in string_fields):
+                return False
+            if any(
+                field in node and not isinstance(node[field], str)
+                for field in ("method", "value_transform")
+            ):
+                return False
+            evidence_ids = node.get("unit_evidence_ids")
+            inputs = node.get("inputs")
+            return (
+                isinstance(evidence_ids, list)
+                and all(isinstance(item, str) for item in evidence_ids)
+                and isinstance(inputs, list)
+                and all(valid_node(item) for item in inputs)
+            )
+
+        return valid_node(payload)
+
+    @staticmethod
     def _fact_row(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         encoded = item.pop("source_bbox_json", None)
@@ -1447,6 +2129,47 @@ class Storage:
                 item["source_bbox"] = None
         else:
             item["source_bbox"] = None
+
+        lineage_json = item.pop("normalization_lineage_json", None)
+        if lineage_json is None:
+            item["normalization_lineage"] = None
+        else:
+            try:
+                lineage_payload = strict_loads(str(lineage_json))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StorageCorruptionError(
+                    "FINANCIAL_FACT_NORMALIZATION_LINEAGE_JSON_INVALID"
+                ) from exc
+            if lineage_payload is not None and (
+                not Storage._valid_lineage_payload(lineage_payload)
+                or FinancialNormalizationLineage.from_value(lineage_payload) is None
+            ):
+                raise StorageCorruptionError(
+                    "FINANCIAL_FACT_NORMALIZATION_LINEAGE_SHAPE_INVALID"
+                )
+            item["normalization_lineage"] = lineage_payload
+
+        classification_json = item.pop("classification_evidence_ids_json", None)
+        try:
+            classification_payload = strict_loads(str(classification_json))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageCorruptionError(
+                "FINANCIAL_FACT_CLASSIFICATION_EVIDENCE_JSON_INVALID"
+            ) from exc
+        if (
+            not isinstance(classification_payload, list)
+            or any(not isinstance(evidence_id, str) for evidence_id in classification_payload)
+        ):
+            raise StorageCorruptionError(
+                "FINANCIAL_FACT_CLASSIFICATION_EVIDENCE_SHAPE_INVALID"
+            )
+        item["classification_evidence_ids"] = tuple(classification_payload)
+        dimensions_json = item.pop("dimensions_json", "[]")
+        try:
+            dimensions = strict_loads(dimensions_json)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StorageCorruptionError("FINANCIAL_FACT_DIMENSIONS_INVALID") from exc
+        item["dimensions"] = Storage._dimension_payload(dimensions)
         return item
 
     def get_validation_groups(self, cik: str) -> list[dict[str, Any]]:
@@ -1472,11 +2195,21 @@ class Storage:
         result = []
         for row in rows:
             item = dict(row)
+            failures = []
             for key in ("issues_json", "covered_concepts_json"):
                 try:
-                    item[key.removesuffix("_json")] = json.loads(item.pop(key))
-                except (TypeError, json.JSONDecodeError):
+                    decoded = strict_loads(item.pop(key))
+                    if not isinstance(decoded, list) or (key == "covered_concepts_json" and any(not isinstance(value, str) for value in decoded)):
+                        raise ValueError("STORAGE_VALIDATION_GROUP_FIELD_INVALID")
+                    item[key.removesuffix("_json")] = decoded
+                except (TypeError, ValueError):
                     item[key.removesuffix("_json")] = []
+                    failures.append({"code": "STORAGE_VALIDATION_GROUP_FIELD_INVALID", "path": key.removesuffix("_json")})
+            if failures:
+                item["status"] = "UNVERIFIABLE"
+                item["covered_concepts"] = []
+                item["issues"] = [*item.get("issues", []), *failures]
+                item["storage_issues"] = failures
             result.append(item)
         return result
 
@@ -1489,19 +2222,23 @@ class Storage:
         query += " ORDER BY evidence_id"
         with self.connect() as db:
             rows = db.execute(query, params).fetchall()
-        result = []
-        for row in rows:
-            item = dict(row)
-            encoded = item.pop("bbox_json", None)
-            if encoded:
-                try:
-                    item["bbox"] = tuple(float(value) for value in json.loads(encoded))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    item["bbox"] = None
-            else:
-                item["bbox"] = None
-            result.append(item)
-        return result
+        return [self._financial_evidence_row(row) for row in rows]
+
+    @staticmethod
+    def _financial_evidence_row(row) -> dict[str, Any]:
+        item = dict(row)
+        encoded = item.pop("bbox_json", None)
+        if encoded:
+            coordinates = strict_loads(encoded)
+            if not isinstance(coordinates, list) or len(coordinates) != 4 or any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value) for value in coordinates
+            ):
+                raise ValueError("FINANCIAL_FACT_EVIDENCE_LOCATOR_INVALID")
+            item["bbox"] = tuple(float(value) for value in coordinates)
+        else:
+            item["bbox"] = None
+        return item
 
     def save_qualitative_evidence_cache(
         self, cache_key: str, evidence: list[dict[str, Any]]
@@ -1560,7 +2297,12 @@ class Storage:
             )
 
     def save_run_with_artifacts(
-        self, run: ResearchRun, artifacts: list[ResearchArtifact]
+        self, run: ResearchRun, artifacts: list[ResearchArtifact], *,
+        expected_run_digest: str | None = None,
+        expected_financial_snapshot: tuple[str, dict[str, Any]] | None = None,
+        expected_report_generation: int | None = None,
+        preserve_existing_payload: bool = False,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         """Persist a run snapshot and new immutable artifacts atomically.
 
@@ -1570,6 +2312,29 @@ class Storage:
         """
         payload = run.to_dict()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("report publication cancelled")
+            existing_run = None
+            if expected_run_digest is not None or preserve_existing_payload:
+                row = db.execute("SELECT payload_json FROM research_runs WHERE run_id=?", (run.run_id,)).fetchone()
+                existing_run = json.loads(row["payload_json"]) if row else None
+            if expected_run_digest is not None:
+                encoded = json.dumps(existing_run, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode("utf-8")
+                if existing_run is None or hashlib.sha256(encoded).hexdigest() != expected_run_digest:
+                    raise RuntimeError("RESEARCH_RUN_SNAPSHOT_CONFLICT")
+            if expected_financial_snapshot is not None:
+                key, captured = expected_financial_snapshot
+                if self._financial_research_snapshot_db(
+                        db, key, include_evidence="evidence" in captured) != captured:
+                    raise RuntimeError("FINANCIAL_GENERATION_CONFLICT")
+            if expected_report_generation is not None:
+                head = db.execute("SELECT generation FROM latest_report_revisions WHERE run_id=?", (run.run_id,)).fetchone()
+                if (int(head["generation"]) if head else 0) != expected_report_generation:
+                    raise RuntimeError("REPORT_REVISION_CONFLICT")
+            if preserve_existing_payload and isinstance(existing_run, dict):
+                payload = {**existing_run, **payload}
             db.execute(
                 """
                 INSERT INTO research_runs(
@@ -1590,70 +2355,10 @@ class Storage:
                 ),
             )
             for artifact in artifacts:
-                encoded = json.dumps(
-                    artifact.content,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                existing = db.execute(
-                    """
-                    SELECT run_id, artifact_type, title, payload_json,
-                           model_id, agent_id
-                    FROM artifacts WHERE artifact_id = ?
-                    """,
-                    (artifact.artifact_id,),
-                ).fetchone()
-                if existing is None:
-                    db.execute(
-                        """
-                        INSERT INTO artifacts(
-                            artifact_id, run_id, artifact_type, title,
-                            payload_json, model_id, agent_id, created_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            artifact.artifact_id,
-                            artifact.run_id,
-                            artifact.artifact_type,
-                            artifact.title,
-                            encoded,
-                            artifact.model_id,
-                            artifact.agent_id,
-                            artifact.created_at,
-                        ),
-                    )
-                    if artifact.artifact_type == "research-report":
-                        self._append_report_revision_db(
-                            db, artifact.run_id, artifact.content
-                        )
-                    continue
-                try:
-                    stored_content = json.loads(existing["payload_json"])
-                except (TypeError, json.JSONDecodeError):
-                    stored_content = None
-                expected = (
-                    artifact.run_id,
-                    artifact.artifact_type,
-                    artifact.title,
-                    artifact.content,
-                    artifact.model_id,
-                    artifact.agent_id,
-                )
-                actual = (
-                    existing["run_id"],
-                    existing["artifact_type"],
-                    existing["title"],
-                    stored_content,
-                    existing["model_id"],
-                    existing["agent_id"],
-                )
-                if actual != expected:
-                    raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT")
-                if artifact.artifact_type == "research-report":
-                    self._append_report_revision_db(
-                        db, artifact.run_id, artifact.content
-                    )
+                self._save_artifact_db(db, artifact)
+
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("report publication cancelled")
 
     def interrupt_running_runs(
         self, reason: str = "应用在研究完成前退出；已保留完成阶段，可从同一研究记录继续"
@@ -1708,73 +2413,415 @@ class Storage:
                     )
         return len(rows)
 
-    def save_artifact(self, artifact: ResearchArtifact) -> None:
-        encoded = json.dumps(
-            artifact.content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        with self.connect() as db:
-            try:
-                db.execute(
-                    """
-                    INSERT INTO artifacts(
-                        artifact_id, run_id, artifact_type, title, payload_json,
-                        model_id, agent_id, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        artifact.artifact_id, artifact.run_id, artifact.artifact_type,
-                        artifact.title, encoded, artifact.model_id, artifact.agent_id,
-                        artifact.created_at,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                existing = db.execute(
-                    "SELECT run_id, artifact_type, title, payload_json, model_id, agent_id FROM artifacts WHERE artifact_id = ?",
-                    (artifact.artifact_id,),
-                ).fetchone()
-                expected = (
-                    artifact.run_id, artifact.artifact_type, artifact.title,
-                    artifact.content, artifact.model_id, artifact.agent_id,
-                )
-                actual = None
-                if existing is not None:
-                    try:
-                        stored_content = json.loads(existing["payload_json"])
-                    except (TypeError, json.JSONDecodeError):
-                        stored_content = None
-                    actual = (
-                        existing["run_id"], existing["artifact_type"], existing["title"],
-                        stored_content, existing["model_id"], existing["agent_id"],
-                    )
-                if actual != expected:
-                    raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT") from exc
-            if artifact.artifact_type == "research-report":
-                self._append_report_revision_db(
-                    db, artifact.run_id, artifact.content
-                )
+    @staticmethod
+    def _canonical_artifact_json(content: Any) -> str:
+        """Encode artifact content with strict, deterministic value identity."""
 
-    def append_stage_attempt(self, attempt: "StageAttempt") -> None:
-        payload = attempt.to_dict()
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT COALESCE(MAX(attempt), 0) AS value FROM research_stage_attempts WHERE run_id = ? AND stage = ?",
-                (payload["run_id"], payload["stage"]),
-            ).fetchone()
-            ordinal = max(int(payload["attempt"]), int(row["value"]) + 1)
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    def _save_artifact_db(self, db: sqlite3.Connection, artifact: ResearchArtifact) -> None:
+        """Insert or verify one immutable artifact within an existing transaction."""
+
+        encoded = self._canonical_artifact_json(artifact.content)
+        stored_encoded = (store_payload(db, artifact.content)
+            if artifact.artifact_type in {"stage-candidate", "stage-checkpoint", "stage-content-flow", "agent-analysis",
+                "research-report", "trusted-content-snapshot"} else encoded)
+        existing = db.execute(
+            """
+            SELECT run_id, artifact_type, title, payload_json,
+                   model_id, agent_id
+            FROM artifacts WHERE artifact_id = ?
+            """,
+            (artifact.artifact_id,),
+        ).fetchone()
+        if existing is None:
             db.execute(
                 """
-                INSERT INTO research_stage_attempts(
-                    run_id, stage, attempt, outcome, error_code, message,
-                    diagnostics_json, created_at
+                INSERT INTO artifacts(
+                    artifact_id, run_id, artifact_type, title, payload_json,
+                    model_id, agent_id, created_at
                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    payload["run_id"], payload["stage"], ordinal,
-                    payload["outcome"], payload["error_code"], payload["message"],
-                    json.dumps(payload["diagnostics"], ensure_ascii=False),
-                    payload["created_at"],
+                    artifact.artifact_id, artifact.run_id, artifact.artifact_type,
+                    artifact.title, stored_encoded, artifact.model_id, artifact.agent_id,
+                    artifact.created_at,
                 ),
             )
+        else:
+            try:
+                stored_content = load_payload(db, existing["payload_json"])
+                stored_encoded = self._canonical_artifact_json(stored_content)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT") from exc
+            if (
+                existing["run_id"], existing["artifact_type"], existing["title"],
+                stored_encoded, existing["model_id"], existing["agent_id"],
+            ) != (
+                artifact.run_id, artifact.artifact_type, artifact.title,
+                encoded, artifact.model_id, artifact.agent_id,
+            ):
+                raise RuntimeError("ARTIFACT_IDENTITY_CONFLICT")
+        if artifact.artifact_type == "research-report":
+            self._append_report_revision_db(db, artifact.run_id, artifact.content)
+        if existing is None and artifact.artifact_type in {"research-report", "stage-checkpoint"}:
+            from .report_content import trusted_snapshot_for_artifact, read_trusted_snapshots, artifacts_for_trusted_input
+            evidence_row = db.execute("""SELECT payload_json FROM artifacts
+                WHERE run_id=? AND artifact_type='deterministic-financial-summary'
+                ORDER BY rowid DESC LIMIT 1""", (artifact.run_id,)).fetchone()
+            read_issues = []
+            try:
+                evidence_payload = load_payload(db, evidence_row["payload_json"]) if evidence_row else {}
+                evidence_records = evidence_payload.get("evidence", []) if isinstance(evidence_payload, dict) else []
+            except (ValueError, TypeError) as exc:
+                evidence_records = []
+                read_issues.append(_storage_issue(exc, "evidence-artifact", artifact.run_id))
+            retained_nodes = None
+            if artifact.content.get("mode") == "progressive-local":
+                originals = [dict(row) for row in db.execute(
+                    "SELECT artifact_id,run_id,artifact_type,payload_json FROM artifacts WHERE run_id=? AND artifact_id<>? ORDER BY rowid",
+                    (artifact.run_id, artifact.artifact_id))]
+                healthy_originals = []
+                for row in originals:
+                    try:
+                        row["content"] = load_payload(db, row.pop("payload_json"))
+                        healthy_originals.append(row)
+                    except (ValueError, TypeError) as exc:
+                        read_issues.append(_storage_issue(exc, "artifacts/" + row["artifact_id"], row["artifact_id"], artifact=True))
+                retained_nodes = read_trusted_snapshots(artifacts_for_trusted_input(healthy_originals,
+                    artifact.content.get("publication_input_digest", "")), run_id=artifact.run_id)
+            if read_issues:
+                self._save_artifact_db(db, ResearchArtifact(
+                    artifact.run_id + ":storage-read-diagnostic:" + hashlib.sha256(json.dumps(read_issues, sort_keys=True).encode()).hexdigest()[:20],
+                    artifact.run_id, "storage-read-diagnostic", "Storage read issues", {"issues": read_issues},
+                    agent_id="storage-read"))
+            snapshot = trusted_snapshot_for_artifact(artifact.to_dict(), evidence_records=evidence_records,
+                                                     retained_nodes=retained_nodes)
+            if artifact.content.get("mode") == "progressive-local" and snapshot is None:
+                raise ValueError("RESEARCH_PROGRESS_ORIGIN_PROOF_MISSING")
+            if snapshot is not None:
+                self._save_artifact_db(db, ResearchArtifact(
+                    artifact_id=artifact.run_id + ":trusted-content-snapshot:" + snapshot["snapshot_sha256"][:20],
+                    run_id=artifact.run_id, artifact_type="trusted-content-snapshot",
+                    title=artifact.title, content=snapshot, model_id=artifact.model_id,
+                    agent_id="trusted-content-commit", created_at=artifact.created_at))
+
+    @staticmethod
+    def _append_stage_attempt_db(db: sqlite3.Connection, attempt: "StageAttempt") -> None:
+        payload = attempt.to_dict()
+        row = db.execute(
+            "SELECT COALESCE(MAX(attempt), 0) AS value FROM research_stage_attempts "
+            "WHERE run_id = ? AND stage = ?",
+            (payload["run_id"], payload["stage"]),
+        ).fetchone()
+        ordinal = max(int(payload["attempt"]), int(row["value"]) + 1)
+        db.execute(
+            """
+            INSERT INTO research_stage_attempts(
+                run_id, stage, attempt, outcome, error_code, message,
+                diagnostics_json, created_at, action_id
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["run_id"], payload["stage"], ordinal,
+                payload["outcome"], payload["error_code"], payload["message"],
+                json.dumps(payload["diagnostics"], ensure_ascii=False, allow_nan=False),
+                payload["created_at"], payload.get("action_id", ""),
+            ),
+        )
+
+    def save_artifact(self, artifact: ResearchArtifact) -> None:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._save_artifact_db(db, artifact)
+
+    def append_stage_attempt(self, attempt: "StageAttempt") -> None:
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._append_stage_attempt_db(db, attempt)
+
+    def save_run_start(self, run: ResearchRun, attempt: "StageAttempt") -> None:
+        """Create an identity and its initial checkpoint, never reset an old run."""
+        if run.status is not RunStatus.RUNNING or attempt.run_id != run.run_id:
+            raise ValueError("RESEARCH_RUN_START_INVALID")
+        encoded = self._canonical_artifact_json(run.to_dict())
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM research_runs WHERE run_id=?", (run.run_id,)).fetchone():
+                raise RuntimeError("RESEARCH_RUN_ALREADY_STARTED")
+            db.execute("""INSERT INTO research_runs(
+                run_id,company_cik,payload_json,status,started_at,completed_at)
+                VALUES(?,?,?,?,?,?)""", (run.run_id, run.company.cik, encoded,
+                    run.status.value, run.started_at, run.completed_at))
+            self._append_stage_attempt_db(db, attempt)
+
+    @staticmethod
+    def _lifecycle_run_db(db: sqlite3.Connection, run_id: str) -> tuple[dict[str, Any], sqlite3.Row]:
+        row = db.execute(
+            "SELECT company_cik,payload_json,status,completed_at FROM research_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise StorageCorruptionError("CONTINUITY_RUN_NOT_FOUND")
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageCorruptionError("CONTINUITY_RUN_PAYLOAD_INVALID") from exc
+        valid_statuses = {item.value for item in RunStatus}
+        if (not isinstance(payload, dict) or payload.get("run_id") != run_id
+                or not isinstance(payload.get("company"), dict)
+                or payload["company"].get("cik") != row["company_cik"]
+                or not isinstance(payload.get("errors"), list)
+                or payload.get("status") not in valid_statuses
+                or row["status"] not in valid_statuses or payload["status"] != row["status"]):
+            raise StorageCorruptionError("CONTINUITY_RUN_PAYLOAD_INVALID")
+        return payload, row
+
+    def _write_lifecycle_run_db(self, db: sqlite3.Connection, run_id: str, payload: dict[str, Any]) -> None:
+        db.execute("UPDATE research_runs SET payload_json=?,status=?,completed_at=? WHERE run_id=?",
+            (self._canonical_artifact_json(payload), payload["status"], payload.get("completed_at"), run_id))
+
+    def save_run_stage_result(
+        self, run_id: str, attempt: "StageAttempt", *, snapshot_updates: dict[str, Any] | None = None,
+        status: RunStatus | None = None, error: str = "", completed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Patch only specified lifecycle fields on the latest persisted payload.
+
+        This is not full research publication and cannot promote a run to
+        COMPLETED. Domain operations supply typed checkpoints; persistence
+        keeps unrelated captured inputs and unknown legacy extensions intact.
+        """
+        if (not isinstance(run_id, str) or not run_id.strip() or attempt.run_id != run_id
+                or (snapshot_updates is not None and not isinstance(snapshot_updates, dict))
+                or status not in {None, RunStatus.PARTIAL, RunStatus.CANCELLED, RunStatus.FAILED}
+                or not isinstance(error, str)):
+            raise ValueError("RESEARCH_RUN_STAGE_RESULT_INVALID")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, row = self._lifecycle_run_db(db, run_id)
+            if snapshot_updates is not None:
+                snapshot = payload.get("data_snapshot", {})
+                if not isinstance(snapshot, dict):
+                    raise StorageCorruptionError("CONTINUITY_RUN_SNAPSHOT_INVALID")
+                payload["data_snapshot"] = {**snapshot, **snapshot_updates}
+            if status is not None and row["status"] not in {RunStatus.COMPLETED.value, RunStatus.CANCELLED.value}:
+                payload["status"], payload["completed_at"] = status.value, completed_at
+            if error and error not in payload["errors"]:
+                payload["errors"].append(error)
+            self._append_stage_attempt_db(db, attempt)
+            self._write_lifecycle_run_db(db, run_id, payload)
+            return payload
+
+    def capture_research_publication(self, run: ResearchRun) -> ResearchPublicationSnapshot:
+        """Capture before analysis; a late worker cannot adopt changed inputs."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            payload, _ = self._lifecycle_run_db(db, run.run_id)
+            if input_digest(payload) != input_digest(run.to_dict()):
+                raise ResearchPublicationConflict("RESEARCH_PUBLICATION_INPUT_CONFLICT")
+            return capture_snapshot(db, payload)
+
+    def begin_research_publication(
+        self, run: ResearchRun, *, expected: ResearchPublicationSnapshot | None,
+    ) -> ResearchPublicationSnapshot:
+        """Start this execution without destroying a newer persisted envelope."""
+        if run.status is not RunStatus.RUNNING:
+            raise ValueError("RESEARCH_PUBLICATION_START_INVALID")
+        proposed = run.to_dict()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if expected is None:
+                if db.execute("SELECT 1 FROM research_runs WHERE run_id=?", (run.run_id,)).fetchone():
+                    raise ResearchPublicationConflict("RESEARCH_PUBLICATION_INPUT_CONFLICT")
+                payload = proposed
+                db.execute("""INSERT INTO research_runs(
+                    run_id,company_cik,payload_json,status,started_at,completed_at)
+                    VALUES(?,?,?,?,?,?)""", (run.run_id, run.company.cik,
+                        self._canonical_artifact_json(payload), run.status.value,
+                        run.started_at, run.completed_at))
+            else:
+                payload, _ = self._lifecycle_run_db(db, run.run_id)
+                if expected.run_id != run.run_id:
+                    raise ResearchPublicationConflict("RESEARCH_PUBLICATION_INPUT_CONFLICT")
+                validate_snapshot(db, payload, expected)
+                if payload.get("company", {}).get("cik") != run.company.cik:
+                    raise ResearchPublicationConflict("RESEARCH_PUBLICATION_INPUT_CONFLICT")
+                payload.update({key: proposed[key] for key in INPUT_FIELDS})
+                payload["status"] = run.status.value
+                # Persisted errors/extensions belong to the latest envelope.
+                self._write_lifecycle_run_db(db, run.run_id, payload)
+            return capture_snapshot(db, payload)
+
+    def update_research_model(
+        self, snapshot: ResearchPublicationSnapshot, *, provider_id: str, model_id: str,
+        model_configuration: dict[str, Any],
+    ) -> ResearchPublicationSnapshot:
+        """Capture an explicitly selected resume model before graph preparation."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, _ = self._lifecycle_run_db(db, snapshot.run_id)
+            validate_snapshot(db, payload, snapshot)
+            if payload["status"] == RunStatus.CANCELLED.value:
+                raise CancelledError("research publication cancelled")
+            payload.update(provider_id=provider_id, model_id=model_id,
+                           model_configuration=model_configuration)
+            self._write_lifecycle_run_db(db, snapshot.run_id, payload)
+            return capture_snapshot(db, payload)
+
+    def update_research_definition(
+        self, snapshot: ResearchPublicationSnapshot, *, workflow_id: str,
+        research_configuration: dict[str, Any],
+    ) -> ResearchPublicationSnapshot:
+        """Bind an OT graph without resetting captured data or unknown fields."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, _ = self._lifecycle_run_db(db, snapshot.run_id)
+            validate_snapshot(db, payload, snapshot)
+            payload["workflow_id"] = workflow_id
+            payload["research_configuration"] = research_configuration
+            self._write_lifecycle_run_db(db, snapshot.run_id, payload)
+            return capture_snapshot(db, payload)
+
+    def bind_research_publication_stages(
+        self, snapshot: ResearchPublicationSnapshot, generations: dict[str, int],
+    ) -> ResearchPublicationSnapshot:
+        with self.connect() as db:
+            db.execute("BEGIN")
+            payload, _ = self._lifecycle_run_db(db, snapshot.run_id)
+            return bind_stage_heads(db, payload, snapshot, generations)
+
+    def publish_research_result(
+        self, snapshot: ResearchPublicationSnapshot, artifact: ResearchArtifact,
+        attempt: "StageAttempt", *, status: RunStatus, completed_at: str,
+        cancel_check: Callable[[], bool], thesis_content: dict[str, Any] | None = None,
+        thesis_created_by: str = "",
+        thesis_artifact_factory: Callable[[dict[str, Any]], ResearchArtifact] | None = None,
+    ) -> dict[str, Any]:
+        """One commit owns outcome, report, revision, attempt and optional thesis.
+
+        Validators belong to the workflow. This repository enforces the frozen
+        input/head contract and never republishes a stale worker's full payload.
+        """
+        from .research_continuity import StageOutcome
+        if (artifact.run_id != snapshot.run_id
+                or artifact.artifact_type not in {"research-report", "stage-outcome"}
+                or attempt.run_id != snapshot.run_id
+                or status not in {RunStatus.COMPLETED, RunStatus.PARTIAL}
+                or (status is RunStatus.COMPLETED and (
+                    artifact.artifact_type != "research-report"
+                    or attempt.outcome is not StageOutcome.COMPLETE
+                    or artifact.content.get("verification", {}).get("passed") is not True
+                    or artifact.content.get("readiness", {}).get("complete") is not True))
+                or (status is RunStatus.PARTIAL and attempt.outcome is StageOutcome.COMPLETE)
+                or (thesis_content is not None and thesis_artifact_factory is None)):
+            raise ValueError("RESEARCH_PUBLICATION_RESULT_INVALID")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, row = self._lifecycle_run_db(db, snapshot.run_id)
+            if cancel_check() or row["status"] == RunStatus.CANCELLED.value:
+                raise CancelledError("research publication cancelled")
+            validate_snapshot(db, payload, snapshot)
+            payload["status"], payload["completed_at"] = status.value, completed_at
+            self._write_lifecycle_run_db(db, snapshot.run_id, payload)
+            self._save_artifact_db(db, artifact)
+            if artifact.artifact_type == "research-report":
+                head = db.execute("""SELECT r.content_sha256 FROM latest_report_revisions l
+                    JOIN report_revisions r ON r.revision_id=l.revision_id WHERE l.run_id=?""",
+                    (snapshot.run_id,)).fetchone()
+                expected_body = hashlib.sha256(self._canonical_artifact_json(
+                    artifact.content).encode("utf-8")).hexdigest()
+                # An old identical artifact may be deduplicated for ordinary
+                # history writes, but that must not masquerade as current
+                # publication while a different body still owns the head.
+                if head is None or head["content_sha256"] != expected_body:
+                    raise ResearchPublicationConflict("RESEARCH_PUBLICATION_REVISION_CONFLICT")
+            if thesis_content is not None:
+                thesis = self._save_thesis_version_db(db, payload["company"]["cik"], thesis_content,
+                    run_id=snapshot.run_id, created_by=thesis_created_by, created_at=completed_at)
+                thesis_artifact = thesis_artifact_factory(thesis)
+                if (not isinstance(thesis_artifact, ResearchArtifact)
+                        or thesis_artifact.run_id != snapshot.run_id
+                        or thesis_artifact.artifact_type != "thesis-snapshot"):
+                    raise ValueError("RESEARCH_PUBLICATION_THESIS_INVALID")
+                self._save_artifact_db(db, thesis_artifact)
+            self._append_stage_attempt_db(db, attempt)
+            if cancel_check():
+                raise CancelledError("research publication cancelled")
+            return payload
+
+    def publish_research_progress(
+        self, snapshot: ResearchPublicationSnapshot, artifact: ResearchArtifact, *,
+        cancel_check: Callable[[], bool],
+    ) -> ResearchPublicationSnapshot:
+        """CAS-append a trusted local revision without completing the run."""
+        from .report_content import trusted_snapshot_for_artifact
+        if (artifact.run_id != snapshot.run_id or artifact.artifact_type != "research-report"
+                or artifact.content.get("mode") != "progressive-local"
+                or artifact.content.get("readiness", {}).get("complete") is not False
+                or trusted_snapshot_for_artifact(artifact.to_dict()) is None):
+            raise ValueError("RESEARCH_PROGRESS_CONTRACT_INVALID")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, row = self._lifecycle_run_db(db, snapshot.run_id)
+            if cancel_check() or row["status"] == RunStatus.CANCELLED.value:
+                raise CancelledError("research publication cancelled")
+            validate_snapshot(db, payload, snapshot)
+            self._save_artifact_db(db, artifact)
+            if cancel_check():
+                raise CancelledError("research publication cancelled")
+            return capture_snapshot(db, payload)
+
+    def save_continuity_result(
+        self,
+        run_id: str,
+        artifact: ResearchArtifact,
+        attempt: "StageAttempt",
+        *,
+        message: str,
+        completed_at: str | None,
+    ) -> dict[str, Any]:
+        """Atomically persist one continuity notice, attempt and run update."""
+
+        if (
+            not isinstance(run_id, str) or not run_id.strip()
+            or not isinstance(artifact, ResearchArtifact)
+            or artifact.run_id != run_id
+            or artifact.artifact_type != "continuity-notice"
+            or not callable(getattr(attempt, "to_dict", None))
+        ):
+            raise ValueError("CONTINUITY_RESULT_INVALID")
+        attempt_payload = attempt.to_dict()
+        if not isinstance(attempt_payload, dict) or attempt_payload.get("run_id") != run_id:
+            raise ValueError("CONTINUITY_RESULT_INVALID")
+        if not isinstance(message, str):
+            raise ValueError("CONTINUITY_RESULT_INVALID")
+
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            payload, row = self._lifecycle_run_db(db, run_id)
+
+            errors = list(payload["errors"])
+            if message and message not in errors:
+                errors.append(message)
+            payload["errors"] = errors
+            status = str(row["status"])
+            if status not in {RunStatus.COMPLETED.value, RunStatus.CANCELLED.value}:
+                status = RunStatus.PARTIAL.value
+                stored_completed_at = completed_at
+            else:
+                stored_completed_at = row["completed_at"]
+            payload["status"] = status
+            payload["completed_at"] = stored_completed_at
+
+            self._save_artifact_db(db, artifact)
+            self._append_stage_attempt_db(db, attempt)
+            self._write_lifecycle_run_db(db, run_id, payload)
+            return payload
 
     def save_research_job(self, snapshot: dict[str, Any]) -> None:
         run_id = str(snapshot.get("run_id") or "")
@@ -1818,7 +2865,7 @@ class Storage:
             rows = db.execute(
                 """
                 SELECT stage, attempt, outcome, error_code, message,
-                       diagnostics_json, created_at
+                       diagnostics_json, created_at, action_id
                 FROM research_stage_attempts WHERE run_id = ? ORDER BY attempt_id
                 """,
                 (run_id,),
@@ -1897,6 +2944,8 @@ class Storage:
             """,
             (revision_id, run_id, parent, generation, encoded, digest, created_at),
         )
+        from .storage_comparison import write_revision_context
+        write_revision_context(db, revision_id, run_id)
         if latest is None:
             db.execute(
                 "INSERT INTO latest_report_revisions(run_id, revision_id, generation) VALUES(?, ?, ?)",
@@ -1937,6 +2986,37 @@ class Storage:
         result = dict(row)
         result["payload"] = json.loads(result.pop("payload_json"))
         return result
+
+    def get_comparison_snapshot(self, primary_id: str, secondary_id: str) -> dict[str, Any]:
+        """Capture both report heads and their metadata in one read transaction."""
+        from .storage_comparison import read_comparison_snapshot
+
+        with self.connect() as db:
+            db.execute("BEGIN")
+            return read_comparison_snapshot(db, primary_id, secondary_id)
+
+    def save_comparison_artifact(self, artifact: ResearchArtifact, snapshot: dict[str, Any],
+                                 attempt: "StageAttempt", *,
+                                 cancel_check: Callable[[], bool] | None = None) -> None:
+        """Publish only against the exact pair of captured, intact revisions."""
+        from .storage_comparison import ComparisonError, read_comparison_snapshot
+
+        if (artifact.artifact_type != "model-comparison"
+                or artifact.run_id != snapshot["primary"]["run_id"]
+                or attempt.run_id != artifact.run_id or attempt.outcome.value != "complete"):
+            raise ValueError("COMPARISON_ARTIFACT_IDENTITY_INVALID")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("comparison publication cancelled")
+            current = read_comparison_snapshot(db, snapshot["primary"]["run_id"],
+                                               snapshot["secondary"]["run_id"])
+            if self._canonical_artifact_json(current) != self._canonical_artifact_json(snapshot):
+                raise ComparisonError("COMPARISON_INPUT_CONFLICT")
+            self._save_artifact_db(db, artifact)
+            self._append_stage_attempt_db(db, attempt)
+            if cancel_check is not None and cancel_check():
+                raise CancelledError("comparison publication cancelled")
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -1992,12 +3072,30 @@ class Storage:
             db.execute("DELETE FROM research_jobs WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM research_stage_attempts WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM latest_report_revisions WHERE run_id = ?", (run_id,))
+            db.execute("DELETE FROM report_revision_contexts WHERE revision_id IN "
+                       "(SELECT revision_id FROM report_revisions WHERE run_id=?)", (run_id,))
             db.execute("DELETE FROM report_revisions WHERE run_id = ?", (run_id,))
+            # Recovery rows form a child-first foreign-key tree. They belong to
+            # this run, not to the shared provider circuit or company cache.
+            plans_for_run = "SELECT plan_id FROM recovery_plans WHERE incident_id IN (SELECT incident_id FROM recovery_incidents WHERE run_id=?)"
+            db.execute(f"DELETE FROM recovery_events WHERE plan_id IN ({plans_for_run})", (run_id,))
+            db.execute("DELETE FROM recovery_target_leases WHERE run_id=?", (run_id,))
+            db.execute(f"DELETE FROM recovery_actions WHERE plan_id IN ({plans_for_run})", (run_id,))
+            db.execute("DELETE FROM recovery_plans WHERE incident_id IN (SELECT incident_id FROM recovery_incidents WHERE run_id=?)", (run_id,))
+            db.execute("DELETE FROM recovery_incidents WHERE run_id=?", (run_id,))
+            db.execute("DELETE FROM stage_verification_snapshots WHERE run_id=?", (run_id,))
+            db.execute("DELETE FROM model_request_journal WHERE run_id=?", (run_id,))
+            db.execute("DELETE FROM model_stage_request_heads WHERE run_id=?", (run_id,))
             db.execute("DELETE FROM research_runs WHERE run_id = ?", (run_id,))
         return True
 
     def get_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        return list(self.read_artifacts(run_id).records)
+
+    def read_artifacts(self, run_id: str) -> StorageReadResult:
+        """Read healthy siblings and explicit issues in one consistent view."""
         with self.connect() as db:
+            db.execute("BEGIN")
             rows = db.execute(
                 """
                 SELECT * FROM artifacts
@@ -2006,12 +3104,19 @@ class Storage:
                 """,
                 (run_id,),
             ).fetchall()
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["content"] = json.loads(item.pop("payload_json"))
-            results.append(item)
-        return results
+            results: list[dict[str, Any]] = []
+            issues = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["content"] = load_payload(db, item.pop("payload_json"))
+                    if not isinstance(item["content"], dict):
+                        raise ValueError("STORAGE_ARTIFACT_SHAPE_INVALID")
+                    results.append(item)
+                except (ValueError, TypeError) as exc:
+                    issues.append({**_storage_issue(exc, "artifacts/" + str(row["artifact_id"]) + "/content", str(row["artifact_id"]), artifact=True),
+                                   "artifact_type": str(row["artifact_type"]), "impact_scope": "artifact"})
+        return StorageReadResult(tuple(results), tuple(issues))
 
     def save_thesis_version(
         self,
@@ -2023,30 +3128,23 @@ class Storage:
         created_at: str,
     ) -> dict[str, Any]:
         with self.connect() as db:
-            row = db.execute(
-                "SELECT COALESCE(MAX(version), 0) AS version "
-                "FROM thesis_versions WHERE company_cik = ?",
-                (company_cik,),
-            ).fetchone()
-            version = int(row["version"]) + 1
-            thesis_version_id = f"{company_cik}:v{version}"
-            db.execute(
-                """
-                INSERT INTO thesis_versions(
-                    thesis_version_id, company_cik, run_id, version,
-                    content_json, created_at, created_by
-                ) VALUES(?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    thesis_version_id,
-                    company_cik,
-                    run_id,
-                    version,
-                    json.dumps(content, ensure_ascii=False),
-                    created_at,
-                    created_by,
-                ),
-            )
+            db.execute("BEGIN IMMEDIATE")
+            return self._save_thesis_version_db(db, company_cik, content, run_id=run_id,
+                created_by=created_by, created_at=created_at)
+
+    @staticmethod
+    def _save_thesis_version_db(
+        db: sqlite3.Connection, company_cik: str, content: dict[str, Any], *,
+        run_id: str | None, created_by: str, created_at: str,
+    ) -> dict[str, Any]:
+        row = db.execute("SELECT COALESCE(MAX(version),0) AS version "
+                         "FROM thesis_versions WHERE company_cik=?", (company_cik,)).fetchone()
+        version = int(row["version"]) + 1
+        thesis_version_id = f"{company_cik}:v{version}"
+        db.execute("""INSERT INTO thesis_versions(
+            thesis_version_id,company_cik,run_id,version,content_json,created_at,created_by)
+            VALUES(?,?,?,?,?,?,?)""", (thesis_version_id, company_cik, run_id, version,
+                json.dumps(content, ensure_ascii=False, allow_nan=False), created_at, created_by))
         return {
             "thesis_version_id": thesis_version_id,
             "company_cik": company_cik,

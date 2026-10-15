@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
+from concurrent.futures import CancelledError
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
 
 from .domain import EvidenceRef, FilingDocument
-from .disclosure_index import cached_page_texts, remember_page_texts
+from .disclosure_index import cached_page_texts
 from .sec_client import SecClient
 
 
-QUALITATIVE_PARSER_VERSION = "filing-evidence-v2"
+QUALITATIVE_PARSER_VERSION = "filing-evidence-v4-bounded-shared-index"
 
 
 TOPIC_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -75,27 +77,30 @@ TOPIC_PATTERNS['capital_allocation'] += (r'[资資]本[开開]支', r'在建工�
 TOPIC_PATTERNS['growth'] += (r'[发發]展[战戰]略', r'[业業][务務]展望', r'新[产產]品',)
 
 
-def _disclosure_pages(path: Path):
+def _disclosure_pages(path: Path, *, deadline=None, cancel_check=None):
     """Stream PDF pages, keeping citations tied to the source page."""
     if path.suffix.lower() == '.pdf':
         cached = cached_page_texts(path)
         if cached is not None:
             for number, text in enumerate(cached, 1):
+                _check_index_budget(deadline, cancel_check)
                 yield number, text
             return
-        import pdfplumber
-        pages: list[str] = []
-        with pdfplumber.open(path) as document:
-            for number, page in enumerate(document.pages, 1):
-                try:
-                    text = page.extract_text() or ''
-                    pages.append(text)
-                    yield number, text
-                finally:
-                    page.close()
-        remember_page_texts(path, pages)
+        from .financial_sources.pdf_document_units import read_document_pages
+        pages = read_document_pages(str(path), deadline=deadline, cancel_check=cancel_check)
+        for number, text in enumerate(pages, 1):
+            _check_index_budget(deadline, cancel_check)
+            yield number, text
     else:
+        _check_index_budget(deadline, cancel_check)
         yield None, SecClient.extract_filing_text(path)
+
+
+def _check_index_budget(deadline, cancel_check):
+    if cancel_check is not None and cancel_check():
+        raise CancelledError()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("DISCLOSURE_INDEX_BUDGET_EXHAUSTED")
 
 
 class FilingTableParser(HTMLParser):
@@ -183,6 +188,8 @@ def extract_topic_evidence(
     *,
     max_per_topic: int = 2,
     radius: int = 850,
+    deadline: float | None = None,
+    cancel_check=None,
 ) -> list[EvidenceRef]:
     if not filing.local_path:
         return []
@@ -191,7 +198,8 @@ def extract_topic_evidence(
         return []
     evidence: list[EvidenceRef] = []
     counts: dict[str, int] = {}
-    for page, text in _disclosure_pages(path):
+    for page, text in _disclosure_pages(path, deadline=deadline, cancel_check=cancel_check):
+        _check_index_budget(deadline, cancel_check)
         refs = _topic_evidence_from_text(filing, text, page, max_per_topic, radius)
         for ref in refs:
             topic = ref.title.split(' · ')[-1]
@@ -210,10 +218,16 @@ def _topic_evidence_from_text(filing, text, page, max_per_topic, radius):
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 start = max(0, match.start() - radius // 4)
                 end = min(len(text), match.end() + radius)
+                # Retrieval windows must not start/end inside a qualifier,
+                # negation or sentence. Keep complete surrounding paragraphs;
+                # long pages are handled by the existing lossless packet lane.
+                start = text.rfind("\n\n", 0, start) + 2 if "\n\n" in text[:start] else 0
+                boundary = text.find("\n\n", end)
+                end = boundary if boundary >= 0 else len(text)
                 if any(start < old_end and end > old_start for old_start, old_end in occupied):
                     continue
                 excerpt = _clean_excerpt(text[start:end])
-                if len(excerpt) < 120:
+                if not excerpt:
                     continue
                 # Contents lists are navigation, not substantive disclosure.
                 # A lone page-header link is intentionally allowed when the
@@ -241,6 +255,29 @@ def _topic_evidence_from_text(filing, text, page, max_per_topic, radius):
             if found >= max_per_topic:
                 break
     return evidence
+
+
+def build_disclosure_index(filing: FilingDocument, *, deadline=None, cancel_check=None) -> list[dict[str, object]]:
+    """Complete source pages for local expansion, not a second evidence gate.
+
+    The index includes navigation/short pages. Retrieval may exclude those as
+    body, but they are never erased from the source catalogue. No network I/O.
+    """
+    path = Path(str(filing.local_path or ""))
+    if not path.is_file():
+        raise ValueError("DISCLOSURE_SOURCE_LOCAL_FILE_UNAVAILABLE")
+    records = []
+    total = 0
+    for page, text in _disclosure_pages(path, deadline=deadline, cancel_check=cancel_check):
+        _check_index_budget(deadline, cancel_check)
+        total += len(text.encode("utf-8"))
+        if total > 32 * 1024 * 1024:
+            raise ValueError("DISCLOSURE_INDEX_RESOURCE_LIMIT")
+        records.append({"page": page, "raw_text": text, "document_id": filing.document_id,
+                        "source_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                        "document_sha256": filing.content_hash, "source_url": filing.source_url,
+                        "locator": f"page:{page}" if page else "document-text"})
+    return records
 
 
 def extract_table_evidence(
@@ -296,6 +333,8 @@ def build_filing_evidence(
     filings: Iterable[FilingDocument],
     *,
     maximum_filings: int = 2,
+    deadline: float | None = None,
+    cancel_check=None,
 ) -> list[dict[str, object]]:
     collected: list[dict[str, object]] = []
     ordered = sorted(filings, key=lambda item: item.filed_at, reverse=True)
@@ -303,9 +342,12 @@ def build_filing_evidence(
     annual = next((item for item in ordered if item.fiscal_period == 'FY'), None)
     selected = ([annual] if annual else []) + [item for item in ordered if item is not annual]
     for filing in selected[:maximum_filings]:
+        _check_index_budget(deadline, cancel_check)
         try:
-            collected.extend(item.to_dict() for item in extract_topic_evidence(filing))
+            collected.extend(item.to_dict() for item in extract_topic_evidence(filing, deadline=deadline, cancel_check=cancel_check))
             collected.extend(item.to_dict() for item in extract_table_evidence(filing))
+        except (CancelledError, TimeoutError):
+            raise
         except Exception as exc:
             # Financial AST validation and narrative extraction are separate
             # capabilities. Retain numeric success while exposing missing text.

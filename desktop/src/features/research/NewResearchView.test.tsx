@@ -1,7 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { captureMarketSnapshot, listConfiguredModels } from "../../backend";
+import { captureMarketSnapshot, listConfiguredModels, searchCompanies } from "../../backend";
 import { COPY } from "../../i18n";
 import type { BootstrapResult } from "../../types";
 import { NewResearchView } from "./NewResearchView";
@@ -66,6 +66,211 @@ describe("NewResearch configured models", () => {
     vi.clearAllMocks();
     vi.mocked(listConfiguredModels).mockResolvedValue(configuredModels);
     vi.mocked(captureMarketSnapshot).mockResolvedValue({ status: "UNAVAILABLE", error_code: "QUOTE_UNAVAILABLE" });
+  });
+
+  it("sends a request id and ignores a search result after the query changes", async () => {
+    let resolveSearch!: (value: Awaited<ReturnType<typeof searchCompanies>>) => void;
+    vi.mocked(searchCompanies).mockImplementation(() => new Promise((resolve) => { resolveSearch = resolve; }));
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+
+    const input = screen.getByRole("textbox", { name: COPY.en.companySearch });
+    fireEvent.change(input, { target: { value: " Tencent " } });
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+    await waitFor(() => expect(searchCompanies).toHaveBeenCalledTimes(1));
+    const [query, market, requestId] = vi.mocked(searchCompanies).mock.calls[0];
+    expect([query, market]).toEqual(["Tencent", "HK"]);
+    expect(requestId).toEqual(expect.any(String));
+
+    fireEvent.change(input, { target: { value: "Alibaba" } });
+    await act(async () => resolveSearch({
+      contract: "openthesis.company-search.v2", request_id: requestId, query: "Tencent", market: "HK", state: "ready",
+      companies: [{ cik: "700", ticker: "0700", name: "Tencent Holdings", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    expect(screen.queryByText("Tencent Holdings")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("times out once, ignores a late result, and allows a manual retry", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (value: Awaited<ReturnType<typeof searchCompanies>>) => void;
+    vi.mocked(searchCompanies)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(async (query, market, requestId) => ({
+        contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+        companies: [{ cik: "700", ticker: "0700", name: "Fresh result", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+        diagnostics: [],
+      }));
+    try {
+      render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+      fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(searchCompanies).toHaveBeenCalledTimes(1);
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+      expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.searchFailed);
+      const [query, market, requestId] = vi.mocked(searchCompanies).mock.calls[0];
+      await act(async () => resolveFirst({
+        contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+        companies: [{ cik: "700", ticker: "0700", name: "Late result", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+        diagnostics: [],
+      }));
+      expect(screen.queryByText("Late result")).not.toBeInTheDocument();
+      expect(searchCompanies).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchRetry }));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      expect(screen.getByText("Fresh result")).toBeVisible();
+      expect(searchCompanies).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts the deadline before saving preferences and lets the user retry without a late save starting search", async () => {
+    vi.useFakeTimers();
+    let resolveLateSave!: (value: typeof bootstrap.preferences) => void;
+    const onSavePreferences = vi.fn()
+      .mockImplementationOnce(() => new Promise<typeof bootstrap.preferences>((resolve) => { resolveLateSave = resolve; }))
+      .mockResolvedValue(bootstrap.preferences);
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2",
+      request_id: requestId,
+      query,
+      market,
+      state: "ready",
+      companies: [{ cik: "700", ticker: "0700", name: "Retry result", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    try {
+      render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={onSavePreferences} onStart={vi.fn()} />);
+      fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+      expect(onSavePreferences).toHaveBeenCalledTimes(1);
+      expect(searchCompanies).not.toHaveBeenCalled();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+      expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.searchFailed);
+      expect(searchCompanies).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchRetry }));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      expect(onSavePreferences).toHaveBeenCalledTimes(2);
+      expect(searchCompanies).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("Retry result")).toBeVisible();
+
+      await act(async () => { resolveLateSave(bootstrap.preferences); await Promise.resolve(); });
+      expect(searchCompanies).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("Retry result")).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("invalidates a pending preference save and clears its deadline on unmount", async () => {
+    vi.useFakeTimers();
+    let resolveSave!: (value: typeof bootstrap.preferences) => void;
+    const onSavePreferences = vi.fn(() => new Promise<typeof bootstrap.preferences>((resolve) => { resolveSave = resolve; }));
+    try {
+      const { unmount } = render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={onSavePreferences} onStart={vi.fn()} />);
+      fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+      expect(vi.getTimerCount()).toBe(1);
+
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+        resolveSave(bootstrap.preferences);
+        await Promise.resolve();
+      });
+      expect(searchCompanies).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the deadline and ignores a late search response after unmount", async () => {
+    vi.useFakeTimers();
+    let resolveSearch!: (value: Awaited<ReturnType<typeof searchCompanies>>) => void;
+    vi.mocked(searchCompanies).mockImplementation(() => new Promise((resolve) => { resolveSearch = resolve; }));
+    try {
+      const { unmount } = render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+      fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      expect(searchCompanies).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(1);
+
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+      const [, market, requestId] = vi.mocked(searchCompanies).mock.calls[0];
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+        resolveSearch({
+          contract: "openthesis.company-search.v2", request_id: requestId, query: "Tencent", market, state: "ready",
+          companies: [{ cik: "700", ticker: "0700", name: "Late after unmount", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+          diagnostics: [],
+        });
+        await Promise.resolve();
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps unavailable identities unselectable and offers network settings", async () => {
+    const requestId = "search-unavailable-1";
+    vi.mocked(searchCompanies).mockResolvedValue({
+      contract: "openthesis.company-search.v2", request_id: requestId, query: "ABC", market: "HK", state: "unavailable",
+      companies: [{ cik: "", ticker: "ABC", name: "Unverified code", exchange: "", market: "HK", identity_state: "unresolved_code" }],
+      diagnostics: [{ code: "SOURCE_NETWORK_UNAVAILABLE", diagnostic_id: "diag-123" }],
+    });
+    const onOpenNetworkSettings = vi.fn();
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onOpenVisionSettings={onOpenNetworkSettings} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "ABC" } });
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+    const unresolved = (await screen.findByText("ABC", { selector: "strong" })).closest("button");
+    expect(unresolved).not.toBeNull();
+    expect(unresolved).toBeDisabled();
+    expect(screen.getByRole("button", { name: COPY.en.chooseCompany })).toBeDisabled();
+    expect(screen.getByText(COPY.en.searchUnavailable)).toBeVisible();
+    expect(screen.getByText("diag-123")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.openNetworkSettings }));
+    expect(onOpenNetworkSettings).toHaveBeenCalledOnce();
+  });
+
+  it("allows a cached verified candidate in degraded mode and warns before selection", async () => {
+    vi.mocked(searchCompanies).mockResolvedValue({
+      contract: "openthesis.company-search.v2", request_id: "search-degraded-1", query: "Tencent", market: "HK", state: "degraded",
+      companies: [{ cik: "700", ticker: "0700", name: "Tencent Holdings", exchange: "SEHK", market: "HK", identity_state: "cached_verified" }],
+      diagnostics: [],
+    });
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+    const candidate = (await screen.findByText("0700", { selector: "strong" })).closest("button");
+    expect(candidate).not.toBeNull();
+    expect(candidate).toBeEnabled();
+    expect(screen.getByText(COPY.en.searchDegraded)).toBeVisible();
+    fireEvent.click(candidate!);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ company: expect.objectContaining({ identity_state: "cached_verified" }) })));
+  });
+
+  it("keeps launch failures in the form instead of leaving an unhandled rejection", async () => {
+    const onStart = vi.fn().mockRejectedValue(new Error("SOURCE_NETWORK_UNAVAILABLE"));
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+    await screen.findByRole("combobox", { name: "Primary model" });
+    fireEvent.click(screen.getByRole("button", { name: "700" }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(COPY.en.searchErrorNetwork);
+    expect(screen.getByRole("button", { name: COPY.en.launchResearch })).toBeEnabled();
   });
 
   it("localizes market snapshot status labels in all supported languages", () => {

@@ -4,6 +4,15 @@ import { describe, expect, it, vi } from "vitest";
 import { ResearchProgress } from "./States";
 
 describe("ResearchProgress", () => {
+  it("distinguishes source-stage processing and partial verification from final review", () => {
+    render(<ResearchProgress language="en" job={{ job_id: "source", state: "running", message: "Reading", percent: 30, run_id: null,
+      agent_states: { "source-risk-analysis": "validating", "source-industry-analysis": "completed_partial", "skeptical-analyst": "queued" } }}
+      onCancel={vi.fn()} />);
+    expect(screen.getByText("Source risk review")).toBeTruthy();
+    expect(screen.getByText("Counter-analysis")).toBeTruthy();
+    expect(screen.getByText("Processing and verifying")).toBeTruthy();
+    expect(screen.getByText("Processed; verification incomplete")).toBeTruthy();
+  });
   it("renders localized approval actions and invokes decisions", () => {
     const onCancel = vi.fn();
     const onVisionDecision = vi.fn();

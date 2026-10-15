@@ -5,6 +5,7 @@ import math
 import re
 from typing import Any
 
+from .financials import format_money
 from .i18n import EN, ZH_HANT, normalize_language
 
 
@@ -24,6 +25,9 @@ _INTERNAL_FIELDS = frozenset(
         "opportunity_id",
         "structured_output_valid",
         "_response_meta",
+        "role",
+        "research_complete",
+        "cross_section_synthesis_status",
     }
 )
 
@@ -39,7 +43,7 @@ _REPORT_FIELDS = frozenset(
         "narrative", "mode", "metrics", "currency", "interim_metrics",
         "market_snapshot", "industry_support", "claims", "text", "kind",
         "confidence", "title", "argument", "counterargument", "severity",
-        "summary", "analysis", "conclusion", "strengths", "concerns",
+        "summary", "body", "analysis", "conclusion", "strengths", "concerns",
         "text_format_warning",
         "risks", "unknowns", "possible_moats", "assumptions", "assumption",
         "financial_analysis", "accounting_risk", "information_gaps",
@@ -59,11 +63,37 @@ _REPORT_FIELDS = frozenset(
         "description", "durability",
         "name", "cagr", "market_assumption", "sensitivity_note",
         "revenue_path", "evidence_basis", "value", "current", "required", "unit",
+        "management_and_capital_allocation", "existing_growth_engines",
+        "industry_changes_and_value_allocation", "source_risk_review", "valuation_and_sensitivity", "evidence_and_methodology",
+        "management", "capital_allocation", "industry_changes", "value_allocation",
+        "methodology", "limitations", "sensitivity", "applicability", "reason",
+        "fcf_growth", "implied_fcf_growth", "equity_market_value", "terminal_growth", "horizon_years",
     }
 )
 
 _FIELD_LABELS: dict[str, tuple[str, str]] = {
+    "fcf_growth": ("自由现金流增速", "FCF Growth"),
+    "implied_fcf_growth": ("隐含自由现金流增速", "Implied FCF Growth"),
+    "equity_value": ("权益价值", "Equity Value"),
+    "equity_market_value": ("权益市值", "Equity Market Value"),
+    "currency": ("币种", "Currency"),
+    "discount_rate": ("折现率", "Discount Rate"),
+    "terminal_growth": ("终值增长率", "Terminal Growth Rate"),
+    "terminal_growth_rate": ("终值增长率", "Terminal Growth Rate"),
+    "horizon_years": ("预测期限（年）", "Forecast Horizon (Years)"),
+    "management_and_capital_allocation": ("管理层与资本配置", "Management and Capital Allocation"),
+    "existing_growth_engines": ("现有增长引擎", "Existing Growth Engines"),
+    "industry_changes_and_value_allocation": ("行业变化与价值分配", "Industry Changes and Value Allocation"),
+    "source_risk_review": ("原件风险初读", "Source Risk Pre-review"),
+    "valuation_and_sensitivity": ("估值与敏感性", "Valuation and Sensitivity"),
+    "evidence_and_methodology": ("证据与研究方法", "Evidence and Methodology"),
+    "management": ("管理层", "Management"), "capital_allocation": ("资本配置", "Capital Allocation"),
+    "industry_changes": ("行业变化", "Industry Changes"), "value_allocation": ("价值分配", "Value Allocation"),
+    "methodology": ("研究方法", "Methodology"), "limitations": ("研究限制", "Limitations"),
+    "sensitivity": ("敏感性分析", "Sensitivity Analysis"), "applicability": ("适用性", "Applicability"),
+    "reason": ("说明", "Reason"),
     "summary": ("摘要", "Summary"),
+    "body": ("正文", "Body"),
     "analysis": ("分析", "Analysis"),
     "claims": ("主要结论", "Key Conclusions"),
     "unknowns": ("信息缺口", "Information Gaps"),
@@ -133,6 +163,15 @@ _FIELD_LABELS: dict[str, tuple[str, str]] = {
     "operating_margin_range": ("营业利润率区间", "Operating Margin Range"),
 }
 _FIELD_LABELS_HANT = {
+    "fcf_growth": "自由現金流增速", "implied_fcf_growth": "隱含自由現金流增速",
+    "equity_value": "權益價值", "equity_market_value": "權益市值", "currency": "幣種",
+    "discount_rate": "折現率", "terminal_growth": "終值增長率", "terminal_growth_rate": "終值增長率",
+    "horizon_years": "預測期限（年）",
+    "management_and_capital_allocation": "管理層與資本配置", "existing_growth_engines": "現有增長引擎",
+    "industry_changes_and_value_allocation": "行業變化與價值分配", "source_risk_review": "原件風險初讀", "valuation_and_sensitivity": "估值與敏感性",
+    "evidence_and_methodology": "證據與研究方法", "management": "管理層", "capital_allocation": "資本配置",
+    "industry_changes": "行業變化", "value_allocation": "價值分配", "methodology": "研究方法",
+    "limitations": "研究限制", "sensitivity": "敏感性分析", "applicability": "適用性", "reason": "說明",
     "summary": "摘要", "analysis": "分析", "claims": "主要結論", "unknowns": "資訊缺口",
     "possible_moats": "潛在護城河", "risks": "主要風險", "conclusion": "結論",
     "description": "說明", "durability": "持續性",
@@ -249,11 +288,11 @@ _DISPLAY_VALUES_HANT = {
 
 
 _INTERNAL_ID_RE = re.compile(
-    r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
+    r"(?i)(?:fact|evidence|filing|artifact|run|observation):[A-Za-z0-9_.:/-]+|"
     r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b"
 )
 _INTERNAL_ID_TOKEN_RE = re.compile(
-    r"(?i)(?:fact|evidence|filing|artifact|run):[A-Za-z0-9_.:/-]+|"
+    r"(?i)(?:fact|evidence|filing|artifact|run|observation):[A-Za-z0-9_.:/-]+|"
     r"\b[0-9a-f]{8}-[0-9a-f-]{27,}\b"
 )
 _PROTOCOL_VALUE_FIELDS = {
@@ -273,9 +312,15 @@ _NESTED_TYPED_FIELDS = {
     "possible_moats": {"kind", "description", "durability", "summary", "text", "title"},
 }
 _TYPED_SECTION_FIELDS = {
+    "management_and_capital_allocation": {"summary", "text", "body", "analysis", "conclusion", "management", "capital_allocation", "risks", "limitations"},
+    "existing_growth_engines": {"summary", "text", "body", "analysis", "conclusion", "mechanism", "risks", "limitations"},
+    "industry_changes_and_value_allocation": {"summary", "text", "body", "analysis", "conclusion", "industry_changes", "value_allocation", "risks", "limitations"},
+    "source_risk_review": {"summary", "text", "body", "analysis", "conclusion", "risks", "limitations", "information_gaps"},
+    "valuation_and_sensitivity": {"summary", "text", "body", "analysis", "conclusion", "valuation", "sensitivity", "assumptions", "limitations", "applicability", "reason", "currency"},
+    "evidence_and_methodology": {"summary", "text", "body", "analysis", "methodology", "limitations"},
     "executive_summary": {"summary", "text", "body", "analysis", "conclusion"},
     "claims": {"text", "conclusion", "argument", "kind", "confidence", "title", "text_format_warning"},
-    "business_model": {"summary", "body", "analysis", "conclusion", "possible_moats", "risks", "unknowns", "strengths", "concerns"},
+    "business_model": {"summary", "body", "analysis", "conclusion", "possible_moats", "risks", "unknowns", "strengths", "concerns", "management_and_capital_allocation", "existing_growth_engines"},
     "financial_quality": {"summary", "body", "analysis", "conclusion", "financial_analysis", "accounting_risk", "strengths", "concerns", "risks", "unknowns", "risk_flags", "benign_explanations", "follow_up_questions"},
     "balance_sheet": {"summary", "body", "analysis", "conclusion", "strengths", "concerns", "risks", "unknowns", "risk_flags", "benign_explanations", "follow_up_questions", "assets", "liabilities", "equity", "total_equity"},
     "competitive_position": {"summary", "body", "analysis", "conclusion", "possible_moats", "strengths", "concerns", "risks", "unknowns"},
@@ -287,13 +332,14 @@ _TYPED_SECTION_FIELDS = {
     "thesis": {"summary", "body", "analysis", "conclusion", "text", "claims", "assumptions", "confidence"},
     "implied_expectations": {
         "summary", "body", "analysis", "conclusion", "text", "assumptions", "scenarios",
-        "current_price", "share_price", "market_cap", "enterprise_value", "equity_value",
+        "current_price", "share_price", "market_cap", "enterprise_value", "equity_value", "equity_market_value",
         "currency", "as_of", "valuation", "valuation_range", "implied_growth",
         "implied_revenue_growth", "required_growth", "required_return", "expected_return",
         "revenue_cagr_range", "operating_margin_range", "probability", "probability_range",
         "discount_rate", "wacc", "terminal_growth_rate", "margin_of_safety", "formula",
         "source", "evidence", "confidence", "metrics",
         "horizon_years", "market_assumption", "sensitivity_note", "unit", "value", "current", "required",
+        "valuation_and_sensitivity",
     },
 }
 
@@ -606,7 +652,7 @@ _PERCENT_FIELDS = frozenset(
         "implied_revenue_growth", "required_growth", "required_return",
         "expected_return", "margin_of_safety", "gross_margin", "net_margin",
         "reported_roe", "return_on_equity", "roe",
-        "cagr",
+        "cagr", "fcf_growth", "implied_fcf_growth", "terminal_growth",
     }
 )
 _PERCENT_RANGE_FIELDS = frozenset(
@@ -614,7 +660,7 @@ _PERCENT_RANGE_FIELDS = frozenset(
 )
 
 
-def format_report_semantic_value(value: Any, field: str | None) -> str | None:
+def format_report_semantic_value(value: Any, field: str | None, currency: str | None = None) -> str | None:
     """Format declared fractional rates/ranges without exposing raw decimals."""
     normalized_field = str(field or "").casefold()
 
@@ -634,6 +680,11 @@ def format_report_semantic_value(value: Any, field: str | None) -> str | None:
                 return f"{left}–{right}"
     if normalized_field in _PERCENT_FIELDS:
         return percentage(value)
+    if (normalized_field in {"equity_value", "equity_market_value", "market_cap", "enterprise_value"}
+            and isinstance(currency, str) and re.fullmatch(r"[A-Z]{3}", currency)
+            and not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(value)):
+        return format_money(value, currency)
     return None
 
 

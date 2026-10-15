@@ -171,9 +171,17 @@ describe("report-first workbench", () => {
   });
 
   it("searches BSE without requiring an SEC email", async () => {
-    vi.mocked(searchCompanies).mockResolvedValue([
-      { cik: "CN_A:BSE:832982.BJ", ticker: "832982.BJ", name: "Jinbo Bio", exchange: "BSE", market: "CN_A", listing_currency: "CNY" },
-    ]);
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2",
+      request_id: requestId,
+      query,
+      market,
+      state: "ready",
+      companies: [
+        { cik: "CN_A:BSE:832982.BJ", ticker: "832982.BJ", name: "Jinbo Bio", exchange: "BSE", market: "CN_A", listing_currency: "CNY", identity_state: "official_verified" },
+      ],
+      diagnostics: [],
+    }));
     vi.mocked(updatePreferences).mockImplementation(async (value) => ({
       ui_language: "en",
       report_language: "zh-CN",
@@ -190,7 +198,7 @@ describe("report-first workbench", () => {
     fireEvent.change(screen.getByLabelText("Search ticker or company name"), { target: { value: "832982" } });
     fireEvent.click(screen.getByRole("button", { name: "Search companies" }));
 
-    await waitFor(() => expect(searchCompanies).toHaveBeenCalledWith("832982", "CN_A"));
+    await waitFor(() => expect(searchCompanies).toHaveBeenCalledWith("832982", "CN_A", expect.any(String)));
     expect(await screen.findByText("Jinbo Bio")).toBeVisible();
     expect(screen.getByLabelText("Listing market").closest(".market-source-row")).not.toBeNull();
   });

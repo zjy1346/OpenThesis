@@ -72,7 +72,11 @@ def select_research_filings(
             # Do not pass an invented/future date into parsing.  The period
             # remains provisional until an observed statement date resolves it.
             updates["period_end"] = ""
-            updates["revision"] = "period_end_provisional"
+            updates["period_metadata_status"] = "unresolved"
+        if item.revision in {"period_end_provisional", "period_end_verified"}:
+            updates["revision"] = "original"
+            updates.setdefault("period_metadata_status",
+                "unresolved" if item.revision == "period_end_provisional" else "discovered")
         normalised_candidates.append(replace(item, **updates) if updates else item)
 
     # De-duplicate by fiscal period, not announcement date/document id.  A

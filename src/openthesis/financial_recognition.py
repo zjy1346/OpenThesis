@@ -16,6 +16,12 @@ from typing import Any, Callable, Sequence
 from .domain import Company, FilingDocument
 from .financial_compiler import FinancialDataset, FinancialFactCompiler
 from .financial_ingestion import FinancialIngestionEngine
+from .financial_pipeline import (
+    FinancialPipeline,
+    FinancialResearchSnapshot,
+)
+from .financial_contracts import CompilationPolicy, GapStageKind
+from .financial_admission import FinancialResearchView
 from .vision_financials import (
     VisionFallbackConfig,
     VisionFinancialSourceAdapter,
@@ -35,6 +41,7 @@ class RecognitionOutcome:
     state: RecognitionState
     elapsed_seconds: float
     diagnostics: tuple[str, ...] = ()
+    research_view: FinancialResearchView | None = None
 
 
 class FinancialRecognitionCoordinator:
@@ -47,6 +54,7 @@ class FinancialRecognitionCoordinator:
     ) -> None:
         self.engine = engine
         self.compiler = compiler or FinancialFactCompiler()
+        self.pipeline = FinancialPipeline(self.engine, self.compiler)
 
     def recognize(
         self,
@@ -68,22 +76,32 @@ class FinancialRecognitionCoordinator:
                 0.0,
                 ("CANCELLED",),
             )
-        try:
-            dataset = self.compiler.compile_from_ingestion(
-                subject,
-                tuple(filings),
-                self.engine,
-                structured_sources=tuple(structured_sources),
+        selected_filings = tuple(filings)
+        authorized_stages = (
+            frozenset({GapStageKind.MINERU})
+            if bool(getattr(vision_config, "enabled", False))
+            and bool(getattr(vision_config, "consent", False))
+            else frozenset()
+        )
+        view = self.pipeline.prepare(
+            FinancialResearchSnapshot(
+                subject=subject,
+                filings=selected_filings,
+                candidate_sources=tuple(structured_sources),
+                authorized_source_stages=authorized_stages,
                 vision_fallback=vision_fallback,
                 vision_config=vision_config,
                 cancel_check=cancel,
                 progress=progress,
+            ),
+            CompilationPolicy(
+                filings=selected_filings,
                 reporting_currency=subject.reporting_currency,
-            )
-        except Exception:
-            # Preserve typed adapter/compiler exceptions for the caller while
-            # ensuring the coordinator never invents a partial success.
-            raise
+            ),
+        )
+        dataset = view.canonical_dataset
+        if not isinstance(dataset, FinancialDataset):
+            raise TypeError("FINANCIAL_PIPELINE_CANONICAL_DATASET_REQUIRED")
         elapsed = max(0.0, time.monotonic() - started)
         if cancel():
             state = RecognitionState.CANCELLED
@@ -98,4 +116,5 @@ class FinancialRecognitionCoordinator:
             state,
             elapsed,
             tuple(dict.fromkeys(dataset.diagnostics)),
+            view,
         )

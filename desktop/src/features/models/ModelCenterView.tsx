@@ -418,7 +418,12 @@ export function ModelCenterView({ language }: { language: Language }) {
 
   const testModel = async (model: ConfiguredModelSummary) => {
     setBusy("test:" + model.configured_model_id); setError("");
-    try { await testConfiguredModel(model.configured_model_id); setNotice(text.testSucceeded); await reload(); }
+    try {
+      const result = await testConfiguredModel(model.configured_model_id);
+      if (result.ok) setNotice(text.testSucceeded);
+      else { setNotice(""); setError(result.message); }
+      await reload();
+    }
     catch (reason) { setError(errorMessage(reason)); } finally { setBusy(""); }
   };
 

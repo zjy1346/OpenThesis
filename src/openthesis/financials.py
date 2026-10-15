@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import math
 from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
+from .financial_comparatives import comparative_amounts_agree
 
 
 _ANNUAL_PERIODS = frozenset({"", "FY", "CY", "ANNUAL"})
@@ -159,6 +161,7 @@ def _fact_money_metadata(fact: dict[str, Any]) -> dict[str, Any]:
         "source_document": str(fact.get("source_document", "")),
         "period": _period(fact.get("fiscal_period")),
         "period_end": str(fact.get("end_date", "")),
+        "period_start": str(fact.get("start_date", "")),
     }
 
 
@@ -186,6 +189,7 @@ def _same_financial_generation(left: dict[str, Any], right: dict[str, Any]) -> b
 
 def _compatible_annual_money_inputs(
     left: dict[str, Any] | None, right: dict[str, Any] | None,
+    *, annual_only: bool = True,
 ) -> bool:
     if not left or not right:
         return False
@@ -195,7 +199,8 @@ def _compatible_annual_money_inputs(
         and left.get("scope")
         and left.get("scope") == right.get("scope")
         and _same_financial_generation(left, right)
-        and left.get("period") in _ANNUAL_PERIODS
+        and (left.get("period") in _ANNUAL_PERIODS if annual_only
+             else bool(left.get("period_start") and left.get("period_start") == right.get("period_start")))
         and left.get("period") == right.get("period")
         and left.get("period_end")
         and left.get("period_end") == right.get("period_end")
@@ -344,6 +349,79 @@ def _period(value: object) -> str:
     return str(value or "").strip().upper()
 
 
+@dataclass(frozen=True, slots=True)
+class MetricPeriodIdentity:
+    """Canonical fiscal period identity shared by financial metric consumers."""
+
+    year: int
+    period: str
+    period_start: str | None = None
+    period_end: str | None = None
+
+    def serialize(self) -> dict[str, int | str | None]:
+        """Return the stable wire shape for a metric period identity."""
+        return {
+            "year": self.year,
+            "period": self.period,
+            "period_start": self.period_start,
+            "period_end": self.period_end,
+        }
+
+
+def read_metric_period(metric: Mapping[str, Any]) -> MetricPeriodIdentity:
+    """Read a metric period, adapting ``fiscal_year`` only for legacy rows.
+
+    ``year`` is the canonical producer field. Legacy rows may use
+    ``fiscal_year`` only when ``year`` is absent; ambiguous or invalid years
+    fail closed instead of becoming a synthetic year-zero period.
+    """
+    if not isinstance(metric, Mapping):
+        raise ValueError("METRIC_PERIOD_INVALID")
+
+    def valid_year(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 9999:
+            raise ValueError("METRIC_PERIOD_YEAR_INVALID")
+        return value
+
+    if "year" in metric:
+        year = valid_year(metric["year"])
+        if "fiscal_year" in metric:
+            legacy_year = valid_year(metric["fiscal_year"])
+            if year != legacy_year:
+                raise ValueError("METRIC_PERIOD_YEAR_CONFLICT")
+    elif "fiscal_year" in metric:
+        year = valid_year(metric["fiscal_year"])
+    else:
+        raise ValueError("METRIC_PERIOD_YEAR_MISSING")
+
+    raw_period = metric.get("period", metric.get("fiscal_period", "FY"))
+    if raw_period is None:
+        period = "FY"
+    elif not isinstance(raw_period, str):
+        raise ValueError("METRIC_PERIOD_PERIOD_INVALID")
+    else:
+        period = raw_period.strip().upper()
+        if period in {"", "FY", "CY", "ANNUAL", "12M", "FULL_YEAR", "FULL-YEAR"}:
+            period = "FY"
+
+    def period_date(canonical: str, legacy: str) -> str | None:
+        value = metric.get(canonical)
+        if value in (None, ""):
+            value = metric.get(legacy)
+        if value in (None, ""):
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"METRIC_PERIOD_{canonical.upper()}_INVALID")
+        return value.strip() or None
+
+    return MetricPeriodIdentity(
+        year=year,
+        period=period,
+        period_start=period_date("period_start", "start_date"),
+        period_end=period_date("period_end", "end_date"),
+    )
+
+
 def latest_by_year(facts: list[dict[str, Any]]) -> dict[int, dict[str, float]]:
     """Return annual facts only.
 
@@ -370,9 +448,14 @@ def latest_by_year(facts: list[dict[str, Any]]) -> dict[int, dict[str, float]]:
 
 def _latest_by_interim_period(
     facts: list[dict[str, Any]],
-) -> tuple[dict[tuple[int, str], dict[str, float]], dict[tuple[int, str], str]]:
+) -> tuple[
+    dict[tuple[int, str], dict[str, float]],
+    dict[tuple[int, str], str],
+    dict[tuple[int, str], str],
+]:
     matrix: dict[tuple[int, str], dict[str, float]] = defaultdict(dict)
     filed: dict[tuple[int, str, str], tuple[int, str, str]] = {}
+    period_starts: dict[tuple[int, str], str] = {}
     period_ends: dict[tuple[int, str], str] = {}
     for fact in facts:
         period = _period(fact.get("fiscal_period"))
@@ -388,8 +471,9 @@ def _latest_by_interim_period(
         if concept_key not in filed or rank >= filed[concept_key]:
             matrix[key][concept] = float(fact["value"])
             filed[concept_key] = rank
+        period_starts[key] = max(period_starts.get(key, ""), str(fact.get("start_date", "")))
         period_ends[key] = max(period_ends.get(key, ""), str(fact.get("end_date", "")))
-    return dict(matrix), period_ends
+    return dict(matrix), period_starts, period_ends
 
 
 def safe_divide(numerator: float | None, denominator: float | None) -> float | None:
@@ -593,6 +677,7 @@ _GROWTH_STATUS_TEXT: dict[str, tuple[str, str, str]] = {
     "loss_unchanged": ("亏损持平", "虧損持平", "Loss unchanged"),
     "zero_base": ("基数为零，不适用", "基數為零，不適用", "Not meaningful on a zero base"),
     "comparison_unavailable": ("缺少可比数据", "缺少可比資料", "Comparable data unavailable"),
+    "unresolved_restatement": ("原报与比较列差异待核实", "原報與比較欄差異待核實", "Original and comparative versions need reconciliation"),
 }
 
 
@@ -607,13 +692,9 @@ def format_growth(value: float | None, status: object, language: str = "zh-CN") 
 
 def _comparison_baseline(
     previous: dict[str, float], records: list[dict[str, Any]],
-) -> tuple[dict[str, float], list[dict[str, Any]], str | None, bool]:
-    """Prefer issuer-stated comparators independently for every concept.
-
-    A later filing can restate revenue, profit and cash-flow rows together.  A
-    revenue-only override produces internally inconsistent growth metrics, so
-    selection happens per concept and keeps every selected fact id auditable.
-    """
+    current_accessions: dict[str, str] | None = None,
+) -> tuple[dict[str, float], list[dict[str, Any]], str | None, bool, dict[str, list[dict[str, Any]]]]:
+    """Keep genuine source versions; exclude only unresolved comparison bases."""
     by_concept: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for fact in records:
         concept = str(fact.get("concept") or "")
@@ -622,10 +703,14 @@ def _comparison_baseline(
     selected: list[dict[str, Any]] = []
     has_comparator = False
     restatement_available = False
+    unresolved: dict[str, list[dict[str, Any]]] = {}
     for concept, candidates in by_concept.items():
         comparators = [
             item for item in candidates
             if str(item.get("usage_status", "")).casefold() == "comparator"
+            and (not current_accessions or not current_accessions.get(concept)
+                 or not item.get("accession_number")
+                 or item["accession_number"] == current_accessions[concept])
         ]
         preferred = comparators or [
             item for item in candidates
@@ -637,6 +722,17 @@ def _comparison_baseline(
             preferred,
             key=lambda item: (str(item.get("filed_at", "")), str(item.get("fact_id", ""))),
         )
+        comparable = [item for item in candidates
+                      if str(item.get("usage_status", "")).casefold() != "comparator" or item in comparators]
+        if any(not comparative_amounts_agree(chosen, item) for item in comparable):
+            restatement_available = True
+            unresolved[concept] = [{key: item.get(key) for key in (
+                "fact_id", "value", "fiscal_year", "fiscal_period", "end_date",
+                "accession_number", "source_document", "source_page", "source_bbox",
+                "source_url", "usage_status", "revision", "normalization_lineage",
+                "currency", "unit", "unit_provenance", "consolidated_scope",
+            )} for item in comparable]
+            continue
         selected.append(chosen)
         if comparators:
             has_comparator = True
@@ -649,12 +745,14 @@ def _comparison_baseline(
         **previous,
         **{str(item["concept"]): float(item["value"]) for item in selected},
     }
+    for concept in unresolved:
+        baseline.pop(concept, None)
     source = (
         "same_filing_comparator" if has_comparator
         else "independent_historical" if selected
         else None
     )
-    return baseline, selected, source, restatement_available
+    return baseline, selected, source, restatement_available, unresolved
 
 
 def _equity_value(values: dict[str, float]) -> float | None:
@@ -666,21 +764,32 @@ def _equity_value(values: dict[str, float]) -> float | None:
 def _annual_roe_details(
     values: dict[str, float], previous: dict[str, float]
 ) -> dict[str, Any]:
-    net_income = values.get("net_income")
-    closing_equity = _equity_value(values)
-    opening_equity = _equity_value(previous)
+    # Numerator attribution and denominator attribution must agree. Group
+    # earnings cannot silently use parent equity, or vice versa.
+    if values.get("parent_net_income") is not None and values.get("equity") is not None:
+        profit_concept, equity_concept = "parent_net_income", "equity"
+    elif values.get("net_income") is not None and values.get("total_equity") is not None:
+        profit_concept, equity_concept = "net_income", "total_equity"
+    elif values.get("parent_net_income") is not None:
+        profit_concept, equity_concept = "parent_net_income", "equity"
+    else:
+        profit_concept, equity_concept = "net_income", "total_equity"
+    net_income = values.get(profit_concept)
+    closing_equity = values.get(equity_concept)
+    opening_equity = previous.get(equity_concept)
     reported_roe = values.get("reported_roe")
     inputs = {
         "net_income": net_income,
         "opening_equity": opening_equity,
         "closing_equity": closing_equity,
     }
+    attribution = {"profit_concept": profit_concept, "equity_concept": equity_concept}
     average_equity = (
         (opening_equity + closing_equity) / 2
         if opening_equity is not None and closing_equity is not None
         else None
     )
-    if closing_equity is not None and closing_equity <= 0:
+    if _equity_value(values) is not None and _equity_value(values) <= 0:
         gap = "non_positive_equity"
     elif average_equity is not None and average_equity <= 0:
         gap = "non_positive_equity"
@@ -690,26 +799,30 @@ def _annual_roe_details(
             "return_on_equity_basis": "reported_weighted_average",
             "return_on_equity_formula": "reported_roe",
             "return_on_equity_inputs": inputs,
+            "return_on_equity_attribution": attribution,
             "return_on_equity_gap": None,
         }
     elif net_income is None:
         gap = "missing_net_income"
     elif closing_equity in (None, 0):
-        gap = "missing_equity"
+        gap = ("missing_equity" if _equity_value(values) is None
+               else "profit_equity_attribution_mismatch")
     elif opening_equity not in (None, 0):
         return {
             "return_on_equity": net_income / average_equity,
             "return_on_equity_basis": "average_equity",
-            "return_on_equity_formula": "net_income / average(opening_equity, closing_equity)",
+            "return_on_equity_formula": f"{profit_concept} / average(opening_{equity_concept}, closing_{equity_concept})",
             "return_on_equity_inputs": inputs,
+            "return_on_equity_attribution": attribution,
             "return_on_equity_gap": None,
         }
     else:
         return {
             "return_on_equity": net_income / closing_equity,
             "return_on_equity_basis": "ending_equity_proxy",
-            "return_on_equity_formula": "net_income / closing_equity",
+            "return_on_equity_formula": f"{profit_concept} / closing_{equity_concept}",
             "return_on_equity_inputs": inputs,
+            "return_on_equity_attribution": attribution,
             "return_on_equity_gap": None,
         }
     return {
@@ -717,13 +830,14 @@ def _annual_roe_details(
         "return_on_equity_basis": None,
         "return_on_equity_formula": None,
         "return_on_equity_inputs": inputs,
+        "return_on_equity_attribution": attribution,
         "return_on_equity_gap": gap,
     }
 
 
 def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     matrix = latest_by_year(facts)
-    metadata: dict[int, tuple[str, str]] = {}
+    metadata: dict[int, tuple[str, str, str]] = {}
     monetary_metadata: dict[tuple[int, str], tuple[str, str]] = {}
     monetary_rank: dict[tuple[int, str], tuple[int, str, str]] = {}
     money_fact_metadata: dict[tuple[int, str], dict[str, Any]] = {}
@@ -735,10 +849,15 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         except (TypeError, ValueError):
             continue
         filed_at = str(fact.get("filed_at", ""))
+        period_start = str(fact.get("start_date", ""))
         period_end = str(fact.get("end_date", ""))
         concept = str(fact.get("concept", ""))
-        previous = metadata.get(year, ("", ""))
-        metadata[year] = (max(previous[0], filed_at), max(previous[1], period_end))
+        previous = metadata.get(year, ("", "", ""))
+        metadata[year] = (
+            max(previous[0], filed_at),
+            max(previous[1], period_start),
+            max(previous[2], period_end),
+        )
         currency = str(fact.get("currency") or fact.get("unit") or "").upper()
         provenance = str(fact.get("unit_provenance") or "")
         money_key = (year, concept)
@@ -808,8 +927,11 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if str(fact.get("fiscal_period", "")).upper() in _ANNUAL_PERIODS
             and fact.get("fiscal_year") == comparison_year
         ] if comparison_year is not None else []
-        previous, comparison_selected, comparison_source, restatement_available = (
-            _comparison_baseline(previous, comparison_records)
+        previous, comparison_selected, comparison_source, restatement_available, comparison_versions = (
+            _comparison_baseline(previous, comparison_records, {
+                concept: str(meta.get("accession_number") or "")
+                for (metric_year, concept), meta in money_fact_metadata.items() if metric_year == year
+            })
         )
         net_income_growth = growth_rate(net_income, previous.get("net_income"))
         operating_cash_flow_growth = growth_rate(
@@ -825,9 +947,13 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Recompute ROE inputs after selecting an issuer-stated comparative
         # column, while keeping that column out of visible rows.
         roe_details = _annual_roe_details(values, previous)
+        roe_equity_concept = roe_details.get("return_on_equity_attribution", {}).get("equity_concept")
+        if roe_equity_concept in comparison_versions and values.get("reported_roe") is None:
+            roe_details.update(return_on_equity=None, return_on_equity_basis=None,
+                               return_on_equity_gap="unresolved_restatement")
         typed_money_metadata: dict[str, dict[str, Any]] = {}
         for concept in (
-            "revenue", "net_income", "operating_cash_flow", "assets",
+            "revenue", "net_income", "parent_net_income", "operating_cash_flow", "assets",
             "liabilities", "equity", "total_equity",
         ):
             fact_metadata = money_fact_metadata.get((year, concept))
@@ -864,14 +990,16 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         results.append(
             {
                 "year": year,
-                "filed_at": metadata.get(year, ("", ""))[0],
-                "period_end": metadata.get(year, ("", ""))[1],
+                "period": "FY",
+                "period_start": metadata.get(year, ("", "", ""))[1],
+                "filed_at": metadata.get(year, ("", "", ""))[0],
+                "period_end": metadata.get(year, ("", "", ""))[2],
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
-                "revenue_growth_status": growth_status(revenue, previous.get("revenue")),
+                "revenue_growth_status": "unresolved_restatement" if "revenue" in comparison_versions else growth_status(revenue, previous.get("revenue")),
                 "comparison_year": comparison_year,
                 "comparison_gap": (
-                    None
+                    "unresolved_restatement" if "revenue" in comparison_versions else None
                     if previous.get("revenue") is not None
                     else "prior_revenue_unavailable"
                     if comparison_year is not None
@@ -884,6 +1012,7 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if item.get("fact_id")
                 ],
                 "restatement_available": restatement_available,
+                "comparison_versions": comparison_versions,
                 "operating_margin": safe_divide(operating_income, revenue),
                 "gross_margin": safe_divide(gross_profit, revenue),
                 "gross_profit_basis": (
@@ -894,11 +1023,14 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     else None
                 ),
                 "operating_income_growth": growth_rate(operating_income, previous.get("operating_income")),
-                "operating_income_growth_status": growth_status(operating_income, previous.get("operating_income")),
+                "operating_income_growth_status": "unresolved_restatement" if "operating_income" in comparison_versions else growth_status(operating_income, previous.get("operating_income")),
                 "net_income_growth": net_income_growth,
-                "net_income_growth_status": growth_status(net_income, previous.get("net_income")),
+                "net_income_growth_status": "unresolved_restatement" if "net_income" in comparison_versions else growth_status(net_income, previous.get("net_income")),
+                "parent_net_income_growth": growth_rate(values.get("parent_net_income"), previous.get("parent_net_income")),
+                "parent_net_income_growth_status": "unresolved_restatement" if "parent_net_income" in comparison_versions else growth_status(values.get("parent_net_income"), previous.get("parent_net_income")),
+                "parent_net_margin": safe_divide(values.get("parent_net_income"), revenue),
                 "operating_cash_flow_growth": operating_cash_flow_growth,
-                "operating_cash_flow_growth_status": growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
+                "operating_cash_flow_growth_status": "unresolved_restatement" if "operating_cash_flow" in comparison_versions else growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": cash_conversion,
                 "cash_conversion_status": cash_conversion_status,
@@ -940,7 +1072,7 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
     year (Q1 vs Q1, H1 vs H1, and so on).  No interim value is annualized.
     """
 
-    matrix, period_ends = _latest_by_interim_period(facts)
+    matrix, period_starts, period_ends = _latest_by_interim_period(facts)
     visible_keys = {
         (int(fact["fiscal_year"]), _period(fact.get("fiscal_period")))
         for fact in facts
@@ -957,12 +1089,22 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
     results: list[dict[str, Any]] = []
     for year, period in keys:
         values = matrix[(year, period)]
+        money_metadata = {}
+        for concept in values:
+            fact = _selected_period_fact(facts, concept, year, period)
+            if fact is not None:
+                money_metadata[concept] = {**_fact_money_metadata(fact),
+                                          "evidence_ids": [f"fact:{fact['fact_id']}"] if fact.get("fact_id") else []}
         previous = matrix.get((year - 1, period), {})
         revenue = values.get("revenue")
         operating_income = values.get("operating_income")
         net_income = values.get("net_income")
         operating_cash_flow = values.get("operating_cash_flow")
         capex = values.get("capital_expenditure")
+        operating_meta = money_metadata.get("operating_cash_flow")
+        capex_meta = money_metadata.get("capital_expenditure")
+        fcf_comparable = _compatible_annual_money_inputs(operating_meta, capex_meta, annual_only=False)
+        fcf = operating_cash_flow - capex if fcf_comparable and operating_cash_flow is not None and capex is not None else None
         assets = values.get("assets")
         liabilities = values.get("liabilities")
         equity = _equity_value(values)
@@ -981,17 +1123,20 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
             if fact.get("fiscal_year") == year - 1
             and _period(fact.get("fiscal_period")) == period
         ]
-        previous, comparison_selected, comparison_source, restatement_available = (
-            _comparison_baseline(previous, comparison_records)
+        previous, comparison_selected, comparison_source, restatement_available, comparison_versions = (
+            _comparison_baseline(previous, comparison_records,
+                current_accessions={concept: str(value.get("accession_number") or "")
+                    for concept, value in money_metadata.items()})
         )
         results.append(
             {
                 "year": year,
                 "period": period,
+                "period_start": period_starts.get((year, period), ""),
                 "period_end": period_ends.get((year, period), ""),
-                "comparison_period": f"{year - 1} {period}" if previous else None,
+                "comparison_period": f"{year - 1} {period}" if previous or comparison_versions else None,
                 "comparison_gap": (
-                    None
+                    "unresolved_restatement" if "revenue" in comparison_versions else None
                     if previous.get("revenue") is not None
                     else "prior_revenue_unavailable"
                     if previous
@@ -1004,32 +1149,31 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                     if item.get("fact_id")
                 ],
                 "restatement_available": restatement_available,
+                "comparison_versions": comparison_versions,
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
-                "revenue_growth_status": growth_status(revenue, previous.get("revenue")),
+                "revenue_growth_status": "unresolved_restatement" if "revenue" in comparison_versions else growth_status(revenue, previous.get("revenue")),
                 "operating_income_growth": growth_rate(operating_income, previous.get("operating_income")),
-                "operating_income_growth_status": growth_status(operating_income, previous.get("operating_income")),
+                "operating_income_growth_status": "unresolved_restatement" if "operating_income" in comparison_versions else growth_status(operating_income, previous.get("operating_income")),
                 "net_income_growth": growth_rate(net_income, previous.get("net_income")),
-                "net_income_growth_status": growth_status(net_income, previous.get("net_income")),
+                "net_income_growth_status": "unresolved_restatement" if "net_income" in comparison_versions else growth_status(net_income, previous.get("net_income")),
+                "parent_net_income_growth": growth_rate(values.get("parent_net_income"), previous.get("parent_net_income")),
+                "parent_net_income_growth_status": "unresolved_restatement" if "parent_net_income" in comparison_versions else growth_status(values.get("parent_net_income"), previous.get("parent_net_income")),
+                "parent_net_margin": safe_divide(values.get("parent_net_income"), revenue),
                 "operating_cash_flow_growth": growth_rate(operating_cash_flow, previous.get("operating_cash_flow")),
-                "operating_cash_flow_growth_status": growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
+                "operating_cash_flow_growth_status": "unresolved_restatement" if "operating_cash_flow" in comparison_versions else growth_status(operating_cash_flow, previous.get("operating_cash_flow")),
                 "operating_margin": safe_divide(operating_income, revenue),
                 "net_margin": safe_divide(net_income, revenue),
                 "cash_conversion": cash_conversion,
                 "cash_conversion_status": cash_conversion_status,
                 "cash_conversion_scope": cash_conversion_scope,
                 "cash_conversion_formula": "operating_cash_flow / net_income",
-                "free_cash_flow": (
-                    operating_cash_flow - capex
-                    if operating_cash_flow is not None and capex is not None
-                    else None
-                ),
+                "free_cash_flow": fcf,
+                "free_cash_flow_gap": None if fcf is not None else _free_cash_flow_gap_reason(
+                    operating_cash_flow, capex, operating_meta, capex_meta),
+                "money_metadata": money_metadata,
                 "debt_to_assets": safe_divide(liabilities, assets),
-                "return_on_equity": (
-                    reported_roe
-                    if reported_roe is not None
-                    else safe_divide(net_income, equity)
-                ),
+                **_annual_roe_details(values, {}),
             }
         )
     return results
@@ -1081,6 +1225,11 @@ def _format_roe(metric: dict[str, Any], language: str) -> str:
             "en": "equity is zero or negative; not applicable",
             "zh-CN": "权益为零或负数，不适用",
             "zh-Hant": "權益為零或負數，不適用",
+        },
+        "profit_equity_attribution_mismatch": {
+            "en": "profit and equity attribution cannot be paired",
+            "zh-CN": "净利润与权益归属口径无法对应",
+            "zh-Hant": "淨利潤與權益歸屬口徑無法對應",
         },
     }
     reason = reasons.get(gap, {}).get(language, "")
@@ -1203,6 +1352,18 @@ def reverse_dcf_analysis(
         }
     if not metrics:
         return {"status": "insufficient_data", "reason": "没有财务指标"}
+    metric_periods: list[tuple[dict[str, Any], MetricPeriodIdentity]] = []
+    for row in metrics:
+        try:
+            period_identity = read_metric_period(row)
+        except ValueError as error:
+            return {
+                "status": "invalid_parameters",
+                "reason": str(error),
+                "invalid_fields": ["metrics"],
+                "policy_version": policy_version,
+            }
+        metric_periods.append((row, period_identity))
     market_money = _coerce_money(market_cap, fallback_currency=currency)
     if strict_mode and not _has_explicit_normalized_money(market_cap):
         return {
@@ -1223,16 +1384,17 @@ def reverse_dcf_analysis(
     # Q1/H1/Q3 and YTD rows remain available to other analysis, but must not
     # be mistaken for a full-year base simply because they sort first.
     eligible = [
-        row for row in metrics
-        if _reverse_dcf_is_complete_fy(row)
+        (row, period_identity)
+        for row, period_identity in metric_periods
+        if period_identity.period == "FY"
         and (not market_as_of or not row.get("filed_at") or str(row.get("filed_at", ""))[:10] <= market_as_of)
     ]
-    eligible.sort(key=lambda row: (
-        str(row.get("filed_at") or "")[:10],
-        str(row.get("end_date") or ""),
-        int(row.get("year") or 0),
+    eligible.sort(key=lambda item: (
+        str(item[0].get("filed_at") or "")[:10],
+        item[1].period_end or "",
+        item[1].year,
     ), reverse=True)
-    base_metric = eligible[0] if eligible else None
+    base_metric, base_metric_period = eligible[0] if eligible else (None, None)
     base_fcf_value = base_metric.get("free_cash_flow") if base_metric else None
     base_money = _coerce_money(
         base_metric.get("free_cash_flow_money") if base_metric else None,
@@ -1316,8 +1478,8 @@ def reverse_dcf_analysis(
         "equity_market_value": normalized_market_cap,
         "base_free_cash_flow": base_fcf,
         "base_fcf_period": (
-            f"{base_metric.get('year')} {base_metric.get('period')}".strip()
-            if base_metric and base_metric.get("period") else str(base_metric.get("year", "")) if base_metric else ""
+            f"{base_metric_period.year} {base_metric_period.period}"
+            if base_metric_period else ""
         ),
         "base_fcf_filed_at": str(base_metric.get("filed_at", "")) if base_metric else "",
         "cash_flow_basis": "FCFE proxy = operating cash flow - capital expenditure",
@@ -1340,10 +1502,10 @@ def reverse_dcf_analysis(
 
 
 def _reverse_dcf_is_complete_fy(row: dict[str, Any]) -> bool:
-    period = str(row.get("period") or row.get("fiscal_period") or "").strip().upper()
-    if not period:
-        return True
-    return period in {"FY", "ANNUAL", "12M", "FULL_YEAR", "FULL-YEAR"}
+    try:
+        return read_metric_period(row).period == "FY"
+    except ValueError:
+        return False
 
 
 def deterministic_summary(
@@ -1376,6 +1538,21 @@ def deterministic_summary(
         if english
         else [heading, "", "\u4ee5\u4e0b\u5167\u5bb9\u7531\u78ba\u5b9a\u6027\u8ca1\u52d9\u5f15\u64ce\u751f\u6210\u3002" if traditional else "以下内容由确定性财务引擎生成。", ""]
     )
+    metric_periods: dict[int, MetricPeriodIdentity] = {}
+    period_diagnostics: list[str] = []
+    valid_metrics: list[dict[str, Any]] = []
+    for row in metrics:
+        try:
+            period_identity = read_metric_period(row)
+        except ValueError as error:
+            period_diagnostics.append(str(error))
+            continue
+        if period_identity.period != "FY":
+            period_diagnostics.append("METRIC_PERIOD_EXPECTED_FY")
+            continue
+        valid_metrics.append(row)
+        metric_periods[id(row)] = period_identity
+    metrics = valid_metrics
     if not metrics:
         lines.append(
             "No normalized annual financial data is available."
@@ -1384,6 +1561,8 @@ def deterministic_summary(
             if traditional
             else "没有可用的标准化年度财务数据。"
         )
+        if period_diagnostics:
+            lines.extend(["", "Metric period rows skipped: " + ", ".join(dict.fromkeys(period_diagnostics))])
         return "\n".join(lines)
 
     has_operating_margin = any(row.get("operating_margin") is not None for row in metrics)
@@ -1395,10 +1574,11 @@ def deterministic_summary(
     ]
     if has_operating_margin:
         columns.append(("operating_margin", "Operating margin", "\u71df\u696d\u5229\u6f64\u7387" if traditional else "\u8425\u4e1a\u5229\u6da6\u7387"))
-    columns.extend([
-        ("net_income", "Net income", "\u6de8\u5229\u6f64" if traditional else "\u51c0\u5229\u6da6"),
-        ("operating_cash_flow", "Operating cash flow", "\u7d93\u71df\u73fe\u91d1\u6d41" if traditional else "\u7ecf\u8425\u73b0\u91d1\u6d41"),
-    ])
+    if any(row.get("net_income") is not None for row in metrics) or not any(row.get("parent_net_income") is not None for row in metrics):
+        columns.append(("net_income", "Net income", "淨利潤" if traditional else "净利润"))
+    if any(row.get("parent_net_income") is not None for row in metrics):
+        columns.append(("parent_net_income", "Profit attributable to owners", "歸母淨利潤" if traditional else "归母净利润"))
+    columns.append(("operating_cash_flow", "Operating cash flow", "經營現金流" if traditional else "经营现金流"))
     if has_free_cash_flow:
         columns.append(("free_cash_flow", "Free cash flow", "\u81ea\u7531\u73fe\u91d1\u6d41" if traditional else "\u81ea\u7531\u73b0\u91d1\u6d41"))
     labels = [column[1] if english else column[2] for column in columns]
@@ -1409,8 +1589,8 @@ def deterministic_summary(
         for key, _, _ in columns:
             value = row.get(key)
             if key == "year":
-                values.append(str(value))
-            elif key in {"revenue", "net_income", "operating_cash_flow", "free_cash_flow"}:
+                values.append(str(metric_periods[id(row)].year))
+            elif key in {"revenue", "net_income", "parent_net_income", "operating_cash_flow", "free_cash_flow"}:
                 values.append(format_money(value, currency))
             elif key.endswith("_growth"):
                 values.append(format_growth(value, row.get(f"{key}_status"), language))
@@ -1424,6 +1604,7 @@ def deterministic_summary(
             ("Gross margin", "毛利率", "毛利率", format_percent(latest.get("gross_margin"))),
             ("Operating income growth", "營業利潤增長", "营业利润增长", format_growth(latest.get("operating_income_growth"), latest.get("operating_income_growth_status"), language)),
             ("Net income growth", "淨利潤增長", "净利润增长", format_growth(latest.get("net_income_growth"), latest.get("net_income_growth_status"), language)),
+            ("Parent-attributable profit growth", "歸母淨利潤增長", "归母净利润增长", format_growth(latest.get("parent_net_income_growth"), latest.get("parent_net_income_growth_status"), language)),
             ("Operating cash-flow growth", "經營現金流增長", "经营现金流增长", format_growth(latest.get("operating_cash_flow_growth"), latest.get("operating_cash_flow_growth_status"), language)),
         ]
     )
@@ -1470,5 +1651,10 @@ def deterministic_summary(
             f"- 净资产收益率：{_format_roe(latest, 'zh-CN')}",
             "",
             "> 这些指标仅作为研究输入，不构成投资建议。",
+        ])
+    if period_diagnostics:
+        lines.extend([
+            "",
+            "Metric period rows skipped: " + ", ".join(dict.fromkeys(period_diagnostics)),
         ])
     return "\n".join(lines)

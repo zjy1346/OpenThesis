@@ -14,6 +14,7 @@ import remarkGfm from "remark-gfm";
 
 import { exportFinancialDiagnostics, exportResearchReport, getFinancialDiagnostics, getResearchReport, listConfiguredModels } from "../../backend";
 import type { ConfiguredModelSummary, ModelSelection, RecoveryStageTarget, ResearchReport } from "../../types";
+import { modelEligibility } from "../../modelEligibility";
 
 type ReportCopy = {
   report: string;
@@ -50,6 +51,9 @@ type ReportCopy = {
   recoveryBody: string;
   recoveryModel: string;
   recoveryRetry: string;
+  recoveryUnknownWarning: string;
+  recoveryConfirmNewAttempt: string;
+  recoveryCooldown: string;
   recoveryNoModels: string;
   retryRecovery: string;
   retryRecoverySucceeded: string;
@@ -64,6 +68,8 @@ type ReportCopy = {
   financialMissingPeriods: string;
   financialAttempts: string;
   financialZeroToken: string;
+  revalidateSaved: string;
+  revalidateSavedBody: string;
   retryFinancials: string;
   retryingFinancials: string;
   retryFinancialsSucceeded: string;
@@ -114,6 +120,7 @@ type ReportCopy = {
   reportStageLabels: Record<string, string>;
   listingCurrency: string;
   reportingCurrency: string;
+  currencyUnconfirmed: string;
   sameCurrency: string;
 };
 
@@ -145,7 +152,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string) => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
+export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRevalidateSaved, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string, confirmNewAttempt?: boolean) => Promise<void>; onRevalidateSaved?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -159,6 +166,8 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
   const [capacityModels, setCapacityModels] = useState<ConfiguredModelSummary[]>([]);
   const [capacityModelsLoading, setCapacityModelsLoading] = useState(false);
   const [selectedCapacityModelId, setSelectedCapacityModelId] = useState("");
+  const [eligibilityTime, setEligibilityTime] = useState(() => Date.now() / 1000);
+  const [confirmNewAttempt, setConfirmNewAttempt] = useState(false);
   const [skipFocusMotion, setSkipFocusMotion] = useState(false);
   const closeTimer = useRef<number | null>(null);
   const reportReadGeneration = useRef(0);
@@ -324,7 +333,21 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
     ? `${displayedReport.run_id.slice(0, 12)}…`
     : displayedReport.run_id;
   const recoveryPlan = displayedReport.recovery_plan;
+  const newAttemptRequired = Boolean(recoveryPlan?.requires_new_attempt_authorization);
+  useEffect(() => { setConfirmNewAttempt(false); }, [recoveryPlan?.plan_hash, selectedCapacityModelId]);
   const recoveryAvailable = Boolean(recoveryPlan?.available && onRetryRecoveryStage);
+  const selectedRecoveryModel = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
+  const selectedRecoveryEligibility = selectedRecoveryModel
+    ? modelEligibility(selectedRecoveryModel, "text_chat", { explicitRetry: true, now: eligibilityTime }) : null;
+  const recoveryCheck = selectedRecoveryModel?.capability_checks?.find((item) => item.capability === "text_chat"
+    && item.model_configuration_version === selectedRecoveryModel.configuration_version);
+  const cooldownSeconds = recoveryCheck ? Math.max(0, Math.ceil(recoveryCheck.checked_at
+    + (recoveryCheck.retry_after_seconds ?? 0) - eligibilityTime)) : 0;
+  useEffect(() => {
+    if (!recoveryAvailable || selectedRecoveryEligibility?.state !== "cooldown") return;
+    const timer = window.setInterval(() => setEligibilityTime(Date.now() / 1000), 1000);
+    return () => window.clearInterval(timer);
+  }, [recoveryAvailable, selectedCapacityModelId, selectedRecoveryEligibility?.state]);
   const contextCapacityExceeded = recoveryPlan?.error_code === "MODEL_CONTEXT_CAPACITY"
     || displayedReport.synthesis_error_code === "MODEL_CONTEXT_CAPACITY";
 
@@ -360,7 +383,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
         if (cancelled) return;
         const currentModelId = String(displayedReport.reproducibility?.model_configuration?.configured_model_id ?? "");
         const usable = items
-          .filter((item) => item.enabled && item.health_status === "ready" && (!contextCapacityExceeded || item.configured_model_id !== currentModelId) && (item.capabilities.includes("text_chat") || item.capabilities.includes("structured_json")))
+          .filter((item) => modelEligibility(item, "text_chat", { explicitRetry: true }).selectable && (!contextCapacityExceeded || item.configured_model_id !== currentModelId))
           .sort((left, right) => (right.context_window_hint ?? -1) - (left.context_window_hint ?? -1));
         setCapacityModels(usable);
         setSelectedCapacityModelId(usable[0]?.configured_model_id ?? "");
@@ -497,10 +520,12 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
   };
 
   const retryPlannedRecovery = async () => {
-    if (!recoveryPlan?.available || !onRetryRecoveryStage) return;
+    if (!recoveryPlan?.available || !onRetryRecoveryStage || recoveryPlan.request_in_progress
+        || (newAttemptRequired && !confirmNewAttempt)) return;
     const target = recoveryPlan.target;
     const configured = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
     if (!configured) return;
+    if (!modelEligibility(configured, "text_chat", { explicitRetry: true }).canRequest) return;
     const model: ModelSelection = {
       configured_model_id: configured.configured_model_id,
       connection_id: configured.connection_id,
@@ -510,7 +535,8 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
     setRetryTarget(target);
     setRetryState("retrying");
     try {
-      await onRetryRecoveryStage(target, model, recoveryPlan.plan_hash);
+      if (newAttemptRequired) await onRetryRecoveryStage(target, model, recoveryPlan.plan_hash, confirmNewAttempt);
+      else await onRetryRecoveryStage(target, model, recoveryPlan.plan_hash);
       setRetryState("succeeded");
     } catch {
       setRetryState("failed");
@@ -542,7 +568,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
           <div className="report-context">
             <span><Clock3 size={13} />{copy.report}</span>
             <span>{displayedReport.market || "US"}{displayedReport.exchange ? ` · ${displayedReport.exchange}` : ""}</span>
-            {displayedReport.listing_currency && displayedReport.reporting_currency && displayedReport.listing_currency !== displayedReport.reporting_currency ? <><span>{copy.listingCurrency}: {displayedReport.listing_currency}</span><span>{copy.reportingCurrency}: {displayedReport.reporting_currency}</span></> : <span>{copy.sameCurrency}: {displayedReport.reporting_currency || displayedReport.listing_currency || "—"}</span>}
+            {displayedReport.listing_currency && displayedReport.reporting_currency && displayedReport.listing_currency === displayedReport.reporting_currency ? <span>{copy.sameCurrency}: {displayedReport.reporting_currency}</span> : <><span>{copy.listingCurrency}: {displayedReport.listing_currency || "—"}</span><span>{copy.reportingCurrency}: {displayedReport.reporting_currency || copy.currencyUnconfirmed}</span></>}
             <span className="report-run" title={displayedReport.run_id}>{copy.researchRun}: <code>{compactRunId}</code></span>
             <span>{copy.reportDisclaimer}</span>
           </div>
@@ -575,49 +601,71 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
         <span>{reportStatus.text}</span>
         {readinessDetails}
       </div>}
-      {recoveryAvailable && (
+      {(recoveryAvailable || (onRevalidateSaved && recoveryPlan?.operations?.some((item) => item.code === "revalidate_saved_content"))) && (
         <section className="synthesis-capacity-recovery" aria-label={copy.recoveryTitle}>
-          <div>
-            <strong>{contextCapacityExceeded ? copy.synthesisCapacityTitle : copy.recoveryTitle}</strong>
-            <p>{contextCapacityExceeded ? copy.synthesisCapacityBody : copy.recoveryBody}</p>
+          <div className="synthesis-capacity-explanation">
+            <strong>{contextCapacityExceeded ? copy.synthesisCapacityTitle : recoveryAvailable ? copy.recoveryTitle : copy.revalidateSaved}</strong>
+            <p>{contextCapacityExceeded ? copy.synthesisCapacityBody : recoveryAvailable ? copy.recoveryBody : copy.revalidateSavedBody}</p>
           </div>
-          {capacityModels.length > 0 ? (
+          {onRevalidateSaved && recoveryPlan?.operations?.some((item) => item.code === "revalidate_saved_content") &&
+            <div className="synthesis-capacity-actions"><p className="synthesis-capacity-action-copy">{copy.revalidateSavedBody}</p>
+              <button type="button" className="synthesis-capacity-action-button report-retry-button" disabled={retryState === "retrying" || recoveryPlan.request_in_progress}
+                onClick={async () => {
+                  setRetryTarget("model-stages"); setRetryState("retrying");
+                  try { await onRevalidateSaved(); setRetryState("succeeded"); }
+                  catch { setRetryState("failed"); }
+                }}><RefreshCw size={16} /><span>{copy.revalidateSaved}</span></button></div>}
+          {recoveryAvailable && capacityModels.length > 0 ? (
             <div className="synthesis-capacity-actions">
-              <label htmlFor="recovery-stage-model">{copy.recoveryModel}</label>
-              <select id="recovery-stage-model" value={selectedCapacityModelId} onChange={(event) => setSelectedCapacityModelId(event.target.value)} disabled={capacityModelsLoading || retryState === "retrying"}>
-                {capacityModels.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>{model.alias || model.model_id}{model.context_window_hint ? ` · ${model.context_window_hint.toLocaleString()} tokens` : ""}</option>)}
-              </select>
-              <button type="button" className="report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => void retryPlannedRecovery()}><RefreshCw size={16} /><span>{copy.recoveryRetry}</span></button>
+              <div className="synthesis-capacity-control">
+                <label htmlFor="recovery-stage-model">{copy.recoveryModel}</label>
+                <select id="recovery-stage-model" value={selectedCapacityModelId} onChange={(event) => setSelectedCapacityModelId(event.target.value)} disabled={capacityModelsLoading || retryState === "retrying"}>
+                  {capacityModels.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>{model.alias || model.model_id}{model.context_window_hint ? ` · ${model.context_window_hint.toLocaleString()} tokens` : ""}</option>)}
+                </select>
+              </div>
+              {(newAttemptRequired || selectedRecoveryEligibility?.state === "cooldown") && <div className="synthesis-capacity-authorization">
+                {newAttemptRequired && <div className="recovery-new-attempt-consent">
+                  <p id="recovery-unknown-warning" role="note">{copy.recoveryUnknownWarning}</p>
+                  <label className="checkbox-label"><input type="checkbox" checked={confirmNewAttempt}
+                    onChange={(event) => setConfirmNewAttempt(event.target.checked)}
+                    aria-describedby="recovery-unknown-warning" disabled={retryState === "retrying"} />
+                    <span>{copy.recoveryConfirmNewAttempt}</span></label>
+                </div>}
+                {selectedRecoveryEligibility?.state === "cooldown" && <p role="status">{copy.recoveryCooldown.replace("{seconds}", String(cooldownSeconds))}</p>}
+              </div>}
+              <button type="button" className="synthesis-capacity-action-button report-retry-button" disabled={!selectedRecoveryEligibility?.canRequest || retryState === "retrying" || recoveryPlan?.request_in_progress || (newAttemptRequired && !confirmNewAttempt)} onClick={() => void retryPlannedRecovery()}><RefreshCw size={16} /><span>{copy.recoveryRetry}</span></button>
             </div>
-          ) : !capacityModelsLoading ? (
+          ) : recoveryAvailable && !capacityModelsLoading ? (
             <div className="synthesis-capacity-actions">
-              <span>{copy.recoveryNoModels}</span>
-              {onConfigureCloud && <button type="button" className="report-retry-button" onClick={onConfigureCloud}>{copy.synthesisCapacityConfigure}</button>}
+              <span className="synthesis-capacity-action-copy">{copy.recoveryNoModels}</span>
+              {onConfigureCloud && <button type="button" className="synthesis-capacity-action-button report-retry-button" onClick={onConfigureCloud}>{copy.synthesisCapacityConfigure}</button>}
             </div>
           ) : null}
         </section>
       )}
       {!recoveryAvailable && contextCapacityExceeded && onRetrySynthesis && (
         <section className="synthesis-capacity-recovery" aria-label={copy.synthesisCapacityTitle}>
-          <div>
+          <div className="synthesis-capacity-explanation">
             <strong>{copy.synthesisCapacityTitle}</strong>
             <p>{copy.synthesisCapacityBody}</p>
           </div>
           {capacityModels.length > 0 ? (
             <div className="synthesis-capacity-actions">
-              <label htmlFor="synthesis-capacity-model">{copy.synthesisCapacityModel}</label>
-              <select id="synthesis-capacity-model" value={selectedCapacityModelId} onChange={(event) => setSelectedCapacityModelId(event.target.value)} disabled={capacityModelsLoading || retryState === "retrying"}>
-                {capacityModels.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>{model.alias || model.model_id}{model.context_window_hint ? ` · ${model.context_window_hint.toLocaleString()} tokens` : ""}</option>)}
-              </select>
-              <button type="button" className="report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => {
+              <div className="synthesis-capacity-control">
+                <label htmlFor="synthesis-capacity-model">{copy.synthesisCapacityModel}</label>
+                <select id="synthesis-capacity-model" value={selectedCapacityModelId} onChange={(event) => setSelectedCapacityModelId(event.target.value)} disabled={capacityModelsLoading || retryState === "retrying"}>
+                  {capacityModels.map((model) => <option key={model.configured_model_id} value={model.configured_model_id}>{model.alias || model.model_id}{model.context_window_hint ? ` · ${model.context_window_hint.toLocaleString()} tokens` : ""}</option>)}
+                </select>
+              </div>
+              <button type="button" className="synthesis-capacity-action-button report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => {
                 const model = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
                 if (model) void retryStage("synthesis", { configured_model_id: model.configured_model_id, connection_id: model.connection_id, configuration_version: model.configuration_version, role: "primary" });
               }}><RefreshCw size={16} /><span>{copy.synthesisCapacityRetry}</span></button>
             </div>
           ) : !capacityModelsLoading ? (
             <div className="synthesis-capacity-actions">
-              <span>{copy.synthesisCapacityNoModels}</span>
-              {onConfigureCloud && <button type="button" className="report-retry-button" onClick={onConfigureCloud}>{copy.synthesisCapacityConfigure}</button>}
+              <span className="synthesis-capacity-action-copy">{copy.synthesisCapacityNoModels}</span>
+              {onConfigureCloud && <button type="button" className="synthesis-capacity-action-button report-retry-button" onClick={onConfigureCloud}>{copy.synthesisCapacityConfigure}</button>}
             </div>
           ) : null}
         </section>

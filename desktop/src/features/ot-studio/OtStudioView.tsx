@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { modelEligibility } from "../../modelEligibility";
 import type { CSSProperties } from "react";
 import { Bot, Braces, Check, CircleHelp, Code2, Download, Redo2, ShieldCheck, SlidersHorizontal, Sparkles, Undo2, X } from "lucide-react";
 
@@ -269,7 +270,7 @@ export function OtStudioView({ language, onOpenModelCenter }: { language: Langua
 
   useEffect(() => {
     void listConfiguredModels().then((items) => {
-      const ready = items.filter((item) => item.enabled && item.health_status === "ready");
+      const ready = items.filter((item) => modelEligibility(item, "text_chat").selectable);
       setModels(ready);
       setModelId((current) => current || ready[0]?.configured_model_id || "");
     }).catch((reason) => setError(errorMessage(reason)));

@@ -3,9 +3,7 @@ from __future__ import annotations
 import hashlib
 import html as html_lib
 import json
-import ipaddress
 import re
-import socket
 import time
 import urllib.parse
 import urllib.request
@@ -16,6 +14,8 @@ from typing import Any, Callable, Protocol
 from urllib.error import HTTPError, URLError
 
 from .domain import Company, FilingDocument
+from .official_network import OfficialNetworkPolicy, OfficialNetworkError, OFFICIAL_HOSTS, OFFICIAL_SUFFIXES
+from .resilience.remote import before_remote_request, current_remote_context, managed_remote_failure
 from .download_safety import (
     UnsafeDisclosurePayload,
     store_immutable_payload,
@@ -33,7 +33,7 @@ from .markets import (
 from .text_normalization import canonical_search_text, normalize_company_query
 
 
-class MarketDataError(RuntimeError):
+class MarketDataError(OfficialNetworkError):
     """A public-disclosure source could not return a trustworthy result."""
 
     def __init__(self, message: str, *, code: str = "FILING_FETCH_FAILED"):
@@ -50,7 +50,10 @@ class _ValidatedRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
         self._validator(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            before_remote_request()
+        return redirected
 
 
 class HttpTransport(Protocol):
@@ -64,13 +67,8 @@ class HttpTransport(Protocol):
 
 
 class OfficialDisclosureHttpClient:
-    _ALLOWED_HOSTS = {
-        "www.cninfo.com.cn",
-        "static.cninfo.com.cn",
-        "www1.hkexnews.hk",
-        "www.hkexnews.hk",
-    }
-    _ALLOWED_HOST_SUFFIXES = (".cninfo.com.cn", ".hkexnews.hk")
+    _ALLOWED_HOSTS = OFFICIAL_HOSTS
+    _ALLOWED_HOST_SUFFIXES = OFFICIAL_SUFFIXES
 
     def __init__(
         self,
@@ -78,10 +76,12 @@ class OfficialDisclosureHttpClient:
         timeout_seconds: int = 30,
         maximum_bytes: int = 150_000_000,
         maximum_attempts: int = 3,
+        network_policy: OfficialNetworkPolicy | None = None,
     ):
         self.timeout_seconds = max(5, min(120, int(timeout_seconds)))
         self.maximum_bytes = max(1_000_000, min(150_000_000, int(maximum_bytes)))
         self.maximum_attempts = max(1, min(5, int(maximum_attempts)))
+        self.network_policy = network_policy or OfficialNetworkPolicy()
 
     def get_json(self, url: str) -> Any:
         return json.loads(self._request(url).decode("utf-8-sig"))
@@ -121,6 +121,11 @@ class OfficialDisclosureHttpClient:
                     require_pdf=target.suffix.lower() == ".pdf",
                 )
             request = self._build_request(url)
+            def cancellation_and_budget():
+                context = current_remote_context()
+                if context is not None:
+                    context.checkpoint()
+                return bool(cancel_check and cancel_check())
             with self._open_with_retry(request, cancel_check=cancel_check) as response:
                 self._validate_url(response.geturl())
                 declared = response.headers.get("Content-Length")
@@ -131,14 +136,16 @@ class OfficialDisclosureHttpClient:
                     response,
                     maximum_bytes=self.maximum_bytes,
                     require_pdf=target.suffix.lower() == ".pdf",
-                    cancel_check=cancel_check,
+                    cancel_check=cancellation_and_budget,
                 )
         except UnsafeDisclosurePayload as exc:
             raise MarketDataError("official disclosure failed safety validation", code="FILING_CONTENT_UNSAFE") from exc
         except InterruptedError as exc:
             raise MarketDataError("official disclosure download was cancelled", code="FILING_DOWNLOAD_CANCELLED") from exc
         except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-            raise MarketDataError("official disclosure source is unavailable", code="FILING_FETCH_FAILED") from exc
+            raise MarketDataError("official disclosure source is unavailable", code=(
+                "SOURCE_RATE_LIMITED" if isinstance(exc, HTTPError) and exc.code == 429
+                else "SOURCE_NETWORK_UNAVAILABLE")) from exc
 
     def _request(
         self,
@@ -153,7 +160,9 @@ class OfficialDisclosureHttpClient:
                 self._validate_url(response.geturl())
                 payload = response.read(self.maximum_bytes + 1)
         except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
-            raise MarketDataError("official disclosure source is unavailable") from exc
+            raise MarketDataError("official disclosure source is unavailable", code=(
+                "SOURCE_RATE_LIMITED" if isinstance(exc, HTTPError) and exc.code == 429
+                else "SOURCE_NETWORK_UNAVAILABLE")) from exc
         if len(payload) > self.maximum_bytes:
             raise MarketDataError("official disclosure document exceeds the size limit")
         return payload
@@ -181,20 +190,27 @@ class OfficialDisclosureHttpClient:
         cancel_check: Callable[[], bool] | None = None,
     ) -> Any:
         last_error: BaseException | None = None
-        for attempt in range(self.maximum_attempts):
+        managed = current_remote_context() is not None
+        attempts = 1 if managed else self.maximum_attempts
+        for attempt in range(attempts):
             if cancel_check is not None and cancel_check():
                 raise InterruptedError("disclosure download cancelled")
             try:
+                before_remote_request()
                 response = self._open_once(request)
                 self._validate_url(response.geturl())
                 return response
             except HTTPError as exc:
+                if managed:
+                    raise managed_remote_failure(exc) from exc
                 last_error = exc
                 if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
                     raise
             except (URLError, TimeoutError, OSError) as exc:
+                if managed:
+                    raise managed_remote_failure(exc) from exc
                 last_error = exc
-            if attempt + 1 < self.maximum_attempts:
+            if attempt + 1 < attempts:
                 delay = min(4.0, 0.5 * (2**attempt))
                 if cancel_check is not None and cancel_check():
                     raise InterruptedError("disclosure download cancelled")
@@ -203,45 +219,31 @@ class OfficialDisclosureHttpClient:
         raise last_error
 
     def _open_once(self, request: urllib.request.Request) -> Any:
-        self._validate_network_target(request.full_url)
-        opener = urllib.request.build_opener(
-            _ValidatedRedirectHandler(self._validate_network_target)
-        )
-        return opener.open(request, timeout=self.timeout_seconds)
+        try:
+            validator = (self.network_policy.validate_url if self.network_policy.connect_proxy
+                         else self.network_policy.resolve)
+            validator(request.full_url)
+            opener = urllib.request.build_opener(
+                self.network_policy.proxy_handler(), self.network_policy.https_handler(),
+                _ValidatedRedirectHandler(validator),
+            )
+            return opener.open(request, timeout=self.timeout_seconds)
+        except OfficialNetworkError as error:
+            raise MarketDataError(str(error), code=error.code) from error
 
     @classmethod
     def _validate_network_target(cls, url: str) -> None:
-        cls._validate_url(url)
-        host = (urllib.parse.urlparse(url).hostname or "").lower()
-        addresses = {
-            item[4][0]
-            for item in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
-        }
-        if not addresses:
-            raise MarketDataError("disclosure source resolved to an unsafe network target")
-        fake_ip_network = ipaddress.ip_network("198.18.0.0/15")
-        for address in addresses:
-            resolved = ipaddress.ip_address(address)
-            # Clash/Surge TUN modes intentionally resolve public destinations
-            # into RFC 2544 benchmark addresses.  Permit that representation
-            # only for the four exact built-in official hosts; wildcard
-            # subdomains and every user-controlled/lookalike host retain the
-            # ordinary globally-routable requirement.
-            if resolved in fake_ip_network and host in cls._ALLOWED_HOSTS:
-                continue
-            if not resolved.is_global:
-                raise MarketDataError("disclosure source resolved to an unsafe network target")
+        try:
+            OfficialNetworkPolicy().resolve(url)
+        except OfficialNetworkError as error:
+            raise MarketDataError(str(error), code=error.code) from error
 
     @classmethod
     def _validate_url(cls, url: str) -> None:
-        parsed = urllib.parse.urlparse(url)
-        host = (parsed.hostname or "").lower()
-        allowed = host in cls._ALLOWED_HOSTS or any(
-            host.endswith(suffix) and host != suffix[1:]
-            for suffix in cls._ALLOWED_HOST_SUFFIXES
-        )
-        if parsed.scheme != "https" or not allowed or parsed.username or parsed.password:
-            raise MarketDataError("unsupported disclosure source URL")
+        try:
+            OfficialNetworkPolicy.validate_url(url)
+        except OfficialNetworkError as error:
+            raise MarketDataError(str(error), code=error.code) from error
 
 
 @dataclass(slots=True)
@@ -270,19 +272,18 @@ class CnInfoAdapter:
 
     def __init__(self, transport: HttpTransport | None = None):
         self.transport = transport or OfficialDisclosureHttpClient()
+        self.search_transport = (OfficialDisclosureHttpClient(timeout_seconds=8, maximum_attempts=1,
+            network_policy=self.transport.network_policy) if transport is None else self.transport)
         self._stock_rows: list[dict[str, str]] | None = None
 
     def resolve(self, query: str, *, limit: int = 15) -> list[Company]:
         normalized = normalize_company_query(query)
         if not normalized:
             raise ValueError("company query is required")
-        try:
-            rows = self._search_rows(normalized, limit)
-        except (MarketDataError, ValueError, TypeError):
-            return search_companies(query, market=Market.CN_A, limit=limit)
-        return [self._company(row) for row in rows[: max(1, limit)]] or search_companies(
-            query, market=Market.CN_A, limit=limit
-        )
+        if re.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", normalized, re.I):
+            normalized = normalized[:6]
+        rows = self._search_rows(normalized, limit)
+        return [self._company(row) for row in rows[: max(1, limit)]]
 
     def list_financial_filings(self, company: Company, *, limit: int = 5) -> list[FilingDocument]:
         exchange = Exchange(company.exchange)
@@ -445,7 +446,7 @@ class CnInfoAdapter:
         return filing
 
     def _search_rows(self, query: str, limit: int) -> list[dict[str, str]]:
-        payload = self.transport.post_form(
+        payload = self.search_transport.post_form(
             self._SEARCH_URL,
             {"keyWord": query, "maxSecNum": str(max(1, min(50, limit)))},
         )
@@ -525,6 +526,8 @@ class HkexNewsAdapter:
         preferred_language: str = "zh-Hant",
     ):
         self.transport = transport or OfficialDisclosureHttpClient()
+        self.search_transport = (OfficialDisclosureHttpClient(timeout_seconds=8, maximum_attempts=1,
+            network_policy=self.transport.network_policy) if transport is None else self.transport)
         self._stock_rows: list[dict[str, str]] | None = None
         self.preferred_language = preferred_language
 
@@ -532,21 +535,19 @@ class HkexNewsAdapter:
         self.preferred_language = str(language or "zh-Hant")
 
     def resolve(self, query: str, *, limit: int = 15) -> list[Company]:
-        needle = canonical_search_text(query)
+        # Normalize a security identifier before punctuation-free name search.
+        # Canonical text drops '.', so testing '.hk' afterwards can never work.
+        code = re.fullmatch(r"([0-9]{1,5})(?:\.HK)?", query.strip(), re.I)
+        needle = code[1].zfill(5) if code else canonical_search_text(query)
         if not needle:
             raise ValueError("company query is required")
-        try:
-            rows = self._stocks()
-        except MarketDataError:
-            return search_companies(query, market=Market.HK, limit=limit)
+        rows = self._stocks()
         matches = [
             row for row in rows
             if needle in canonical_search_text(row["code"])
             or needle in row["search_text"]
         ]
-        return [self._company(row) for row in matches[: max(1, limit)]] or search_companies(
-            query, market=Market.HK, limit=limit
-        )
+        return [self._company(row) for row in matches[: max(1, limit)]]
 
     def list_financial_filings(self, company: Company, *, limit: int = 5) -> list[FilingDocument]:
         code = company.ticker[:5]
@@ -676,7 +677,9 @@ class HkexNewsAdapter:
         if self._stock_rows is not None:
             return self._stock_rows
         try:
-            payload = self.transport.get_json(self._STOCK_LIST_URL)
+            payload = self.search_transport.get_json(self._STOCK_LIST_URL)
+        except MarketDataError:
+            raise
         except Exception as exc:
             raise MarketDataError("HKEX company catalogue is unavailable") from exc
         rows: list[dict[str, str]] = []
@@ -730,6 +733,13 @@ class MarketDataModule:
             Market.CN_A: cn_adapter or CnInfoAdapter(),
             Market.HK: hk_adapter or HkexNewsAdapter(),
         }
+
+    def configure_network(self, policy: OfficialNetworkPolicy) -> None:
+        for adapter in self._adapters.values():
+            for name in ("transport", "search_transport"):
+                transport = getattr(adapter, name, None)
+                if isinstance(transport, OfficialDisclosureHttpClient):
+                    transport.network_policy = policy
 
     def resolve(self, query: str, market: str | Market, *, limit: int = 15) -> list[Company]:
         normalized = normalize_market(market)
@@ -853,23 +863,28 @@ def _report_period_end(year: int, fiscal_period: str, filed_at: str, title: str 
     return f"{year:04d}-{suffix}" if suffix else filed_at[:10]
 
 
-def _report_period_revision(fiscal_period: str, title: str) -> str:
-    """Mark annual dates without a title-level month/day as provisional."""
+def _report_revision(fiscal_period: str, title: str) -> str:
+    """A preliminary results announcement is an edition, date knowledge is not."""
     if fiscal_period == "H1" and (
         "interim result" in title.casefold()
         or "中期業績" in title
         or "中期业绩" in title
     ):
         return "provisional_results_announcement"
+    return "original"
+
+
+def _report_period_status(fiscal_period: str, title: str) -> str:
+    """Keep discovery date knowledge outside the physical edition identity."""
     if fiscal_period != "FY":
-        return "original"
+        return "discovered"
     explicit = re.search(
         r"(?:year\s+ended|year\s+ending|for\s+the\s+year\s+ended)\s+\d{1,2}\s+"
         r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}",
         title,
         flags=re.IGNORECASE,
     ) or re.search(r"截至\s*20\d{2}年\s*\d{1,2}月\s*\d{1,2}日", title)
-    return "period_end_verified" if explicit else "period_end_provisional"
+    return "discovered" if explicit else "unresolved"
 
 
 def _title_period_year(title: str) -> int | None:
@@ -1041,7 +1056,8 @@ def _hkex_filings_from_json(
                 filed_at=filed_at,
                 primary_document=title or accession,
                 source_url=source_url,
-                revision=_report_period_revision(fiscal_period, title),
+                revision=_report_revision(fiscal_period, title),
+                period_metadata_status=_report_period_status(fiscal_period, title),
             )
         )
         if len(filings) >= max(1, limit):
@@ -1095,7 +1111,8 @@ def _hkex_filings_from_text(company: Company, text: str, *, limit: int) -> list[
                 filed_at=filed_at,
                 primary_document=title[:240] or accession,
                 source_url=f"https://www1.hkexnews.hk{path}",
-                revision=_report_period_revision(fiscal_period, title),
+                revision=_report_revision(fiscal_period, title),
+                period_metadata_status=_report_period_status(fiscal_period, title),
             )
         )
         if len(filings) >= limit:

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  agentDisplayName,
   formatElapsedTime,
   progressStageCopy,
   waitingMessageAt,
@@ -8,6 +9,13 @@ import {
 } from "./researchProgress";
 
 describe("research progress experience", () => {
+  it("distinguishes source reading from later growth and counter research in every locale", () => {
+    expect(agentDisplayName("en", "source-risk-analysis")).toBe("Source risk review");
+    expect(agentDisplayName("en", "skeptical-analyst")).toBe("Counter-analysis");
+    expect(agentDisplayName("zh-CN", "source-industry-analysis")).toBe("原件行业分析");
+    expect(agentDisplayName("zh-Hant", "source-risk-analysis")).toBe("原件風險審查");
+    expect(agentDisplayName("zh-Hant", "financial-analyst")).toBe("財務分析");
+  });
   it("formats a monotonic count-up timer", () => {
     expect(formatElapsedTime(0)).toBe("00:00");
     expect(formatElapsedTime(198)).toBe("03:18");

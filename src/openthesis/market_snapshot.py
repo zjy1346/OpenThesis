@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import csv
+import hashlib
 import io
 import math
 import re
@@ -39,6 +40,7 @@ class SnapshotStatus(StrEnum):
     STALE = "STALE"
     MANUAL = "MANUAL"
     UNAVAILABLE = "UNAVAILABLE"
+    UNRESOLVED = "UNRESOLVED"
     CONFLICT = "CONFLICT"
 
 
@@ -64,6 +66,24 @@ class ReverseDcfPolicy:
             raise ValueError("invalid market freshness policy")
 
 
+def _policy_fingerprint(policy: ReverseDcfPolicy) -> str:
+    """Hash all policy values that can affect cache trust or valuation."""
+    payload = {
+        "version": policy.version,
+        "horizon_years": policy.horizon_years,
+        "discount_rate": policy.discount_rate,
+        "terminal_growth": policy.terminal_growth,
+        "max_quote_age_days": policy.max_quote_age_days,
+        "request_timeout_seconds": policy.request_timeout_seconds,
+        "max_retries": policy.max_retries,
+        "conflict_tolerance": policy.conflict_tolerance,
+        "circuit_breaker_failures": policy.circuit_breaker_failures,
+        "circuit_breaker_cooldown_seconds": policy.circuit_breaker_cooldown_seconds,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class SymbolMapping:
     provider_symbol: str
@@ -84,6 +104,47 @@ class QuoteSnapshot:
     market_cap_scope: str = "security"
     source_id: str = ""
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotCacheEnvelope:
+    """Versioned, semantic cache record for one market capture.
+
+    The selected quote alone is not sufficient to establish trust: a
+    conflict, policy, or identity decision must survive process restarts.
+    ``source_candidates`` therefore remains part of the immutable envelope.
+    """
+
+    schema_version: str
+    selected_quote: QuoteSnapshot | None
+    source_candidates: tuple[QuoteSnapshot, ...]
+    status: SnapshotStatus
+    warnings: tuple[str, ...]
+    validation_version: str
+    policy_fingerprint: str
+    identity: dict[str, str]
+    captured_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "selected_quote": _quote_to_dict(self.selected_quote) if self.selected_quote else None,
+            "source_candidates": [_quote_to_dict(item) for item in self.source_candidates],
+            "status": self.status.value,
+            "warnings": list(self.warnings),
+            "validation_version": self.validation_version,
+            "policy_fingerprint": self.policy_fingerprint,
+            "identity": dict(self.identity),
+            "captured_at": self.captured_at,
+        }
+
+    @property
+    def quote(self) -> QuoteSnapshot | None:
+        return self.selected_quote
+
+
+SNAPSHOT_CACHE_SCHEMA = "market-snapshot-cache-v3"
+SNAPSHOT_VALIDATION_VERSION = "market-snapshot-validation-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,25 +239,132 @@ class TextTransport(Protocol):
 class SnapshotCache(Protocol):
     """Normalized snapshot cache port; implementations must be atomic."""
 
-    def get(self, key: str) -> QuoteSnapshot | None: ...
+    def get(self, key: str) -> SnapshotCacheEnvelope | QuoteSnapshot | None: ...
 
-    def set(self, key: str, snapshot: QuoteSnapshot) -> None: ...
+    def set(self, key: str, snapshot: SnapshotCacheEnvelope | QuoteSnapshot) -> None: ...
+
+
+def _quote_to_dict(quote: QuoteSnapshot) -> dict[str, Any]:
+    return {
+        "provider": quote.provider,
+        "symbol": quote.symbol,
+        "exchange": quote.exchange,
+        "price": quote.price,
+        "market_cap": quote.market_cap,
+        "currency": quote.currency,
+        "as_of": quote.as_of,
+        "retrieved_at": quote.retrieved_at,
+        "market_cap_scope": quote.market_cap_scope,
+        "source_id": quote.source_id,
+        "warnings": list(quote.warnings),
+    }
+
+
+def _quote_from_dict(value: Any) -> QuoteSnapshot | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        warnings = value.get("warnings", ())
+        if not isinstance(warnings, (list, tuple)):
+            return None
+        return QuoteSnapshot(
+            provider=str(value["provider"]),
+            symbol=str(value["symbol"]),
+            exchange=str(value["exchange"]),
+            price=value.get("price"),
+            market_cap=value.get("market_cap"),
+            currency=str(value["currency"]),
+            as_of=str(value["as_of"]),
+            retrieved_at=str(value["retrieved_at"]),
+            market_cap_scope=str(value.get("market_cap_scope", "security")),
+            source_id=str(value.get("source_id", "")),
+            warnings=tuple(str(item) for item in warnings),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _cache_envelope_from_dict(value: Any) -> SnapshotCacheEnvelope | QuoteSnapshot | None:
+    """Decode current envelopes while preserving read-only legacy quotes."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("schema_version") != SNAPSHOT_CACHE_SCHEMA:
+        return _quote_from_dict(value)
+    selected = _quote_from_dict(value.get("selected_quote"))
+    raw_candidates = value.get("source_candidates", ())
+    if not isinstance(raw_candidates, (list, tuple)):
+        return None
+    candidates = tuple(_quote_from_dict(item) for item in raw_candidates)
+    if any(item is None for item in candidates):
+        return None
+    try:
+        status = SnapshotStatus(str(value["status"]))
+        warnings = value.get("warnings", ())
+        identity = value.get("identity", {})
+        if not isinstance(warnings, (list, tuple)) or not isinstance(identity, dict):
+            return None
+        return SnapshotCacheEnvelope(
+            schema_version=SNAPSHOT_CACHE_SCHEMA,
+            selected_quote=selected,
+            source_candidates=tuple(item for item in candidates if item is not None),
+            status=status,
+            warnings=tuple(str(item) for item in warnings),
+            validation_version=str(value["validation_version"]),
+            policy_fingerprint=str(value["policy_fingerprint"]),
+            identity={str(key): str(item) for key, item in identity.items()},
+            captured_at=str(value.get("captured_at", "")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _cache_identity(company: Company) -> dict[str, str]:
+    """Return every identity dimension that can change valuation meaning."""
+    return {
+        "issuer_id": str(getattr(company, "issuer_id", "") or "").strip().upper(),
+        "security_id": str(getattr(company, "security_id", "") or "").strip().upper(),
+        "ticker": str(getattr(company, "ticker", "") or "").strip().upper(),
+        "market": str(getattr(company, "market", "") or "").strip().upper(),
+        "exchange": str(getattr(company, "exchange", "") or "").strip().upper(),
+        "listing_currency": str(getattr(company, "listing_currency", "") or "").strip().upper(),
+        "reporting_currency": str(getattr(company, "reporting_currency", "") or "").strip().upper(),
+    }
+
+
+def _identity_fingerprint(identity: Mapping[str, str]) -> str:
+    encoded = json.dumps(dict(identity), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _legacy_cache_key(company: Company, policy: ReverseDcfPolicy) -> str:
+    identity = str(company.security_id or company.issuer_id or company.ticker).strip().upper()
+    return f"market-snapshot-v2|{identity}|{policy.version}"
+
+
+def _legacy_quote_is_usable(quote: QuoteSnapshot, company: Company) -> bool:
+    try:
+        _validate_quote(quote, company)
+        if quote.market_cap is not None and _requires_issuer_scope(company) and quote.market_cap_scope not in {"issuer", "consolidated"}:
+            return False
+        return not _quote_currency_conflicts(quote, company)
+    except (TypeError, ValueError):
+        return False
 
 
 class MemorySnapshotCache:
     """Thread-safe cache useful for desktop storage adapters and fixtures."""
 
     def __init__(self) -> None:
-        self._values: dict[str, QuoteSnapshot] = {}
+        self._values: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
 
-    def get(self, key: str) -> QuoteSnapshot | None:
+    def get(self, key: str) -> SnapshotCacheEnvelope | QuoteSnapshot | None:
         with self._lock:
-            return self._values.get(key)
+            return _cache_envelope_from_dict(self._values.get(key))
 
-    def set(self, key: str, snapshot: QuoteSnapshot) -> None:
+    def set(self, key: str, snapshot: SnapshotCacheEnvelope | QuoteSnapshot) -> None:
         with self._lock:
-            self._values[key] = snapshot
+            self._values[key] = snapshot.to_dict() if isinstance(snapshot, SnapshotCacheEnvelope) else _quote_to_dict(snapshot)
 
 
 class StorageSnapshotCache:
@@ -205,32 +373,14 @@ class StorageSnapshotCache:
     def __init__(self, storage: Any):
         self.storage = storage
 
-    def get(self, key: str) -> QuoteSnapshot | None:
+    def get(self, key: str) -> SnapshotCacheEnvelope | QuoteSnapshot | None:
         value = self.storage.get_market_snapshot(key)
-        if not isinstance(value, dict):
-            return None
-        try:
-            return QuoteSnapshot(
-                provider=str(value["provider"]), symbol=str(value["symbol"]),
-                exchange=str(value["exchange"]), price=value.get("price"),
-                market_cap=value.get("market_cap"), currency=str(value["currency"]),
-                as_of=str(value["as_of"]), retrieved_at=str(value["retrieved_at"]),
-                market_cap_scope=str(value.get("market_cap_scope", "security")),
-                source_id=str(value.get("source_id", "")),
-                warnings=tuple(value.get("warnings", ())),
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        return _cache_envelope_from_dict(value)
 
-    def set(self, key: str, snapshot: QuoteSnapshot) -> None:
-        self.storage.save_market_snapshot(key, {
-            "provider": snapshot.provider, "symbol": snapshot.symbol,
-            "exchange": snapshot.exchange, "price": snapshot.price,
-            "market_cap": snapshot.market_cap, "currency": snapshot.currency,
-            "as_of": snapshot.as_of, "retrieved_at": snapshot.retrieved_at,
-            "market_cap_scope": snapshot.market_cap_scope,
-            "source_id": snapshot.source_id, "warnings": list(snapshot.warnings),
-        }, snapshot.retrieved_at)
+    def set(self, key: str, snapshot: SnapshotCacheEnvelope | QuoteSnapshot) -> None:
+        payload = snapshot.to_dict() if isinstance(snapshot, SnapshotCacheEnvelope) else _quote_to_dict(snapshot)
+        retrieved_at = snapshot.captured_at if isinstance(snapshot, SnapshotCacheEnvelope) else snapshot.retrieved_at
+        self.storage.save_market_snapshot(key, payload, retrieved_at)
 
 
 _VERIFIED_CONTEXT_LOCK = threading.Lock()
@@ -856,18 +1006,36 @@ class MarketSnapshotModule:
         if manual_override is not None:
             quote = _manual_quote(company, manual_override, self._clock())
             return self._outcome(company, quote, policy, status=SnapshotStatus.MANUAL)
-        cached = self._cache_port.get(key)
-        if cached is not None and _is_fresh(cached.as_of, self._clock().date(), policy.max_quote_age_days):
-            try:
-                _validate_quote(cached, company)
-                if cached.market_cap is not None and _requires_issuer_scope(company) and cached.market_cap_scope not in {"issuer", "consolidated"}:
-                    raise ValueError("MARKET_CAP_SCOPE_INCOMPLETE")
-                if _quote_currency_conflicts(cached, company):
-                    return self._outcome(company, cached, policy, status=SnapshotStatus.CONFLICT, warnings=("QUOTE_CURRENCY_MISMATCH",), cache="fresh")
-            except ValueError:
-                cached = None
-            else:
-                return self._outcome(company, cached, policy, cache="fresh")
+        cached_record = self._cache_port.get(key)
+        if cached_record is None:
+            # Read old quote-only records for migration/revalidation, but do
+            # not treat them as trusted valuation evidence.
+            cached_record = self._cache_port.get(_legacy_cache_key(company, policy))
+        cached: QuoteSnapshot | None = None
+        if isinstance(cached_record, SnapshotCacheEnvelope):
+            expected_identity = _cache_identity(company)
+            fingerprint_matches = cached_record.policy_fingerprint == _policy_fingerprint(policy)
+            identity_matches = cached_record.identity == expected_identity
+            validation_matches = cached_record.validation_version == SNAPSHOT_VALIDATION_VERSION
+            quote = cached_record.quote
+            if validation_matches and fingerprint_matches and identity_matches and quote is not None and _legacy_quote_is_usable(quote, company):
+                if cached_record.status is SnapshotStatus.STALE:
+                    # Freshness is a trust decision, not a hint.  Do not
+                    # silently promote an explicitly stale record during a
+                    # cache hit; a new policy/key or explicit refresh is
+                    # required to establish a new valuation.
+                    return self._outcome(company, quote, policy, status=SnapshotStatus.STALE, cache="stale", warnings=cached_record.warnings)
+                if _is_fresh(quote.as_of, self._clock().date(), policy.max_quote_age_days):
+                    # A conflict/unresolved result is terminal until a new
+                    # explicit policy/key is used; never silently promote it.
+                    if cached_record.status in {SnapshotStatus.CONFLICT, SnapshotStatus.UNRESOLVED}:
+                        return self._outcome(company, quote, policy, status=cached_record.status, cache="fresh", warnings=cached_record.warnings)
+                    if cached_record.status is SnapshotStatus.VERIFIED:
+                        return self._outcome(company, quote, policy, status=SnapshotStatus.VERIFIED, cache="fresh", warnings=cached_record.warnings)
+                cached = quote
+        elif isinstance(cached_record, QuoteSnapshot):
+            if _legacy_quote_is_usable(cached_record, company):
+                cached = cached_record
         with self._flight_lock:
             flight = self._inflight.get(key)
             owner = flight is None
@@ -893,8 +1061,8 @@ class MarketSnapshotModule:
                 flight.event.set()
 
     def _cache_key(self, company: Company, policy: ReverseDcfPolicy) -> str:
-        identity = str(company.security_id or company.issuer_id or company.ticker).strip().upper()
-        return f"market-snapshot-v2|{identity}|{policy.version}"
+        identity = _cache_identity(company)
+        return f"market-snapshot-v3|{_identity_fingerprint(identity)}|{_policy_fingerprint(policy)}"
 
     def _capture_network(self, company: Company, policy: ReverseDcfPolicy, cached: QuoteSnapshot | None) -> MarketSnapshotOutcome:
         quotes: list[QuoteSnapshot] = []
@@ -941,8 +1109,21 @@ class MarketSnapshotModule:
         if not _is_fresh(chosen.as_of, self._clock().date(), policy.max_quote_age_days):
             status = SnapshotStatus.STALE
             warnings.append("QUOTE_DATE_OUTSIDE_POLICY")
-        self._cache_port.set(self._cache_key(company, policy), chosen)
-        return self._outcome(company, chosen, policy, status=status, warnings=tuple(warnings))
+        warnings.extend(item for quote in quotes for item in quote.warnings)
+        normalized_warnings = tuple(dict.fromkeys(warnings))
+        envelope = SnapshotCacheEnvelope(
+            schema_version=SNAPSHOT_CACHE_SCHEMA,
+            selected_quote=chosen,
+            source_candidates=tuple(quotes),
+            status=status,
+            warnings=normalized_warnings,
+            validation_version=SNAPSHOT_VALIDATION_VERSION,
+            policy_fingerprint=_policy_fingerprint(policy),
+            identity=_cache_identity(company),
+            captured_at=self._clock().isoformat(),
+        )
+        self._cache_port.set(self._cache_key(company, policy), envelope)
+        return self._outcome(company, chosen, policy, status=status, warnings=normalized_warnings)
 
     def _query_adapter(self, adapter: QuoteAdapter, company: Company, policy: ReverseDcfPolicy) -> tuple[QuoteSnapshot | None, str]:
         name = str(getattr(adapter, "name", "unknown"))
@@ -983,12 +1164,22 @@ class MarketSnapshotModule:
                 self._adapter_open_until[name] = time.monotonic() + policy.circuit_breaker_cooldown_seconds
 
     def _outcome(self, company: Company, quote: QuoteSnapshot, policy: ReverseDcfPolicy, *, status: SnapshotStatus = SnapshotStatus.VERIFIED, cache: str = "miss", warnings: tuple[str, ...] = ()) -> MarketSnapshotOutcome:
-        report_currency = str(company.reporting_currency or quote.currency).upper()
+        report_currency = str(company.reporting_currency or "").upper()
         value = quote.market_cap
         fx_rate = None
         fx_as_of = ""
         fx_source = ""
         all_warnings = tuple(dict.fromkeys((*quote.warnings, *warnings)))
+        if not re.fullmatch(r"[A-Z]{3}", report_currency):
+            # A tradable quote does not establish a financial statement's
+            # reporting currency. Retain the quote; disable only valuation.
+            return MarketSnapshotOutcome(status=SnapshotStatus.UNRESOLVED, issuer_id=company.issuer_id,
+                security_id=company.security_id, symbol=quote.symbol, exchange=quote.exchange,
+                price=quote.price, market_cap=quote.market_cap, currency=quote.currency,
+                reporting_currency="", as_of=quote.as_of, provider=quote.provider,
+                source_id=quote.source_id, retrieved_at=quote.retrieved_at, cache=cache,
+                warnings=all_warnings, error_code="REPORTING_CURRENCY_UNCONFIRMED",
+                policy_version=policy.version, quote_currency=quote.currency, valuation_currency="")
         if quote.currency != report_currency:
             if status is SnapshotStatus.CONFLICT:
                 return MarketSnapshotOutcome(status=SnapshotStatus.CONFLICT, issuer_id=company.issuer_id, security_id=company.security_id,

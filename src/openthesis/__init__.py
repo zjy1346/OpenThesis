@@ -1,4 +1,4 @@
 """OpenThesis application package."""
 
-__version__ = "2.8.8"
+__version__ = "3.0.4"
 

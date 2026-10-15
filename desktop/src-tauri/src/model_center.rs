@@ -53,7 +53,7 @@ impl ModelCenter {
         connection
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;")
             .map_err(|_| "model center database could not be initialized".to_string())?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS model_center_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS provider_connections (connection_id TEXT PRIMARY KEY NOT NULL, provider_id TEXT NOT NULL, display_name TEXT NOT NULL, region TEXT NOT NULL, endpoint TEXT NOT NULL, credential_ref TEXT, credential_version INTEGER NOT NULL DEFAULT 0, has_secret INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS configured_models (configured_model_id TEXT PRIMARY KEY NOT NULL, connection_id TEXT NOT NULL REFERENCES provider_connections(connection_id) ON DELETE CASCADE, model_id TEXT NOT NULL, alias TEXT NOT NULL, free_tier INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, capabilities_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE(connection_id, model_id)); INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(|_| "model center database could not be initialized".to_string())?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS model_center_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS provider_connections (connection_id TEXT PRIMARY KEY NOT NULL, provider_id TEXT NOT NULL, display_name TEXT NOT NULL, region TEXT NOT NULL, endpoint TEXT NOT NULL, credential_ref TEXT, credential_version INTEGER NOT NULL DEFAULT 0, has_secret INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS configured_models (configured_model_id TEXT PRIMARY KEY NOT NULL, connection_id TEXT NOT NULL REFERENCES provider_connections(connection_id) ON DELETE CASCADE, model_id TEXT NOT NULL, alias TEXT NOT NULL, free_tier INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, capabilities_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE(connection_id, model_id)); CREATE TABLE IF NOT EXISTS model_capability_checks (configured_model_id TEXT NOT NULL REFERENCES configured_models(configured_model_id) ON DELETE CASCADE, capability TEXT NOT NULL, model_configuration_version INTEGER NOT NULL, connection_configuration_version INTEGER NOT NULL, credential_version INTEGER NOT NULL, status TEXT NOT NULL, checked_at INTEGER NOT NULL, error_code TEXT, retry_after_seconds INTEGER, PRIMARY KEY(configured_model_id, capability, model_configuration_version, connection_configuration_version, credential_version)); INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(|_| "model center database could not be initialized".to_string())?;
         for (table, column, definition) in [
             (
                 "provider_connections",
@@ -97,7 +97,7 @@ impl ModelCenter {
         }
         connection
             .execute(
-                "INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '2') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                "INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [],
             )
             .map_err(|_| "model center database could not be initialized".to_string())?;
@@ -339,33 +339,17 @@ impl ModelCenter {
         self.with_connection(|connection| {
             let mut query = connection
                 .prepare(
-                    "SELECT configured_model_id, connection_id, model_id, alias, free_tier, enabled, capabilities_json, billing_class, free_source_url, free_verified_at, health_status, last_discovered_at, context_window_hint, temperature, timeout_seconds, configuration_version FROM configured_models ORDER BY alias COLLATE NOCASE, configured_model_id",
+                    "SELECT configured_model_id FROM configured_models ORDER BY alias COLLATE NOCASE, configured_model_id",
                 )
                 .map_err(|_| "model center database is unavailable".to_string())?;
             let rows = query
-                .query_map([], |row| {
-                    let capabilities: String = row.get(6)?;
-                    Ok(ConfiguredModelSummary {
-                        configured_model_id: row.get(0)?,
-                        connection_id: row.get(1)?,
-                        model_id: row.get(2)?,
-                        alias: row.get(3)?,
-                        free_tier: row.get::<_, i64>(4)? != 0,
-                        enabled: row.get::<_, i64>(5)? != 0,
-                        capabilities: serde_json::from_str(&capabilities).unwrap_or_default(),
-                        billing_class: row.get(7)?,
-                        free_source_url: row.get(8)?,
-                        free_verified_at: row.get(9)?,
-                        health_status: row.get(10)?,
-                        last_discovered_at: row.get(11)?,
-                        context_window_hint: row.get(12)?,
-                        temperature: row.get(13)?,
-                        timeout_seconds: row.get(14)?,
-                        configuration_version: row.get(15)?,
-                    })
-                })
+                .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|_| "model center database is unavailable".to_string())?;
-            rows.map(|row| row.map_err(|_| "model center database is unavailable".to_string()))
+            let ids: Result<Vec<String>, String> = rows
+                .map(|row| row.map_err(|_| "model center database is unavailable".to_string()))
+                .collect();
+            ids?.into_iter()
+                .map(|id| self.model_summary(connection, &id))
                 .collect()
         })
     }
@@ -511,6 +495,55 @@ impl ModelCenter {
         })
     }
 
+    pub(crate) fn record_capability_check(
+        &self,
+        configured_model_id: &str,
+        capability: &str,
+        status: &str,
+        error_code: Option<&str>,
+        retry_after_seconds: Option<u64>,
+    ) -> Result<(), String> {
+        let model = self.configured_model_runtime(configured_model_id)?;
+        self.record_capability_check_for_versions(configured_model_id, capability, status,
+            error_code, retry_after_seconds,
+            (model.configuration_version, model.connection_configuration_version, model.credential_version))
+    }
+
+    pub(crate) fn record_capability_check_for_versions(
+        &self, configured_model_id: &str, capability: &str, status: &str,
+        error_code: Option<&str>, retry_after_seconds: Option<u64>,
+        versions: (i64, i64, i64),
+    ) -> Result<(), String> {
+        validate_configured_model_id(configured_model_id)?;
+        validate_capability(capability)?;
+        validate_capability_status(status)?;
+        if let Some(value) = error_code {
+            validate_capability_error_code(value)?;
+        }
+        if status == "ready" && (error_code.is_some() || retry_after_seconds.is_some()) {
+            return Err("ready capability checks cannot carry an error".to_string());
+        }
+        let retry_after = retry_after_seconds
+            .map(|value| i64::try_from(value).map_err(|_| "capability retry interval is invalid".to_string()))
+            .transpose()?;
+        if versions.0 < 1 || versions.1 < 1 || versions.2 < 0 {
+            return Err("capability probe identity is invalid".to_string());
+        }
+        self.with_connection(|connection| {
+            // Bind to the configuration that produced the response, never to
+            // settings looked up after I/O. A stale probe remains historical
+            // and the summary's current-version query will not reuse it.
+            let (model_version, connection_version, credential_version) = versions;
+            connection
+                .execute(
+                    "INSERT INTO model_capability_checks(configured_model_id, capability, model_configuration_version, connection_configuration_version, credential_version, status, checked_at, error_code, retry_after_seconds) VALUES (?1,?2,?3,?4,?5,?6,unixepoch(),?7,?8) ON CONFLICT(configured_model_id, capability, model_configuration_version, connection_configuration_version, credential_version) DO UPDATE SET status=excluded.status, checked_at=excluded.checked_at, error_code=excluded.error_code, retry_after_seconds=excluded.retry_after_seconds",
+                    params![configured_model_id, capability, model_version, connection_version, credential_version, status, error_code, retry_after],
+                )
+                .map_err(|_| "capability check could not be saved".to_string())?;
+            Ok(())
+        })
+    }
+
     pub(crate) fn credential_for_connection(
         &self,
         connection: &ConnectionRuntime,
@@ -548,23 +581,32 @@ impl ModelCenter {
         })
     }
 
-    pub(crate) fn mark_model_health(
-        &self,
-        configured_model_id: &str,
-        status: &str,
+    pub(crate) fn mark_probe_health_for_versions(
+        &self, configured_model_id: &str, status: &str, error_code: Option<&str>,
+        versions: (i64, i64, i64),
     ) -> Result<(), String> {
         validate_health_status(status)?;
+        if let Some(code) = error_code { validate_capability_error_code(code)?; }
         self.with_connection(|connection| {
-            let changed = connection
-                .execute(
-                    "UPDATE configured_models SET health_status=?1, updated_at=unixepoch() WHERE configured_model_id=?2",
-                    params![status, configured_model_id],
-                )
-                .map_err(|_| "configured model health could not be saved".to_string())?;
-            if changed == 0 {
-                return Err("configured model was not found".to_string());
-            }
-            Ok(())
+            // One transaction ties both summaries to the response-producing
+            // model, endpoint and credential versions. Late probes remain
+            // historical, never changing a newly configured model's health.
+            connection.execute_batch("BEGIN IMMEDIATE").map_err(|_| "probe health transaction failed".to_string())?;
+            let result = (|| {
+                connection.execute(
+                    "UPDATE configured_models SET health_status=?1, updated_at=unixepoch() WHERE configured_model_id=?2 AND configuration_version=?3 AND connection_id IN (SELECT connection_id FROM provider_connections WHERE configuration_version=?4 AND credential_version=?5)",
+                    params![status, configured_model_id, versions.0, versions.1, versions.2],
+                ).map_err(|_| "probe model health could not be saved".to_string())?;
+                connection.execute(
+                    "UPDATE provider_connections SET status=?1, last_tested_at=unixepoch(), last_error_code=?2, updated_at=unixepoch() WHERE configuration_version=?4 AND credential_version=?5 AND connection_id IN (SELECT connection_id FROM configured_models WHERE configured_model_id=?3 AND configuration_version=?6)",
+                    params![status, error_code, configured_model_id, versions.1, versions.2, versions.0],
+                ).map_err(|_| "probe connection health could not be saved".to_string())?;
+                Ok(())
+            })();
+            if result.is_ok() { connection.execute_batch("COMMIT") }
+            else { connection.execute_batch("ROLLBACK") }
+                .map_err(|_| "probe health transaction could not finish".to_string())?;
+            result
         })
     }
 
@@ -662,12 +704,34 @@ impl ModelCenter {
         connection: &Connection,
         id: &str,
     ) -> Result<ConfiguredModelSummary, String> {
+        let (provider_id, credential_ref): (String, Option<String>) = connection
+            .query_row(
+                "SELECT c.provider_id, c.credential_ref FROM configured_models m JOIN provider_connections c ON c.connection_id=m.connection_id WHERE m.configured_model_id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "configured model was not found".to_string())?;
+        let has_secret = match credential_ref.as_deref() {
+            Some(target) => self.vault.has(target)?,
+            None => false,
+        };
+        let credential_available = provider_registry::find(&provider_id)
+            .map(|definition| !definition.requires_api_key || has_secret)
+            .unwrap_or(false);
         connection
             .query_row(
-                "SELECT configured_model_id, connection_id, model_id, alias, free_tier, enabled, capabilities_json, billing_class, free_source_url, free_verified_at, health_status, last_discovered_at, context_window_hint, temperature, timeout_seconds, configuration_version FROM configured_models WHERE configured_model_id=?1",
+                "SELECT m.configured_model_id, m.connection_id, m.model_id, m.alias, m.free_tier, m.enabled, m.capabilities_json, m.billing_class, m.free_source_url, m.free_verified_at, m.health_status, m.last_discovered_at, m.context_window_hint, m.temperature, m.timeout_seconds, m.configuration_version, c.enabled, c.provider_id, c.credential_ref, c.configuration_version, c.credential_version FROM configured_models m JOIN provider_connections c ON c.connection_id=m.connection_id WHERE m.configured_model_id=?1",
                 [id],
                 |row| {
                     let capabilities: String = row.get(6)?;
+                    let connection_enabled = row.get::<_, i64>(16)? != 0;
+                    let checks = self.capability_checks(
+                        connection,
+                        id,
+                        row.get(15)?,
+                        row.get(19)?,
+                        row.get(20)?,
+                    )?;
                     Ok(ConfiguredModelSummary {
                         configured_model_id: row.get(0)?,
                         connection_id: row.get(1)?,
@@ -685,10 +749,42 @@ impl ModelCenter {
                         temperature: row.get(13)?,
                         timeout_seconds: row.get(14)?,
                         configuration_version: row.get(15)?,
+                        connection_enabled,
+                        credential_available,
+                        capability_checks: checks,
                     })
                 },
             )
             .map_err(|_| "configured model was not found".to_string())
+    }
+
+    fn capability_checks(
+        &self,
+        connection: &Connection,
+        configured_model_id: &str,
+        model_configuration_version: i64,
+        connection_configuration_version: i64,
+        credential_version: i64,
+    ) -> Result<Vec<CapabilityCheckSummary>, rusqlite::Error> {
+        let mut query = connection.prepare(
+            "SELECT capability, status, checked_at, error_code, retry_after_seconds, model_configuration_version, connection_configuration_version, credential_version FROM model_capability_checks WHERE configured_model_id=?1 AND model_configuration_version=?2 AND connection_configuration_version=?3 AND credential_version=?4 ORDER BY capability",
+        )?;
+        let rows = query.query_map(
+            params![configured_model_id, model_configuration_version, connection_configuration_version, credential_version],
+            |row| {
+                Ok(CapabilityCheckSummary {
+                    capability: row.get(0)?,
+                    status: row.get(1)?,
+                    checked_at: row.get(2)?,
+                    error_code: row.get(3)?,
+                    retry_after_seconds: row.get(4)?,
+                    model_configuration_version: row.get(5)?,
+                    connection_configuration_version: row.get(6)?,
+                    credential_version: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect()
     }
 }
 
@@ -739,6 +835,35 @@ fn validate_health_status(value: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err("model health status is invalid".to_string())
+    }
+}
+
+fn validate_capability(value: &str) -> Result<(), String> {
+    if matches!(value, "text_chat" | "structured_json" | "vision") {
+        Ok(())
+    } else {
+        Err("model capability is invalid".to_string())
+    }
+}
+
+fn validate_capability_status(value: &str) -> Result<(), String> {
+    if matches!(value, "ready" | "error" | "disabled" | "unavailable") {
+        Ok(())
+    } else {
+        Err("capability check status is invalid".to_string())
+    }
+}
+
+fn validate_capability_error_code(value: &str) -> Result<(), String> {
+    if value.len() > 64
+        || !value.starts_with("MODEL_")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        Err("capability error code is invalid".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -864,6 +989,22 @@ pub struct ConfiguredModelSummary {
     pub temperature: Option<f64>,
     pub timeout_seconds: i64,
     pub configuration_version: i64,
+    pub connection_enabled: bool,
+    pub credential_available: bool,
+    pub capability_checks: Vec<CapabilityCheckSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CapabilityCheckSummary {
+    pub capability: String,
+    pub status: String,
+    pub checked_at: i64,
+    pub error_code: Option<String>,
+    pub retry_after_seconds: Option<i64>,
+    pub model_configuration_version: i64,
+    pub connection_configuration_version: i64,
+    pub credential_version: i64,
 }
 #[tauri::command]
 pub fn model_center_list_providers() -> Vec<provider_registry::ProviderDefinition> {
@@ -1114,5 +1255,114 @@ mod tests {
             .unwrap();
         vault.delete(&reference).unwrap();
         assert!(!center.list_connections().unwrap()[0].has_secret);
+    }
+
+    #[test]
+    fn capability_checks_are_version_bound_and_summary_never_exposes_secret() {
+        let center = center();
+        center.save_connection(connection()).unwrap();
+        center.set_secret("primary", "model-center-secret").unwrap();
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: "probe-model".into(),
+                connection_id: "primary".into(),
+                model_id: "gpt-test".into(),
+                alias: "Probe".into(),
+                enabled: true,
+                capabilities: vec!["text_chat".into(), "structured_json".into()],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+        center
+            .record_capability_check("probe-model", "text_chat", "ready", None, None)
+            .unwrap();
+        let schema: String = center
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT value FROM model_center_meta WHERE key='schema_version'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(schema, "3");
+        let first = center.list_models().unwrap().remove(0);
+        assert!(first.connection_enabled);
+        assert!(first.credential_available);
+        assert_eq!(first.capability_checks.len(), 1);
+        assert_eq!(first.capability_checks[0].capability, "text_chat");
+        assert!(serde_json::to_string(&first)
+            .unwrap()
+            .contains("capability_checks"));
+        assert!(!serde_json::to_string(&first)
+            .unwrap()
+            .contains("model-center-secret"));
+
+        // Editing the model creates a new configuration generation.  The old
+        // probe remains audit data but cannot back the new summary.
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: "probe-model".into(),
+                connection_id: "primary".into(),
+                model_id: "gpt-test-v2".into(),
+                alias: "Probe v2".into(),
+                enabled: true,
+                capabilities: vec!["text_chat".into(), "structured_json".into()],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+        assert!(center.list_models().unwrap()[0].capability_checks.is_empty());
+        let before_stale_probe = center.list_models().unwrap().remove(0).health_status;
+        center.mark_probe_health_for_versions("probe-model", "unavailable", Some("MODEL_TIMEOUT"),
+            (1, 1, 1)).unwrap();
+        assert_eq!(center.list_models().unwrap()[0].health_status, before_stale_probe);
+        center
+            .record_capability_check(
+                "probe-model",
+                "structured_json",
+                "error",
+                Some("MODEL_RATE_LIMITED"),
+                Some(19),
+            )
+            .unwrap();
+        let current = center.list_models().unwrap().remove(0);
+        assert_eq!(current.capability_checks.len(), 1);
+        assert_eq!(current.capability_checks[0].status, "error");
+        assert_eq!(current.capability_checks[0].retry_after_seconds, Some(19));
+        assert!(center
+            .record_capability_check(
+                "probe-model",
+                "structured_json",
+                "error",
+                Some("https://not-an-error-code"),
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn credential_availability_uses_provider_requirement_without_reading_secret() {
+        let center = center();
+        center.save_connection(connection()).unwrap();
+        center
+            .save_model(SaveConfiguredModelInput {
+                configured_model_id: "without-secret".into(),
+                connection_id: "primary".into(),
+                model_id: "gpt-test".into(),
+                alias: "No secret".into(),
+                enabled: true,
+                capabilities: vec!["text_chat".into()],
+                context_window_hint: None,
+                temperature: None,
+                timeout_seconds: None,
+            })
+            .unwrap();
+        assert!(!center.list_models().unwrap()[0].credential_available);
     }
 }

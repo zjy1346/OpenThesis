@@ -8,7 +8,7 @@ approval; neither path exposes long-term credentials to Python.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, timedelta
 from hashlib import sha256
 from io import BytesIO
@@ -18,19 +18,26 @@ import multiprocessing as mp
 import re
 import threading
 import time
+from decimal import Decimal, InvalidOperation
+from .financial_cloud_proof import CloudUnitContext
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from .financial_contracts import QuantityKind, SourceAmount
+from .financial_gateway_proof import GATEWAY_FACT_VERSION, gateway_source_id
+from .financial_cloud_proof import canonical_cloud_source
 from .model_scheduler import shared_model_scheduler
 from .providers import ProviderError
+from .resilience.contracts import Usage
 
 
 VISION_MAX_PAGES = 20
 VISION_MAX_BYTES = 10 * 1024 * 1024
 VISION_TASK_SCHEMA_VERSION = "vision-task-v1"
-MINERU_UPLOAD_PROTOCOL_VERSION = "oss-put-v2"
+MINERU_UPLOAD_PROTOCOL_VERSION = "oss-put-ocr-table-v4"
 
 _VISION_CONCEPT_STATEMENTS = {
     "revenue": "income_statement",
@@ -109,6 +116,27 @@ def _parse_vision_number(value: Any) -> float | None:
     return -abs(parsed) if negative else parsed
 
 
+def _vision_decimal_source_text(value: Any) -> str:
+    """Return an exact JSON numeric token, rejecting already-rounded floats."""
+    if isinstance(value, bool) or value is None or isinstance(value, float):
+        raise ValueError("VISION_SOURCE_DECIMAL_REQUIRED")
+    if isinstance(value, (int, Decimal, str)):
+        token = str(value).strip()
+        # SourceAmount performs the authoritative syntax and precision checks.
+        if token:
+            return token
+    raise ValueError("VISION_SOURCE_DECIMAL_REQUIRED")
+
+
+def _vision_unit_evidence_id(
+    document_id: str, page_no: int, content_hash: str, unit_text: str,
+) -> str:
+    digest = sha256(
+        f"{document_id}|{page_no}|{content_hash}|unit|{unit_text}".encode("utf-8")
+    ).hexdigest()[:32]
+    return f"unit:{digest}"
+
+
 def _unverified_vision_observation(
     row: Mapping[str, Any],
     filing: FilingDocument,
@@ -159,8 +187,20 @@ def _vision_period_start(fiscal_period: str, period_end: str, statement: str) ->
 class VisionAdapterError(RuntimeError):
     """Safe, stable failure; never includes tokens, signed URLs, or payloads."""
 
-    def __init__(self, code: str):
+    def __init__(
+        self,
+        code: str,
+        *,
+        http_status: int | None = None,
+        retry_after_seconds: float = 0.0,
+    ):
         self.code = code
+        self.http_status = http_status if isinstance(http_status, int) and not isinstance(http_status, bool) else None
+        try:
+            retry_after = float(retry_after_seconds)
+        except (TypeError, ValueError, OverflowError):
+            retry_after = 0.0
+        self.retry_after_seconds = min(300.0, retry_after) if math.isfinite(retry_after) and retry_after >= 0 else 0.0
         super().__init__(code)
 
 
@@ -287,8 +327,32 @@ class VisionFallbackConfig:
     language: str = "auto"
     require_page_approval: bool = False
     approval_mode: str = "review_each_plan"
+    # Host-only original policy value. Queue/task remainders are execution
+    # allowances, not configuration changes that invalidate saved candidates.
+    configured_timeout_seconds: float | None = None
 
     def validate(self) -> None:
+        if (isinstance(self.configuration_version, bool)
+                or not isinstance(self.configuration_version, int) or self.configuration_version < 1):
+            raise VisionAdapterError("VISION_CONFIGURATION_VERSION_INVALID")
+        timeout = self.timeout_seconds
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError, OverflowError):
+            timeout_value = math.nan
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float, Decimal))
+            or not math.isfinite(timeout_value)
+            or timeout_value <= 0
+        ):
+            raise VisionAdapterError("VISION_TIMEOUT_INVALID")
+        if self.configured_timeout_seconds is not None and (
+                isinstance(self.configured_timeout_seconds, bool)
+                or not isinstance(self.configured_timeout_seconds, (int, float, Decimal))
+                or not math.isfinite(float(self.configured_timeout_seconds))
+                or float(self.configured_timeout_seconds) <= 0):
+            raise VisionAdapterError("VISION_TIMEOUT_INVALID")
         if not self.enabled:
             return
         if not self.consent:
@@ -314,6 +378,9 @@ class VisionPageRequest:
     source_url: str = ""
     source_document: str = ""
     content_hash: str = ""
+    # Locally observed document-wide presentation declarations. They are not
+    # uploaded to the provider and cannot stand in for a table's own unit.
+    unit_contexts: tuple[CloudUnitContext, ...] = ()
 
     def __post_init__(self) -> None:
         if self.original_page < 1:
@@ -323,6 +390,10 @@ class VisionPageRequest:
             raise ValueError("page_hash_mismatch")
         if not self.content_hash:
             object.__setattr__(self, "content_hash", digest)
+        contexts = tuple(self.unit_contexts)
+        if any(not isinstance(item, CloudUnitContext) for item in contexts):
+            raise ValueError("VISION_UNIT_CONTEXT_INVALID")
+        object.__setattr__(self, "unit_contexts", contexts)
 
 
 FinancialPageRequest = VisionPageRequest
@@ -470,6 +541,16 @@ class VisionExtractionResult:
     evidence: tuple[EvidenceRef, ...] = ()
     diagnostics: tuple[str, ...] = ()
     error_code: str | None = None
+    retry_after_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        try:
+            value = float(self.retry_after_seconds)
+        except (TypeError, ValueError, OverflowError):
+            value = 0.0
+        if isinstance(self.retry_after_seconds, bool) or not math.isfinite(value) or value < 0:
+            value = 0.0
+        object.__setattr__(self, "retry_after_seconds", min(300.0, value))
 
     @property
     def ok(self) -> bool:
@@ -512,6 +593,8 @@ def _provider_identity(config: VisionFallbackConfig) -> str:
             f"configured_model:{config.configured_model_id}:"
             f"configuration-{config.configuration_version}"
         )
+    if config.provider == "mineru_flash":
+        return f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}"
     return config.provider
 
 
@@ -521,18 +604,30 @@ def _serialize_vision_result(result: VisionExtractionResult) -> dict[str, Any]:
         "evidence": [item.to_dict() for item in result.evidence],
         "diagnostics": list(result.diagnostics),
         "error_code": result.error_code,
+        "retry_after_seconds": result.retry_after_seconds,
     }
 
 
 def _deserialize_vision_result(payload: Mapping[str, Any]) -> VisionExtractionResult | None:
     try:
-        facts = tuple(FinancialFact(**dict(item)) for item in payload.get("facts", ()))
-        evidence = tuple(EvidenceRef(**dict(item)) for item in payload.get("evidence", ()))
+        def bbox_fields(item, key):
+            value = dict(item)
+            if value.get(key) is not None:
+                box = value[key]
+                if (not isinstance(box, (list, tuple)) or len(box) != 4
+                        or any(isinstance(point, bool) or not isinstance(point, (int, float))
+                               or not math.isfinite(point) for point in box)):
+                    raise ValueError("VISION_GEOMETRY_INVALID")
+                value[key] = tuple(box)
+            return value
+        facts = tuple(FinancialFact(**bbox_fields(item, "source_bbox")) for item in payload.get("facts", ()))
+        evidence = tuple(EvidenceRef(**bbox_fields(item, "bbox")) for item in payload.get("evidence", ()))
         diagnostics = tuple(str(item) for item in payload.get("diagnostics", ()))
         error_code = payload.get("error_code")
-        if error_code is not None or not facts:
+        retry_after = payload.get("retry_after_seconds", 0.0)
+        if error_code is not None or (not facts and not any(ref.evidence_id.startswith("cell-map:") for ref in evidence)):
             return None
-        return VisionExtractionResult(facts, evidence, diagnostics, None)
+        return VisionExtractionResult(facts, evidence, diagnostics, None, retry_after)
     except (TypeError, ValueError):
         return None
 
@@ -543,9 +638,27 @@ class VisionHttpResponse:
     headers: Mapping[str, str] = field(default_factory=dict)
 
     def json(self) -> Any:
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate JSON object key")
+                result[key] = value
+            return result
+
+        def reject_nonfinite(token: str) -> Any:
+            raise ValueError(f"nonfinite JSON constant: {token}")
+
         try:
-            return json.loads(self.body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            # Keep source number tokens as Decimal; a binary float here would
+            # make the later source-to-canonical lineage unverifiable.
+            return json.loads(
+                self.body.decode("utf-8"),
+                parse_float=Decimal,
+                parse_constant=reject_nonfinite,
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             raise VisionAdapterError("VISION_MALFORMED_RESPONSE") from exc
 
 
@@ -732,117 +845,344 @@ class MineruFlashAdapter:
         self.clock = clock
         self.journal = journal
 
+    @staticmethod
+    def _retry_after(response: VisionHttpResponse) -> float | None:
+        value = next(
+            (item for key, item in response.headers.items() if str(key).casefold() == "retry-after"),
+            None,
+        )
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return min(300.0, seconds)
+
+    def _remaining(self, deadline: float, cancel_check: Callable[[], bool] | None) -> float:
+        if cancel_check and cancel_check():
+            raise VisionAdapterError("VISION_CANCELLED")
+        remaining = deadline - self.clock()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise VisionAdapterError("VISION_TIMEOUT")
+        return remaining
+
+    def _usage(self, recovery_context: Any, *, calls: int = 0, pages: int = 0) -> None:
+        if recovery_context is None:
+            return
+        checkpoint = getattr(recovery_context, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint()
+        consume = getattr(recovery_context, "consume", None)
+        if callable(consume):
+            consume(Usage(calls=calls, pages=pages))
+
     def _request(
         self,
         method: str,
         url: str,
-        config: VisionFallbackConfig,
         *,
+        deadline: float,
+        recovery_context: Any = None,
         headers: Mapping[str, str] | None = None,
         body: bytes | None = None,
         cancel_check: Callable[[], bool] | None = None,
     ) -> VisionHttpResponse:
-        """Retry only bounded network/server failures, never auth or payload errors."""
+        """Issue a deadline-bound request; only an unjournaled GET may retry once."""
 
-        deadline = self.clock() + max(0.01, config.timeout_seconds)
+        method = method.upper()
+        safe_url = _https_url(url)
         attempts = 0
         while True:
-            if cancel_check and cancel_check():
-                raise VisionAdapterError("VISION_CANCELLED")
+            self._remaining(deadline, cancel_check)
+            self._usage(recovery_context, calls=1)
+            timeout = self._remaining(deadline, cancel_check)
             try:
                 response = self.transport.request(
-                    method, _https_url(url), headers=headers, body=body,
-                    timeout=max(0.01, deadline - self.clock()),
+                    method, safe_url, headers=headers, body=body, timeout=timeout,
                 )
             except (VisionAdapterError, OSError, TimeoutError) as exc:
                 error_code = exc.code if isinstance(exc, VisionAdapterError) else "VISION_NETWORK_ERROR"
-                if error_code != "VISION_NETWORK_ERROR" or attempts >= 1:
+                can_retry = (
+                    method == "GET"
+                    and recovery_context is None
+                    and attempts == 0
+                    and error_code == "VISION_NETWORK_ERROR"
+                )
+                if not can_retry:
                     if isinstance(exc, VisionAdapterError):
                         raise
                     raise VisionAdapterError("VISION_NETWORK_ERROR") from exc
                 delay = 0.1
-                attempts += 1
-                if self.clock() + delay >= deadline:
+                if self._remaining(deadline, cancel_check) <= delay:
                     raise VisionAdapterError("VISION_TIMEOUT") from exc
+                attempts += 1
                 self.sleep(delay)
                 continue
-            if response.status in {401, 403}:
-                raise VisionAdapterError(_safe_error(response))
-            retryable = response.status == 429 or 500 <= response.status < 600
-            if not retryable:
-                if response.status >= 400:
-                    raise VisionAdapterError(_safe_error(response))
-                return response
-            if attempts >= 1:
-                raise VisionAdapterError(_safe_error(response))
-            retry_after = next(
-                (value for key, value in response.headers.items() if str(key).lower() == "retry-after"),
-                "",
-            )
-            try:
-                delay = max(0.0, float(retry_after))
-            except (TypeError, ValueError):
-                # A 429 without a valid server budget is not retried; 5xx gets
-                # one short bounded retry.
-                if response.status == 429:
-                    raise VisionAdapterError("VISION_RATE_LIMITED")
-                delay = 0.1
-            attempts += 1
-            if self.clock() + delay >= deadline:
-                raise VisionAdapterError("VISION_TIMEOUT")
-            if cancel_check and cancel_check():
-                raise VisionAdapterError("VISION_CANCELLED")
-            self.sleep(delay)
 
-    def _poll(self, url: str, config: VisionFallbackConfig, cancel_check):
-        deadline = self.clock() + max(0.01, config.timeout_seconds)
-        while self.clock() < deadline:
-            if cancel_check and cancel_check():
-                raise VisionAdapterError("VISION_CANCELLED")
-            response = self._request("GET", url, config, cancel_check=cancel_check)
-            payload = response.json()
-            state = str(_json_value(payload, "state", "status", "data.state") or "").lower()
-            if state in {"success", "succeeded", "done", "completed"}:
-                return payload
-            if state in {"failed", "error", "cancelled"}:
-                raise VisionAdapterError("VISION_REMOTE_FAILED")
-            self.sleep(min(2.0, max(0.01, deadline - self.clock())))
-        raise VisionAdapterError("VISION_TIMEOUT")
+            if response.status >= 400:
+                retry_after = self._retry_after(response) if response.status == 429 else None
+                retry_delay = retry_after if retry_after is not None else 0.1
+                retryable_get = (
+                    method == "GET"
+                    and recovery_context is None
+                    and attempts == 0
+                    and (500 <= response.status < 600 or (response.status == 429 and retry_after is not None))
+                )
+                if retryable_get:
+                    if self._remaining(deadline, cancel_check) <= retry_delay:
+                        raise VisionAdapterError("VISION_TIMEOUT")
+                    attempts += 1
+                    self.sleep(retry_delay)
+                    continue
+                raise VisionAdapterError(
+                    _safe_error(response),
+                    http_status=response.status,
+                    retry_after_seconds=retry_after or 0.0,
+                )
 
-    def _save_journal(self, task_key: str, filing: FilingDocument, page: VisionPageRequest, *, status: str, remote_task_id: str = "", error_code: str = "") -> None:
+            # A late GET result must not be interpreted or published. POST is
+            # different: its task id still has to be journaled by the caller.
+            if method == "GET":
+                self._remaining(deadline, cancel_check)
+            return response
+
+    def _save_journal(
+        self,
+        task_key: str,
+        filing: FilingDocument,
+        page: VisionPageRequest,
+        *,
+        status: str,
+        remote_task_id: str = "",
+        error_code: str = "",
+    ) -> None:
         if self.journal is None:
             return
-        self.journal.save_vision_task(
-            task_key,
-            company_cik=filing.company_cik,
-            document_id=filing.document_id,
-            provider="mineru_flash",
-            page_hashes=(page.content_hash,),
-            page_numbers=(page.original_page,),
-            status=status,
-            remote_task_id=remote_task_id,
-            error_code=error_code,
-        )
-
-    def extract(self, company, filing, pages, config, *, cancel_check=None):
         try:
+            self.journal.save_vision_task(
+                task_key,
+                company_cik=filing.company_cik,
+                document_id=filing.document_id,
+                provider="mineru_flash",
+                page_hashes=(page.content_hash,),
+                page_numbers=(page.original_page,),
+                status=status,
+                remote_task_id=remote_task_id,
+                error_code=error_code,
+            )
+        except ValueError as exc:
+            if str(exc) == "VISION_TASK_IDENTITY_CONFLICT":
+                raise VisionAdapterError("VISION_RECOVERY_BLOCKED") from exc
+            raise
+
+    @staticmethod
+    def _identity_matches(prior: Mapping[str, Any], filing: FilingDocument, page: VisionPageRequest) -> bool:
+        expected = {
+            "company_cik": filing.company_cik,
+            "document_id": filing.document_id,
+            "provider": "mineru_flash",
+        }
+        for key, value in expected.items():
+            stored = prior.get(key)
+            if stored not in (None, "") and stored != value:
+                return False
+        for key, value in (("page_hashes", (page.content_hash,)), ("page_numbers", (page.original_page,))):
+            stored = prior.get(key)
+            if stored not in (None, "", (), []):
+                try:
+                    if tuple(stored) != value:
+                        return False
+                except TypeError:
+                    return False
+        return True
+
+    @staticmethod
+    def _page_cache_valid(
+        payload: Mapping[str, Any], company: Company, filing: FilingDocument, page: VisionPageRequest,
+    ) -> VisionExtractionResult | None:
+        if (
+            payload.get("cache_schema") != f"{VISION_TASK_SCHEMA_VERSION}:{MINERU_UPLOAD_PROTOCOL_VERSION}:page-candidate-v1"
+            or payload.get("filing_hash") != filing.content_hash
+            or payload.get("page_hash") != page.content_hash
+            or payload.get("original_page") != page.original_page
+        ):
+            return None
+        restored = _deserialize_vision_result(payload)
+        if restored is None:
+            return None
+        evidence_by_id = {evidence.evidence_id: evidence for evidence in restored.evidence}
+        is_table = all(fact.parser_version == "vision-markdown-v4" for fact in restored.facts)
+        if not restored.evidence or any(evidence.document_id != filing.document_id
+                or evidence.content_hash != (filing.content_hash if is_table else page.content_hash)
+                or (not is_table and evidence.locator != f"page:{page.original_page}")
+                for evidence in restored.evidence):
+            return None
+        for fact in restored.facts:
+            lineage = fact.normalization_lineage
+            if (
+                fact.company_cik != company.security_id
+                or fact.source_document != filing.primary_document
+                or fact.source_page != page.original_page
+                or (not is_table and fact.end_date != filing.period_end)
+                or fact.currency != company.reporting_currency.upper()
+                or lineage is None
+                or not lineage.unit_evidence_ids
+                or f"fact:{fact.fact_id}" not in evidence_by_id
+                or any(item not in evidence_by_id for item in lineage.unit_evidence_ids)
+            ):
+                return None
+            try:
+                normalized = SourceAmount(
+                    lineage.raw_value,
+                    lineage.scale,
+                    QuantityKind(lineage.quantity_kind),
+                    lineage.currency,
+                    lineage.unit_evidence_ids,
+                    value_transform=lineage.value_transform,
+                ).normalize()
+                if (
+                    normalized.normalized_value != lineage.normalized_value
+                    or lineage.currency != fact.currency
+                    or float(Decimal(normalized.normalized_value)) != fact.value
+                ):
+                    return None
+            except (InvalidOperation, TypeError, ValueError, OverflowError):
+                return None
+            if is_table:
+                from .financial_cloud_proof import cloud_table_source_issue
+                if cloud_table_source_issue(fact, evidence_by_id[f"fact:{fact.fact_id}"], evidence_by_id):
+                    return None
+                proof = evidence_by_id[fact.classification_evidence_ids[0]]
+                source = json.loads(proof.excerpt)
+                from dataclasses import asdict
+                if (source.get("unit_contexts") != [asdict(item) for item in page.unit_contexts]
+                        or source.get("page_hash") != page.content_hash
+                        or source.get("period_end") != filing.period_end):
+                    return None
+        return restored
+
+    def _cached_page_result(
+        self, key: str, company: Company, filing: FilingDocument, page: VisionPageRequest,
+    ) -> VisionExtractionResult | None:
+        load = getattr(self.journal, "get_vision_result", None) if self.journal is not None else None
+        if not callable(load):
+            return None
+        payload = load(key)
+        if not isinstance(payload, Mapping):
+            return None
+        return self._page_cache_valid(payload, company, filing, page)
+
+    def _page_markdown(self, key, filing, page, markdown=None):
+        """Retain a bound raw OCR receipt even when financial parsing fails.
+
+        Source retention is not admission. A resumed parse still uses current
+        unit contexts and crosses the independent compiler. Signed download
+        URLs and credentials are deliberately absent from this receipt.
+        """
+        load = getattr(self.journal, "get_vision_result", None)
+        save = getattr(self.journal, "save_vision_result", None)
+        identity = {"schema": "mineru-source-markdown-v1", "provider": "mineru_flash",
+            "protocol": MINERU_UPLOAD_PROTOCOL_VERSION, "company_cik": filing.company_cik,
+            "document_id": filing.document_id, "filing_hash": filing.content_hash,
+            "original_page": page.original_page, "page_hash": page.content_hash}
+        source_key = key + ":source-markdown"
+        if markdown is None:
+            payload = load(source_key) if callable(load) else None
+            if not isinstance(payload, Mapping) or any(payload.get(k) != v for k, v in identity.items()):
+                return None
+            text = payload.get("markdown")
+            if not isinstance(text, str) or len(text.encode("utf-8")) > 4 * 1024 * 1024:
+                return None
+            if sha256(text.encode("utf-8")).hexdigest() != payload.get("markdown_sha256"):
+                return None
+            return text
+        if len(markdown.encode("utf-8")) > 4 * 1024 * 1024:
+            raise VisionAdapterError("VISION_MARKDOWN_SIZE_LIMIT")
+        if callable(save):
+            save(source_key, {**identity, "markdown": markdown,
+                "markdown_sha256": sha256(markdown.encode("utf-8")).hexdigest()})
+        return markdown
+
+    def _save_page_result(
+        self, key: str, result: VisionExtractionResult, filing: FilingDocument, page: VisionPageRequest,
+    ) -> None:
+        save = getattr(self.journal, "save_vision_result", None) if self.journal is not None else None
+        if not callable(save) or result.error_code is not None or not result.facts:
+            return
+        payload = _serialize_vision_result(result)
+        payload.update({
+            "cache_schema": f"{VISION_TASK_SCHEMA_VERSION}:{MINERU_UPLOAD_PROTOCOL_VERSION}:page-candidate-v1",
+            "filing_hash": filing.content_hash,
+            "page_hash": page.content_hash,
+            "original_page": page.original_page,
+        })
+        save(key, payload)
+
+    def _poll(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        recovery_context: Any = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> tuple[Mapping[str, Any], bool]:
+        encoded_id = quote(task_id, safe="").replace(".", "%2E")
+        url = self.endpoint + "/parse/" + encoded_id
+        while True:
+            response = self._request(
+                "GET", url, deadline=deadline, recovery_context=recovery_context,
+                cancel_check=cancel_check,
+            )
+            payload = response.json()
+            state = str(_json_value(payload, "state", "status", "data.state") or "").casefold()
+            if state in {"success", "succeeded", "done", "completed"}:
+                return payload, False
+            if state in {"failed", "error", "cancelled"}:
+                raise VisionAdapterError("VISION_REMOTE_FAILED")
+            if recovery_context is not None:
+                return payload, True
+            remaining = self._remaining(deadline, cancel_check)
+            self.sleep(min(2.0, remaining))
+
+    def extract(
+        self,
+        company,
+        filing,
+        pages,
+        config,
+        *,
+        cancel_check=None,
+        recovery_context=None,
+        remote_task_id="",
+    ):
+        current_page: VisionPageRequest | None = None
+        page_task_key = ""
+        task_id = ""
+        remote_state = ""
+        submission_started = False
+        explicit_rejection = False
+        deadline = 0.0
+        facts: list[FinancialFact] = []
+        refs: list[EvidenceRef] = []
+        diagnostics: list[str] = []
+        page_errors: list[str] = []
+        try:
+            config.validate()
+            deadline = self.clock() + float(config.timeout_seconds)
             _check_request(config, pages, filing)
             if config.provider != "mineru_flash":
                 raise VisionAdapterError("VISION_PROVIDER_UNSUPPORTED")
-            facts: list[FinancialFact] = []
-            refs: list[EvidenceRef] = []
-            diagnostics: list[str] = []
-            page_errors: list[str] = []
-            page_task_key = ""
-            current_page: VisionPageRequest | None = None
-            task_id = ""
-            remote_state = ""
+            if remote_task_id and len(pages) != 1:
+                raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+
             for page in pages:
                 current_page = page
                 task_id = ""
                 remote_state = ""
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
+                submission_started = False
+                explicit_rejection = False
+                self._remaining(deadline, cancel_check)
                 page_task_key = vision_task_key(
                     f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}",
                     filing.content_hash,
@@ -850,61 +1190,157 @@ class MineruFlashAdapter:
                     namespace="page",
                 )
                 prior = self.journal.get_vision_task(page_task_key) if self.journal is not None else None
-                prior_status = str(prior.get("status") or "") if prior else ""
-                if prior_status == "created":
-                    # The service cannot prove that the prior upload completed.
-                    # Polling could incorrectly treat an empty remote task as a
-                    # valid parse, while re-uploading could duplicate disclosure.
+                if prior and not self._identity_matches(prior, filing, page):
                     raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
-                if prior and prior.get("remote_task_id") and prior_status in {"uploaded", "running", "completed"}:
-                    task_id = str(prior["remote_task_id"])
-                    remote_state = prior_status
+                prior_status = str(prior.get("status") or "") if prior else ""
+                stored_task_id = str(prior.get("remote_task_id") or "") if prior else ""
+                if remote_task_id and stored_task_id and remote_task_id != stored_task_id:
+                    raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+                task_id = stored_task_id or (str(remote_task_id) if remote_task_id else "")
+
+                source_markdown = self._page_markdown(page_task_key, filing, page)
+                if source_markdown is not None:
+                    candidate = parse_vision_markdown(source_markdown, company, filing, (page,))
+                    facts.extend(candidate.facts)
+                    refs.extend(candidate.evidence)
+                    diagnostics.extend((*candidate.diagnostics, "VISION_SOURCE_MARKDOWN_CACHE_HIT"))
+                    if candidate.error_code:
+                        page_errors.append(candidate.error_code)
+                    else:
+                        self._save_page_result(page_task_key, candidate, filing, page)
+                    continue
+
+                cached = self._cached_page_result(page_task_key, company, filing, page)
+                if cached is not None:
+                    # Older candidate caches already carry the complete bound
+                    # table proof. Migrate its raw text locally, without a new
+                    # upload or download; invalid proofs were rejected above.
+                    proof = next((ref for ref in cached.evidence if ref.evidence_id.startswith("vision-table:")), None)
+                    if proof is not None:
+                        self._page_markdown(page_task_key, filing, page, json.loads(proof.excerpt)["markdown"])
+                    facts.extend(cached.facts)
+                    refs.extend(cached.evidence)
+                    diagnostics.extend(cached.diagnostics)
+                    diagnostics.append("VISION_PAGE_RESULT_CACHE_HIT")
+                    continue
+
+                if task_id:
+                    if prior_status not in {"created", "uploaded", "running", "failed", "completed"} and not remote_task_id:
+                        raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+                    remote_state = prior_status or "running"
+                elif prior:
+                    if prior_status in {"submitting", "submission_unknown"}:
+                        raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+                    if prior_status != "rejected":
+                        # A journal row with no handle and no explicit provider
+                        # rejection is never evidence that another POST is safe.
+                        raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+
+                if remote_task_id and not task_id:
+                    task_id = str(remote_task_id)
+                    remote_state = "running"
+                    self._save_journal(page_task_key, filing, page, status="running", remote_task_id=task_id)
+
                 payload = {
                     "file_name": f"failed-page-{page.original_page}.pdf",
                     "language": config.language if config.language in {"ch", "en"} else ("ch" if company.market == "CN_A" else "en"),
                     "enable_table": True,
-                    "is_ocr": False,
+                    "is_ocr": True,
                     "enable_formula": False,
                 }
+
                 if not task_id:
+                    claim = getattr(self.journal, "claim_vision_task", None) if self.journal is not None else None
+                    if callable(claim):
+                        try:
+                            claimed = claim(
+                                page_task_key,
+                                company_cik=filing.company_cik,
+                                document_id=filing.document_id,
+                                provider="mineru_flash",
+                                page_hashes=(page.content_hash,),
+                                page_numbers=(page.original_page,),
+                            )
+                        except ValueError as exc:
+                            if str(exc) == "VISION_TASK_IDENTITY_CONFLICT":
+                                raise VisionAdapterError("VISION_RECOVERY_BLOCKED") from exc
+                            raise
+                        if not claimed:
+                            raise VisionAdapterError("VISION_RECOVERY_BLOCKED")
+                    else:
+                        self._save_journal(page_task_key, filing, page, status="submitting")
+                    remote_state = "submitting"
+                    self._remaining(deadline, cancel_check)
+                    self._usage(recovery_context, pages=1)
+                    self._remaining(deadline, cancel_check)
+                    record_intent = getattr(recovery_context, "record_external_intent", None)
+                    if callable(record_intent):
+                        record_intent()
+                    self._remaining(deadline, cancel_check)
+                    submission_started = True
                     response = self._request(
-                        "POST",
-                        self.endpoint + "/parse/file",
-                        config,
+                        "POST", self.endpoint + "/parse/file", deadline=deadline,
+                        recovery_context=recovery_context,
                         headers={"Content-Type": "application/json"},
-                        body=json.dumps(payload).encode("utf-8"),
-                        cancel_check=cancel_check,
+                        body=json.dumps(payload).encode("utf-8"), cancel_check=cancel_check,
                     )
                     data = response.json()
+                    raw_task_id = _json_value(data, "data.task_id")
+                    if isinstance(raw_task_id, (str, int)) and not isinstance(raw_task_id, bool):
+                        candidate_task_id = str(raw_task_id)
+                        task_id = candidate_task_id if candidate_task_id and len(candidate_task_id) <= 256 else ""
+                    if task_id:
+                        remote_state = "created"
+                        self._save_journal(page_task_key, filing, page, status="created", remote_task_id=task_id)
+                        record_task = getattr(recovery_context, "record_external_task", None)
+                        if callable(record_task):
+                            record_task(task_id)
                     _ensure_business_success(data)
-                    task_id = str(_json_value(data, "data.task_id") or "")
-                    file_url = _https_url(_json_value(data, "data.file_url"))
-                    if not task_id:
+                    if not task_id or len(task_id) > 256:
                         raise VisionAdapterError("VISION_MALFORMED_RESPONSE")
-                    # ``created`` means the upload is not known to have
-                    # completed. A restart blocks instead of guessing whether
-                    # the signed upload was consumed.
-                    self._save_journal(page_task_key, filing, page, status="created", remote_task_id=task_id)
-                    remote_state = "created"
-                    if cancel_check and cancel_check():
-                        raise VisionAdapterError("VISION_CANCELLED")
-                    self._request("PUT", file_url, config, body=page.pdf_bytes, cancel_check=cancel_check)
+                    file_url = _https_url(_json_value(data, "data.file_url"))
+                    # Keep the remote handle even if the POST completed after
+                    # the deadline; the next turn can query, never resubmit.
+                    self._remaining(deadline, cancel_check)
+                    self._request(
+                        "PUT", file_url, deadline=deadline,
+                        recovery_context=recovery_context, body=page.pdf_bytes,
+                        cancel_check=cancel_check,
+                    )
                     self._save_journal(page_task_key, filing, page, status="uploaded", remote_task_id=task_id)
                     remote_state = "uploaded"
-                self._save_journal(page_task_key, filing, page, status="running", remote_task_id=task_id)
-                remote_state = "running"
-                result = self._poll(self.endpoint + "/parse/" + str(task_id), config, cancel_check)
+
+                self._remaining(deadline, cancel_check)
+                if remote_state != "running":
+                    self._save_journal(page_task_key, filing, page, status="running", remote_task_id=task_id)
+                    remote_state = "running"
+                result, pending = self._poll(
+                    task_id, deadline=deadline, recovery_context=recovery_context,
+                    cancel_check=cancel_check,
+                )
+                if pending:
+                    self._save_journal(page_task_key, filing, page, status="running", remote_task_id=task_id)
+                    return VisionExtractionResult(
+                        tuple(facts), tuple(refs), tuple(diagnostics) + ("VISION_PENDING",), "VISION_PENDING",
+                    )
                 markdown_url = _https_url(_json_value(result, "data.markdown_url", "data.result.markdown_url"))
-                if cancel_check and cancel_check():
-                    raise VisionAdapterError("VISION_CANCELLED")
-                markdown = self._request("GET", markdown_url, config, cancel_check=cancel_check)
-                candidate = parse_vision_markdown(markdown.body.decode("utf-8", errors="strict"), company, filing, (page,))
+                markdown = self._request(
+                    "GET", markdown_url, deadline=deadline,
+                    recovery_context=recovery_context, cancel_check=cancel_check,
+                )
+                source_markdown = self._page_markdown(page_task_key, filing, page,
+                    markdown.body.decode("utf-8", errors="strict"))
+                candidate = parse_vision_markdown(source_markdown, company, filing, (page,))
                 facts.extend(candidate.facts)
                 refs.extend(candidate.evidence)
                 diagnostics.extend(candidate.diagnostics)
                 if candidate.error_code:
                     page_errors.append(candidate.error_code)
+                if candidate.error_code is None and candidate.facts:
+                    self._save_page_result(page_task_key, candidate, filing, page)
                 self._save_journal(page_task_key, filing, page, status="completed", remote_task_id=task_id)
+                remote_state = "completed"
+
             if not facts:
                 error_code = page_errors[0] if page_errors else "VISION_NO_CANDIDATES"
                 return VisionExtractionResult((), (), tuple(diagnostics) + (error_code,), error_code)
@@ -913,26 +1349,39 @@ class MineruFlashAdapter:
                 page_errors[0] if page_errors else None,
             )
         except UnicodeDecodeError:
-            return VisionExtractionResult(diagnostics=("VISION_MALFORMED_RESPONSE",), error_code="VISION_MALFORMED_RESPONSE")
-        except VisionAdapterError as exc:
-            if (
-                exc.code != "VISION_RECOVERY_BLOCKED"
-                and self.journal is not None
-                and current_page is not None
-                and page_task_key
-            ):
+            caught = VisionAdapterError("VISION_MALFORMED_RESPONSE")
+        except VisionAdapterError as vision_exc:
+            caught = vision_exc
+
+        if (
+            self.journal is not None
+            and current_page is not None
+            and page_task_key
+            and caught.code != "VISION_RECOVERY_BLOCKED"
+        ):
+            if not task_id and caught.http_status in {401, 403, 429} and submission_started:
+                reject = getattr(recovery_context, "record_external_rejection", None)
+                if callable(reject):
+                    reject(caught.http_status)
+                explicit_rejection = True
+            status = (
+                "rejected" if explicit_rejection
+                else "submission_unknown" if submission_started and not task_id
+                else "created" if task_id and remote_state in {"created", "submitting"}
+                else "failed" if task_id
+                else remote_state or "failed"
+            )
+            try:
                 self._save_journal(
-                    page_task_key,
-                    filing,
-                    current_page,
-                    # A failed/aborted PUT has an unknowable remote outcome.
-                    # Keep ``created`` so restart blocks instead of creating a
-                    # second chargeable task or polling an unproven upload.
-                    status="created" if remote_state == "created" else "failed",
-                    remote_task_id=task_id,
-                    error_code=exc.code,
+                    page_task_key, filing, current_page, status=status,
+                    remote_task_id=task_id, error_code=caught.code,
                 )
-            return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
+            except VisionAdapterError as save_exc:
+                caught = save_exc
+        return VisionExtractionResult(
+            diagnostics=(caught.code,), error_code=caught.code,
+            retry_after_seconds=caught.retry_after_seconds,
+        )
 class GatewayVisionAdapter:
     """Render failed pages locally, then call only the Rust credential gateway."""
 
@@ -946,7 +1395,12 @@ class GatewayVisionAdapter:
         self._uses_default_renderer = image_renderer is None
         self.image_renderer = image_renderer or default_pdf_to_png
 
-    def extract(self, company, filing, pages, config, *, cancel_check=None):
+    def extract(self, company, filing, pages, config, *, cancel_check=None, recovery_context=None):
+        deadline = time.monotonic() + float(config.timeout_seconds)
+
+        def budget_cancel():
+            return bool(cancel_check and cancel_check()) or time.monotonic() >= deadline
+
         try:
             _check_request(config, pages, filing)
             if not config.configured_model_id:
@@ -955,45 +1409,87 @@ class GatewayVisionAdapter:
             refs: list[EvidenceRef] = []
             diagnostics: list[str] = []
             page_errors: list[str] = []
+            scope = getattr(self.provider, "for_request_budget", None)
+            provider = scope(deadline, cancel_check) if callable(scope) else self.provider
             for page in pages:
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
                 if self._uses_default_renderer:
-                    image = default_pdf_to_png(page.pdf_bytes, cancel_check=cancel_check)
+                    image = default_pdf_to_png(page.pdf_bytes, cancel_check=budget_cancel)
                 else:
                     image = self.image_renderer(page.pdf_bytes)
                 if not image:
                     raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
+                if time.monotonic() >= deadline:
+                    raise VisionAdapterError("VISION_TIMEOUT")
                 prompt = (
                     "Return JSON only with this shape: "
                     "{facts:[{concept,value,currency,unit_scale,unit_text,statement,"
                     "scope,scope_text,period_end,period_text,original_page,raw_text}],"
-                    "observations:[{label,value_text,original_page,raw_text}]}. "
+                    "observations:[{label,value_text,original_page,raw_text}],"
+                    "cell_mappings:[{concept,label,row_quote,original_page}]}. "
                     f"Use only original_page {page.original_page}; prefer consolidated "
                     "scope, preserve the stated period and currency, and omit uncertain facts. "
                     "For every fact quote unit_text, scope_text, and period_text verbatim "
                     "from the page and include all three in raw_text with the numeric row. "
                     "Only emit supported standard concepts; put other visible numeric metrics "
                     "in observations as text, never as facts. Observations are unverified "
-                    "and must not be used for calculations."
+                    "and must not be used for calculations. If an unfamiliar row label needs "
+                    "semantic interpretation, optionally emit cell_mappings with its exact "
+                    "label and complete row_quote (including every displayed column), never "
+                    "a value, scale, currency or date override. The host rereads that original "
+                    "row and the statement context; a mapping is not an admitted fact."
                 )
                 scheduler = shared_model_scheduler(
                     config.connection_id or config.configured_model_id,
                     limit=2,
                 )
                 try:
-                    with scheduler.slot(cancel_check):
-                        structured = self.provider.generate_vision(
+                    with scheduler.slot(budget_cancel):
+                        once = getattr(provider, "generate_vision_once", None)
+                        system = (
                             "Extract candidate financial facts from one approved filing page. "
                             "Do not infer missing values or use outside knowledge. "
-                            "Never promote segment, custom, or ambiguous metrics to financial facts.",
-                            prompt,
-                            image,
+                            "Never promote segment, custom, or ambiguous metrics to financial facts."
                         )
+                        for json_mode in (True, False):
+                            if cancel_check and cancel_check():
+                                raise VisionAdapterError("VISION_CANCELLED")
+                            if time.monotonic() >= deadline:
+                                raise VisionAdapterError("VISION_TIMEOUT")
+                            if recovery_context is not None:
+                                recovery_context.checkpoint()
+                                recovery_context.consume(Usage(calls=1, pages=int(json_mode)))
+                                # Each wire intent is durable. A known rejected
+                                # format may be retried, an unknown outcome may not.
+                                recovery_context.record_external_intent()
+                            try:
+                                structured = (
+                                    once(system, prompt, image, json_mode=json_mode)
+                                    if callable(once) else provider.generate_vision(system, prompt, image)
+                                )
+                                break
+                            except ProviderError as exc:
+                                format_rejected = (
+                                    exc.code == "MODEL_RESPONSE_FORMAT_UNSUPPORTED"
+                                    and type(exc.http_status) is int and exc.http_status in {400, 422}
+                                )
+                                if format_rejected and recovery_context is not None:
+                                    recovery_context.record_external_rejection(
+                                        exc.http_status, reason="response_format_unsupported")
+                                if format_rejected and json_mode and callable(once):
+                                    continue
+                                raise
                     scheduler.mark_success()
                 except InterruptedError as exc:
-                    raise VisionAdapterError("VISION_CANCELLED") from exc
+                    raise VisionAdapterError("VISION_TIMEOUT" if time.monotonic() >= deadline
+                                             and not (cancel_check and cancel_check()) else "VISION_CANCELLED") from exc
                 except ProviderError as exc:
+                    if exc.code == "MODEL_CANCELLED":
+                        raise VisionAdapterError("VISION_CANCELLED") from exc
+                    rejected_status = {"MODEL_UNAUTHORIZED": 401, "MODEL_RATE_LIMITED": 429}.get(exc.code)
+                    if recovery_context is not None and rejected_status is not None:
+                        recovery_context.record_external_rejection(rejected_status)
                     if exc.code == "MODEL_RATE_LIMITED":
                         scheduler.mark_rate_limited(exc.retry_after_seconds)
                     if exc.code == "MODEL_TIMEOUT":
@@ -1001,7 +1497,9 @@ class GatewayVisionAdapter:
                     if exc.code in {"MODEL_UNAUTHORIZED", "MODEL_CREDENTIAL_MISSING"}:
                         raise VisionAdapterError("VISION_UNAUTHORIZED") from exc
                     if exc.code == "MODEL_RATE_LIMITED":
-                        raise VisionAdapterError("VISION_RATE_LIMITED") from exc
+                        raise VisionAdapterError("VISION_RATE_LIMITED", retry_after_seconds=exc.retry_after_seconds or 0.0) from exc
+                    if exc.code == "MODEL_RESPONSE_FORMAT_UNSUPPORTED":
+                        raise VisionAdapterError("VISION_MODEL_FORMAT_UNSUPPORTED") from exc
                     raise VisionAdapterError("VISION_MODEL_ERROR") from exc
                 structured.pop("_response_meta", None)
                 candidate = parse_vision_json(structured, company, filing, (page,))
@@ -1010,7 +1508,7 @@ class GatewayVisionAdapter:
                 diagnostics.extend(candidate.diagnostics)
                 if candidate.error_code:
                     page_errors.append(candidate.error_code)
-            if not facts:
+            if not facts and not any(ref.evidence_id.startswith("cell-map:") for ref in refs):
                 return VisionExtractionResult(
                     (),
                     tuple(refs),
@@ -1024,7 +1522,10 @@ class GatewayVisionAdapter:
                 page_errors[0] if page_errors else None,
             )
         except VisionAdapterError as exc:
-            return VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
+            code = ("VISION_TIMEOUT" if exc.code == "VISION_CANCELLED" and time.monotonic() >= deadline
+                    and not (cancel_check and cancel_check()) else exc.code)
+            return VisionExtractionResult(diagnostics=(code,), error_code=code,
+                                          retry_after_seconds=exc.retry_after_seconds)
 
 
 class VisionTaskCoordinator:
@@ -1043,6 +1544,7 @@ class VisionTaskCoordinator:
         self.max_workers = max(1, min(2, int(max_workers)))
         self.progress = progress
         self._completed_results: dict[str, VisionExtractionResult] = {}
+        self._completed_bindings: dict[str, str] = {}
 
     def extract(
         self,
@@ -1053,12 +1555,18 @@ class VisionTaskCoordinator:
         *,
         cancel_check: Callable[[], bool] | None = None,
     ) -> VisionExtractionResult:
+        started = time.monotonic()
         try:
             unique: dict[tuple[int, str], VisionPageRequest] = {}
             for page in sorted(pages, key=lambda item: (item.original_page, item.content_hash)):
                 unique.setdefault((page.original_page, page.content_hash), page)
             ordered_pages = tuple(unique.values())
             config.validate()
+            deadline = started + float(config.timeout_seconds)
+            if cancel_check and cancel_check():
+                raise VisionAdapterError("VISION_CANCELLED")
+            if time.monotonic() >= deadline:
+                raise VisionAdapterError("VISION_TIMEOUT")
             if not config.enabled:
                 raise VisionAdapterError("VISION_DISABLED")
             if not ordered_pages:
@@ -1084,14 +1592,23 @@ class VisionTaskCoordinator:
                 ordered_pages,
                 namespace="batch",
             )
+            from dataclasses import asdict
+            binding = sha256(json.dumps({
+                "schema": "vision-batch-candidate-v2", "company": company.to_dict(),
+                "filing": {key: value for key, value in filing.to_dict().items() if key not in {"local_path", "ingested_at"}},
+                "configuration_version": config.configuration_version,
+                "pages": [{"page": page.original_page, "hash": page.content_hash,
+                    "unit_contexts": [asdict(item) for item in page.unit_contexts]} for page in ordered_pages],
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
             prior = self.journal.get_vision_task(task_key) if self.journal is not None else None
             cached = self._completed_results.get(task_key)
-            if cached is not None:
+            if cached is not None and self._completed_bindings.get(task_key) == binding:
                 return cached
             load_result = getattr(self.journal, "get_vision_result", None)
             if callable(load_result):
                 persisted = load_result(task_key)
-                restored = _deserialize_vision_result(persisted) if persisted else None
+                restored = (_deserialize_vision_result(persisted)
+                    if isinstance(persisted, dict) and persisted.get("candidate_binding") == binding else None)
                 if restored is not None:
                     cached = VisionExtractionResult(
                         restored.facts,
@@ -1100,8 +1617,13 @@ class VisionTaskCoordinator:
                         None,
                     )
                     self._completed_results[task_key] = cached
+                    self._completed_bindings[task_key] = binding
                     return cached
             _check_request(config, ordered_pages, filing, plan=plan)
+            if cancel_check and cancel_check():
+                raise VisionAdapterError("VISION_CANCELLED")
+            if time.monotonic() >= deadline:
+                raise VisionAdapterError("VISION_TIMEOUT")
             if prior and prior.get("status") in {"created", "uploaded", "running"} and config.provider != "mineru_flash":
                 return VisionExtractionResult(
                     diagnostics=("VISION_RECOVERY_BLOCKED",),
@@ -1119,48 +1641,57 @@ class VisionTaskCoordinator:
                 )
             # The coordinator performs one approval for the complete manifest;
             # worker calls use an internal no-op callback and cannot re-prompt.
-            worker_config = replace(config, approve_upload=lambda _summary: True)
+            worker_config = replace(config, approve_upload=lambda _summary: True,
+                configured_timeout_seconds=config.configured_timeout_seconds or float(config.timeout_seconds))
             results: dict[int, VisionExtractionResult] = {}
             errors: list[str] = []
             internal_cancel = threading.Event()
 
             def combined_cancel() -> bool:
-                return internal_cancel.is_set() or bool(cancel_check and cancel_check())
+                return internal_cancel.is_set() or bool(cancel_check and cancel_check()) or time.monotonic() >= deadline
+
+            def run_page(page):
+                remaining = deadline - time.monotonic()
+                if combined_cancel():
+                    return VisionExtractionResult(error_code="VISION_CANCELLED" if cancel_check and cancel_check() else "VISION_TIMEOUT")
+                scoped_config = replace(worker_config, timeout_seconds=remaining)
+                return self.adapter.extract(company, filing, (page,), scoped_config, cancel_check=combined_cancel)
 
             executor = ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="vision-page")
             futures = {
-                executor.submit(
-                    self.adapter.extract,
-                    company,
-                    filing,
-                    (page,),
-                    worker_config,
-                    cancel_check=combined_cancel,
-                ): index
+                executor.submit(run_page, page): index
                 for index, page in enumerate(ordered_pages)
             }
             try:
-                timeout = max(0.01, float(config.timeout_seconds))
-                for future in as_completed(futures, timeout=timeout):
-                    index = futures[future]
+                while futures:
                     if cancel_check and cancel_check():
                         raise VisionAdapterError("VISION_CANCELLED")
-                    try:
-                        results[index] = future.result()
-                    except VisionAdapterError as exc:
-                        results[index] = VisionExtractionResult(
-                            diagnostics=(exc.code,), error_code=exc.code
-                        )
-                    except Exception:
-                        results[index] = VisionExtractionResult(
-                            diagnostics=("VISION_PROVIDER_ERROR",),
-                            error_code="VISION_PROVIDER_ERROR",
-                        )
-                    if self.progress is not None:
-                        self.progress(len(results), len(ordered_pages))
-            except FuturesTimeoutError:
-                errors.append("VISION_TIMEOUT")
-                internal_cancel.set()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        errors.append("VISION_TIMEOUT")
+                        break
+                    done, _ = wait(tuple(futures), timeout=min(.05, remaining), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index = futures.pop(future)
+                        if cancel_check and cancel_check():
+                            raise VisionAdapterError("VISION_CANCELLED")
+                        try:
+                            results[index] = future.result()
+                        except VisionAdapterError as exc:
+                            results[index] = VisionExtractionResult(diagnostics=(exc.code,), error_code=exc.code)
+                        except Exception:
+                            results[index] = VisionExtractionResult(diagnostics=("VISION_PROVIDER_ERROR",), error_code="VISION_PROVIDER_ERROR")
+                        if time.monotonic() >= deadline:
+                            # The underlying durable Adapter may retain a
+                            # received body/remote handle for local recovery;
+                            # this expired owner cannot cache/adopt its return.
+                            results.pop(index, None)
+                            errors.append("VISION_TIMEOUT")
+                            break
+                        if self.progress is not None:
+                            self.progress(len(results), len(ordered_pages))
+                    if errors:
+                        break
             except VisionAdapterError as exc:
                 errors.append(exc.code)
                 internal_cancel.set()
@@ -1169,17 +1700,20 @@ class VisionTaskCoordinator:
                     internal_cancel.set()
                     for future in futures:
                         future.cancel()
-                # Transport calls are themselves deadline-bounded. Waiting
-                # here guarantees no worker can mutate the journal after this
-                # method has returned a timeout/cancellation result.
-                executor.shutdown(wait=True, cancel_futures=True)
+                # Give cooperative transports one bounded cancellation drain.
+                # No unbounded shutdown: queued pages cannot start; late
+                # returns have no path to this coordinator's result/cache.
+                if futures:
+                    wait(tuple(futures), timeout=.1)
+                executor.shutdown(wait=all(future.done() for future in futures), cancel_futures=True)
             facts: list[FinancialFact] = []
             evidence: list[EvidenceRef] = []
             diagnostics: list[str] = []
             for index in range(len(ordered_pages)):
                 result = results.get(index)
                 if result is None:
-                    errors.append("VISION_CANCELLED")
+                    if not errors:
+                        errors.append("VISION_CANCELLED")
                     continue
                 facts.extend(result.facts)
                 evidence.extend(result.evidence)
@@ -1187,7 +1721,8 @@ class VisionTaskCoordinator:
                 if result.error_code:
                     errors.append(result.error_code)
             error_code = errors[0] if errors else None
-            if not facts and error_code is None:
+            mapping_body = any(ref.evidence_id.startswith("cell-map:") for ref in evidence)
+            if not facts and not mapping_body and error_code is None:
                 error_code = "VISION_NO_CANDIDATES"
             if self.journal is not None:
                 self.journal.save_vision_task(
@@ -1200,14 +1735,15 @@ class VisionTaskCoordinator:
                     status="failed" if error_code and not facts else "partial" if error_code else "completed",
                     error_code=error_code or "",
                 )
-            if error_code is None and facts:
+            if error_code is None and (facts or mapping_body):
                 completed = VisionExtractionResult(
                     tuple(facts), tuple(evidence), tuple(diagnostics), None
                 )
                 self._completed_results[task_key] = completed
+                self._completed_bindings[task_key] = binding
                 save_result = getattr(self.journal, "save_vision_result", None)
                 if callable(save_result):
-                    save_result(task_key, _serialize_vision_result(completed))
+                    save_result(task_key, {**_serialize_vision_result(completed), "candidate_binding": binding})
                 return completed
             if error_code and not facts:
                 diagnostics.append(error_code)
@@ -1227,11 +1763,16 @@ def _render_pdfium_page(pdf_bytes: bytes) -> bytes:
         if len(document) < 1:
             raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED")
         page = document[0]
+        # Reject an excessive surface before native allocation. Silently
+        # thumbnailing it can remove small digits from a financial statement.
+        width, height = math.ceil(page.get_width() * 1.5), math.ceil(page.get_height() * 1.5)
+        if width > 4096 or height > 4096 or width * height > 12_000_000:
+            raise VisionAdapterError("VISION_IMAGE_SIZE_LIMIT")
         bitmap = page.render(scale=1.5, rev_byteorder=True)
         image = bitmap.to_pil()
         width, height = image.size
         if width > 4096 or height > 4096 or width * height > 12_000_000:
-            image.thumbnail((4096, 4096))
+            raise VisionAdapterError("VISION_IMAGE_SIZE_LIMIT")
         output = BytesIO()
         image.save(output, format="PNG", optimize=True)
         data = output.getvalue()
@@ -1279,81 +1820,42 @@ def default_pdf_to_png(
         raise VisionAdapterError("VISION_IMAGE_RENDER_FAILED") from None
 
 
+def default_pdf_to_image_pdf(
+    pdf_bytes: bytes, *, cancel_check: Callable[[], bool] | None = None,
+    timeout_seconds: float = 35.0,
+) -> bytes:
+    """Render the complete page, retaining every rendered pixel losslessly.
+
+    The original remains authoritative and untouched. Only this explicitly
+    hashed upload representation loses its broken native PDF reading order;
+    local unit declarations continue to reference the original page.
+    """
+    from .financial_sources.image_pdf import image_pdf_from_png
+
+    png = default_pdf_to_png(pdf_bytes, cancel_check=cancel_check,
+                             timeout_seconds=timeout_seconds)
+    if cancel_check is not None and cancel_check():
+        raise VisionAdapterError("VISION_CANCELLED")
+    try:
+        return image_pdf_from_png(png)
+    except (TypeError, ValueError):
+        raise VisionAdapterError("VISION_IMAGE_REPRESENTATION_FAILED") from None
+
+
 def parse_vision_markdown(
     markdown: str,
     company: Company,
     filing: FilingDocument,
     pages: Sequence[VisionPageRequest],
 ) -> VisionExtractionResult:
-    """Conservatively turn labelled markdown rows into candidate facts."""
-    if not markdown or not pages:
-        return VisionExtractionResult(error_code="VISION_EMPTY_MARKDOWN", diagnostics=("VISION_EMPTY_MARKDOWN",))
-    context = markdown[:2000]
-    unit_match = re.search(r"(?im)^\s*(?:unit|currency|单位|币种|幣種)\s*[:：]?\s*[^\n]+", markdown)
-    scope_match = re.search(r"(?im)^.{0,80}(?:consolidated|合并|合併|綜合).{0,100}$", markdown)
-    period_match = re.search(rf"(?im)^.{{0,100}}{re.escape(str(filing.period_end)[:4])}.{{0,100}}$", markdown)
-    if not unit_match or not scope_match or not period_match:
-        return VisionExtractionResult(error_code="VISION_CONTEXT_NOT_EXPLICIT", diagnostics=("VISION_CONTEXT_NOT_EXPLICIT",))
-    unit_text = unit_match.group(0).strip()
-    scope_text = scope_match.group(0).strip()
-    period_text = period_match.group(0).strip()
-    compact = unit_text.lower()
-    scale = next(
-        (candidate for candidate in (1_000_000_000.0, 100_000_000.0, 1_000_000.0, 100_000.0, 10_000.0, 1_000.0, 1.0)
-         if _vision_unit_scale_is_explicit(unit_text, candidate)),
-        0.0,
-    )
-    currency = company.reporting_currency.upper()
-    if (
-        scale not in _VISION_UNIT_SCALES
-        or not _vision_currency_is_explicit(unit_text, currency)
-        or any(marker in scope_text.casefold() for marker in ("parent company", "母公司", "单体", "單體", "个别报表", "個別報表"))
-    ):
-        return VisionExtractionResult(error_code="VISION_CONTEXT_NOT_EXPLICIT", diagnostics=("VISION_CONTEXT_NOT_EXPLICIT",))
-    labels = {
-        "revenue": r"(?:revenue|operating revenue|营业收入)",
-        "net_income": r"(?:net income|net profit|净利润)",
-        "operating_cash_flow": r"(?:operating cash flow|cash flows? .*operating activities|经营活动.*现金流)",
-        "assets": r"(?:total assets|资产总计)",
-        "liabilities": r"(?:total liabilities|负债合计)",
-        "total_equity": r"(?:total equity|total shareholders.? equity|所有者权益合计)",
-    }
-    facts: list[FinancialFact] = []
-    evidence: list[EvidenceRef] = []
-    first_page = pages[0]
-    for concept, label in labels.items():
-        match = re.search(rf"(?im)^{label}[^\n]*?([\(\-]?\d[\d,]*(?:\.\d+)?\)?)(?:\s|$)", markdown)
-        if not match:
-            continue
-        token = match.group(1).replace(",", "")
-        negative = token.startswith("(") and token.endswith(")")
-        value = float(token.strip("()")) * scale
-        if negative:
-            value = -value
-        statement = "cash_flow" if concept == "operating_cash_flow" else "balance_sheet" if concept in {"assets", "liabilities", "total_equity"} else "income_statement"
-        if _VISION_CONCEPT_STATEMENTS.get(concept) != statement:
-            continue
-        fact = FinancialFact(
-            hashlib_id := f"{filing.document_id}:{concept}:{first_page.original_page}:{first_page.content_hash[:16]}:{value}",
-            company.security_id, concept, concept,
-            value, company.reporting_currency, int(filing.period_end[:4]), filing.fiscal_period,
-            filing.form_type, _vision_period_start(filing.fiscal_period, filing.period_end, statement),
-            filing.period_end, filing.filed_at, filing.accession_number, filing.source_url,
-            scope="consolidated", entity=company.name, market=company.market, statement=statement,
-            period_start=_vision_period_start(filing.fiscal_period, filing.period_end, statement),
-            consolidated_scope="consolidated", currency=company.reporting_currency,
-            unit_scale=scale, unit_provenance="vision_explicit", source_document=filing.primary_document, source_page=first_page.original_page,
-            source_bbox=None, raw_text=context, parser_version="vision-markdown-v2",
-        )
-        facts.append(fact)
-        evidence.append(EvidenceRef(
-            f"fact:{fact.fact_id}", filing.document_id, filing.source_url,
-            filing.primary_document, f"page:{first_page.original_page}", context,
-            filing.filed_at, first_page.content_hash,
-        ))
-    if not facts:
-        return VisionExtractionResult(error_code="VISION_NO_CANDIDATES", diagnostics=("VISION_NO_CANDIDATES",))
-    return VisionExtractionResult(tuple(facts), tuple(evidence), ("VISION_CANDIDATES_ONLY",))
+    """Collect cells; the compiler separately verifies their source proof."""
+    from .financial_sources.markdown import collect_markdown_cells
+    if len(pages) != 1:
+        return VisionExtractionResult(error_code="VISION_PAGE_MAPPING_REQUIRED",
+            diagnostics=("VISION_PAGE_MAPPING_REQUIRED",))
+    facts, evidence, error = collect_markdown_cells(markdown, company, filing, pages[0])
+    return VisionExtractionResult(facts, evidence,
+        (error,) if error else ("VISION_CANDIDATES_ONLY",), error)
 
 
 def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pages: Sequence[VisionPageRequest]) -> VisionExtractionResult:
@@ -1368,6 +1870,10 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
     facts: list[FinancialFact] = []
     refs: list[EvidenceRef] = []
     pages_by_number = {page.original_page: page for page in pages}
+    from .financial_cell_repair import mapping_reference
+    mappings = payload.get("cell_mappings", [])
+    if isinstance(mappings, list) and len(mappings) <= 200:
+        refs.extend(ref for item in mappings if (ref := mapping_reference(item, filing, set(pages_by_number))) is not None)
     consolidated_markers = ("consolidated", "合并", "合併", "綜合")
     parent_markers = ("parent company", "parent only", "company only", "母公司", "單體", "单体", "个别报表", "個別報表")
     for row in rows:
@@ -1383,7 +1889,8 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
         try:
             page_no = int(row.get("original_page"))
             page = pages_by_number[page_no]
-            reported_value = _parse_vision_number(row.get("value"))
+            raw_value = _vision_decimal_source_text(row.get("value"))
+            reported_value = _parse_vision_number(raw_value)
             scale = float(row.get("unit_scale"))
             end_date = str(row.get("period_end", "")).strip()[:10]
             currency = str(row.get("currency", "")).strip().upper()
@@ -1419,9 +1926,28 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
             if observation is not None:
                 refs.append(observation)
             continue
-        value = reported_value * scale
+        unit_evidence_id = _vision_unit_evidence_id(
+            filing.document_id, page_no, page.content_hash, unit_text,
+        )
+        try:
+            lineage = SourceAmount(
+                raw_value, str(int(scale)), QuantityKind.MONEY, currency,
+                (unit_evidence_id,),
+            ).normalize()
+            value = float(Decimal(lineage.normalized_value))
+        except (InvalidOperation, TypeError, ValueError, OverflowError):
+            continue
         if not math.isfinite(value):
             continue
+        proof_payload = {
+            "schema": GATEWAY_FACT_VERSION, "document_hash": filing.content_hash,
+            "page_hash": page.content_hash, "original_page": page_no,
+            "observation": {"concept": concept, "raw_value": raw_value,
+                "currency": currency, "scale": str(int(scale)), "unit_text": unit_text,
+                "statement": statement, "scope": scope, "scope_text": scope_text,
+                "period_end": end_date, "period_text": period_text, "raw_text": raw_text},
+        }
+        proof_id = gateway_source_id(filing.document_id, proof_payload)
         period_start = _vision_period_start(filing.fiscal_period, filing.period_end, statement)
         fact_id = f"{filing.document_id}:{concept}:{page_no}:{page.content_hash[:16]}:{value}"
         fact = FinancialFact(
@@ -1432,13 +1958,25 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
             market=company.market, statement=statement, period_start=period_start,
             consolidated_scope="consolidated", currency=currency, unit_scale=scale,
             unit_provenance="vision_explicit", source_document=filing.primary_document,
-            source_page=page_no, raw_text=raw_text, parser_version="vision-json-v2",
+            source_page=page_no, raw_text=raw_text, parser_version=GATEWAY_FACT_VERSION,
+            normalization_lineage=lineage, classification_evidence_ids=(proof_id,),
+            revision=filing.revision,
         )
         facts.append(fact)
         refs.append(EvidenceRef(
             f"fact:{fact_id}", filing.document_id, filing.source_url,
             filing.primary_document, f"page:{page_no}", raw_text, filing.filed_at,
-            page.content_hash,
+            filing.content_hash,
+        ))
+        refs.append(EvidenceRef(
+            unit_evidence_id, filing.document_id, filing.source_url,
+            f"{filing.form_type} {filing.period_end} / explicit displayed unit",
+            f"page:{page_no}", unit_text, filing.filed_at, filing.content_hash,
+        ))
+        refs.append(EvidenceRef(
+            proof_id, filing.document_id, filing.source_url,
+            "Captured visual observation / candidate only", f"page:{page_no}",
+            canonical_cloud_source(proof_payload), filing.filed_at, filing.content_hash,
         ))
 
     for row in observation_rows:
@@ -1452,6 +1990,8 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
         unique_refs.setdefault(ref.evidence_id, ref)
     refs = list(unique_refs.values())
 
+    if not facts and any(ref.evidence_id.startswith("cell-map:") for ref in refs):
+        return VisionExtractionResult((), tuple(refs), ("VISION_MAPPING_CANDIDATES_ONLY",))
     if not facts:
         return VisionExtractionResult(
             (), tuple(refs), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES"

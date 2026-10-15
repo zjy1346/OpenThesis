@@ -6,11 +6,14 @@ the two renderers below only lay those blocks out and escape them.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
+from decimal import Decimal, InvalidOperation
 from html import escape
+import math
 import re
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 
 from .i18n import EN, ZH_HANT, normalize_language
 from .financials import (
@@ -19,8 +22,20 @@ from .financials import (
     format_growth,
     format_money,
     format_percent,
+    read_metric_period,
     reverse_dcf_disclaimer,
     reverse_dcf_status_text,
+)
+from .report_content import (
+    ValidationRecord,
+    section_content_metadata,
+    validation_record_for_artifact,
+    read_trusted_snapshots,
+    node_validation_record,
+    minimum_presentation,
+    unresolved_content_invalidations,
+    invalidated_content_sections,
+    project_financial_source_corrections,
 )
 
 
@@ -45,6 +60,12 @@ class ReportNode:
     level: int = 0
     confidence_tier: str = ""
     money_facts: tuple[MoneyFact, ...] = ()
+    # Appended defaults preserve positional construction and old serialized
+    # nodes that contain only the original six fields.
+    role: str = "unknown"
+    source_ids: tuple[str, ...] = ()
+    validation_record: ValidationRecord = ValidationRecord()
+    materiality: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +79,28 @@ class SectionBlock:
     evidence_ids: tuple[str, ...] = ()
     state: str = "available"
     source_artifact_ids: tuple[str, ...] = ()
-    verification_state: str = "needs_review"
-    is_substantive: bool = False
+    verification_state: str = "unknown"
+    is_substantive: bool | None = None
     diagnostic_code: str = ""
+    is_visible: bool | None = None
+    completeness: str = "unknown"
+
+    def __post_init__(self) -> None:
+        # Older serialized sections omit the new semantic fields. Derive them
+        # from node metadata rather than reviving the prior length heuristic.
+        if self.is_visible is None:
+            object.__setattr__(
+                self,
+                "is_visible",
+                bool(self.body.strip()) or any(_node_markdown(node).strip() for node in self.nodes),
+            )
+        if self.is_substantive is None:
+            semantic_nodes = _section_node_semantics(self.section_id, self.nodes)
+            object.__setattr__(
+                self,
+                "is_substantive",
+                _section_is_substantive(self.section_id, semantic_nodes),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,9 +164,10 @@ class ReadinessView:
     missing_stages: tuple[str, ...] = ()
     issues: tuple[str, ...] = ()
     recovery_action: str = ""
+    coverage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "state": self.state,
             "complete": self.complete,
             "substantive_sections": list(self.substantive_sections),
@@ -135,6 +176,9 @@ class ReadinessView:
             "issues": list(self.issues),
             "recovery_action": self.recovery_action,
         }
+        if self.coverage is not None:
+            result["coverage"] = copy.deepcopy(self.coverage)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,8 +250,13 @@ def _node_markdown(node: ReportNode) -> str:
     if node.kind == "table" and node.rows:
         header, *body = node.rows
         separator = tuple("---" for _ in header)
+
+        def markdown_cell(cell: str) -> str:
+            normalized = cell.replace("\r\n", "\n").replace("\r", "\n")
+            return normalized.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
+
         return "\n".join(
-            "| " + " | ".join(row) + " |"
+            "| " + " | ".join(markdown_cell(cell) for cell in row) + " |"
             for row in (header, separator, *body)
         )
     return node.text
@@ -221,7 +270,8 @@ def _localized_section_title(key: str, language: str) -> str:
     from .reporting import SECTION_LABELS_EN, SECTION_LABELS_HANT, SECTION_LABELS_ZH
 
     labels = SECTION_LABELS_EN if language == EN else SECTION_LABELS_HANT if language == ZH_HANT else SECTION_LABELS_ZH
-    return labels.get(key, key)
+    return labels.get(key, "Supplementary Research" if language == EN else
+        "補充研究" if language == ZH_HANT else "补充研究")
 
 
 def _scalar_text(value: Any, key: str | None, language: str) -> str:
@@ -480,11 +530,13 @@ def _section(
     assumption_ids: tuple[str, ...] = (),
     evidence_ids: tuple[str, ...] = (),
     source_artifact_ids: tuple[str, ...] = (),
-    verification_state: str = "needs_review",
+    verification_state: str = "unknown",
     diagnostic_code: str = "",
     is_substantive: bool | None = None,
+    completeness: str = "unknown",
 ) -> SectionBlock:
-    immutable_nodes = tuple(nodes)
+    immutable_nodes = _section_node_semantics(section_id, tuple(nodes))
+    visible = any(_node_markdown(node).strip() for node in immutable_nodes)
     return SectionBlock(
         section_id=section_id or _slug(title, ordinal),
         title=title,
@@ -493,7 +545,7 @@ def _section(
         claim_ids=claim_ids,
         assumption_ids=assumption_ids,
         evidence_ids=evidence_ids,
-        state="available" if any(node.text or node.rows for node in immutable_nodes) else "needs_review",
+        state="available" if visible else "needs_review",
         source_artifact_ids=source_artifact_ids,
         verification_state=verification_state,
         is_substantive=(
@@ -501,6 +553,8 @@ def _section(
             if is_substantive is None else is_substantive
         ),
         diagnostic_code=diagnostic_code,
+        is_visible=visible,
+        completeness=completeness,
     )
 
 
@@ -513,7 +567,7 @@ _NON_SUBSTANTIVE_SECTION_IDS = {
 
 
 def _section_is_substantive(section_id: str, nodes: Sequence[ReportNode]) -> bool:
-    """Count domain content, not headings, notices, or presentation metadata."""
+    """Count typed material content; rendered length and arbitrary cells do not count."""
     if section_id in _NON_SUBSTANTIVE_SECTION_IDS:
         return False
     if section_id not in {
@@ -523,24 +577,109 @@ def _section_is_substantive(section_id: str, nodes: Sequence[ReportNode]) -> boo
         "counterarguments", "scenarios", "thesis", "invalidation_conditions",
         "leading_indicators", "unresolved_questions", "opposing-views",
     }:
+        # Registry membership determines labels/order, not whether an
+        # independently committed custom-pack analysis is substantive. An
+        # unknown section without a body-bound host proof remains unverified;
+        # provider-supplied roles and nonempty strings cannot promote it.
+        return any(
+            _node_is_substantive(node)
+            and (node.validation_record.state == "verified" and node.validation_record.passed is True
+                 or node.role == "analysis" and node.validation_record.state == "partial"
+                 and node.validation_record.validator_version == "evidence-bound-sections-v9-analysis-presentation"
+                 and bool(node.validation_record.evidence_ids))
+            and bool(node.validation_record.node_id)
+            and bool(node.validation_record.body_sha256)
+            for node in nodes
+        )
+    return any(_node_is_substantive(node) for node in nodes)
+
+
+def _node_is_substantive(node: ReportNode) -> bool:
+    if node.role not in {"analysis", "verified_analysis", "assumption", "fact_table"}:
         return False
+    if node.materiality != "material":
+        return False
+    if node.role == "verified_analysis" and (
+        not isinstance(node.validation_record, ValidationRecord)
+        or node.validation_record.state != "verified"
+        or node.validation_record.passed is not True
+    ):
+        return False
+    if node.role == "fact_table" or node.kind == "table":
+        # Tables count only when the typed fact projection carries actual
+        # numeric facts. A year, currency, unit, or arbitrary non-empty cell
+        # is display metadata, not a fact by itself.
+        return node.kind == "table" and any(
+            isinstance(fact, MoneyFact)
+            and fact.concept
+            and fact.period
+            and math.isfinite(fact.value)
+            for fact in node.money_facts
+        )
+    return node.kind in {"paragraph", "list_item", "quote"} and bool(node.text.strip())
+
+
+def _section_node_semantics(
+    section_id: str,
+    nodes: tuple[ReportNode, ...],
+) -> tuple[ReportNode, ...]:
+    """Fill semantic metadata for deterministic nodes with typed provenance."""
+    result: list[ReportNode] = []
     for node in nodes:
-        if node.kind == "table" and len(node.rows) > 1:
-            if any(
-                str(cell).strip() not in {
-                    "", "—", "-", "n/a", "N/A", "待核验", "待核實",
-                    "Pending verification", "Unit pending verification",
-                    "单位待核实", "單位待核實",
-                }
-                for row in node.rows[1:]
-                for cell in row[1:]
-            ):
-                return True
-        elif node.kind in {"paragraph", "list_item", "quote"}:
-            text = re.sub(r"[\s*_`]+", "", str(node.text or ""))
-            if len(text) >= 12 and text not in {"—", "-", "未知", "Unknown", "待核验", "待核實"}:
-                return True
-    return False
+        role = node.role
+        materiality = node.materiality
+        source_ids = node.source_ids
+        if node.kind in {"heading", "confidence_heading"}:
+            role = "unknown"
+            materiality = "non_material"
+        elif role == "unknown" and section_id in _NON_SUBSTANTIVE_SECTION_IDS:
+            role = "source" if section_id == "evidence-sources" else "notice"
+            materiality = "non_material"
+        elif role == "unknown" and node.kind == "table":
+            role = "fact_table"
+            materiality = "material" if node.money_facts else "non_material"
+            if not source_ids:
+                source_ids = tuple(dict.fromkeys(
+                    evidence_id
+                    for fact in node.money_facts
+                    for evidence_id in fact.evidence_ids
+                ))
+        elif role == "unknown" and section_id == "financial-overview":
+            role = "notice"
+            materiality = "non_material"
+        elif role == "unknown" and section_id == "deterministic-valuation":
+            role = "analysis"
+            materiality = "material"
+        result.append(replace(
+            node,
+            role=role,
+            materiality=materiality,
+            source_ids=source_ids,
+        ))
+    return tuple(result)
+
+
+def _apply_section_content_metadata(
+    nodes: Sequence[ReportNode],
+    *,
+    role: str,
+    source_ids: tuple[str, ...],
+    record: ValidationRecord,
+    materiality: str,
+) -> tuple[ReportNode, ...]:
+    annotated: list[ReportNode] = []
+    if role == "verified_analysis" and record.state != "verified":
+        role = "analysis"
+    for node in nodes:
+        is_heading = node.kind in {"heading", "confidence_heading"}
+        annotated.append(replace(
+            node,
+            role="unknown" if is_heading else role,
+            source_ids=() if is_heading else source_ids or node.source_ids,
+            validation_record=record,
+            materiality="non_material" if is_heading else materiality,
+        ))
+    return tuple(annotated)
 
 
 def _money_cell(
@@ -649,12 +788,98 @@ def _free_cash_flow_gap_label(reason: Any, language: str) -> str:
     return mapping.get(str(reason or ""), mapping["inputs_not_comparable"])
 
 
+def _comparison_version_nodes(metrics, language, currency):
+    """Expose differing official versions without selecting or averaging them."""
+    english, traditional = language == EN, language == ZH_HANT
+    labels = {
+        "revenue": ("Revenue", "營業收入", "营业收入"),
+        "operating_income": ("Operating profit", "營業利潤", "营业利润"),
+        "net_income": ("Group net profit", "合併淨利潤", "合并净利润"),
+        "parent_net_income": ("Profit attributable to owners", "歸母淨利潤", "归母净利润"),
+        "operating_cash_flow": ("Operating cash flow", "經營現金流", "经营现金流"),
+        "capital_expenditure": ("Capital expenditure", "資本開支", "资本开支"),
+        "assets": ("Assets", "總資產", "总资产"),
+        "liabilities": ("Liabilities", "總負債", "总负债"),
+        "equity": ("Owners' equity", "歸母權益", "归母权益"),
+        "total_equity": ("Group equity", "合併總權益", "合并总权益"),
+    }
+    nodes, seen = [], set()
+    for metric in metrics:
+        versions = metric.get("comparison_versions") if isinstance(metric, dict) else None
+        if not isinstance(versions, dict):
+            continue
+        for concept, candidates in versions.items():
+            if not isinstance(candidates, list):
+                continue
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                identity = (concept, str(candidate.get("fact_id")), str(candidate.get("value")))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                try:
+                    amount = Decimal(str(candidate.get("value")))
+                    if not amount.is_finite():
+                        continue
+                except InvalidOperation:
+                    continue
+                names = labels.get(concept)
+                label = names[0 if english else 1 if traditional else 2] if names else (
+                    "Financial value" if english else "財務數值" if traditional else "财务数值")
+                comparative = str(candidate.get("usage_status", "")).casefold() == "comparator"
+                version = ("Comparative column" if comparative else "Original report") if english else (
+                    "比較欄" if comparative else "原報") if traditional else ("比较列" if comparative else "原报")
+                stated_currency = str(candidate.get("currency") or candidate.get("unit") or currency or "").upper()
+                value = f"{stated_currency} {amount:,.2f}" if stated_currency else (
+                    "Currency pending verification" if english else "幣種待核實" if traditional else "币种待核实")
+                period = f"{candidate.get('fiscal_year', '')} {candidate.get('fiscal_period', '')}"
+                source = str(candidate.get("accession_number") or candidate.get("source_document") or "")
+                page = candidate.get("source_page")
+                if page:
+                    source += f" · page {page}" if english else f" · 第{page}頁" if traditional else f" · 第{page}页"
+                url = str(candidate.get("source_url") or "")
+                try:
+                    parsed = urlsplit(url)
+                    if parsed.scheme in {"http", "https"} and parsed.netloc and not parsed.username:
+                        source = f"[{source or version}]({url})"
+                except ValueError:
+                    pass
+                nodes.append(ReportNode("list_item", f"**{label} · {period} · {version}:** {value} · {source}",
+                    role="fact", source_ids=(f"fact:{candidate['fact_id']}",) if candidate.get("fact_id") else ()))
+    if not nodes:
+        return []
+    return [ReportNode("heading", "Official source versions pending reconciliation" if english else
+        "待釐清的官方版本差異" if traditional else "待澄清的官方版本差异", level=3),
+        ReportNode("paragraph", "Both official values are retained below. Only calculations depending on the disputed baseline are paused; other verified data remains usable." if english else
+            "以下並列保留官方原報與比較欄。僅暫停依賴爭議基數的計算，其他已核驗資料仍可使用。" if traditional else
+            "以下并列保留官方原报与比较列。仅暂停依赖争议基数的计算，其他已核验数据仍可使用。"), *nodes]
+
+
 def _financial_nodes(
     content: dict[str, Any], language: str,
 ) -> tuple[tuple[ReportNode, ...], tuple[ReportNode, ...]]:
     metrics = content.get("metrics")
     if not isinstance(metrics, list):
         return (), ()
+    period_diagnostics: list[str] = []
+    metric_periods: dict[int, Any] = {}
+    valid_metrics: list[dict[str, Any]] = []
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            period_diagnostics.append("METRIC_PERIOD_INVALID")
+            continue
+        try:
+            period_identity = read_metric_period(metric)
+        except ValueError as error:
+            period_diagnostics.append(str(error))
+            continue
+        if period_identity.period != "FY":
+            period_diagnostics.append("METRIC_PERIOD_EXPECTED_FY")
+            continue
+        valid_metrics.append(metric)
+        metric_periods[id(metric)] = period_identity
+    metrics = valid_metrics
     currency = str(content.get("currency", "") or "").upper()
     generations = content.get("financial_generations", {})
     if not isinstance(generations, dict):
@@ -667,12 +892,13 @@ def _financial_nodes(
         "revenue_growth": ("Revenue growth", "收入增長", "收入增长"),
         "operating_margin": ("Operating margin", "營業利潤率", "营业利润率"),
         "net_income": ("Net income", "淨利潤", "净利润"),
+        "parent_net_income": ("Profit attributable to owners", "歸母淨利潤", "归母净利润"),
         "operating_cash_flow": ("Operating cash flow", "經營現金流", "经营现金流"),
         "free_cash_flow": ("Free cash flow", "自由現金流", "自由现金流"),
     }
     annual_concepts = ["revenue"]
     annual_concepts.append("revenue_growth")
-    for concept in ("operating_margin", "net_income", "operating_cash_flow", "free_cash_flow"):
+    for concept in ("operating_margin", "net_income", "parent_net_income", "operating_cash_flow", "free_cash_flow"):
         if any(
             isinstance(item, dict)
             and (item.get(concept) is not None or item.get(f"{concept}_status"))
@@ -687,12 +913,9 @@ def _financial_nodes(
     balance_rows: list[tuple[str, ...]] = []
     balance_facts: list[MoneyFact] = []
     for metric in metrics:
-        if not isinstance(metric, dict):
-            continue
-        year = metric.get("year")
-        if year is None:
-            continue
-        period = f"FY{year}"
+        period_identity = metric_periods[id(metric)]
+        year = period_identity.year
+        period = f"{period_identity.period}{year}"
         row = [str(year)]
         for concept in annual_concepts:
             value = metric.get(concept)
@@ -750,35 +973,54 @@ def _financial_nodes(
         ]
         if rows and len(headers) > 1 else []
     )
-    interim = content.get("interim_metrics")
-    if isinstance(interim, list):
-        interim_rows: list[tuple[str, ...]] = []
-        for item in interim:
+    raw_interim = content.get("interim_metrics")
+    interim: list[dict[str, Any]] = []
+    interim_periods: dict[int, Any] = {}
+    if isinstance(raw_interim, list):
+        for item in raw_interim:
             if not isinstance(item, dict):
+                period_diagnostics.append("METRIC_PERIOD_INVALID")
                 continue
-            period = f"{item.get('year', '')} {item.get('period', '')}".strip()
+            try:
+                period_identity = read_metric_period(item)
+            except ValueError as error:
+                period_diagnostics.append(str(error))
+                continue
+            if period_identity.period == "FY":
+                period_diagnostics.append("METRIC_PERIOD_EXPECTED_INTERIM")
+                continue
+            interim.append(item)
+            interim_periods[id(item)] = period_identity
+    if isinstance(raw_interim, list):
+        interim_rows: list[tuple[str, ...]] = []
+        interim_concepts = ["revenue", "revenue_growth"]
+        interim_concepts.extend(concept for concept in ("net_income", "parent_net_income")
+                                if any(isinstance(item, dict) and item.get(concept) is not None for item in interim))
+        interim_concepts.append("operating_cash_flow")
+        for item in interim:
+            period_identity = interim_periods[id(item)]
+            period = f"{period_identity.year} {period_identity.period}"
             growth = item.get("revenue_growth")
             interim_cells: list[str] = []
-            for concept in ("revenue", "net_income", "operating_cash_flow"):
+            for concept in interim_concepts:
+                if concept == "revenue_growth":
+                    interim_cells.append(format_growth(growth, item.get("revenue_growth_status"), language))
+                    continue
+                metadata = item.get("money_metadata", {})
                 cell, fact = _money_cell(
-                    concept, item.get(concept), None, currency, period,
+                    concept, item.get(concept), metadata.get(concept) if isinstance(metadata, dict) else None, currency, period,
                     language, generations,
                 )
                 interim_cells.append(cell)
                 if fact is not None:
                     interim_money_facts.append(fact)
-            interim_rows.append((
-                period,
-                interim_cells[0],
-                format_percent(growth) if not item.get("comparison_gap") else ("Unavailable" if english else "未提供" if not traditional else "未提供"),
-                interim_cells[1],
-                interim_cells[2],
-            ))
+            interim_rows.append((period, *interim_cells))
         if interim_rows:
             interim_title = "Latest interim and quarterly data" if english else "最新季度及中期數據" if traditional else "最新季度及中期数据"
-            interim_headers = ("Period", "Revenue", "Comparable growth", "Net income", "Operating cash flow") if english else ("期間", "營業收入", "同期增長", "淨利潤", "經營現金流") if traditional else ("期间", "营业收入", "同期增长", "净利润", "经营现金流")
+            interim_headers = (("Period" if english else "期間" if traditional else "期间"),
+                               *(column_labels[key][0 if english else 1 if traditional else 2] for key in interim_concepts))
             nodes.append(ReportNode("heading", interim_title, level=3))
-            interim_period = next((f"{item.get('year', '')} {item.get('period', '')}".strip() for item in interim if isinstance(item, dict)), "")
+            interim_period = f"{interim_periods[id(interim[0])].year} {interim_periods[id(interim[0])].period}"
             nodes.append(ReportNode("quote", f"{interim_period} is cumulative period data and is not mixed with full fiscal years." if english else f"{interim_period} 為累計期間資料，不與完整財年混算。" if traditional else f"{interim_period} 为累计期间数据，不与完整财年混算。"))
             comparison = next((item.get("comparison_period") for item in interim if isinstance(item, dict) and item.get("comparison_period")), None)
             comparison_gap = next((item.get("comparison_gap") for item in interim if isinstance(item, dict) and item.get("comparison_gap")), None)
@@ -793,7 +1035,12 @@ def _financial_nodes(
                 nodes.append(ReportNode("paragraph", "Revenue growth: prior-year comparable disclosure is missing or did not pass validation." if english else "同期收入增長：缺少或未通過校驗的上年同期披露。" if traditional else "同期收入增长：缺少或未通过校验的上年同期披露。"))
             nodes.append(ReportNode("table", rows=(interim_headers, *interim_rows), money_facts=tuple(interim_money_facts)))
 
-    latest = next((item for item in metrics if isinstance(item, dict)), None)
+    nodes.extend(_comparison_version_nodes([*metrics, *interim], language, currency))
+    latest = metrics[0] if metrics else None
+    gap_notes = [
+        f"Metric period row skipped: {code}."
+        for code in dict.fromkeys(period_diagnostics)
+    ]
     if latest is not None:
         detail_items: list[tuple[str, str, bool]] = [
             (("Cash conversion" if english else "現金利潤轉化率" if traditional else "现金利润转化率"), format_cash_conversion(latest, language), "cash_conversion_status" in latest),
@@ -839,22 +1086,23 @@ def _financial_nodes(
                     "本報告已核驗的輸入尚未確認背離原因，因此不推斷具體成因。" if traditional else
                     "本报告已验证的输入尚未确认背离原因，因此不推断具体成因。",
                 ))
-        gap_notes: list[str] = []
         for metric in metrics[:5]:
             if not isinstance(metric, dict) or metric.get("revenue_growth") is not None:
                 continue
+            year = metric_periods[id(metric)].year
             gap = str(metric.get("comparison_gap") or "")
             if gap.startswith("missing_"):
                 previous_year = gap.removeprefix("missing_")
                 gap_notes.append(
-                    f"Fiscal {metric.get('year')} revenue growth is missing verified fiscal {previous_year} revenue." if english else
-                    f"{metric.get('year')} 財年收入增長缺少 {previous_year} 財年已驗證收入" if traditional else
-                    f"{metric.get('year')} 财年收入增长缺少 {previous_year} 财年已验证收入"
+                    f"Fiscal {year} revenue growth is missing verified fiscal {previous_year} revenue." if english else
+                    f"{year} 財年收入增長缺少 {previous_year} 財年已驗證收入" if traditional else
+                    f"{year} 财年收入增长缺少 {previous_year} 财年已验证收入"
                 )
         for metric in metrics[:5]:
             if not isinstance(metric, dict) or not metric.get("free_cash_flow_gap"):
                 continue
-            period = f"FY{metric.get('year')}" if english else f"{metric.get('year')} 財年" if traditional else f"{metric.get('year')} 财年"
+            year = metric_periods[id(metric)].year
+            period = f"FY{year}" if english else f"{year} 財年" if traditional else f"{year} 财年"
             gap_notes.append(
                 f"{period} free cash flow was not calculated: {_free_cash_flow_gap_label(metric['free_cash_flow_gap'], language)}"
                 if english else
@@ -867,6 +1115,7 @@ def _financial_nodes(
                 "missing_net_income": ("net income is missing", "缺少淨利潤資料", "缺少净利润数据"),
                 "missing_equity": ("equity data is missing", "缺少權益資料", "缺少权益数据"),
                 "non_positive_equity": ("equity is zero or negative; not applicable", "權益為零或負數，不適用", "权益为零或负数，不适用"),
+                "unresolved_restatement": ("opening equity has unresolved official source versions", "期初權益官方版本差異待釐清", "期初权益官方版本差异待澄清"),
             }
             reason = reasons.get(str(latest.get("return_on_equity_gap") or ""))
             if reason:
@@ -875,12 +1124,18 @@ def _financial_nodes(
                     f"淨資產收益率無法計算：{reason[1]}" if traditional else
                     f"净资产收益率无法计算：{reason[2]}"
                 )
-        if gap_notes:
-            nodes.append(ReportNode("heading", "Financial data gaps" if english else "財務數據缺口" if traditional else "财务数据缺口", level=3))
-            nodes.extend(ReportNode("list_item", note) for note in gap_notes)
+    if gap_notes:
+        nodes.append(ReportNode("heading", "Financial data gaps" if english else "財務數據缺口" if traditional else "财务数据缺口", level=3))
+        nodes.extend(ReportNode("list_item", note) for note in gap_notes)
     overview_nodes = tuple(
-        ReportNode(node.kind, node.text, node.rows, node.level, node.confidence_tier,
-                   tuple(money_facts) if node.kind == "table" and node.rows and node.rows[0] == headers else node.money_facts)
+        replace(
+            node,
+            money_facts=(
+                tuple(money_facts)
+                if node.kind == "table" and node.rows and node.rows[0] == headers
+                else node.money_facts
+            ),
+        )
         for node in nodes
     )
     balance_concepts = ["assets", "liabilities", "equity", "total_equity"]
@@ -940,6 +1195,8 @@ _REPORT_SECTION_KEYS = (
     "balance_sheet", "competitive_position", "growth_opportunities",
     "counterarguments", "scenarios", "implied_expectations", "thesis",
     "invalidation_conditions", "leading_indicators", "unresolved_questions",
+    "management_and_capital_allocation", "existing_growth_engines",
+    "industry_changes_and_value_allocation", "source_risk_review", "valuation_and_sensitivity", "evidence_and_methodology",
 )
 
 
@@ -1021,6 +1278,9 @@ def _stage_section_fallbacks(
 
 
 def _growth_status_nodes(content: Any, language: str) -> tuple[ReportNode, ...]:
+    def notice(text: str) -> tuple[ReportNode, ...]:
+        return (ReportNode("paragraph", text, role="notice", materiality="non_material"),)
+
     if isinstance(content, dict):
         if content.get("opportunities"):
             return ()
@@ -1034,7 +1294,7 @@ def _growth_status_nodes(content: Any, language: str) -> tuple[ReportNode, ...]:
                 if language == ZH_HANT else
                 "增长机会模型未返回有效内容，可单独重试该阶段。"
             )
-            return (ReportNode("paragraph", text),)
+            return notice(text)
         if isinstance(validation, dict) and validation.get("passed") is False:
             text = (
                 "The growth-opportunity output did not pass structure or evidence validation. You can retry only this stage."
@@ -1043,7 +1303,7 @@ def _growth_status_nodes(content: Any, language: str) -> tuple[ReportNode, ...]:
                 if language == ZH_HANT else
                 "增长机会输出未通过结构或证据校验，可单独重试该阶段。"
             )
-            return (ReportNode("paragraph", text),)
+            return notice(text)
     text = (
         "Current evidence is insufficient to present a growth opportunity."
         if language == EN else
@@ -1051,7 +1311,7 @@ def _growth_status_nodes(content: Any, language: str) -> tuple[ReportNode, ...]:
         if language == ZH_HANT else
         "当前证据不足，未形成可展示的增长机会。"
     )
-    return (ReportNode("paragraph", text),)
+    return notice(text)
 
 
 def assemble_report_document(
@@ -1084,9 +1344,15 @@ def assemble_report_document(
     from .report_revisions import resolve_report_artifact
 
     adapted_artifacts = _adapt_nested_expectation_narrative(
-        [item for item in artifacts if isinstance(item, dict)]
+        project_financial_source_corrections([item for item in artifacts if isinstance(item, dict)], run_id=run_id)
     )
     safe_artifacts = tuple(adapted_artifacts)
+    trusted_nodes = read_trusted_snapshots(artifacts, run_id=run_id)
+    invalidations = unresolved_content_invalidations(artifacts, run_id=run_id)
+    revoked_sections = invalidated_content_sections(artifacts, run_id=run_id)
+    trusted_by_section: dict[str, list[dict[str, Any]]] = {}
+    for node in trusted_nodes:
+        trusted_by_section.setdefault(node.get("display_section_id", node["section_id"]), []).append(node)
     locale = normalize_language(language)
     from .report_projection import resolve_report_identity
     identity = resolve_report_identity(list(safe_artifacts), explicit_name=company_name)
@@ -1120,7 +1386,11 @@ def assemble_report_document(
             "opposing-views": ("counter-analysis",),
             "scenarios": ("forecast-scenarios",),
             "claims": ("research-report", "verified-research-dossier"),
-        }.get(section_id, ("research-report", "verified-research-dossier"))
+        }.get(
+            section_id,
+            ("research-report", "verified-research-dossier")
+            if section_id in _REPORT_SECTION_KEYS else (),
+        )
         ids = []
         for artifact_type in artifact_types:
             artifact = latest_artifacts.get(artifact_type)
@@ -1130,6 +1400,9 @@ def assemble_report_document(
         return tuple(ids)
 
     def verification_for_section(section_id: str) -> str:
+        return validation_record_for_section(section_id).state
+
+    def validation_record_for_section(section_id: str) -> ValidationRecord:
         artifact_types = {
             "financial-overview": ("deterministic-financial-summary",),
             "deterministic-balance-sheet": ("deterministic-financial-summary",),
@@ -1140,38 +1413,16 @@ def assemble_report_document(
             "opposing-views": ("counter-analysis",),
             "scenarios": ("forecast-scenarios",),
             "claims": ("research-report", "verified-research-dossier"),
-        }.get(section_id, ("research-report", "verified-research-dossier"))
+        }.get(
+            section_id,
+            ("research-report", "verified-research-dossier")
+            if section_id in _REPORT_SECTION_KEYS else (),
+        )
         for artifact_type in artifact_types:
             artifact = latest_artifacts.get(artifact_type)
-            content = artifact.get("content") if isinstance(artifact, dict) else None
-            if not isinstance(content, dict):
-                continue
-            if artifact_type == "research-report":
-                verification = content.get("verification")
-                if isinstance(verification, dict):
-                    return "verified" if verification.get("passed") is True else "partial"
-            elif artifact_type == "verified-research-dossier":
-                analyses = content.get("verified_analyses")
-                if isinstance(analyses, dict) and analyses:
-                    return "partial"
-            elif artifact_type == "deterministic-financial-summary":
-                verification = content.get("verification")
-                if isinstance(verification, dict):
-                    return "verified" if verification.get("passed") is True else "partial"
-                if str(content.get("verification_state") or "").upper() == "VERIFIED":
-                    return "verified"
-            else:
-                validation = content.get("_validation")
-                audit = content.get("_audit")
-                audit_verification = audit.get("verification") if isinstance(audit, dict) else None
-                if (
-                    isinstance(validation, dict) and validation.get("passed") is True
-                    or isinstance(audit_verification, dict) and audit_verification.get("passed") is True
-                    or artifact_type == "deterministic-valuation" and content.get("status") == "ok"
-                ):
-                    return "verified"
-                return "partial"
-        return "needs_review"
+            if isinstance(artifact, dict):
+                return validation_record_for_artifact(artifact, artifact_type=artifact_type)
+        return ValidationRecord()
     diagnostics: list[DeliveryDiagnostic] = []
     if stage_fallback_error:
         diagnostics.append(DeliveryDiagnostic("section_projection_failed", "presentation", "stage-fallbacks"))
@@ -1260,11 +1511,17 @@ def assemble_report_document(
             if not valid:
                 diagnostics.append(DeliveryDiagnostic("claim_text_not_string", "presentation", f"claims[{index}].text", (claim_id,), "This claim was isolated; repair its text field before relying on it."))
 
-    # Only the current deterministic artifact defines the displayed source set,
-    # matching the report's financial provenance rather than stale overlays.
+    # Financial source records describe current metrics. Committed qualitative
+    # nodes keep their own frozen links: reusing an evidence ID in a later
+    # financial refresh must not silently redirect an existing conclusion.
+    frozen_sources = [source for unit in trusted_nodes for source in unit.get("sources", ())]
+    frozen_ids = {source["evidence_id"] for source in frozen_sources}
+    display_evidence = [row for row in evidence if isinstance(row, dict)
+        and row.get("evidence_id") not in frozen_ids] if isinstance(evidence, list) else []
+    display_evidence.extend(frozen_sources)
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    if isinstance(evidence, list):
-        for raw in evidence:
+    if display_evidence:
+        for raw in display_evidence:
             if not isinstance(raw, dict):
                 continue
             url = str(raw.get("source_url", raw.get("url", "")) or "").strip()
@@ -1303,11 +1560,65 @@ def assemble_report_document(
         missing_stages=tuple(str(item) for item in readiness_value.get("missing_stages", []) if isinstance(item, str)) if isinstance(readiness_value.get("missing_stages", []), (list, tuple)) else (),
         issues=tuple(str(item) for item in readiness_value.get("issues", []) if isinstance(item, str)) if isinstance(readiness_value.get("issues", []), (list, tuple)) else (),
         recovery_action=str(readiness_value.get("recovery_action", "")),
+        coverage=copy.deepcopy(readiness_value.get("coverage")) if isinstance(readiness_value.get("coverage"), dict) else None,
     ) if isinstance(readiness_value, dict) else ReadinessView(
         state="action_required",
         issues=("research_report_artifact_missing",),
         recovery_action="resume_or_repair_missing_research_stages",
     )
+
+    qualitative_required = (
+        "executive_summary", "claims", "business_model", "financial_quality",
+        "balance_sheet", "competitive_position", "growth_opportunities",
+        "counterarguments", "scenarios", "thesis", "invalidation_conditions",
+        "leading_indicators", "unresolved_questions",
+    )
+    semantic_missing_sections = tuple(
+        key
+        for key in qualitative_required
+        if (
+            raw_report.get(key) in (None, "", [], {})
+            and key not in stage_fallbacks
+        )
+        or (
+            key in stage_fallbacks
+            and isinstance(stage_fallbacks[key], dict)
+            and str(stage_fallbacks[key].get("role") or "").casefold()
+            in {"notice", "placeholder", "source", "unknown"}
+        )
+        or (
+            isinstance(raw_report.get(key), dict)
+            and str(raw_report[key].get("role") or "").casefold()
+            in {"notice", "placeholder", "source", "unknown"}
+        )
+    ) if isinstance(raw_report, dict) else qualitative_required
+
+    def guard_report_completeness(value: ReadinessView) -> ReadinessView:
+        if invalidations:
+            value = replace(value, state="substantive_partial", complete=False,
+                issues=tuple(dict.fromkeys((*value.issues, "source_confirmed_fact_correction"))),
+                recovery_action="reverify_corrected_fact_dependencies")
+        validation = validation_record_for_artifact(final, artifact_type="research-report")
+        local_complete = (isinstance(value.coverage, dict) and value.coverage.get("complete") is True
+                          and bool(trusted_nodes))
+        if not value.complete or (local_complete and not semantic_missing_sections):
+            return value
+        missing = tuple(dict.fromkeys((*value.missing_sections, *semantic_missing_sections)))
+        issues = tuple(dict.fromkeys((
+            *value.issues,
+            *(("report_verification_unknown",) if validation.state == "unknown" else ()),
+            *(("report_section_content_missing",) if semantic_missing_sections else ()),
+        )))
+        return replace(
+            value,
+            state="substantive_partial" if value.substantive_sections else "action_required",
+            complete=False,
+            missing_sections=missing,
+            issues=issues,
+            recovery_action="complete_missing_or_unverified_sections",
+        )
+
+    readiness = guard_report_completeness(readiness)
 
     # All report sections are assembled from the versioned artifact contract.
     # Format renderers consume these immutable nodes; Markdown is no longer
@@ -1325,19 +1636,44 @@ def assemble_report_document(
         evidence_ids: tuple[str, ...] = (),
         diagnostic_code: str = "",
         is_substantive: bool | None = None,
+        role: str = "",
+        source_ids: tuple[str, ...] = (),
+        validation_record: ValidationRecord | None = None,
+        materiality: str = "",
+        completeness: str = "unknown",
     ) -> None:
         nonlocal ordinal
         ordinal += 1
+        section_record = validation_record or validation_record_for_section(section_id)
+        section_nodes = tuple(nodes)
+        if role:
+            section_nodes = _apply_section_content_metadata(
+                section_nodes,
+                role=role,
+                source_ids=source_ids,
+                record=section_record,
+                materiality=materiality or "material",
+            )
+        else:
+            section_nodes = _section_node_semantics(section_id, section_nodes)
+        section_nodes = tuple(
+            node if node.validation_record != ValidationRecord() else replace(
+                node, validation_record=section_record
+            )
+            for node in section_nodes
+        )
         blocks.append(_section(
             ordinal, section_id, title,
-            (ReportNode("heading", title, level=2), *nodes),
+            (ReportNode("heading", title, level=2), *section_nodes),
             claim_ids=section_claim_ids,
             assumption_ids=assumption_ids,
             evidence_ids=evidence_ids,
             source_artifact_ids=artifact_ids_for_section(section_id),
-            verification_state=verification_for_section(section_id),
+            verification_state=(section_record.state if validation_record is not None
+                                else verification_for_section(section_id)),
             diagnostic_code=diagnostic_code,
             is_substantive=is_substantive,
+            completeness=completeness,
         ))
 
     complete_title = final is not None and readiness.complete
@@ -1366,6 +1702,18 @@ def assemble_report_document(
         identity_nodes,
     )
 
+    if invalidations:
+        message = ("New source evidence corrected financial facts. Related previous conclusions were withdrawn; "
+                   "independent verified content remains available. Re-verify affected conclusions before relying on them."
+                   if locale == EN else
+                   "新來源證據更正了財務事實。相關舊結論已撤回，無關的可信內容仍可閱讀；請重新核驗受影響結論。"
+                   if locale == ZH_HANT else
+                   "新来源证据更正了财务事实。相关旧结论已撤回，无关的可信内容仍可阅读；请重新核验受影响结论。")
+        diagnostics.append(DeliveryDiagnostic("source_confirmed_fact_correction", "evidence", "trusted-content"))
+        add_section("source-corrections", "Source corrections" if locale == EN else
+                    "來源更正" if locale == ZH_HANT else "来源更正", (ReportNode("paragraph", message),),
+                    role="notice", materiality="non_material", is_substantive=False,
+                    diagnostic_code="source_confirmed_fact_correction")
     if not safe_artifacts:
         message = (
             "No usable research report is available. Start a company research run to build one."
@@ -1376,7 +1724,15 @@ def assemble_report_document(
         )
         add_section("research-status", "Research status" if locale == EN else "研究狀態" if locale == ZH_HANT else "研究状态", (ReportNode("paragraph", message),))
     elif final is None or not readiness.complete:
+        final_content = final.get("content") if isinstance(final, dict) else None
+        final_verification = final_content.get("verification") if isinstance(final_content, dict) else None
+        integrated_partial = (readiness.coverage is not None and isinstance(final_verification, dict)
+                              and final_verification.get("claim_integrity_passed") is True)
         message = (
+            "Integrated analysis has been preserved, but some required research obligations remain incomplete."
+            if locale == EN else "已保留綜合分析，但部分必要研究義務尚未完成。"
+            if locale == ZH_HANT else "已保留综合分析，但部分必要研究义务尚未完成。"
+        ) if integrated_partial else (
             "No final integrated report has been generated. Completed research stages are preserved below."
             if locale == EN else
             "尚未生成最终综合报告，以下保留已完成的研究阶段。"
@@ -1384,6 +1740,36 @@ def assemble_report_document(
             "尚未生成最终综合报告，以下保留已完成的研究阶段。"
         )
         add_section("research-status", "Staged research" if locale == EN else "階段性研究" if locale == ZH_HANT else "阶段性研究", (ReportNode("quote", message),))
+
+    if isinstance(readiness.coverage, dict) and readiness.coverage.get("gaps"):
+        coverage_labels = {
+            "company_business_model": ("公司与商业模式", "公司與商業模式", "Company and Business Model"),
+            "historical_financial_performance": ("历史财务表现", "歷史財務表現", "Historical Financial Performance"),
+            "earnings_quality": ("盈利质量", "盈利品質", "Earnings Quality"),
+            "balance_sheet_strength": ("资产负债表稳健性", "資產負債表穩健性", "Balance-sheet Strength"),
+            "competitive_advantages": ("竞争优势", "競爭優勢", "Competitive Advantages"),
+            "management_capital_allocation": ("管理层与资本配置", "管理層與資本配置", "Management and Capital Allocation"),
+            "existing_growth_engines": ("现有增长引擎", "現有增長引擎", "Existing Growth Engines"),
+            "potential_growth_opportunities": ("潜在增长机会", "潛在增長機會", "Potential Growth Opportunities"),
+            "industry_value_allocation": ("行业变化与价值分配", "行業變化與價值分配", "Industry Changes and Value Allocation"),
+            "growth_counterarguments": ("增长机会反方审查", "增長機會反方審查", "Growth-opportunity Counterarguments"),
+            "operating_scenarios": ("悲观、基准与乐观情景", "悲觀、基準與樂觀情境", "Bear, Base and Bull Scenarios"),
+            "current_price_expectations": ("当前价格隐含预期", "目前價格隱含預期", "Current-price Implied Expectations"),
+            "valuation_sensitivity": ("估值与敏感性", "估值與敏感性", "Valuation and Sensitivity"),
+            "investment_thesis": ("投资逻辑", "投資邏輯", "Investment Thesis"),
+            "thesis_invalidation": ("逻辑失效条件", "邏輯失效條件", "Thesis Invalidation"),
+            "leading_indicators": ("领先指标", "領先指標", "Leading Indicators"),
+            "unresolved_questions": ("未解决问题", "未解決問題", "Unresolved Questions"),
+            "evidence_methodology": ("证据与研究方法", "證據與研究方法", "Evidence and Methodology"),
+        }
+        position = 2 if locale == EN else 1 if locale == ZH_HANT else 0
+        gap_nodes = tuple(ReportNode("list_item", coverage_labels[item][position])
+                          for item in readiness.coverage["gaps"] if item in coverage_labels)
+        if gap_nodes:
+            add_section("research-coverage-gaps", "Remaining Research Obligations" if locale == EN
+                        else "尚待完成的研究義務" if locale == ZH_HANT else "尚待完成的研究义务",
+                        gap_nodes, role="notice", materiality="non_material", is_substantive=False,
+                        completeness="incomplete")
 
     if isinstance(final, dict):
         final_content = final.get("content") if isinstance(final.get("content"), dict) else {}
@@ -1428,16 +1814,22 @@ def assemble_report_document(
             # Historical deterministic summaries use USD when they omit the
             # currency field; preserve that established input contract.
             content = {**content, "currency": "USD"}
+        # Financial quality can be the only surviving deterministic material
+        # when every metric row was rejected.  Establish the evidence
+        # identity from the summary's accepted source records before any
+        # branch-specific section is built; otherwise the quality section
+        # would reference an uninitialised local (and, worse, have no stable
+        # evidence boundary to project against).
+        all_financial_ids = tuple(dict.fromkeys(
+            str(item.get("evidence_id")) for item in evidence
+            if isinstance(item, dict) and item.get("evidence_id")
+        )) if isinstance(evidence, list) else ()
         try:
             metric_nodes, balance_nodes = _financial_nodes(content, locale)
         except Exception:
             metric_nodes, balance_nodes = (), ()
             diagnostics.append(DeliveryDiagnostic("section_projection_failed", "presentation", "financial-overview"))
         if metric_nodes:
-            all_financial_ids = tuple(dict.fromkeys(
-                str(item.get("evidence_id")) for item in evidence
-                if isinstance(item, dict) and item.get("evidence_id")
-            )) if isinstance(evidence, list) else ()
             add_section("financial-overview", financial_title, metric_nodes, evidence_ids=all_financial_ids)
         if balance_nodes:
             balance_ids = tuple(dict.fromkeys(
@@ -1456,7 +1848,7 @@ def assemble_report_document(
         if isinstance(financial_quality, dict):
             projected_quality = project_report_value(
                 financial_quality, include_technical=include_technical,
-                available_evidence=set(all_financial_ids if metric_nodes else ()),
+                available_evidence=set(all_financial_ids),
             )
             quality_nodes = _semantic_nodes(projected_quality, locale)
             rejected = financial_quality.get("rejected_periods", [])
@@ -1576,12 +1968,92 @@ def assemble_report_document(
                 nodes.append(ReportNode("list_item", f"**{label}:** {rendered}" if locale == EN else f"**{label}：** {rendered}"))
         return tuple(nodes)
 
-    for key in (_REPORT_SECTION_KEYS if safe_artifacts else ()):
-        raw_value = raw_report.get(key) if isinstance(raw_report, dict) else None
-        if raw_value in (None, "", [], {}) and key in stage_fallbacks:
+    # Extensible, independently proven sections share the SAME commit/read
+    # path. Registration controls preferred order/labels, never factual trust.
+    section_keys = tuple(dict.fromkeys((*_REPORT_SECTION_KEYS, *trusted_by_section))) if safe_artifacts else ()
+    for key in section_keys:
+        if key in trusted_by_section:
+            # The normal and emergency lanes consume the same commit-time
+            # nodes. Neither an artifact-wide passed bit nor another section
+            # can promote this body's validation state.
+            proven_nodes = []
+            emitted_context = set()
+            for unit in trusted_by_section[key]:
+                record = node_validation_record(unit)
+                for context_label in unit.get("context", ()):
+                    identity = (context_label.get("path"), context_label.get("field"), context_label.get("text"))
+                    if identity not in emitted_context:
+                        emitted_context.add(identity)
+                        proven_nodes.append(ReportNode("heading", str(context_label["text"]),
+                            role="notice", materiality="non_material"))
+                field = re.sub(r"\[\d+\]", "", unit["source_path"].split(".")[-1])
+                body = unit["body"]
+                # Retain the leaf's semantic field label (and original list
+                # position) rather than turn every assumption into an
+                # indistinguishable paragraph. The proof remains body-bound.
+                def simple_nodes():
+                    minimum = minimum_presentation(unit, locale)
+                    return [ReportNode("table", rows=minimum["rows"])] if minimum["kind"] == "table" else [
+                        ReportNode("paragraph", minimum["text"])]
+                try:
+                    if isinstance(body, (dict, list)):
+                        formatted = simple_nodes()
+                    elif field in {"analysis", "summary", "text", "body", "conclusion", "reason"}:
+                        formatted = _semantic_nodes(body, locale, field=field)
+                    else:
+                        formatted = _semantic_nodes({field: body}, locale)
+                except Exception:
+                    # Presentation failure changes only layout. The exact
+                    # committed body/proof and its siblings remain readable.
+                    formatted = simple_nodes()
+                    diagnostics.append(DeliveryDiagnostic("trusted_node_presentation_fallback", "presentation",
+                        unit["source_path"], (unit["node_id"],)))
+                proven_nodes.extend(_apply_section_content_metadata(formatted,
+                    role=unit["role"], source_ids=record.evidence_ids, record=record, materiality="material"))
+                if unit["role"] == "analysis" and unit.get("validation_state") == "partial":
+                    label = ("Model analysis · sources located; factual premises not independently verified."
+                             if locale == EN else "模型分析 · 來源已定位，事實前提尚未獨立核驗。"
+                             if locale == ZH_HANT else "模型分析 · 来源已定位，事实前提尚未独立核验。")
+                    proven_nodes.append(ReportNode("paragraph", label, role="notice", materiality="non_material"))
+            refs = tuple(dict.fromkeys(ref for unit in trusted_by_section[key] for ref in unit.get("evidence_ids", ())))
+            verified_section = all(unit.get("validation_state") == "verified" for unit in trusted_by_section[key])
+            add_section("opposing-views" if key == "counterarguments" else key,
+                        _localized_section_title(key, locale), proven_nodes, evidence_ids=refs,
+                        validation_record=ValidationRecord(state="verified" if verified_section else "partial",
+                            passed=verified_section, validator="section-content-proof",
+                            validator_version=trusted_by_section[key][0]["validator_version"], evidence_ids=refs),
+                        completeness="incomplete" if not readiness.complete else "complete")
+            continue
+        if key in revoked_sections:
+            # A withdrawn last node must not reappear via the legacy fallback.
+            continue
+        raw_source_value = raw_report.get(key) if isinstance(raw_report, dict) else None
+        used_stage_fallback = raw_source_value in (None, "", [], {}) and key in stage_fallbacks
+        if used_stage_fallback:
             raw_value = stage_fallbacks[key]
         else:
-            raw_value = display_report.get(key, raw_value)
+            raw_value = display_report.get(key, raw_source_value)
+        semantic_source = stage_fallbacks[key] if used_stage_fallback else raw_source_value
+        generated_placeholder = (
+            not used_stage_fallback
+            and raw_source_value in (None, "", [], {})
+            and key in {
+                "executive_summary", "claims", "business_model", "financial_quality",
+                "balance_sheet", "competitive_position", "growth_opportunities",
+                "counterarguments", "scenarios", "thesis", "invalidation_conditions",
+                "leading_indicators", "unresolved_questions",
+            }
+        )
+        if generated_placeholder and readiness.coverage is not None:
+            # Current reports collect absent obligations once above. Preserve
+            # legacy presentation, but never pile empty headings into 3.0.0.
+            continue
+        section_record = validation_record_for_section(key)
+        role, source_ids, materiality_level, completeness = section_content_metadata(
+            semantic_source,
+            validation=section_record,
+            generated_placeholder=generated_placeholder,
+        )
         try:
             projected = project_report_value(
                 raw_value,
@@ -1595,12 +2067,26 @@ def assemble_report_document(
                 nodes = _claim_nodes(tuple(claims), projected, locale)
                 claim_ids = tuple(item.claim_id for item in claims)
                 assumptions = tuple(item.assumption_id for item in claims if item.assumption_id)
+                if not source_ids:
+                    source_ids = tuple(dict.fromkeys(
+                        evidence_id for item in claims for evidence_id in item.evidence_ids
+                    ))
             elif key == "growth_opportunities":
                 nodes = growth_nodes(raw_value)
             else:
                 nodes = _typed_section_nodes(key, projected, locale)
+            nodes = _apply_section_content_metadata(
+                nodes,
+                role=role,
+                source_ids=source_ids,
+                record=section_record,
+                materiality=materiality_level,
+            )
             if key == "growth_opportunities" and not nodes:
                 nodes = _growth_status_nodes(raw_value, locale)
+                role = "notice"
+                materiality_level = "non_material"
+                completeness = "incomplete"
             if not nodes:
                 continue
             section_evidence = tuple(dict.fromkeys(
@@ -1613,6 +2099,11 @@ def assemble_report_document(
                 section_claim_ids=claim_ids,
                 assumption_ids=assumptions,
                 evidence_ids=section_evidence,
+                role=role,
+                source_ids=source_ids,
+                validation_record=section_record,
+                materiality=materiality_level,
+                completeness=completeness,
             )
         except Exception:
             diagnostics.append(DeliveryDiagnostic("section_projection_failed", "presentation", key))
@@ -1650,9 +2141,21 @@ def assemble_report_document(
             label = source.title + (f" ({locators})" if locators and locale == EN else f"（{locators}）" if locators else "")
             if source.url.startswith(("https://", "http://")):
                 label = f"[{label}]({source.url})"
-            source_nodes.append(ReportNode("list_item", label))
+            source_nodes.append(ReportNode(
+                "list_item",
+                label,
+                role="source",
+                source_ids=source.evidence_ids,
+                materiality="non_material",
+            ))
             if not source.url.startswith(("https://", "http://")):
-                source_nodes.append(ReportNode("paragraph", source.url))
+                source_nodes.append(ReportNode(
+                    "paragraph",
+                    source.url,
+                    role="source",
+                    source_ids=source.evidence_ids,
+                    materiality="non_material",
+                ))
         add_section("evidence-sources", title, source_nodes, evidence_ids=tuple(dict.fromkeys(item for source in sources for item in source.evidence_ids)))
 
     if safe_artifacts:
@@ -1712,11 +2215,13 @@ def assemble_report_document(
         missing_stages=tuple(str(item) for item in readiness_value.get("missing_stages", []) if isinstance(item, str)) if isinstance(readiness_value.get("missing_stages", []), (list, tuple)) else (),
         issues=tuple(str(item) for item in readiness_value.get("issues", []) if isinstance(item, str)) if isinstance(readiness_value.get("issues", []), (list, tuple)) else (),
         recovery_action=str(readiness_value.get("recovery_action", "")),
+        coverage=copy.deepcopy(readiness_value.get("coverage")) if isinstance(readiness_value.get("coverage"), dict) else None,
     ) if isinstance(readiness_value, dict) else ReadinessView(
         state="action_required",
         issues=("research_report_artifact_missing",),
         recovery_action="resume_or_repair_missing_research_stages",
     )
+    readiness = guard_report_completeness(readiness)
     continuity_state = str(continuity.get("state", "unknown")) if isinstance(continuity, dict) else "unknown"
     from .report_projection import resolve_report_identity
 
@@ -1741,7 +2246,7 @@ def render_markdown(document: ReportDocument) -> str:
     return "\n\n".join(
         section.body.rstrip()
         for section in document.sections
-        if section.body.strip()
+        if section.is_visible and section.body.strip()
     ).rstrip() + "\n"
 
 
@@ -1800,10 +2305,15 @@ def render_html(document: ReportDocument) -> str:
     """Lay out the same immutable section nodes as an escaped HTML report."""
     from .report_html import _document
 
-    sections = "".join(
-        f'<section id="{escape(section.section_id, quote=True)}">{_render_blocks(section.nodes)}</section>'
-        for section in document.sections
-    )
+    def section_html(section):
+        body = _render_blocks(section.nodes)
+        if section.section_id == "research-coverage-gaps":
+            # One visible summary, full obligations still available on demand
+            # and in the same canonical Markdown/diagnostic payload.
+            count = sum(node.kind == "list_item" for node in section.nodes)
+            body = f'<details><summary>{escape(section.title)} ({count})</summary>{body}</details>'
+        return f'<section id="{escape(section.section_id, quote=True)}">{body}</section>'
+    sections = "".join(section_html(section) for section in document.sections if section.is_visible)
     title = document.company_name or ("OpenThesis Research Report" if document.language == EN else "OpenThesis 研究报告")
     status = document.run_digest.run_status.casefold()
     status_allows_complete = not status or status == "completed"

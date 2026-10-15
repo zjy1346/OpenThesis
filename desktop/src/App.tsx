@@ -61,6 +61,7 @@ export default function App() {
     retrySynthesis,
     retryGrowth,
     retryRecoveryStage,
+    revalidateSaved,
     retryFinancials,
     rebuildFinancials,
     refreshFinancialReport,
@@ -271,10 +272,10 @@ export default function App() {
                 <span>{copy.reportPreviousVersion}</span>
                 <button type="button" onClick={() => void retryReportRead()}>{copy.retryReportRead}</button>
               </div>
-              <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+              <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRevalidateSaved={revalidateSaved} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
             </>
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+            <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRevalidateSaved={revalidateSaved} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
           ) : reportLoadState.status === "loading" || bootstrap.recent_runs.length > 0 && reportLoadState.status === "idle" ? (
             <LoadingState label={copy.reportReading} />
           ) : reportLoadState.status === "failed" ? (

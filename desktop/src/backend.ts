@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   BootstrapResult,
   Company,
+  CompanySearchResponse,
   ConfiguredModelSummary,
   DiscoveredModel,
   ModelReference,
@@ -67,13 +68,28 @@ export function getResearchReport(
 }
 
 export function updatePreferences(
-  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market">>,
+  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy">>,
 ): Promise<Preferences> {
   return request("settings.update", { preferences });
 }
 
-export function searchCompanies(query: string, market: Market): Promise<Company[]> {
-  return request("company.search", { query, market });
+export async function searchCompanies(query: string, market: Market, requestId: string): Promise<CompanySearchResponse> {
+  const response = await request("company.search", { query, market, request_id: requestId });
+  if (
+    !response
+    || response.contract !== "openthesis.company-search.v2"
+    || response.query !== query
+    || response.market !== market
+    || response.request_id !== requestId
+    || !["ready", "empty", "degraded", "unavailable"].includes(response.state)
+    || !Array.isArray(response.companies)
+    || !Array.isArray(response.diagnostics)
+    || response.diagnostics.some((item) => !item || typeof item.code !== "string" || typeof item.diagnostic_id !== "string")
+    || response.companies.some((company) => !company || !["official_verified", "cached_verified", "unresolved_code"].includes(company.identity_state ?? ""))
+  ) {
+    throw new Error("COMPANY_SEARCH_CONTRACT_MISMATCH");
+  }
+  return response;
 }
 
 export function captureMarketSnapshot(
@@ -235,13 +251,19 @@ export function retryResearchStage(
   target: RecoveryStageTarget,
   model: ModelSelection,
   planHash: string,
+  confirmNewAttempt = false,
 ): Promise<ResearchReport> {
   return request("research.retry_stage", {
     run_id: runId,
     target,
     model,
     plan_hash: planHash,
+    ...(confirmNewAttempt ? { confirm_new_attempt: true } : {}),
   });
+}
+
+export function revalidateSavedResearch(runId: string): Promise<ResearchReport> {
+  return request("research.revalidate_saved", { run_id: runId });
 }
 
 export function retryResearchFinancials(runId: string): Promise<ResearchReport> {

@@ -19,6 +19,8 @@ const STAGES: Record<string, Record<string, StageCopy>> = {
     "financial-analysis": { title: "正在分析近年财务表现……", note: "营收告诉我们规模，现金流往往告诉我们质量。" },
     "base-analysis": { title: "正在协同分析财务、商业与会计风险……", note: "先把不同视角分别研究，再把它们放回同一套证据中核对。" },
     "business-analysis": { title: "正在理解商业模式与竞争位置……", note: "一家公司如何赚钱，与它能否持续赚钱同样重要。" },
+    "source-industry-analysis": { title: "正在读取原件中的行业信息……", note: "先看产业结构与价值分配，再判断增长机会。" },
+    "source-risk-analysis": { title: "正在独立审查原件风险……", note: "先保留风险线索，再检视后续形成的投资假设。" },
     "risk-analysis": { title: "正在梳理竞争优势与风险……", note: "好的投资研究，不应该只寻找买入的理由。" },
     "growth-analysis": { title: "正在研究未来增长机会……", note: "增长不只需要方向，也需要证据、时间与兑现路径。" },
     "counter-analysis": { title: "正在进行反方审查……", note: "如果结论经不起反对意见，它也很难经得起市场。" },
@@ -41,6 +43,8 @@ const STAGES: Record<string, Record<string, StageCopy>> = {
     "financial-analysis": { title: "Analyzing recent financial performance…", note: "Revenue shows scale; cash flow often reveals quality." },
     "base-analysis": { title: "Analyzing financials, the business, and accounting risks…", note: "Each perspective is studied separately, then checked against the same body of evidence." },
     "business-analysis": { title: "Studying the business model and competitive position…", note: "How a company makes money matters as much as whether it can keep doing so." },
+    "source-industry-analysis": { title: "Reading industry disclosures…", note: "Understand industry structure and value allocation before assessing growth." },
+    "source-risk-analysis": { title: "Independently reviewing source risks…", note: "Preserve source-backed risks before challenging the later investment hypotheses." },
     "risk-analysis": { title: "Reviewing advantages and risks…", note: "Good investment research should not look only for reasons to buy." },
     "growth-analysis": { title: "Evaluating future growth opportunities…", note: "Growth needs more than a direction; it needs evidence, timing, and a path to execution." },
     "counter-analysis": { title: "Stress-testing the thesis…", note: "If a conclusion cannot withstand objections, it is unlikely to withstand the market." },
@@ -65,6 +69,8 @@ STAGES["zh-Hant"] = {
   "financial-analysis": { title: "正在分析近年財務表現……", note: "營收呈現規模，現金流往往呈現品質。" },
   "base-analysis": { title: "正在協同分析財務、商業與會計風險……", note: "先分別研究不同觀點，再以同一套證據核對。" },
   "business-analysis": { title: "正在理解商業模式與競爭位置……", note: "公司如何賺錢，與能否持續賺錢同樣重要。" },
+  "source-industry-analysis": { title: "正在讀取原件中的行業資訊……", note: "先看產業結構與價值分配，再判斷成長機會。" },
+  "source-risk-analysis": { title: "正在獨立審查原件風險……", note: "先保留風險線索，再檢視後續形成的投資假設。" },
   "risk-analysis": { title: "正在整理競爭優勢與風險……", note: "好的研究不應只尋找支持結論的理由。" },
   "growth-analysis": { title: "正在研究未來成長機會……", note: "成長需要方向、證據、時間與實現路徑。" },
   "counter-analysis": { title: "正在進行反方審查……", note: "經不起反對意見的結論，也很難經得起市場。" },
@@ -270,12 +276,22 @@ export function progressStageDetail(
 
 export function agentDisplayName(language: string | undefined, agentId: string): string {
   const normalized = normalizeProgressLanguage(language);
-  const labels: Record<string, readonly [string, string]> = {
-    "financial-analyst": ["财务分析", "Financial analysis"],
-    "business-analyst": ["商业模式", "Business analysis"],
-    "accounting-risk-analyst": ["会计与风险", "Accounting and risk"],
+  const labels: Record<string, readonly [string, string, string]> = {
+    "financial-analyst": ["财务分析", "Financial analysis", "財務分析"],
+    "business-analyst": ["商业模式", "Business analysis", "商業模式"],
+    "accounting-risk-analyst": ["会计与风险", "Accounting and risk", "會計與風險"],
+    "source-industry-analysis": ["原件行业分析", "Source industry analysis", "原件行業分析"],
+    "source-risk-analysis": ["原件风险审查", "Source risk review", "原件風險審查"],
+    "growth-opportunity-analyst": ["增长机会", "Growth opportunities", "成長機會"],
+    "skeptical-analyst": ["反方审查", "Counter-analysis", "反方審查"],
+    "forecast-analyst": ["经营情景", "Operating scenarios", "經營情境"],
+    "research-synthesizer": ["综合结论", "Final synthesis", "綜合結論"],
   };
   const label = labels[agentId];
-  if (label) return label[normalized === "en" ? 1 : 0];
+  if (label) return label[normalized === "en" ? 1 : normalized === "zh-Hant" ? 2 : 0];
   return normalized === "en" ? "Research stage" : normalized === "zh-Hant" ? "研究階段" : "研究阶段";
+}
+
+export function isAgentStageComplete(state: string): boolean {
+  return ["completed", "completed_verified", "completed_partial", "reused_verified"].includes(state);
 }

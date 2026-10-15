@@ -4,6 +4,7 @@ import { Clock3, FileText } from "lucide-react";
 import type { ResearchJob } from "../types";
 import {
   agentDisplayName,
+  isAgentStageComplete,
   formatElapsedTime,
   progressStageCopy,
   progressStageDetail,
@@ -130,6 +131,11 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
     unknown: "Waiting",
   };
   const statusLabel = (state: string) => {
+    if (state === "validating") return language === "en" ? "Processing and verifying" : language === "zh-Hant" ? "整理與核驗中" : "整理与核验中";
+    if (state === "completed_partial") return language === "en" ? "Processed; verification incomplete" : language === "zh-Hant" ? "已處理，核驗尚未完整" : "已处理，核验尚未完整";
+    if (state === "completed_verified" || state === "reused_verified") return copy.completed;
+    if (state === "needs_action") return language === "en" ? "Action required" : language === "zh-Hant" ? "等待處理" : "等待处理";
+    if (state === "failed_verification") return copy.failed;
     if (state === "running") return copy.running;
     if (state === "retrying") return copy.retrying;
     if (state === "queued") return copy.queued;
@@ -140,7 +146,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   };
   const agentStates = job.agent_states ?? {};
   const totalAgents = job.total_agents ?? Object.keys(agentStates).length;
-  const completedAgents = job.completed_agents ?? Object.values(agentStates).filter((state) => state === "completed").length;
+  const completedAgents = job.completed_agents ?? Object.values(agentStates).filter(isAgentStageComplete).length;
   const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
   const [elapsed, setElapsed] = useState(backendElapsed);
   const elapsedAnchor = useRef({
