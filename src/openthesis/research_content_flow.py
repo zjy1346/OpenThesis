@@ -6,13 +6,17 @@ from typing import Any, Mapping
 
 
 VERSION = "openthesis.research-content-flow.v1"
-_LABELS = {"evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids", "claim_ids",
+_LABELS = {"evidence_ids", "source_evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids", "claim_ids",
     "input_claim_ids", "id", "claim_id", "name", "title", "label", "kind", "type", "confidence",
-    "severity", "role", "method", "applicability", "structured_output_valid"}
+    "severity", "role", "method", "applicability", "structured_output_valid", "as_of",
+    "supporting_evidence_count", "contradicting_evidence_count"}
 
 
 def parsed_paths(value: Any, path: str = "$") -> list[str]:
     if isinstance(value, dict):
+        if path == "$":
+            from .research_response import response_parts
+            value, _metadata, _diagnostics = response_parts(value)
         return [child for key, item in value.items() if not str(key).startswith("_") and key not in _LABELS
             for child in parsed_paths(item, path + "." + str(key))]
     if isinstance(value, (list, tuple)):

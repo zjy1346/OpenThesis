@@ -13,6 +13,50 @@ from openthesis.filing_parser import (
 
 
 class FilingParserTests(unittest.TestCase):
+    def test_toc_navigation_does_not_drop_audit_body(self) -> None:
+        html = """
+        <html><body>
+          <nav><a href='#audit'>Table of Contents</a></nav>
+          <h1 id='audit'>Report of Independent Registered Public Accounting Firm</h1>
+          <p>We have audited the accompanying consolidated balance sheets and the
+          related consolidated statements of operations, stockholders' equity and
+          cash flows. In our opinion, the financial statements present fairly, in
+          all material respects, the financial position of the company.</p>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.html"
+            path.write_text(html, encoding="utf-8")
+            filing = FilingDocument(
+                "test:audit-nav", "0001", "audit-nav", "10-K", "FY",
+                "2025-12-31", "2026-02-01", path.name,
+                f"https://example.test/{path.name}", local_path=str(path),
+            )
+            evidence = extract_topic_evidence(filing)
+        audits = [item for item in evidence if item.title.endswith(" · audit")]
+        self.assertTrue(audits)
+        self.assertIn("financial statements present fairly", audits[0].excerpt)
+
+    def test_real_table_of_contents_remains_filtered(self) -> None:
+        html = """
+        <html><body>
+          <h1>Table of Contents</h1>
+          <p>Item 1. Business ........ 3</p>
+          <p>Item 1A. Risk Factors ........ 5</p>
+          <p>Report of Independent Registered Public Accounting Firm ........ 42</p>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "toc.html"
+            path.write_text(html, encoding="utf-8")
+            filing = FilingDocument(
+                "test:toc", "0001", "toc", "10-K", "FY",
+                "2025-12-31", "2026-02-01", path.name,
+                f"https://example.test/{path.name}", local_path=str(path),
+            )
+            evidence = extract_topic_evidence(filing)
+        self.assertFalse(any(item.title.endswith(" · audit") for item in evidence))
+
     def test_sec_registered_public_accounting_firm_heading_is_audit_evidence(self) -> None:
         external = """<html><body><h1>Report of Independent Registered Public Accounting Firm</h1>
         <p>We have audited the accompanying consolidated balance sheets and the

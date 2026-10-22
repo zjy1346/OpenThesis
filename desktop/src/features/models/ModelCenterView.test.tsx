@@ -120,6 +120,7 @@ describe("ModelCenterView", () => {
       enabled: model.enabled,
       capabilities: model.capabilities,
       timeout_seconds: 240,
+      context_window_hint: null,
     }));
   });
 

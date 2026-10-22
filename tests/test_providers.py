@@ -48,6 +48,7 @@ class ProviderTests(unittest.TestCase):
                         "provider_id": "openai",
                     },
                 },
+                "wire_contract": "text-single-request-v1",
             }
             completed = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
@@ -74,6 +75,80 @@ class ProviderTests(unittest.TestCase):
             self.assertNotIn("base_url", serialized)
             self.assertNotIn("secret", serialized)
 
+    def test_text_single_wire_request_preserves_prompts_and_json_mode_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {
+                "ok": True,
+                "result": {"content": '{"ok":true}', "meta": {}},
+                "wire_contract": "text-single-request-v1",
+            }
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
+            )
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="text.ready"), gateway_path=gateway
+                )
+                result = provider.generate(
+                    "system text with punctuation", "user text with full context", json_mode=False
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(invoked.call_count, 1)
+            request = json.loads(invoked.call_args.kwargs["input"])
+            self.assertEqual(request["operation"], "generate")
+            self.assertEqual(request["system_prompt"], "system text with punctuation")
+            self.assertEqual(request["user_prompt"], "user text with full context")
+            self.assertFalse(request["json_mode"])
+            self.assertEqual(request["wire_contract"], "text-single-request-v1")
+
+    def test_text_response_without_contract_is_protocol_error_with_one_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {"ok": True, "result": {"content": '{"ok":true}', "meta": {}}}
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
+            )
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="text.ready"), gateway_path=gateway
+                )
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate("system", "user")
+            self.assertEqual(caught.exception.code, "MODEL_GATEWAY_PROTOCOL_ERROR")
+            self.assertEqual(invoked.call_count, 1)
+
+    def test_text_format_rejection_preserves_http_status_without_provider_retry(self) -> None:
+        for status in (400, 422):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                gateway = Path(directory) / "OpenThesis.exe"
+                gateway.write_bytes(b"MZ")
+                response = {
+                    "ok": False,
+                    "wire_contract": "text-single-request-v1",
+                    "error": {
+                        "code": "MODEL_RESPONSE_FORMAT_UNSUPPORTED",
+                        "message": "unsupported format",
+                        "http_status": status,
+                        "retryable": False,
+                    },
+                }
+                completed = subprocess.CompletedProcess(
+                    args=[], returncode=1, stdout=json.dumps(response).encode(), stderr=b""
+                )
+                with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                    provider = RustModelGatewayProvider(
+                        ModelConfig(configured_model_id="text.ready"), gateway_path=gateway
+                    )
+                    with self.assertRaises(ProviderError) as caught:
+                        provider.generate("system", "user")
+                self.assertEqual(caught.exception.code, "MODEL_RESPONSE_FORMAT_UNSUPPORTED")
+                self.assertEqual(caught.exception.http_status, status)
+                self.assertEqual(invoked.call_count, 1)
+
     def test_vision_payload_is_bounded_png_and_never_uses_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             gateway = Path(directory) / "OpenThesis.exe"
@@ -81,6 +156,7 @@ class ProviderTests(unittest.TestCase):
             response = {
                 "ok": True,
                 "result": {"content": '{"facts":[]}', "meta": {}},
+                "wire_contract": "vision-single-request-v1",
             }
             completed = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout=json.dumps(response).encode(), stderr=b""
@@ -96,10 +172,49 @@ class ProviderTests(unittest.TestCase):
             request = json.loads(kwargs["input"])
             self.assertEqual(request["operation"], "vision")
             self.assertEqual(request["image_media_type"], "image/png")
+            self.assertEqual(request["wire_contract"], "vision-single-request-v1")
             self.assertNotIn(request["image_base64"], " ".join(kwargs["args"]))
             with self.assertRaises(ProviderError) as caught:
                 provider.generate_vision("system", "user", b"not-png")
             self.assertEqual(caught.exception.code, "MODEL_VISION_PAYLOAD_INVALID")
+
+    def test_single_vision_request_can_disable_format_without_hidden_python_retry(self):
+        provider = RustModelGatewayProvider(ModelConfig(configured_model_id="vision.ready"))
+        with patch.object(provider, "_invoke_gateway", return_value={"facts": []}) as invoked:
+            provider.generate_vision_once("system", "user", b"\x89PNG\r\n\x1a\ncontent", json_mode=False)
+        self.assertEqual(invoked.call_count, 1)
+        self.assertFalse(invoked.call_args.args[0]["json_mode"])
+        self.assertEqual(invoked.call_args.args[0]["wire_contract"], "vision-single-request-v1")
+
+    def test_vision_rejects_a_legacy_response_without_single_wire_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            old_response = {"ok": True, "result": {"content": '{"facts":[]}', "meta": {}}}
+            completed = subprocess.CompletedProcess([], 0, json.dumps(old_response).encode(), b"")
+            provider = RustModelGatewayProvider(ModelConfig(configured_model_id="vision.ready"), gateway_path=gateway)
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate_vision("system", "user", b"\x89PNG\r\n\x1a\ncontent")
+            self.assertEqual(caught.exception.code, "MODEL_GATEWAY_PROTOCOL_ERROR")
+            self.assertEqual(invoked.call_count, 1)
+
+    def test_explicit_format_rejection_preserves_http_status_and_has_no_provider_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            response = {"ok": False, "wire_contract": "vision-single-request-v1", "error": {
+                "code": "MODEL_RESPONSE_FORMAT_UNSUPPORTED", "message": "unsupported format",
+                "http_status": 400, "retryable": False,
+            }}
+            completed = subprocess.CompletedProcess([], 1, json.dumps(response).encode(), b"")
+            provider = RustModelGatewayProvider(ModelConfig(configured_model_id="vision.ready"), gateway_path=gateway)
+            with patch("openthesis.providers.subprocess.run", return_value=completed) as invoked:
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate_vision("system", "user", b"\x89PNG\r\n\x1a\ncontent")
+            self.assertEqual(caught.exception.http_status, 400)
+            self.assertEqual(caught.exception.code, "MODEL_RESPONSE_FORMAT_UNSUPPORTED")
+            self.assertEqual(invoked.call_count, 1)
 
     def test_gateway_errors_are_typed_and_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -107,10 +222,12 @@ class ProviderTests(unittest.TestCase):
             gateway.write_bytes(b"MZ")
             response = {
                 "ok": False,
+                "wire_contract": "text-single-request-v1",
                 "error": {
                     "code": "MODEL_RATE_LIMITED",
                     "message": "quota exhausted",
                     "retryable": True,
+                    "retry_after_seconds": 19,
                 },
             }
             completed = subprocess.CompletedProcess(
@@ -125,6 +242,7 @@ class ProviderTests(unittest.TestCase):
                     provider.generate("system", "user")
             self.assertEqual(caught.exception.code, "MODEL_RATE_LIMITED")
             self.assertTrue(caught.exception.retryable)
+            self.assertEqual(caught.exception.retry_after_seconds, 19)
             self.assertNotIn("ignored", str(caught.exception))
 
     def test_gateway_oserror_remains_unavailable_and_does_not_echo_detail(self) -> None:
@@ -154,12 +272,42 @@ class ProviderTests(unittest.TestCase):
             provider.generate("system", "user")
         self.assertEqual(caught.exception.code, "MODEL_GATEWAY_UNAVAILABLE")
 
+    def test_research_cancellation_terminates_the_gateway_process(self) -> None:
+        class Process:
+            returncode = None
+
+            def __init__(self) -> None:
+                self.killed = False
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            def communicate(self, input=None, timeout=None):
+                return b"", b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = Path(directory) / "OpenThesis.exe"
+            gateway.write_bytes(b"MZ")
+            process = Process()
+            with patch("openthesis.providers.subprocess.Popen", return_value=process):
+                provider = RustModelGatewayProvider(
+                    ModelConfig(configured_model_id="model.ready"),
+                    gateway_path=gateway,
+                )
+                provider.set_cancel_check(lambda: True)
+                with self.assertRaises(ProviderError) as caught:
+                    provider.generate("system", "user")
+            self.assertEqual(caught.exception.code, "MODEL_CANCELLED")
+            self.assertTrue(process.killed)
+
     def test_gateway_error_diagnostics_are_bounded_and_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             gateway = Path(directory) / "OpenThesis.exe"
             gateway.write_bytes(b"MZ")
             response = {
                 "ok": False,
+                "wire_contract": "text-single-request-v1",
                 "error": {
                     "code": "MODEL_PROVIDER_ERROR",
                     "message": "prompt=private prompt api_key=sk-private-value " * 100,
@@ -192,6 +340,34 @@ class ProviderTests(unittest.TestCase):
         self.assertFalse(result["structured_output_valid"])
         self.assertEqual(result["_response_error"], "invalid_shape")
         self.assertNotIn("prompt", result)
+
+    def test_duplicate_json_keys_are_not_silently_last_write_wins(self) -> None:
+        for response in (
+            '{"revenue":1,"revenue":2}',
+            '{"financial_quality":{"profit":1,"profit":1}}',
+            'Here is JSON: {"revenue":1,"revenue":2}',
+            '```json\n{"revenue":1,"revenue":2}\n```',
+        ):
+            with self.subTest(response=response):
+                result = _parse_model_json(response)
+                self.assertFalse(result["structured_output_valid"])
+                self.assertEqual(result["_response_error"], "duplicate_json_key")
+                self.assertNotIn("revenue", result)
+
+    def test_non_finite_numbers_are_not_valid_model_financials(self) -> None:
+        for number in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(number=number):
+                result = _parse_model_json('{"growth":' + number + '}')
+                self.assertFalse(result["structured_output_valid"])
+                self.assertEqual(result["_response_error"], "non_finite_json_number")
+                self.assertNotIn("growth", result)
+
+    def test_valid_nested_json_preserves_every_field(self) -> None:
+        response = {"financial_quality": {"cash_conversion": 0.82, "notes": ["source checked"]},
+                    "implied_expectations": {"growth": 0.12}}
+        result = _parse_model_json(json.dumps(response))
+        for key, value in response.items():
+            self.assertEqual(result[key], value)
 
 
 if __name__ == "__main__":

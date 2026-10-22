@@ -165,6 +165,7 @@ def _emit_filing_progress(
     status: str,
     elapsed_seconds: float = 0.0,
     error_code: str = "",
+    outcome: dict[str, Any] | None = None,
 ) -> None:
     """Emit stable filing states while retaining three-argument callbacks."""
 
@@ -176,6 +177,7 @@ def _emit_filing_progress(
         "status": status,
         "error_code": str(error_code),
         "elapsed_seconds": round(max(0.0, float(elapsed_seconds)), 3),
+        **(outcome or {}),
     }
     try:
         signature = inspect.signature(progress)
@@ -190,6 +192,89 @@ def _emit_filing_progress(
         progress(stage, current, total, detail)
     else:
         progress(stage, current, total)
+
+
+def document_processing_outcome(filing: FilingDocument, dataset: FinancialDataset,
+                                collection: Any) -> dict[str, Any]:
+    """Describe this original's contribution independently of latest targets.
+
+    A candidate belongs to the captured document/hash, not merely its year.
+    Admission and conflict records remain compiler-owned; this projection does
+    not promote a fact or turn a historical document into a verified target.
+    """
+    batches = collection.batches_by_document.get(filing.document_id, ())
+    bound_batches = [batch for batch in batches if batch.filing.document_id == filing.document_id
+        and batch.filing.content_hash == filing.content_hash
+        and batch.filing.accession_number == filing.accession_number]
+    document_candidates = [item.fact for batch in bound_batches for item in batch.candidates]
+    candidate_ids = {fact.fact_id for fact in document_candidates}
+    bound_refs = {ref.evidence_id for ref in dataset.evidence
+                  if ref.document_id == filing.document_id and ref.content_hash == filing.content_hash
+                  and bool(filing.content_hash) and ref.source_url == filing.source_url}
+    candidate_ids.update(fact.fact_id for fact in (*dataset.resolved_facts, *dataset.quarantined_facts)
+                         if fact.accession_number == filing.accession_number and
+                         any(ref in bound_refs for ref in (f"fact:{fact.fact_id}",
+                             f"fact:{fact.fact_id.removeprefix('ingest:')}")))
+    def contributes(group):
+        if not group.identity or group.identity[0] != filing.accession_number:
+            return False
+        # Accession and period identify a compiler group, not the original
+        # bytes. Only a fact explicitly tied to this document's bound candidate
+        # set can make that group relevant to this filing.
+        return bool(candidate_ids) and any(
+            fact.fact_id in candidate_ids for fact in (*group.accepted, *group.quarantined)
+        )
+    groups = [item for item in (*dataset.validations, *dataset.research_validations) if contributes(item)]
+    bound_groups = [
+        group for group in groups
+        if (group_facts := (*group.accepted, *group.quarantined))
+        and all(fact.fact_id in candidate_ids for fact in group_facts)
+    ]
+    admitted_ids = {fact.fact_id for group in groups for fact in group.accepted
+                    if fact.fact_id in candidate_ids}
+    rejected_ids = {fact.fact_id for group in groups for fact in group.quarantined
+                    if fact.fact_id in candidate_ids}
+    # Validation issues and role are group-level compiler metadata. If the
+    # group mixes this original with another source/hash, retain this filing's
+    # fact admission but do not attribute aggregate metadata to either source.
+    roles = sorted({group.role for group in bound_groups if group.role})
+    failures = [item for item in (*collection.source_failures, *dataset.source_failures)
+                if item.document_id == filing.document_id and item.accession_number == filing.accession_number]
+    def document_issues(group):
+        observed = [fact for fact in (*group.accepted, *group.quarantined) if fact.fact_id in candidate_ids]
+        supplemental = (group.role != "target" or group.identity[1] < filing.period_end) and observed and all(
+            fact.statement not in {"income_statement", "balance_sheet", "cash_flow"} for fact in observed)
+        for code in group.issues:
+            # A summary may legitimately disclose only a third-year ROE. Its
+            # absence of full third-year statements is a planner coverage gap,
+            # not a failed extraction of tables this original never presented.
+            if supplemental and (str(code).endswith("_core_missing") or str(code).startswith("required_profile_missing:")
+                                 or code in {"core_coverage_insufficient", "compiler_incomplete_profile"}):
+                continue
+            yield str(code)
+    codes = sorted({code for group in bound_groups for code in document_issues(group)}
+                   | {item.code for item in failures}
+                   | {str(code) for batch in bound_batches for code in batch.diagnostics})
+    partial = bool(rejected_ids or failures or codes)
+    historical = bool(roles) and "target" not in roles
+    if admitted_ids:
+        availability = "partial" if partial else "complete"
+        status = "partial" if partial else "historical" if historical else "validated"
+    else:
+        availability = "none"
+        status = "needs-action"
+    execution_failed = any(item.stage in {"download", "parse", "worker", "index"} for item in failures)
+    return {"status": status, "processing_state": "failed" if execution_failed else "completed",
+            "availability": availability, "roles": roles,
+            "candidate_count": len(candidate_ids), "admitted_count": len(admitted_ids),
+            "quarantined_count": len(rejected_ids), "issue_codes": codes,
+            "recognized_statements": sorted({fact.statement for group in groups
+                for fact in group.accepted if fact.fact_id in admitted_ids and fact.statement}),
+            "extracted_pages": sorted({fact.source_page for group in groups
+                for fact in group.accepted if fact.fact_id in admitted_ids and fact.source_page}),
+            "source_hash": filing.content_hash, "accession_number": filing.accession_number,
+            "period_end": filing.period_end, "fiscal_period": filing.fiscal_period,
+            "error_code": codes[0] if codes else "" if admitted_ids else "FILING_NO_ADMITTED_UNITS"}
 
 class FinancialCandidatePipeline:
     """One collector-to-compiler execution path for initial and repair inputs."""
@@ -336,33 +421,22 @@ class FinancialCandidatePipeline:
             if extra:
                 current = _append_dataset_diagnostics(current, extra)
             for index, filing in enumerate(filings, start=1):
-                groups = tuple(
-                    item for item in current.research_validations
-                    if tuple(getattr(item, "identity", ()))
-                    and item.identity[0] == filing.accession_number
-                    and getattr(item, "role", "target") == "target"
-                )
-                final_status = (
-                    "validated"
-                    if groups
-                    and any(
-                        getattr(item.status, "value", item.status)
-                        == ValidationStatus.VERIFIED.value
-                        for item in groups
-                    )
-                    else "blocked"
-                )
+                outcome = document_processing_outcome(filing, current, collection)
+                observation = getattr(engine, "_document_execution", {}).get(filing.document_id, {})
+                if observation.get("source_hash") == filing.content_hash:
+                    outcome.update({key: value for key, value in observation.items() if key in {
+                        "page_count", "native_text_page_count", "indexed_page_count", "window_total",
+                        "completed_window_count", "parse_elapsed_seconds", "failure_stage",
+                        "root_error_code", "attempt_count", "cache_reused"}})
                 _emit_filing_progress(
                     progress,
                     "filing-validation",
                     index,
                     total_filings,
                     filing,
-                    status=final_status,
+                    status=outcome["status"],
                     elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
-                    error_code=(
-                        "FILING_VALIDATION_BLOCKED" if final_status == "blocked" else ""
-                    ),
+                    outcome=outcome,
                 )
             return replace(
                 current,
@@ -452,6 +526,12 @@ class FinancialCandidatePipeline:
                     for document_id, batch in pdf.items()
                 },
                 deadline=task_deadline,
+                parser_failed_pages_by_document={
+                    filing.document_id: tuple(observation.get("parser_failed_pages", ()))
+                    for filing in visual_filings
+                    for observation in [getattr(engine, "_document_execution", {}).get(filing.document_id, {})]
+                    if observation.get("source_hash") == filing.content_hash
+                },
             )
             for index, filing in enumerate(visual_filings, start=1):
                 _emit_filing_progress(
@@ -678,6 +758,11 @@ class FinancialPipeline:
         self.candidates = candidate_pipeline or FinancialCandidatePipeline(compiler)
         self.admission = admission or FinancialAdmission()
 
+    def pending_local_mappings(self, subject: Company, filings: Sequence[FilingDocument]) -> frozenset[str]:
+        engine = self.engine_for(subject, filings) if self.engine_for is not None else self.engine
+        check = getattr(engine, "pending_row_mappings", None)
+        return frozenset(check(subject, filings)) if callable(check) else frozenset()
+
     def prepare(
         self,
         snapshot: FinancialResearchSnapshot,
@@ -772,7 +857,7 @@ class FinancialPipeline:
 def disclosed_reporting_currency(
     subject: Company, dataset: FinancialDataset, filings: Sequence[FilingDocument],
 ) -> tuple[str, bool]:
-    """Resolve a metadata currency only from complete, verified annual groups.
+    """Resolve a metadata currency from individually admitted monetary cells.
 
     A translated note/currency lane is not a mandate to convert or replace
     the preferred lane. Ambiguity stays explicit; no amounts are changed.
@@ -782,15 +867,14 @@ def disclosed_reporting_currency(
     if not annual_ends:
         return subject.reporting_currency, False
     latest = max(annual_ends)
-    required = CoveragePlanner().plan(subject).required_concepts
     currencies = {
-        str(group.identity[4]).upper() for group in dataset.validations
-        if str(group.identity[1])[:10] == latest
+        str(fact.currency).upper() for group in dataset.validations
+        if str(group.identity[1])[:10] == latest and group.role == "target"
         and str(group.identity[2]).upper() == "FY"
         and str(group.identity[3]).casefold() == "consolidated"
-        and group.role == "target" and group.status == ValidationStatus.VERIFIED.value
-        and concepts_cover_profile((fact.concept for fact in group.accepted), required)
-        and group.identity[4]
+        for fact in group.accepted
+        if fact.statement in {"income_statement", "balance_sheet", "cash_flow"}
+        and fact.currency and fact.validation_status == ValidationStatus.VERIFIED.value
     }
     preferred = str(subject.reporting_currency).upper()
     if preferred in currencies or not currencies:

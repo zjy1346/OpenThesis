@@ -216,6 +216,95 @@ pub fn find(provider_id: &str) -> Option<&'static ProviderDefinition> {
         .iter()
         .find(|provider| provider.provider_id == provider_id)
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AppliedOutputTokenBudget {
+    pub(crate) wire_field: &'static str,
+    pub(crate) applied_tokens: u32,
+    pub(crate) semantics: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputTokenBudgetSupport {
+    Applied(AppliedOutputTokenBudget),
+    Unsupported,
+}
+
+/// Add an output budget only where the provider's current chat contract is
+/// known. Returning `Unsupported` is intentional: callers must not infer a
+/// vendor field from the OpenAI-compatible label alone.
+pub(crate) fn apply_output_token_budget(
+    provider_id: &str,
+    model_id: &str,
+    payload: &mut serde_json::Value,
+    max_output_tokens: u32,
+) -> OutputTokenBudgetSupport {
+    let model_id = model_id.to_ascii_lowercase();
+    // These are exact model IDs with official model-specific maximum output
+    // limits. Unknown aliases and dynamically routed/local models intentionally
+    // do not receive a guessed cap.
+    let (field, model_max_output_tokens) = match provider_id {
+        "openai" => match model_id.as_str() {
+            "gpt-5.6-sol" | "gpt-5.6-terra" => ("max_completion_tokens", 128_000),
+            _ => return OutputTokenBudgetSupport::Unsupported,
+        },
+        "deepseek" => match model_id.as_str() {
+            // DeepSeek lists the currently routed Flash and V4-Pro maximum as
+            // 393,216 output tokens. The legacy V4 Flash ID remains accepted.
+            "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-flash" => {
+                ("max_tokens", 393_216)
+            }
+            _ => return OutputTokenBudgetSupport::Unsupported,
+        },
+        "qwen" => match model_id.as_str() {
+            "qwen3.5-plus" => ("max_completion_tokens", 65_536),
+            "qwen3.8-max" | "qwen3.7-plus" | "qwen3.7-flash" => {
+                ("max_completion_tokens", 131_072)
+            }
+            // Older Qwen's max_tokens may only bound visible answer tokens,
+            // not the full generation including thinking.
+            _ => return OutputTokenBudgetSupport::Unsupported,
+        },
+        _ => return OutputTokenBudgetSupport::Unsupported,
+    };
+    if max_output_tokens == 0 {
+        return OutputTokenBudgetSupport::Unsupported;
+    }
+    let applied_tokens = max_output_tokens.min(model_max_output_tokens);
+    let Some(object) = payload.as_object_mut() else {
+        return OutputTokenBudgetSupport::Unsupported;
+    };
+    object.insert(field.to_string(), serde_json::json!(applied_tokens));
+    OutputTokenBudgetSupport::Applied(AppliedOutputTokenBudget {
+        wire_field: field,
+        applied_tokens,
+        semantics: "total_generated_tokens_including_reasoning",
+    })
+}
+
+/// First-party contracts are recorded in docs/research/provider-contracts-3.1.0.md.
+/// Gemini's compatible path has no bound terminal/usage contract in those
+/// sources; custom endpoints have no provider contract. Neither is guessed.
+pub(crate) fn text_stream_protocol(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "openai" | "deepseek" | "qwen" | "kimi_cn" | "kimi_global" | "glm" | "openrouter" => Some("sse"),
+        "ollama" => Some("ndjson"),
+        _ => None,
+    }
+}
+
+pub(crate) fn stream_requests_usage(provider_id: &str) -> bool {
+    matches!(provider_id, "openai" | "deepseek" | "qwen" | "kimi_cn" | "kimi_global")
+}
+
+pub(crate) fn stream_reasoning_fields(provider_id: &str) -> &'static [&'static str] {
+    match provider_id {
+        "deepseek" | "qwen" | "kimi_cn" | "kimi_global" | "glm" => &["reasoning_content"],
+        "openrouter" => &["reasoning", "reasoning_details"],
+        "ollama" => &["thinking"],
+        _ => &[],
+    }
+}
 pub fn validate_provider_id(value: &str) -> Result<(), String> {
     if value.len() > 64
         || value.is_empty()
@@ -344,6 +433,61 @@ mod tests {
         assert!(validate_endpoint("openai", "http://api.openai.com/v1").is_err());
         assert!(validate_endpoint("openai", "https://evil.example/v1").is_err());
         assert!(validate_endpoint("custom", "https://example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn output_budget_is_capped_to_exact_model_limit_and_unknown_contracts_stay_unsupported() {
+        for (provider, model, requested, expected_key, expected_tokens) in [
+            ("openai", "gpt-5.6-sol", 200_000, "max_completion_tokens", 128_000),
+            ("openai", "gpt-5.6-terra", 131_072, "max_completion_tokens", 128_000),
+            ("deepseek", "deepseek-v4-flash", 500_000, "max_tokens", 393_216),
+            ("qwen", "qwen3.5-plus", 131_072, "max_completion_tokens", 65_536),
+            ("qwen", "qwen3.8-max", 200_000, "max_completion_tokens", 131_072),
+            ("qwen", "qwen3.7-plus", 131_072, "max_completion_tokens", 131_072),
+            ("qwen", "qwen3.7-flash", 131_072, "max_completion_tokens", 131_072),
+        ] {
+            let mut payload = serde_json::json!({
+                "temperature": 0.2,
+                "options": {"temperature": 0.7},
+                "sentinel": "unchanged"
+            });
+            assert_eq!(
+                apply_output_token_budget(provider, model, &mut payload, requested),
+                OutputTokenBudgetSupport::Applied(AppliedOutputTokenBudget {
+                    wire_field: expected_key,
+                    applied_tokens: expected_tokens,
+                    semantics: "total_generated_tokens_including_reasoning",
+                }),
+                "{provider}/{model}"
+            );
+            assert_eq!(payload.get(expected_key), Some(&serde_json::json!(expected_tokens)), "{provider}/{model}");
+            assert!(payload.get("max_tokens").is_none() || expected_key == "max_tokens");
+            assert!(payload.get("max_completion_tokens").is_none() || expected_key == "max_completion_tokens");
+            assert_eq!(payload["sentinel"], "unchanged");
+            assert_eq!(payload["temperature"], 0.2);
+        }
+
+        for (provider, model) in [
+            ("gemini", "gemini-3.7-flash"),
+            ("glm", "glm-5.2"),
+            ("custom", "private-model"),
+            ("qwen", "unclassified-qwen-model"),
+            ("qwen", "qwen-plus"),
+            ("kimi_cn", "kimi-k2.5"),
+            ("kimi_global", "kimi-k2.5"),
+            ("openrouter", "openrouter/free"),
+            ("ollama", "qwen3:8b"),
+        ] {
+            let mut payload = serde_json::json!({"model": model});
+            assert_eq!(
+                apply_output_token_budget(provider, model, &mut payload, 321),
+                OutputTokenBudgetSupport::Unsupported,
+                "{provider}/{model}"
+            );
+            assert!(payload.get("max_tokens").is_none());
+            assert!(payload.get("max_completion_tokens").is_none());
+            assert!(payload.pointer("/options/num_predict").is_none());
+        }
     }
 }
 

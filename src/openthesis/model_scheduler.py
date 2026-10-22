@@ -43,12 +43,19 @@ class ModelRequestScheduler:
                     if cancel_check is not None and cancel_check():
                         raise InterruptedError("model request cancelled while waiting")
                     now = self._clock()
-                    cooldown = self._cooldown_until - now
-                    if cooldown <= 0 and self._active < self._limit:
+                    cooldown_remaining = max(0.0, self._cooldown_until - now)
+                    if cooldown_remaining <= 0 and self._active < self._limit:
                         self._waiting -= 1
                         self._active += 1
                         break
-                    timeout = min(0.1, cooldown) if cancel_check is not None else (cooldown or None)
+                    if cooldown_remaining > 0:
+                        timeout = (
+                            min(0.1, cooldown_remaining)
+                            if cancel_check is not None
+                            else cooldown_remaining
+                        )
+                    else:
+                        timeout = 0.1 if cancel_check is not None else None
                     self._condition.wait(timeout=timeout)
             except BaseException:
                 self._waiting -= 1

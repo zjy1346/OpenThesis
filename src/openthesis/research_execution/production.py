@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -22,6 +23,7 @@ from .durable import DurableStageVerifier
 from .executor import StageExecutionCancelled, StageExecutor, StageResult, StageValidation, stage_input_digest
 from .model import SynthesisContextLimitError
 from .registry import SOURCE_ANALYSIS_STAGES, StageRegistry
+from .request_planning import RoleRequestMaterials, plan_role_requests
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +48,8 @@ class GraphBindings:
 def _save_stage_flow(workflow, run, result, sources, generation):
     with workflow.storage.connect() as db:
         rows = db.execute("""SELECT response_received,state FROM model_request_journal
-            WHERE run_id=? AND stage_id=? AND generation=? AND purpose='generation'""",
+            WHERE run_id=? AND stage_id=? AND generation=?
+              AND purpose IN ('generation','material_coverage','section_delivery')""",
             (run.run_id, result.stage_id, generation)).fetchall()
     workflow._save(run, "stage-content-flow", result.stage_id,
         stage_flow(result, sources, generation=generation, request_rows=rows), agent_id="content-observability")
@@ -209,13 +212,17 @@ def run_declarative_ot_workflow(
     verifications: dict[str, dict[str, Any]] = {}
     completed = 0
 
+    def request_materials(spec, inputs, dependencies):
+        return RoleRequestMaterials(spec.stage_id, inputs["context_json"],
+            {"workflow_role": spec.role, "workflow_settings": inputs["workflow_settings"],
+             "dependency_outputs": dependencies}, spec.role, spec.output_contract)
+
     def produce(spec, inputs, dependencies):
+        packet = request_materials(spec, inputs, dependencies)
         return workflow._run_agent_adaptive(
-            spec.stage_id, spec.prompt_path, inputs["context_json"],
-            {"workflow_role": spec.role,
-             "workflow_settings": inputs["workflow_settings"],
-             "dependency_outputs": dependencies}, run=run,
-            role_id=spec.role, output_schema=spec.output_contract,
+            packet.agent_id, spec.prompt_path, packet.context_json,
+            packet.prior_artifacts, run=run,
+            role_id=packet.role_id, output_schema=packet.output_schema,
         )
 
     def validate(spec, candidate, inputs):
@@ -247,6 +254,10 @@ def run_declarative_ot_workflow(
         if not verification:
             verification = {"passed": False, "issues": [result.error_code],
                             "claim_count": 0, "verified_claim_count": 0}
+        if "MODEL_OUTPUT_BUDGET_EXHAUSTED" in result.validation.issues:
+            verification["passed"] = False
+            verification["issues"] = list(dict.fromkeys([
+                *verification.get("issues", ()), "MODEL_OUTPUT_BUDGET_EXHAUSTED"]))
         results[result.stage_id] = result.validation.trusted_output or {
             "_verification_state": result.validation.state,
             "_stage_error_code": result.error_code,
@@ -283,7 +294,8 @@ def run_declarative_ot_workflow(
         on_read_issues=lambda issues: workflow._save(run, "model-candidate-read-diagnostic", "Saved candidate integrity", {"issues": issues}, agent_id="local-revalidation"))
         if getattr(workflow, "local_revalidation", False) else {})
     request_generations = request_journal.prepare(registry, recovery_digest(graph_inputs),
-        local_only=bool(getattr(workflow, "local_revalidation", False)))
+        local_only=bool(getattr(workflow, "local_revalidation", False)),
+        planned_requests=plan_role_requests(workflow, registry, graph_inputs, request_materials=request_materials))
     publication = workflow.storage.bind_research_publication_stages(publication, request_generations)
     produce_unbound = produce
 
@@ -491,7 +503,8 @@ def execute_official_model_graph(
         "evidence_records": evidence_records,
         "report_language": workflow.report_language,
         "ui_language": workflow.ui_language,
-        "pack_content_identity": workflow.pack.content_hash,
+        # StageSpec.identity binds this stage's actual prompt and shared rules.
+        # A different, unused pack prompt is not a change to these materials.
         "research_coverage_contract": bindings.coverage_version,
         "research_verification_contract": bindings.verification_version,
         "capabilities": sorted([
@@ -520,13 +533,11 @@ def execute_official_model_graph(
         invalidated = tuple(spec.stage_id for spec in registry.stages
             if spec.stage_id not in local_candidates and (spec.stage_id not in previous or previous[spec.stage_id].validation.state not in
             {"completed_verified", "completed_partial", "reused_verified"}))
+    if getattr(workflow, "budget_gap_resume", False):
+        invalidated = ()
     fingerprints, invalidated = stage_execution_plan(
         registry, previous, workflow.model_config.public_id, tuple(invalidated),
         scoped_resume=bool(invalidated) or bool(saved_artifacts), material_digest=stage_material_digests)
-    request_generations = request_journal.prepare(
-        registry, recovery_digest(inputs), invalidated, stage_configurations=fingerprints,
-        local_only=bool(getattr(workflow, "local_revalidation", False)), stage_material_digests=stage_material_digests)
-    publication = workflow.storage.bind_research_publication_stages(publication, request_generations)
     completed_base: set[str] = set()
 
     def progress(stage_id: str, state: str) -> None:
@@ -605,8 +616,7 @@ def execute_official_model_graph(
             ],
         }
 
-    def produce_unbound(spec, frozen_inputs, dependencies):
-        workflow._check_cancelled()
+    def request_materials(spec, frozen_inputs, dependencies):
         if spec.stage_id in base_ids:
             assignment = {"assigned_research_obligations": obligation_production_plan(spec.role)}
             if spec.stage_id == "source-industry-analysis":
@@ -621,45 +631,38 @@ def execute_official_model_graph(
                     "source_research_lane": spec.stage_id,
                     "scope_instructions": "Independently examine the supplied originals for business-model vulnerabilities, competitive constraints, disclosure contradictions and governance risks. No growth thesis has been supplied yet: do not pretend to rebut one. Cite the original disclosures, separate interpretation from facts, and do not promote raw unadmitted amounts to financial facts. Later counter-analysis must challenge the actual growth hypotheses and newly admitted financial results, retaining this source-risk work without repeating it.",
                 }
-            return workflow._run_agent_adaptive(
-                spec.role,
-                spec.prompt_path,
-                frozen_inputs["context_json"],
-                assignment,
-                run=run,
-            )
+            return RoleRequestMaterials(spec.role, frozen_inputs["context_json"], assignment)
         dossier = dossier_from(dependencies)
         if spec.stage_id == "growth-opportunities":
-            return workflow._run_agent_adaptive(
-                spec.role,
-                spec.prompt_path,
-                frozen_inputs["context_json"],
+            return RoleRequestMaterials(spec.role, frozen_inputs["context_json"],
                 {"research_dossier": dossier,
-                 "assigned_research_obligations": obligation_production_plan(spec.role)},
-                run=run,
-            )
+                 "assigned_research_obligations": obligation_production_plan(spec.role)})
         growth = dependencies.get("growth-opportunities", {})
         if spec.stage_id == "counter-analysis":
-            return workflow._run_agent_adaptive(
-                spec.role,
-                spec.prompt_path,
-                frozen_inputs["context_json"],
-                bindings.skeptical_prior_artifacts(context, dossier, growth),
-                run=run,
-            )
+            return RoleRequestMaterials(spec.role, frozen_inputs["context_json"],
+                bindings.skeptical_prior_artifacts(context, dossier, growth))
         skeptic = dependencies.get("counter-analysis", {})
         if spec.stage_id == "forecast-scenarios":
-            return workflow._run_agent_adaptive(
-                spec.role,
-                spec.prompt_path,
-                frozen_inputs["context_json"],
+            return RoleRequestMaterials(spec.role, frozen_inputs["context_json"],
                 {
                     "research_dossier": dossier,
                     "growth_opportunities": growth,
                     "counter_analysis": skeptic,
-                },
-                run=run,
-            )
+                })
+        forecast = dependencies.get("forecast-scenarios", {})
+        from ..research import _synthesis_prior_artifacts
+        return RoleRequestMaterials("research-synthesizer", context.compact_json(),
+            _synthesis_prior_artifacts(dossier, growth, skeptic, forecast))
+
+    def produce_unbound(spec, frozen_inputs, dependencies):
+        workflow._check_cancelled()
+        if spec.stage_id != "final-synthesis":
+            packet = request_materials(spec, frozen_inputs, dependencies)
+            return workflow._run_agent_adaptive(packet.agent_id, spec.prompt_path,
+                packet.context_json, packet.prior_artifacts, run=run)
+        dossier = dossier_from(dependencies)
+        growth = dependencies.get("growth-opportunities", {})
+        skeptic = dependencies.get("counter-analysis", {})
         forecast = dependencies.get("forecast-scenarios", {})
         try:
             return workflow._run_synthesis_with_budget(
@@ -687,8 +690,32 @@ def execute_official_model_graph(
                 "_context_counting_mode": "provider_error_code",
             }
 
+    request_generations = request_journal.prepare(
+        registry, recovery_digest(inputs), invalidated, stage_configurations=fingerprints,
+        local_only=bool(getattr(workflow, "local_revalidation", False)), stage_material_digests=stage_material_digests,
+        planned_requests=plan_role_requests(workflow, registry, inputs, previous,
+            stage_inputs=stage_inputs, request_materials=request_materials,
+            reused_stage_ids=tuple(spec.stage_id for spec in registry.stages
+                if spec.stage_id not in invalidated and spec.stage_id in previous
+                and previous[spec.stage_id].validation.state in {"completed_verified", "reused_verified"}
+                and previous[spec.stage_id].stage_identity == spec.identity
+                and previous[spec.stage_id].input_digest == stage_input_digest(spec,
+                    stage_material_digests.get(spec.stage_id, recovery_digest(inputs)),
+                    fingerprints[spec.stage_id], previous))))
+    publication = workflow.storage.bind_research_publication_stages(publication, request_generations)
+
     def validate(spec, candidate, frozen_inputs):
         candidate_copy = deepcopy(candidate)
+        if candidate_copy.get("_response_error"):
+            # Transport/protocol failures are durable candidates for recovery,
+            # not business findings. Keep their body in the candidate journal;
+            # downstream stages receive a structured gap, never error prose.
+            code = candidate_copy.get("_provider_error_code") or "STAGE_RESPONSE_UNAVAILABLE"
+            if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", code):
+                code = "STAGE_RESPONSE_UNAVAILABLE"
+            return StageValidation(False, state="needs_action", issues=(code,),
+                record={"response_error_code": code,
+                        "provider_retryable": candidate_copy.get("_provider_retryable") is True})
         if spec.stage_id in base_ids or spec.stage_id == "counter-analysis":
             verification = bindings.verify_agent_output(
                 candidate_copy,
@@ -869,7 +896,8 @@ def execute_official_model_graph(
             code = result.error_code or (
                 result.validation.issues[0] if result.validation.issues else "MODEL_RESPONSE_INVALID"
             )
-            retryable = result.retryable or state == "failed_verification"
+            retryable = result.retryable or state == "failed_verification" or (
+                isinstance(record, dict) and record.get("provider_retryable") is True)
             legacy_stage = {
                 "growth-opportunities": "growth-opportunities",
                 "counter-analysis": "counterarguments",

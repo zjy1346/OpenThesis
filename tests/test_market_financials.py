@@ -140,6 +140,39 @@ class MarketFinancialNormalizationTests(unittest.TestCase):
         self.assertAlmostEqual(values["reported_roe"], 0.034)
         self.assertEqual(values["operating_cash_flow"], 20_080_979_000)
 
+    def test_roe_percent_boundaries_use_source_unit_and_unknown_unit_is_omitted(self) -> None:
+        company = build_company("688981.SH", "SMIC")
+        filing = _filing(company.security_id)
+        for displayed, expected in ((0.85, 0.0085), (1.00, 0.01), (1.05, 0.0105)):
+            facts, _ = parse_financial_pages(
+                [(9, f"加权平均净资产收益率（%） {displayed} 0.7")],
+                filing,
+                company,
+            )
+            roe = next(item for item in facts if item.concept == "reported_roe")
+            self.assertAlmostEqual(roe.value, expected)
+            self.assertEqual(roe.unit_provenance, "explicit_percent")
+
+        header_unit, _ = parse_financial_pages(
+            [(9, "单位：%\n加权平均净资产收益率 0.85 0.7")],
+            filing,
+            company,
+        )
+        header_roe = next(item for item in header_unit if item.concept == "reported_roe")
+        self.assertAlmostEqual(header_roe.value, 0.0085)
+
+        ambiguous, _ = parse_financial_pages(
+            [(9, "加权平均净资产收益率 0.85 0.7")], filing, company
+        )
+        self.assertNotIn("reported_roe", {item.concept for item in ambiguous})
+
+        unrelated_percent, _ = parse_financial_pages(
+            [(9, "加权平均净资产收益率 0.85 0.7\n毛利率（%） 45.0")],
+            filing,
+            company,
+        )
+        self.assertNotIn("reported_roe", {item.concept for item in unrelated_percent})
+
     def test_quality_gate_rejects_tiny_narrative_equity_and_missing_unit(self) -> None:
         company = build_company("688981.SH", "SMIC")
         filing = _filing(company.security_id)

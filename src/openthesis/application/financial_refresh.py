@@ -80,7 +80,10 @@ class FinancialArtifactRefresher:
             ResearchArtifact(f"{run_id}:research-report:overlay-{digest(overlay)[:16]}", run_id,
                 "research-report", "Financial Refresh Report", overlay, agent_id="financial-refresh"),
         ]
+        from .research_snapshot import financial_semantics_digest
         payload["data_snapshot"] = {**dict(payload.get("data_snapshot", {})), "captured_at": now,
+            "financial_facts_sha256": digest(list(profile.fact_dicts)),
+            "financial_semantics_sha256": financial_semantics_digest(profile.fact_dicts),
             "financial_fact_count": len(profile.fact_dicts),
             "financial_generations": dict(summary["financial_generations"]),
             "financial_fact_ids_sha256": digest(sorted(item.get("fact_id", "") for item in profile.fact_dicts))}

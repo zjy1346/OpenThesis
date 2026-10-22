@@ -22,6 +22,22 @@ class StageExecutionCancelled(RuntimeError):
     pass
 
 
+def dependency_findings(value: Any) -> Any:
+    """The actual downstream input, excluding host proof/prompt history.
+
+    Proof records stay in their stage checkpoint. Including their changing
+    local audit hashes in producer input makes identical business findings
+    look new and repeats already completed calls after local revalidation.
+    """
+    if isinstance(value, dict):
+        return {key: dependency_findings(child) for key, child in value.items()
+                if (not str(key).startswith("_") or key == "_verification_state")
+                and key not in {"trusted_channels", "prior_artifacts", "raw_response", "prompt", "journal"}}
+    if isinstance(value, (list, tuple)):
+        return [dependency_findings(child) for child in value]
+    return deepcopy(value)
+
+
 def stage_input_digest(spec: StageSpec, input_identity: str, fingerprint: str,
                        dependencies: Mapping[str, "StageResult"]) -> str:
     """One input identity for both planning and executing persisted stages."""
@@ -31,7 +47,7 @@ def stage_input_digest(spec: StageSpec, input_identity: str, fingerprint: str,
                        key: {"stage_identity": dependencies[key].stage_identity,
                              "validation_state": dependencies[key].validation.state,
                              "issue_codes": dependencies[key].validation.issues,
-                             "trusted_output_sha256": digest(dependencies[key].validation.trusted_output)}
+                             "trusted_output_sha256": digest(dependency_findings(dependencies[key].validation.trusted_output))}
                        for key in spec.depends_on}})
 
 
@@ -164,6 +180,21 @@ class StageExecutor:
                 if not isinstance(validation, StageValidation) or digest(verification_copy) != candidate_hash:
                     raise ValueError("STAGE_VALIDATOR_CONTRACT_INVALID")
                 validation = deepcopy(validation)
+                response_meta = frozen_candidate.get("_response_meta", {})
+                incomplete = (isinstance(frozen_candidate.get("_output_incomplete"), dict)
+                    or isinstance(response_meta, dict) and str(response_meta.get("finish_reason") or "").casefold()
+                       in {"length", "max_tokens", "max_output_tokens"})
+                if (incomplete
+                        and validation.state in {"completed_verified", "completed_partial"}):
+                    # A syntactically valid object may still be length-cut.
+                    # Keep verified findings, but never certify completeness
+                    # just because every required key happened to arrive.
+                    validation = StageValidation(False,
+                        {**validation.trusted_output, "_verification_state": "completed_partial"},
+                        "completed_partial",
+                        tuple(dict.fromkeys((*validation.issues, "MODEL_OUTPUT_BUDGET_EXHAUSTED"))),
+                        {**validation.record, "output_incomplete": {
+                            "code": "MODEL_OUTPUT_BUDGET_EXHAUSTED", "state": "pending"}})
                 error_code = ("" if validation.state in {"completed_verified", "completed_partial"}
                               else "STAGE_CANDIDATE_REJECTED")
             except StageExecutionCancelled:
@@ -267,7 +298,8 @@ class StageExecutor:
                                              StageValidation(False, state="needs_action", issues=tuple(
                                                  [*bad_dependencies, *missing_capabilities])),
                                              digest({}), "STAGE_INPUT_CAPABILITY_UNAVAILABLE" if missing_capabilities
-                                                 else "STAGE_DEPENDENCY_UNAVAILABLE")
+                                                 else "STAGE_DEPENDENCY_UNAVAILABLE",
+                                             execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint))
                         self.checkpoint(result)
                         results[spec.stage_id] = result
                         remaining.remove(spec.stage_id)
@@ -332,7 +364,7 @@ class StageExecutor:
                     if len(pending) >= max_workers:
                         continue
                     self.progress(spec.stage_id, "queued")
-                    dependencies = {key: results[key].validation.trusted_output for key in spec.depends_on}
+                    dependencies = {key: dependency_findings(results[key].validation.trusted_output) for key in spec.depends_on}
                     if spec.optional_dependencies:
                         dependencies["_dependency_gaps"] = [{"stage_id": key,
                             "state": results[key].validation.state,
@@ -361,6 +393,14 @@ class StageExecutor:
                                 and re.fullmatch(r"(?:MODEL|STAGE|RECOVERY)_[A-Z0-9_]{1,70}", supplied)
                                 else f"STAGE_INTERNAL_{type(exc).__name__}")
                         diagnostic = {"response_received": getattr(exc, "response_received", False) is True}
+                        counting_mode = getattr(exc, "counting_mode", "")
+                        if counting_mode in {"estimated_utf8_shape", "conservative_utf8_upper_bound", "provider_error_code", "provider_tokenizer",
+                                             "utf8_bytes_estimate", "observed_usage_calibrated_estimate"}:
+                            diagnostic["counting_mode"] = counting_mode
+                            for field_name in ("required_bytes", "available_bytes"):
+                                value = getattr(exc, field_name, None)
+                                if type(value) is int and value >= 0:
+                                    diagnostic[field_name] = value
                         phase = getattr(exc, "processing_phase", "")
                         if phase in {"candidate_storage", "response_identity", "response_parsing"}:
                             diagnostic["processing_phase"] = phase
@@ -372,7 +412,9 @@ class StageExecutor:
                             diagnostic["trace_id"] = trace_id
                         result = StageResult(spec.stage_id, spec.identity, stage_input, {},
                                              StageValidation(False, state="needs_action"), digest({}), code,
-                                             bool(getattr(exc, "retryable", False)), diagnostics=diagnostic)
+                                             bool(getattr(exc, "retryable", False)),
+                                             execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint),
+                                             diagnostics=diagnostic)
                     self._check_cancelled()
                     self.checkpoint(result)
                     self._check_cancelled()

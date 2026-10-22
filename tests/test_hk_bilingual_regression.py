@@ -45,7 +45,19 @@ class HkBilingualRegressionTests(unittest.TestCase):
             self.assertEqual(current[concept].currency, 'CNY')
             self.assertEqual(current[concept].unit_scale, 1000)
             self.assertIsNotNone(current[concept].source_bbox)
-        self.assertEqual(len(facts), len(refs))
+        refs_by_id = {ref.evidence_id: ref for ref in refs}
+        self.assertEqual(len(refs_by_id), len(refs))
+        self.assertGreater(len(refs), len(facts))
+        for fact in facts:
+            evidence_fact_id = fact.fact_id.removeprefix("ingest:")
+            row_ref = refs_by_id.get(f"fact:{evidence_fact_id}")
+            self.assertIsNotNone(row_ref, fact.fact_id)
+            self.assertEqual(row_ref.locator, f"page:{fact.source_page}")
+            self.assertEqual(row_ref.bbox, fact.source_bbox)
+            if fact.normalization_lineage is not None:
+                self.assertTrue(set(fact.normalization_lineage.unit_evidence_ids).issubset(refs_by_id))
+            self.assertTrue(set(fact.classification_evidence_ids).issubset(refs_by_id))
+        self.assertTrue(all(ref.locator and ref.excerpt for ref in refs))
 
     def test_absent_provider_period_uses_document_date(self):
         facts, _ = self.extract('')

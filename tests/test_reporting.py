@@ -1,13 +1,44 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from openthesis.application_services import ReportService, _report_read_state
 from openthesis.report_html import render_research_html
 from openthesis.reporting import render_research_run
 from openthesis.financials import deterministic_summary
 
 
 class ReportingTests(unittest.TestCase):
+    def test_report_read_state_distinguishes_ready_partial_and_diagnostics(self) -> None:
+        self.assertEqual(
+            _report_read_state(has_substantive_content=True, readiness_complete=True),
+            "ready",
+        )
+        self.assertEqual(
+            _report_read_state(has_substantive_content=True, readiness_complete=False),
+            "partial",
+        )
+        self.assertEqual(
+            _report_read_state(has_substantive_content=False, readiness_complete=False),
+            "diagnostic_only",
+        )
+
+    def test_report_service_assembles_standard_formats_once(self) -> None:
+        from openthesis.report_document import assemble_report_document
+
+        artifacts = [{"artifact_type": "research-report", "content": {"report": {"executive_summary": "A concise summary."}}}]
+        service = ReportService(render_research_run, render_research_html)
+        with patch(
+            "openthesis.report_document.assemble_report_document",
+            wraps=assemble_report_document,
+        ) as assemble:
+            markdown, html = service.render("shared-document", artifacts, language="en")
+
+        self.assertEqual(assemble.call_count, 1)
+        self.assertIn("A concise summary.", markdown)
+        self.assertIn("A concise summary.", html)
+
     def test_staged_context_capacity_callout_is_localized_and_keeps_byte_budget(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",
@@ -36,7 +67,9 @@ class ReportingTests(unittest.TestCase):
             self.assertIn(phrase, report)
             self.assertIn("36,327", report)
             self.assertIn("36,000", report)
-            self.assertIn("conservative UTF-8 byte upper bound", report) if language == "en" else None
+            if language == "en":
+                self.assertIn("UTF-8 byte shape estimate", report)
+                self.assertIn("not an official token count or a safe upper bound", report)
 
         normal = [{
             "artifact_type": "research-report",
@@ -187,6 +220,29 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("https://example.test/old", report)
         self.assertNotIn("Some annual data failed validation", report)
 
+    def test_unverified_free_cash_flow_is_reported_as_a_gap_not_a_money_amount(self) -> None:
+        report = render_research_run(
+            "fcf-gap",
+            [{
+                "artifact_type": "deterministic-financial-summary",
+                "content": {
+                    "currency": "USD",
+                    "metrics": [{
+                        "year": 2025,
+                        "revenue": 100,
+                        "free_cash_flow": 60,
+                        "free_cash_flow_gap": "inputs_not_comparable_or_unverified",
+                        "money_metadata": {},
+                    }],
+                    "evidence": [],
+                },
+            }],
+            "en",
+        )
+
+        self.assertIn("inputs could not be verified as comparable", report)
+        self.assertNotIn("$60", report)
+
     def test_financial_refresh_marks_retained_qualitative_synthesis_as_stale(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",
@@ -281,12 +337,12 @@ class ReportingTests(unittest.TestCase):
         table = re.search(r'<table class="data-table">(.*?)</table>', html, re.S)
         self.assertIsNotNone(table)
         rows = re.findall(r"<tr>(.*?)</tr>", table.group(1), re.S)
-        self.assertEqual([len(re.findall(r"<t[hd]", row)) for row in rows], [5, 5])
+        self.assertEqual([len(re.findall(r"<t[hd]", row)) for row in rows], [4, 4])
         cells = re.findall(r"<td[^>]*>(.*?)</td>", rows[1], re.S)
-        self.assertEqual(len(cells), 5)
+        self.assertEqual(len(cells), 4)
         self.assertIn("10", cells[1])
-        self.assertIn("1", cells[3])
-        self.assertIn("2", cells[4])
+        self.assertIn("1", cells[2])
+        self.assertIn("2", cells[3])
 
     def test_html_schema_keeps_operating_margin_and_omits_only_free_cash_flow(self) -> None:
         artifacts = [{
@@ -459,7 +515,7 @@ class ReportingTests(unittest.TestCase):
         report = render_research_run(
             "run-en", artifacts, "en", company_name="Example Corp"
         )
-        self.assertIn("Long-term Company Research", report)
+        self.assertIn("OpenThesis Staged Research", report)
         self.assertIn("Financial Overview", report)
         self.assertIn("Executive Summary", report)
         self.assertIn("Verification Results", report)
@@ -468,7 +524,20 @@ class ReportingTests(unittest.TestCase):
 
     def test_unknown_report_language_falls_back_to_chinese(self) -> None:
         report = render_research_run("run-fallback", [], "unknown")
-        self.assertIn("长期公司研究", report)
+        self.assertIn("研究尚未形成可用报告", report)
+        self.assertNotIn("# OpenThesis 长期公司研究", report)
+
+    def test_stage_artifacts_without_final_report_are_labeled_as_incomplete(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "title": "确定性财务概览",
+            "content": {"metrics": []},
+        }]
+        report = render_research_run("run-stage-only", artifacts, "zh-CN")
+        self.assertIn("# OpenThesis 阶段性研究", report)
+        self.assertIn("尚未生成最终综合报告", report)
 
     def test_markdown_nontechnical_projection_hides_internal_ids(self) -> None:
         artifacts = [
@@ -638,6 +707,23 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("calculation", report)
         self.assertNotIn("raw_internal_key", report)
         self.assertNotIn("business_model", report)
+
+    def test_claim_without_confidence_is_rendered_without_missing_confidence_heading(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test:model",
+            "content": {
+                "report": {
+                    "claims": [{"text": "现金流仍需进一步核实。", "kind": "inference"}],
+                },
+            },
+        }]
+
+        report = render_research_run("missing-confidence", artifacts, "zh-CN")
+
+        self.assertIn("现金流仍需进一步核实。", report)
+        self.assertNotIn("置信度未提供", report)
 
     def test_markdown_renders_latest_interim_separately_from_annual_metrics(self) -> None:
         artifacts = [

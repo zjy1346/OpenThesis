@@ -38,7 +38,7 @@ from .model_scheduler import shared_model_scheduler
 from .storage import Storage
 from .storage_research_publication import ResearchPublicationConflict, ResearchPublicationSnapshot
 from .research_continuity import StageAttempt, StageOutcome
-from .research_materials import route_materials, prompt_materials, insufficient_material_result
+from .research_materials import route_materials, prompt_materials, insufficient_material_result, canonical_request_materials
 from .research_coverage import CONTRACT_VERSION as RESEARCH_COVERAGE_VERSION, ResearchCoverageContract, prompt_contract as coverage_prompt_contract, obligation_production_plan
 from .research_execution.registry import SOURCE_ANALYSIS_STAGES, StageRegistry, standard_model_registry
 from .research_execution.model import (
@@ -83,7 +83,7 @@ from .research_assertions import classify_assertion
 from .research_calculations import formula_contract, prove_calculation
 from .research_section_validation import SECTION_PROOF_VERSION, project_supported_sections, rewrite_claim_references
 from .research_claim_dedup import deduplicate_claims
-from .research_claim_repair import ClaimValidation, ClaimRepairContract, stable_claim_id
+from .research_claim_repair import ClaimValidation, ClaimRepairContract, stable_claim_id, claim_presentation
 from .financial_disclosure_bindings import cited_compiled_rows
 
 
@@ -235,14 +235,38 @@ def _agent_prompt_bundle(
     language_instruction = OUTPUT_LANGUAGE_INSTRUCTIONS[report_language]
     role = _agent_role(agent_id, role_id)
     claim_contract = _claim_contract_shape()
+    def stable_record(value):
+        if isinstance(value, dict):
+            return {key: stable_record(value[key]) for key in sorted(value)}
+        if isinstance(value, list):
+            return [stable_record(item) for item in value]
+        return value
+
+    from .research_execution.source_compiler import compiled_role_sources
+    compiled_sources = compiled_role_sources(context_json, role, _collect_evidence_ids(prior_artifacts))
+    # Keep the existing material sections and list ordering (which can encode
+    # source/role priority). Canonicalize mapping keys only, without dropping
+    # fields, changing independent agents or inventing a paid cache prewarm.
+    from .research_execution.executor import dependency_findings
+    materials, stage_findings, material_registry = canonical_request_materials(
+        {}, dependency_findings(prior_artifacts), compiled_sources=compiled_sources)
+    # Role-specific adequacy metadata varies between agents, while the rest of
+    # this context is shared. Keep the shared factual material in the longest
+    # possible common prefix by placing this metadata after it.
+    for late_key in ("material_adequacy", "reading_packet"):
+        if late_key in materials:
+            late_value = materials.pop(late_key)
+            materials[late_key] = late_value
     prompt_payload = {
-        "agent": agent_id,
-        "task_instructions": role_prompt,
+        "claim_contract": stable_record(claim_contract),
         "output_language": report_language,
         "output_language_instruction": language_instruction,
-        "research_context": prompt_materials(json.loads(context_json), role),
-        "prior_artifacts": prior_artifacts,
-        "claim_contract": claim_contract,
+        "material_registry": material_registry,
+        "request_reference_contract": "material_ref resolves to complete text in material_registry in THIS request. finding_ref resolves to prior_artifacts.findings_registry in THIS request. request_path_ref resolves to the JSON path array in THIS request. Preserve each referring record's issuer, period, units and revision; identical text never merges those identities. All referenced material is included, not a summary or external lookup.",
+        "research_context": materials,
+        "agent": agent_id,
+        "task_instructions": role_prompt,
+        "prior_artifacts": stage_findings,
         "assigned_research_obligations": obligation_production_plan(role),
     }
     if role_id is not None:
@@ -258,6 +282,34 @@ def _agent_prompt_bundle(
         prompt_payload["required_claim_shape"] = claim_contract
     if role.startswith("research-synthesizer"):
         prompt_payload["research_coverage_contract"] = coverage_prompt_contract(compact=True)
+        from .research_execution.analysis_references import reference_registry
+        prompt_payload["analysis_registry"] = reference_registry(prior_artifacts)
+        prompt_payload["analysis_reference_contract"] = (
+            "Prefer analysis_refs:[{analysis_id,section}] to retain prior findings verbatim. IDs resolve only to current "
+            "prior_artifacts paths; the host copies their complete bodies and performs the ordinary source/numeric checks. "
+            "Do not rewrite unchanged premises just to fill sections. New conclusions and opposing views still need their own sources.")
+    delivery = prior_artifacts.get("sectional_delivery")
+    if (role == "research-synthesizer" and output_schema == "research-report-section-v1"
+            and isinstance(delivery, dict)):
+        sections = delivery.get("sections", [delivery.get("section")])
+        if (not isinstance(sections, list) or not sections or any(not isinstance(section, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{1,79}", section) for section in sections)):
+            raise ValueError("MODEL_SECTION_DELIVERY_TARGETS_INVALID")
+        prompt_payload["sectional_delivery"] = deepcopy(delivery)
+        prompt_payload["prior_artifacts"].pop("sectional_delivery", None)
+        prompt_payload["task_instructions"] += (
+            "\nOutput-length recovery overrides only delivery shape, not research scope. "
+            f"Return only these missing section objects: {', '.join(sections)}, and their source-bound `claims` in JSON. "
+            "Do not return a shortened whole report. Do not shorten evidence, omit opposing views, "
+            "or infer from absent sources. All original sources and prior findings remain supplied. "
+            "Use them to preserve cross-section dependencies and explicit uncertainties. "
+            "The host will assemble these complete section objects without another lossy rewrite.")
+        prompt_payload["assigned_research_obligations"] = [item for item in obligation_production_plan()
+            if any(path.split(".")[0] in sections for path in item["report_paths"])]
+        from .research_execution.repair_context import repair_context
+        narrowed = repair_context(json.dumps(prompt_payload, ensure_ascii=False), tuple(sections))
+        prompt_payload = {**narrowed, **{key: prompt_payload[key] for key in (
+            "agent", "task_instructions", "assigned_research_obligations", "sectional_delivery", "output_schema")}}
     user_prompt = json.dumps(
         prompt_payload,
         ensure_ascii=False,
@@ -296,6 +348,7 @@ class ResearchContext:
     financial_period_coverage: dict[str, Any] = field(default_factory=dict)
     repair_observations: list[dict[str, Any]] = field(default_factory=list)
     material_issues: list[dict[str, Any]] = field(default_factory=list)
+    research_as_of: str = ""
 
     def compact_json(self) -> str:
         return json.dumps(
@@ -307,6 +360,8 @@ class ResearchContext:
                 "evidence": self.evidence,
                 "valuation": self.valuation,
                 "market_snapshot": self.market_snapshot,
+                "research_as_of": self.research_as_of,
+                "valuation_gaps": self.valuation_gaps(),
                 "repair_observations": self.repair_observations,
                 "issues": self.material_issues,
                 **({"financial_period_coverage": self.financial_period_coverage}
@@ -315,6 +370,28 @@ class ResearchContext:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+
+    def valuation_gaps(self) -> dict[str, Any]:
+        """Host-owned missing inputs; None is not permission to guess CapEx."""
+        latest = max((row for row in self.metrics if isinstance(row, dict)), key=lambda row: str(
+            row.get("period_end") or row.get("end_date") or row.get("year") or row.get("fiscal_year") or ""), default={})
+        status = str((self.valuation or {}).get("status") or "not_calculated")
+        reasons = []
+        market = self.market_snapshot or {}
+        if not market.get("equity_market_value", market.get("market_cap")) and not (
+                self.valuation or {}).get("equity_market_value"):
+            reasons.append("market_equity_value_missing")
+        if latest.get("free_cash_flow") is None:
+            reasons.append(str(latest.get("free_cash_flow_gap") or "verified_cash_flow_base_missing"))
+        elif not isinstance(latest.get("free_cash_flow"), (int, float)) or latest["free_cash_flow"] <= 0:
+            reasons.append("positive_verified_cash_flow_base_unavailable")
+        if status not in {"ok", "extreme_assumption", "not_calculated"}:
+            reasons.append(status)
+        return {"status": status, "reasons": list(dict.fromkeys(reasons)),
+                "available_financial_inputs": [key for key in
+                    ("operating_cash_flow", "capital_expenditure", "free_cash_flow")
+                    if latest.get(key) is not None],
+                "instruction": "Use these host gaps exactly; do not infer non-disclosure from an absent valuation. Existing inputs remain usable under their own contracts."}
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,11 +506,15 @@ def verify_agent_output(
             issues.append(
                 "A claim is not a JSON object" if english else "存在非对象 claim"
             )
+            # Shape errors are not evidence that readable source analysis is
+            # false. Keep a string as an explicitly untyped pending assertion;
+            # never invent a fact kind, value, unit or supporting reference.
+            pending_claim = {"text": claim} if isinstance(claim, str) and claim.strip() else {}
             claim_verifications.append({"index": claim_index, "state": "insufficient_evidence",
                 "path": claim_path, "claim_id": claim_identity, "issue_code": "CLAIM_OBJECT_REQUIRED",
-                "missing_fields": [], "evidence_ids": [], "normalized_claim": {},
+                "missing_fields": [], "evidence_ids": [], "normalized_claim": pending_claim,
                 "repairability": "unrepairable"})
-            normalized_claims.append({})
+            normalized_claims.append(pending_claim)
             continue
         evidence_ids = claim.get("evidence_ids", [])
         if (not isinstance(evidence_ids, list)
@@ -678,6 +759,8 @@ def verify_agent_output(
             if english
             else "模型输出不是有效的结构化 JSON"
         )
+    for row in claim_verifications:
+        row.update(claim_presentation(row["state"], row.get("normalized_claim")))
     return {
         "structured_output_valid": structured_output_valid,
         "claim_count": len(claims or []),
@@ -685,6 +768,9 @@ def verify_agent_output(
         "unsupported_fact_count": unsupported_count,
         "claim_verifications": claim_verifications,
         "normalized_claims": normalized_claims,
+        "candidate_claims": deepcopy(claims or []),
+        "displayable_claims": [deepcopy(row["normalized_claim"]) for row in claim_verifications
+                               if row["display_eligible"]],
         "issues": issues,
         "passed": structured_output_valid and not issues and unsupported_count == 0,
     }
@@ -1069,6 +1155,11 @@ def validate_research_synthesis(
             if english
             else "最终报告没有可验证的主要结论"
         )
+    response_meta = output.get("_response_meta", {})
+    if (isinstance(output.get("_output_incomplete"), dict)
+            or isinstance(response_meta, dict) and str(response_meta.get("finish_reason") or "").casefold()
+               in {"length", "max_tokens", "max_output_tokens"}):
+        verification["issues"].append("MODEL_OUTPUT_BUDGET_EXHAUSTED")
     verification["passed"] = not verification["issues"] and verification["unsupported_fact_count"] == 0
     coverage = (ResearchCoverageContract().assess(
         verification.get("trusted_report", {}), verification, evidence_records=evidence_records or {},
@@ -1120,14 +1211,37 @@ def _supported_research_fields(
     def verify(claims):
         return verify_agent_output({"claims": claims}, available, language, records)
 
+    numeric_gaps = {}
     def prose(text, refs):
         cited = [records[ref] for ref in refs if ref in records]
+        from .research_numeric_assertions import disclosure_quantity_conflicted
+        if disclosure_quantity_conflicted(text, cited):
+            return "contradicted"
+        conflict_candidates = cited or list(records.values())
+        years = set(re.findall(r"(?:19|20)\d{2}", text))
+        targeted = [record for record in conflict_candidates if record.get("kind") == "financial_fact"
+                    and (str(record.get("fiscal_year")) in years or not years and bool(cited))
+                    and _claim_targets_record({}, text, record)]
+        if targeted and not numeric_prose_supported(text, targeted):
+            # A missing source is not a proof of error. Only an unambiguous
+            # same-concept, explicitly same-year financial target can establish
+            # a numeric conflict here; other statements stay pending.
+            targets = {(row.get("concept"), row.get("fiscal_year"), row.get("scope"),
+                        row.get("currency") or row.get("unit"), row.get("company_cik"),
+                        row.get("start_date"), row.get("end_date")) for row in targeted}
+            if (len(targets) == 1 and (not years or years == {str(targeted[0].get("fiscal_year"))})
+                    and _has_numeric_fact_assertion({"text": text})):
+                return "contradicted"
         if not numeric_prose_supported(text, cited):
-            return False
+            from .research_section_validation import content_digest
+            key = content_digest(text)
+            numeric_gaps[key] = {"body_sha256": key, "evidence_ids": list(refs),
+                                 "code": "CONTENT_NUMERIC_PREMISE_UNVERIFIED"}
+            return False  # Conflict detection alone never grants source support.
         state = _claim_text_support_state({"kind": "inference", "text": text,
                                           "evidence_ids": refs}, cited)
         if state == "contradicted":
-            return False
+            return "contradicted"
         if state == "text_supported":
             return True
         # Mentioning a metric name is not proof of the surrounding analysis.
@@ -1138,14 +1252,27 @@ def _supported_research_fields(
 
     from .research_assertions import ensure_assertion_session
     with ensure_assertion_session():
-        return project_supported_sections(output, fields,
+        safe, audit = project_supported_sections(output, fields,
                                           verify, prose, available, computed_fields=computed_fields)
+    from .research_section_validation import content_digest
+    from .research_assertions import independent_sentences
+    for node in audit.get("nodes", ()):
+        if node.get("validation_state") != "partial" or not isinstance(node.get("body"), str):
+            continue
+        parts = [node["body"], *independent_sentences(node["body"])]
+        if any(content_digest(part) in numeric_gaps for part in parts):
+            node["issue_code"] = "CONTENT_NUMERIC_PREMISE_UNVERIFIED"
+    audit["local_numeric_gaps"] = list(numeric_gaps.values())
+    return safe, audit
 
 
-def _presentation_stage_value(value: Any, *, remove_claims: bool = True) -> Any:
+def _presentation_stage_value(value: Any, *, remove_claims: bool = True, _root: bool = True) -> Any:
     if isinstance(value, dict):
+        if _root:
+            from .research_response import response_parts
+            value, _metadata, _diagnostics = response_parts(value)
         return {
-            key: _presentation_stage_value(item, remove_claims=remove_claims)
+            key: _presentation_stage_value(item, remove_claims=remove_claims, _root=False)
             for key, item in value.items()
             if not str(key).startswith("_")
             and key != "structured_output_valid"
@@ -1153,7 +1280,7 @@ def _presentation_stage_value(value: Any, *, remove_claims: bool = True) -> Any:
         }
     if isinstance(value, list):
         return [
-            _presentation_stage_value(item, remove_claims=remove_claims)
+            _presentation_stage_value(item, remove_claims=remove_claims, _root=False)
             for item in value
         ]
     return value
@@ -1246,10 +1373,14 @@ def _trusted_stage_result(
         # Stage claims belong to this stage's object; they cannot grant trust
         # to an unrelated sibling paragraph. Use the same leaf-level proof as
         # final synthesis, rather than copy the whole partial provider object.
+        from .research_response import response_parts
+        stage_body, stage_metadata, stage_diagnostics = response_parts(result)
         safe, audit = _supported_research_fields(
-            {"stage": result, "claims": result.get("claims", [])}, ["stage"],
+            {"stage": stage_body, "claims": result.get("claims", [])}, ["stage"],
             set(evidence_records), evidence_records, language,
         )
+        audit["stage_system_metadata"] = stage_metadata
+        audit["stage_response_diagnostics"] = stage_diagnostics
         retained = safe.get("stage", {})
         safe_claims = safe.get("claims", [])
         safe_verification = verify_agent_output(
@@ -1345,200 +1476,35 @@ def _gate_stage_output(
     evidence_records: dict[str, dict[str, Any]],
     language: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Verify a later stage and return a safe downstream projection."""
+    """One local-retention contract for base, opportunity and scenario stages."""
     verification = verify_agent_output(result, available, language, evidence_records)
-    if isinstance(result.get("scenarios"), list):
-        # Forecast agents have a deliberately narrower contract than factual
-        # analysts: scenarios are assumptions to be reviewed, never verified
-        # facts.  Keep structurally valid scenarios in a partial channel and
-        # validate any attached references/certainty bounds.
-        safe_scenarios: list[Any] = []
-        scenario_issues: list[str] = []
-        for scenario in result["scenarios"]:
-            if isinstance(scenario, str):
-                if scenario.strip():
-                    safe_scenarios.append(scenario)
-                continue
-            if not isinstance(scenario, dict):
-                scenario_issues.append("Scenario must be an object or non-empty text")
-                continue
-            ids = [
-                str(item).strip()
-                for key in (
-                    "evidence_ids",
-                    "supporting_evidence_ids",
-                    "contradicting_evidence_ids",
-                )
-                for item in scenario.get(key, [])
-                if isinstance(scenario.get(key), list) and str(item).strip()
-            ]
-            if any(item not in available for item in ids):
-                scenario_issues.append("Scenario contains unverified evidence")
-                continue
-            probability = scenario.get("probability_range")
-            if probability is not None:
-                valid_probability = (
-                    isinstance(probability, list)
-                    and len(probability) == 2
-                    and all(isinstance(item, (int, float)) and 0 <= item <= 1 for item in probability)
-                )
-                if not valid_probability:
-                    scenario_issues.append("Scenario probability range is invalid")
-                    continue
-            safe_scenarios.append(dict(scenario))
-        verification["issues"].extend(scenario_issues)
+    trusted = _trusted_stage_result(result, verification, evidence_records, language)
+    if trusted.get("_verification_state") != "completed_verified":
+        # Protocol validity is not evidence verification. In particular an
+        # assumptions-only scenario with no claims is displayable, not a fully
+        # verified stage simply because all([]) passed the claims validator.
         verification["passed"] = False
-        trusted = {"scenarios": safe_scenarios}
-        trusted["trusted_channels"] = {
-            "verified_facts": [], "verified_calculations": [],
-            "labelled_inferences": [], "assumptions_scenarios": safe_scenarios,
-            "unresolved": [],
-        }
-        trusted["_verification_state"] = (
-            "completed_partial" if safe_scenarios else "failed_verification"
-        )
-        trusted["_verified_claim_count"] = 0
-        return trusted, verification
+    # The shared projector owns references and per-assertion state. Specialized
+    # growth/forecast gates must not delete entire objects for a missing locator.
     if isinstance(result.get("opportunities"), list):
-        safe_opportunities: list[dict[str, Any]] = []
-        verified_opportunities = 0
-        partial_opportunity = False
-        for opportunity in result["opportunities"]:
-            if not isinstance(opportunity, dict):
-                continue
-            supporting_ids = [
-                str(item).strip()
-                for item in opportunity.get("supporting_evidence_ids", [])
-                if str(item).strip()
-            ] if isinstance(opportunity.get("supporting_evidence_ids"), list) else []
-            ids = [
-                str(item).strip()
-                for key in ("supporting_evidence_ids", "contradicting_evidence_ids")
-                for item in opportunity.get(key, [])
-                if isinstance(opportunity.get(key), list) and str(item).strip()
-            ]
-            valid_supporting = [item for item in supporting_ids if item in available]
-            if not valid_supporting:
-                verification["issues"].append(
-                    "Growth opportunity requires verified supporting evidence"
-                )
-                continue
-            if not all(item in available for item in ids):
-                verification["issues"].append("Growth opportunity contains unverified evidence")
-                continue
-            # If the provider supplied an explicit claim/assertion, run it
-            # through the same text/numeric gate as every other stage.  A
-            # generic mechanism without a claim is retained only when it has
-            # at least one concrete evidence record (not a reference-only
-            # pointer).
-            claim_text = str(
-                opportunity.get("claim")
-                or opportunity.get("assertion")
-                or opportunity.get("text")
-                or opportunity.get("mechanism")
-                or ""
-            ).strip()
-            opportunity_verified = True
-            support_records = [
-                evidence_records[item]
-                for item in valid_supporting
-                if isinstance(evidence_records.get(item), dict)
-            ]
-            if not support_records or all(
-                str(record.get("kind", "")).casefold()
-                in {"reference", "reference_only"}
-                for record in support_records
-            ):
-                verification["issues"].append(
-                    "Growth opportunity evidence is reference-only"
-                )
-                continue
-            if claim_text:
-                claim_check = verify_agent_output(
-                    {
-                        "claims": [
-                            {
-                                "kind": "inference",
-                                "text": claim_text,
-                                "evidence_ids": valid_supporting,
-                            }
-                        ]
-                    },
-                    available,
-                    language,
-                    evidence_records,
-                )
-                claim_state = (
-                    claim_check.get("claim_verifications", [{}])[0].get("state")
-                    if claim_check.get("claim_verifications")
-                    else "insufficient_evidence"
-                )
-                if claim_state == "reference_only":
-                    # Retain this explicitly qualified opportunity for human
-                    # review and evidence-count display, but never promote it
-                    # to a verified opportunity.
-                    partial_opportunity = True
-                    opportunity_verified = False
-                elif claim_state not in {"numeric_verified", "text_supported"}:
-                    # Apply the same host-source-bound analysis policy as other
-                    # sections. Source presence alone is never verified growth.
-                    projected, proof = _supported_research_fields(
-                        {"growth_opportunities": [opportunity], "claims": []},
-                        ["growth_opportunities"], available, evidence_records, language)
-                    retained = projected.get("growth_opportunities", [])
-                    if not retained or not proof.get("nodes"):
-                        verification["issues"].append("Growth opportunity claim failed evidence verification")
-                        continue
-                    opportunity = retained[0]
-                    opportunity["_section_validation"] = proof
-                    opportunity_verified = False
-                    partial_opportunity = True
-                    verification["issues"].append("Growth opportunity analysis awaits independent premise verification")
-            else:
-                # A name and citations without an economic mechanism is not a
-                # verified opportunity or substantive growth analysis.
-                continue
-            safe_opportunities.append(opportunity)
-            if opportunity_verified:
-                verified_opportunities += 1
-        if partial_opportunity:
-            verification["issues"].append(
-                "Growth opportunity claim remains reference-only"
-            )
-        verification["passed"] = not verification["issues"]
-        trusted = dict(result)
-        trusted["opportunities"] = safe_opportunities
+        retained = trusted.get("opportunities", [])
+        retained = retained if isinstance(retained, list) else []
+        audit = trusted.get("_section_validation", {})
+        nodes = audit.get("nodes", [])
+        verified = sum(bool(local) and all(node.get("validation_state") == "verified" for node in local)
+                       for index in range(len(retained))
+                       if (local := [node for node in nodes
+                           if str(node.get("path", "")).startswith(f"stage.opportunities[{index}].")]))
         lineage = dict(result.get("_lineage") or {})
-        raw_count = int(lineage.get("raw_candidate_count", len(result["opportunities"])))
-        lineage.update({
-            "raw_candidate_count": raw_count,
-            "normalized_count": int(lineage.get("normalized_count", len(result["opportunities"]))),
-            "verified_count": verified_opportunities,
-            "retained_count": len(safe_opportunities),
-            "rejected_count": max(0, raw_count - len(safe_opportunities)),
-            "rejected_reasons": list(dict.fromkeys(
-                list(lineage.get("rejected_reasons", [])) + list(verification["issues"])
-            )),
-            "cap_applied": bool(lineage.get("cap_applied", False) or raw_count > 5),
-            "cap_limit": int(lineage.get("cap_limit", 5)),
-        })
+        raw_count = lineage.get("raw_candidate_count", len(result["opportunities"]))
+        lineage.update({"raw_candidate_count": raw_count,
+                        "normalized_count": len(result["opportunities"]),
+                        "verified_count": verified, "retained_count": len(retained),
+                        "rejected_count": max(0, len(result["opportunities"]) - len(retained)),
+                        "rejected_reasons": [item["reason"] for item in audit.get("quarantined_paths", [])]})
         trusted["_lineage"] = lineage
-        trusted["trusted_channels"] = {
-            "verified_facts": [], "verified_calculations": [],
-            "labelled_inferences": safe_opportunities if not partial_opportunity else [],
-            "assumptions_scenarios": safe_opportunities if partial_opportunity else [],
-            "unresolved": [],
-        }
-        trusted["_verification_state"] = (
-            "completed_verified"
-            if verification["passed"]
-            else "completed_partial"
-            if safe_opportunities
-            else "failed_verification"
-        )
-        trusted["_verified_claim_count"] = verified_opportunities
-        return trusted, verification
-    return _trusted_stage_result(result, verification, evidence_records, language), verification
+        trusted["_verified_claim_count"] = verified
+    return trusted, verification
 
 
 def _collect_strings(value: Any, *keys: str) -> list[str]:
@@ -1747,13 +1713,42 @@ def _synthesis_json_bytes(value: Any) -> int:
 def _recursive_synthesis_chunks(
     value: Any, budget: int, *, measure: Callable[[Any], int] = _synthesis_json_bytes,
 ) -> list[Any]:
-    """Split a JSON value without splitting an atomic value."""
+    """Split complete structured material; source strings retain every character."""
     if measure(value) <= budget:
         return [value]
     if isinstance(value, dict):
         chunks: list[dict[str, Any]] = []
         current: dict[str, Any] = {}
+        identity_keys = {"evidence_id", "document_id", "content_hash", "company_cik", "source_url",
+            "accession_number", "fiscal_year", "fiscal_period", "start_date", "end_date", "period_end",
+            "currency", "unit", "scale", "scope", "consolidated_scope", "source_page", "page", "locator",
+            "title", "topic", "kind", "statement", "table_id", "column_headers"}
+        identity = {key: child for key, child in value.items() if key in identity_keys}
         for key, child in value.items():
+            inherited_span = value.get("_source_span")
+            inherited_field = inherited_span.get("field") if isinstance(inherited_span, dict) else None
+            if key == "_source_span" and identity and isinstance(value.get(inherited_field), str):
+                continue  # Emitted with its text, never as a detached metadata packet.
+            if (identity and isinstance(child, str) and key not in identity_keys
+                    and (measure({str(key): child}) > budget or inherited_field == str(key))):
+                if current:
+                    chunks.append(current)
+                    current = {}
+                parent_span = value.get("_source_span")
+                parent_span = parent_span if isinstance(parent_span, dict) and parent_span.get("field") == str(key) else {}
+                base_offset = parent_span.get("start", 0)
+                original_sha = parent_span.get("original_sha256") or hashlib.sha256(child.encode("utf-8")).hexdigest()
+                def source_fragment(text, start=0, end=None):
+                    return {**identity, str(key): text, "_source_span": {"field": str(key),
+                        "start": base_offset + start, "end": base_offset + (len(child) if end is None else end),
+                        "total_characters": parent_span.get("total_characters", len(child)), "original_sha256": original_sha}}
+                fragments = _source_text_chunks(child, budget,
+                    measure=lambda text: measure(source_fragment(text, len(child), len(child))))
+                offset = 0
+                for fragment in fragments:
+                    chunks.append(source_fragment(fragment, offset, offset + len(fragment)))
+                    offset += len(fragment)
+                continue
             for child_chunk in _recursive_synthesis_chunks(
                 child, budget, measure=lambda chunk, field=str(key): measure({field: chunk})
             ):
@@ -1799,11 +1794,45 @@ def _recursive_synthesis_chunks(
         if current:
             chunks.append(current)
         return chunks or [[]]
+    if isinstance(value, str):
+        return _source_text_chunks(value, budget, measure=measure)
     # A scalar larger than the input budget is indivisible by contract.
     raise SynthesisContextLimitError(
         [{"name": "atomic-value", "bytes": measure(value)}],
         budget,
     )
+
+
+def _source_text_chunks(value: str, budget: int, *, measure) -> list[str]:
+    """Prefer page/paragraph/row/sentence seams, with exact ordered UTF-8 replay.
+
+    No strip, character cap, summarization or dropped suffix. Long unbroken
+    prose can split at a codepoint seam, but a numeric literal is never cut.
+    """
+    result, start = [], 0
+    while start < len(value):
+        low, high = start, len(value)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if measure(value[start:middle]) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        end = low
+        if end < len(value):
+            seams = [match.end() + start for match in re.finditer(r"\n\s*\n|\n|[。！？；.!?;](?:\s|$)|\s+", value[start:end])]
+            preferred = [position for position in seams if position >= start + (end - start) // 2]
+            if preferred:
+                end = preferred[-1]
+            while (end > start and end < len(value) and value[end - 1] in "0123456789.,+-"
+                   and value[end] in "0123456789.,+-"):
+                end -= 1
+        if end <= start:
+            raise SynthesisContextLimitError([{"name": "indivisible-source-context-or-quantity",
+                "bytes": measure(value[start:])}], budget)
+        result.append(value[start:end])
+        start = end
+    return result
 
 
 def _collect_evidence_ids(value: Any) -> list[str]:
@@ -1867,18 +1896,24 @@ def _lossless_synthesis_value(value: Any, _seen: set[int] | None = None) -> Any:
         if id(value) in seen:
             return "[cyclic synthesis value]"
         seen.add(id(value))
-        return [_lossless_synthesis_value(item, seen) for item in value]
+        try:
+            return [_lossless_synthesis_value(item, seen) for item in value]
+        finally:
+            seen.remove(id(value))
     if isinstance(value, tuple):
         return [_lossless_synthesis_value(item, seen) for item in value]
     if isinstance(value, dict):
         if id(value) in seen:
             return "[cyclic synthesis value]"
         seen.add(id(value))
-        return {
-            str(key): _lossless_synthesis_value(item, seen)
-            for key, item in value.items()
-            if not str(key).startswith("_") and key not in {"raw_response", "prompt"}
-        }
+        try:
+            return {
+                str(key): _lossless_synthesis_value(item, seen)
+                for key, item in value.items()
+                if not str(key).startswith("_") and key not in {"raw_response", "prompt", "trusted_channels"}
+            }
+        finally:
+            seen.remove(id(value))
     return value
 
 
@@ -1991,14 +2026,13 @@ class ResearchWorkflow:
         self._model_context = threading.local()
         self.manual_authorization_id = ""
         self.local_revalidation = False
-        # A model's rate limit is shared across simultaneous company runs in
-        # this process, preventing each workflow from independently saturating it.
+        self.budget_gap_resume = False
+        # A model's request ceiling is shared across simultaneous company runs
+        # in this process. The graph still opts into one or two workers per run;
+        # the scheduler's adaptive 429 handling can lower this shared ceiling.
         self.model_scheduler = shared_model_scheduler(
             model_config.connection_id or model_config.configured_model_id,
-            # No provider-wide concurrency contract is available in the model
-            # connection schema yet.  Serialise by default; users/providers
-            # can opt into a higher limit once that contract is explicit.
-            limit=1,
+            limit=2,
         )
 
     def _report_text(
@@ -2028,13 +2062,11 @@ class ResearchWorkflow:
         *,
         run: ResearchRun | None = None,
     ) -> dict[str, Any]:
-        """Submit the complete canonical synthesis context exactly once.
+        """Produce synthesis from complete material using adaptive requests.
 
-        Local byte/token estimates are diagnostics only.  Provider tokenizers,
-        server-side prompt framing and context limits differ, so a conservative
-        local estimate must never reject a request the selected provider can
-        accept.  Capacity is classified from the provider's explicit response
-        or an incomplete length-truncated response after this one attempt.
+        Input refusal and output exhaustion are different recovery conditions.
+        A received length-cut body is retained as partial, never mislabeled as
+        an input-context refusal or certified complete because keys exist.
         """
         projected = _synthesis_prior_artifacts(dossier, growth, skeptic, forecast)
         context_json = context.compact_json()
@@ -2045,20 +2077,80 @@ class ResearchWorkflow:
             projected,
             run=run,
         )
+        from .research_execution.model_output import response_refused
+        if response_refused(result) or result.get("_response_error") == "provider_refusal":
+            return result
         meta = result.get("_response_meta") if isinstance(result, dict) else None
         finish_reason = str(meta.get("finish_reason") or "").casefold() if isinstance(meta, dict) else ""
         if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
-            missing_sections = {
-                key for key in _REQUIRED_SYNTHESIS_SECTIONS
-                if result.get(key) in (None, "", [])
-            }
-            if missing_sections:
-                raise SynthesisContextLimitError(
-                    [{"name": "complete", "bytes": len(context_json.encode("utf-8"))}],
-                    0,
-                    required_bytes=len(context_json.encode("utf-8")),
-                    counting_mode="provider_finish_reason",
-                )
+            result = {**result, "_output_incomplete": {
+                "code": "MODEL_OUTPUT_BUDGET_EXHAUSTED", "state": "pending"}}
+        if result.get("_output_incomplete"):
+            result = self._recover_synthesis_output_sections(context_json, projected, result, run=run)
+        from .research_execution.analysis_references import resolve_references
+        result = resolve_references(result, projected)
+        return result
+
+    def _recover_synthesis_output_sections(self, context_json: str, projected: dict[str, Any],
+            original: dict[str, Any], *, run: ResearchRun | None = None) -> dict[str, Any]:
+        """One targeted supplement; never rewrite closed sections or loop.
+
+        Missing objects are named before dispatch. An open partial object is
+        retained for inspection, not overwritten by a guessed continuation.
+        The request is charged to the same per-stage/run repair allowance.
+        """
+        sections = list(dict.fromkeys([*(key for key in REQUIRED_REPORT_SECTIONS if key != "claims"),
+            *sorted({path.split(".")[0] for item in ResearchCoverageContract.obligations
+                     for path in item.paths if path.split(".")[0] != "claims"})]))
+        result = deepcopy(original)
+        from .research_execution.executor import dependency_findings
+        from .report_readiness import section_has_substance
+        prior_findings = dependency_findings(original)
+        issues = original.get("_output_normalization_issues", [])
+        open_paths = [item.get("path", "") for item in issues if isinstance(item, dict)
+                      and item.get("code") == "MODEL_OUTPUT_CONTAINER_INCOMPLETE"]
+        states = [{"section": section, "complete": section_has_substance(section, original.get(section))
+                   and not any(path.startswith("$." + section) for path in open_paths)} for section in sections]
+        missing = [section for section in sections if section not in original]
+        parts = []
+        if missing:
+            self._check_cancelled()
+            try:
+                part = self._run_agent_adaptive("research-synthesizer-missing-sections",
+                    "prompts/research-synthesizer.md", context_json,
+                    {**projected, "received_synthesis_findings": prior_findings,
+                     "sectional_delivery": {"schema": "research-section-delivery-v2-targeted",
+                         "sections": missing, "all_sections": sections}},
+                    run=run, role_id="research-synthesizer", output_schema="research-report-section-v1")
+                from .research_execution.model_output import response_refused
+                meta = part.get("_response_meta", {})
+                finished = (not part.get("_response_error") and not part.get("_output_incomplete")
+                    and not response_refused(part) and str(meta.get("finish_reason", "")).casefold()
+                    not in {"length", "max_tokens", "max_output_tokens"})
+                parts.append(part)
+                for state in states:
+                    section = state["section"]
+                    if section in missing:
+                        if part.get(section) not in (None, "", [], {}):
+                            result[section] = deepcopy(part[section])
+                        state.update(complete=finished and section_has_substance(section, part.get(section)),
+                                     candidate_sha256=recovery_digest(part))
+            except (ProviderError, SynthesisContextLimitError) as exc:
+                for state in states:
+                    if state["section"] in missing:
+                        state["code"] = exc.code
+        result["claims"] = _collect_stage_claims(original, *parts)
+        complete = bool(missing) and bool(states) and all(item["complete"] for item in states)
+        result["_sectional_delivery"] = {"schema": "research-section-delivery-v1", "complete": complete,
+            "original_candidate_sha256": recovery_digest(original), "sections": states}
+        if complete:
+            # This is a host-assembled candidate, not the original truncated
+            # provider response. Never fabricate a supplier finish/usage receipt.
+            for key in ("_response_meta", "_response_error", "_output_incomplete"):
+                result.pop(key, None)
+            result["structured_output_valid"] = True
+        else:
+            result["_output_incomplete"] = {"code": "MODEL_OUTPUT_BUDGET_EXHAUSTED", "state": "pending"}
         return result
 
     def _bounded_synthesis_merge(
@@ -2460,9 +2552,22 @@ class ResearchWorkflow:
             local = assemble_trusted_report_payload(self.storage.get_artifacts(run.run_id),
                 run_id=run.run_id, input_digest=publication.input_digest)
             report_mode = "staged-fallback" if response_error == "insufficient_material" else "synthesis-incomplete"
-            report_payload = deepcopy(local["report"]) if local else {"claims": []}
-            verification["section_validation"] = (deepcopy(local["verification"]["section_validation"])
-                                                   if local else {"schema": SECTION_PROOF_VERSION, "nodes": []})
+            # A failed claim cannot replace generated synthesis with a staged
+            # template. Fill genuinely absent sections only; preserve the
+            # synthesis' independently bound nodes and its original wording.
+            section_audit = verification.setdefault("section_validation",
+                {"schema": SECTION_PROOF_VERSION, "nodes": []})
+            if local:
+                for key, body in local["report"].items():
+                    if key.startswith("_") or key in {"claims", "research_complete", "cross_section_synthesis_status"}:
+                        continue
+                    if report_payload.get(key) not in (None, "", [], {}):
+                        continue
+                    report_payload[key] = deepcopy(body)
+                    section_audit.setdefault("nodes", []).extend(
+                        deepcopy(node) for node in local["verification"]["section_validation"].get("nodes", ())
+                        if node.get("section_id") == key)
+            report_payload.setdefault("claims", [])
             # The engine owns these computed fields. Project only its output,
             # never any provider-written valuation prose, once at this seam.
             valuation_fields = enforce_valuation_consistency(
@@ -2479,7 +2584,8 @@ class ResearchWorkflow:
                 "context_budget_exceeded": "not_completed_context_capacity",
                 "provider_error": "not_completed_provider_error",
                 "insufficient_material": "not_completed_insufficient_material",
-            }.get(response_error, "not_completed_invalid_output")
+            }.get(response_error, "generated_pending_verification" if not response_error and report_payload
+                  else "not_completed_invalid_output")
             if context_budget_exceeded:
                 report_payload["context_budget"] = {
                     "required_bytes": synthesis.get("_context_required_bytes"),
@@ -2506,6 +2612,9 @@ class ResearchWorkflow:
             verification["passed"] = False
             if report_mode == "synthesized":
                 report_mode = "synthesis-incomplete"
+        report_payload["research_complete"] = bool(readiness.complete)
+        if not readiness.complete:
+            report_payload.setdefault("cross_section_synthesis_status", "generated_pending_verification")
         diagnostics = _response_diagnostics(synthesis)
         if synthesis.get("_response_error") == "context_budget_exceeded":
             diagnostics.update({
@@ -2699,6 +2808,14 @@ class ResearchWorkflow:
                 )
                 valuation["currency"] = company.reporting_currency
                 valuation["market_snapshot"] = dict(market_snapshot or {})
+            from .financials import fcf_sensitivity_analysis
+            if company.industry_support != "financial_beta":
+                sensitivity = fcf_sensitivity_analysis(metrics, currency=company.reporting_currency,
+                    discount_rate=(valuation_inputs or {}).get("discount_rate", .10),
+                    terminal_growth=(valuation_inputs or {}).get("terminal_growth", .03),
+                    horizon_years=(valuation_inputs or {}).get("horizon_years", 5))
+                valuation = {**(valuation or {"status": "missing_market_price", "currency": company.reporting_currency}),
+                             "intrinsic_analysis": sensitivity}
             context = ResearchContext(
                 company,
                 facts,
@@ -2709,6 +2826,7 @@ class ResearchWorkflow:
                 market_snapshot,
                 dict(profile.period_coverage) if profile is not None else {},
                 list(profile.repair_observations) if profile is not None else [],
+                research_as_of=run.data_as_of,
             )
             self._check_cancelled()
             notify(self._progress_text("已完成确定性财务计算"), 15)
@@ -2875,6 +2993,7 @@ class ResearchWorkflow:
             deterministic_content.get("market_snapshot"),
             (deterministic_content.get("financial_quality") or {}).get("period_coverage", {}),
             deterministic_content.get("repair_observations", []),
+            research_as_of=run.data_as_of,
         )
         publication = self._capture_resume_publication(run)
         graph, publication = self._execute_official_model_graph(
@@ -2914,6 +3033,7 @@ class ResearchWorkflow:
             deterministic_content.get("market_snapshot"),
             (deterministic_content.get("financial_quality") or {}).get("period_coverage", {}),
             deterministic_content.get("repair_observations", []),
+            research_as_of=run.data_as_of,
         )
         publication = self._capture_resume_publication(run)
         graph, publication = self._execute_official_model_graph(
@@ -2960,10 +3080,13 @@ class ResearchWorkflow:
             self._model_context.journal = previous
 
     def _new_request_journal(self, run: ResearchRun) -> ModelRequestJournal:
-        return ModelRequestJournal(self.storage, run.run_id, self.model_config.public_id,
+        journal = ModelRequestJournal(self.storage, run.run_id, self.model_config.public_id,
                                    timeout_seconds=self.model_config.timeout_seconds,
                                    cancel_check=self.cancel_check,
                                    manual_authorization_id=self.manual_authorization_id)
+        journal.budget_only = self.budget_gap_resume
+        journal.hydrate_input_budget(self.provider)
+        return journal
 
     def _generate_with_cancellation(
         self, system_prompt: str, user_prompt: str, *, json_mode: bool = True,
@@ -2972,7 +3095,9 @@ class ResearchWorkflow:
         # There is one provider-call implementation for every model stage.
         try:
             return self._model_stage_executor().execute(
-                ModelStageRequest("material-coverage", system_prompt, user_prompt, json_mode),
+                ModelStageRequest("material-coverage", system_prompt, user_prompt, json_mode,
+                                  purpose="material_coverage",
+                                  max_output_tokens=self._stage_output_budget("material-coverage")),
             )
         except ModelStageCancelled:
             raise ResearchCancelled() from None
@@ -2996,15 +3121,34 @@ class ResearchWorkflow:
         )
         request = ModelStageRequest(
             agent_id, system_prompt, user_prompt,
-            max_input_bytes=(provider_context_capability(self.provider).max_input_bytes
+            max_input_bytes=(provider_context_capability(self._stage_budget_provider(agent_id)).max_input_bytes
                              if enforce_local_budget else None),
             output_contract=_agent_output_contract(role, output_schema),
             claim_repair_contract=self._claim_repair_contract(context_json) if role == "research-synthesizer" else None,
+            max_output_tokens=self._stage_output_budget(agent_id),
+            purpose="section_delivery" if output_schema == "research-report-section-v1" else "generation",
         )
         try:
             return executor.execute(request, material_adequacy=gate, language=self.report_language)
         except ModelStageCancelled:
             raise ResearchCancelled() from None
+
+    def _stage_output_budget(self, agent_id: str) -> int:
+        # A per-call allowance, never a report length cap. Truncation is not
+        # completion; the adaptive coverage path retains received candidates.
+        synthesis = "synthes" in agent_id
+        extended = any(key in agent_id for key in ("growth", "skeptic", "forecast"))
+        desired = 131_072 if synthesis else 98_304 if extended else 65_536
+        # Even without a user hint the planner has a provisional context. Do
+        # not reserve more than that whole window and collapse recovery to a
+        # one-byte input allowance. This is planning, not a vendor maximum;
+        # the host applies only officially supported model-specific limits.
+        capacity = provider_context_capability(self.provider).max_input_tokens
+        return min(desired, max(1024, capacity // (2 if synthesis else 3 if extended else 4)))
+
+    def _stage_budget_provider(self, agent_id: str):
+        scope = getattr(self.provider, "for_output_budget", None)
+        return scope(self._stage_output_budget(agent_id)) if callable(scope) else self.provider
 
     def _claim_repair_contract(self, context_json: str) -> ClaimRepairContract:
         context = json.loads(context_json)
@@ -3015,7 +3159,10 @@ class ResearchWorkflow:
             from .research_source_context import route_repair_observations
             selected, catalog = route_repair_observations(context.get("repair_observations", ()),
                 [{"evidence_id": ref} for target in targets for ref in target.evidence_ids])
-            return {"targeted_repair_observations": selected, "repair_catalog": catalog,
+            return {"sources": [deepcopy(records[ref]) for ref in sorted({ref for target in targets
+                        for ref in target.evidence_ids}) if ref in records],
+                    "company": context.get("company", {}),
+                    "targeted_repair_observations": selected, "repair_catalog": catalog,
                     "allowed_uses": ["repair_mapping"], "financial_admission": False,
                     "instruction": "Observations may locate a damaged source cell. They are not accepted financial facts. A mapping must return through the financial compiler; a claim patch cannot admit or calculate from them."}
         return ClaimRepairContract(lambda output: verify_agent_output(
@@ -3032,6 +3179,7 @@ class ResearchWorkflow:
         total: int,
         capability: ProviderContextCapability,
         role_id: str | None = None, output_schema: str | None = None,
+        refinement: int = 0,
     ) -> dict[str, Any]:
         """Read one complete material partition without pretending it is a final stage."""
 
@@ -3065,7 +3213,55 @@ class ResearchWorkflow:
                 [{"name": f"{agent_id}:partition:{index}", "bytes": input_size}],
                 capability.max_input_bytes,
             )
-        content = self._generate_with_cancellation(system_prompt, user_prompt, json_mode=True)
+        refine_material = False
+        try:
+            content = self._generate_with_cancellation(system_prompt, user_prompt, json_mode=True)
+        except ProviderError as exc:
+            if exc.code not in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE"} or refinement >= 8:
+                raise
+            refine_material = True
+            content = {}
+        from .research_execution.model_output import response_refused
+        if response_refused(content) or content.get("_response_error") == "provider_refusal":
+            raise ProviderError("Provider refused this material partition", code="MODEL_PROVIDER_REFUSAL", retryable=False)
+        meta = content.get("_response_meta", {}) if isinstance(content, dict) else {}
+        output_incomplete = (isinstance(content.get("_output_incomplete"), dict)
+            or isinstance(meta, dict) and str(meta.get("finish_reason") or "").casefold()
+               in {"length", "max_tokens", "max_output_tokens"})
+        if output_incomplete and refinement < 8:
+            refine_material = True
+        children_complete = True
+        if refine_material:
+            # A confirmed refusal has no unknown remote result. Split the
+            # original packet, not a lossy summary. Output exhaustion can also
+            # need smaller material obligations, not an identical paid retry.
+            refined = ProviderContextCapability(capability.max_input_tokens,
+                capability.reserved_output_tokens, capability.reserved_repair_tokens,
+                max(1, min(capability.max_input_bytes - 1, input_size // 2)), capability.bytes_per_token)
+            overhead = len(system_prompt.encode()) + len(json.dumps({
+                "target_agent": agent_id, "target_instructions": role_prompt,
+                "target_role": role_id, "output_schema": output_schema,
+                "partition": {"index": index, "total": total, "sha256": packet_digest},
+                "material": {}}).encode()) + 256
+            try:
+                pieces = _partition_synthesis_context({"material": packet}, refined,
+                                                      input_overhead_bytes=overhead)
+            except SynthesisContextLimitError:
+                if not output_incomplete:
+                    raise
+                # An indivisible context is not permission to discard its
+                # already received findings or claim complete coverage.
+                children_complete = False
+            else:
+                children = [self._coverage_capsule(agent_id=agent_id, role_prompt=role_prompt,
+                    packet=part, index=part_index, total=len(pieces), capability=refined,
+                    role_id=role_id, output_schema=output_schema, refinement=refinement + 1)
+                    for part_index, part in enumerate(pieces, 1)]
+                children_complete = all(child.get("complete", True) for child in children)
+                content = {"partition_findings": [child["content"] for child in children],
+                           "source_evidence_ids": _collect_evidence_ids(packet)}
+                output_incomplete = not children_complete
+        complete = children_complete and not output_incomplete
         source_evidence_ids = _collect_evidence_ids(packet)
         content, unsupported_ids = _isolate_unknown_evidence_references(
             content, set(source_evidence_ids)
@@ -3077,6 +3273,7 @@ class ResearchWorkflow:
             "sha256": packet_digest,
             "source_evidence_ids": source_evidence_ids,
             "isolated_evidence_ids": sorted(unsupported_ids),
+            "complete": complete,
             "content": content,
         }
 
@@ -3225,7 +3422,7 @@ class ResearchWorkflow:
         if self.provider is None:
             raise RuntimeError("model provider is not configured")
         role_prompt = self.pack.prompt(prompt_path)
-        capability = provider_context_capability(self.provider)
+        capability = provider_context_capability(self._stage_budget_provider(agent_id))
         capability_declared = _provider_declares_context_capability(self.provider)
         input_size = _agent_input_size(
             agent_id,
@@ -3235,17 +3432,37 @@ class ResearchWorkflow:
             prior_artifacts,
             role_id=role_id, output_schema=output_schema,
         )
-        if input_size <= capability.max_input_bytes or not capability_declared:
-            result = self._run_agent(
-                agent_id,
-                prompt_path,
-                context_json,
-                prior_artifacts,
-                enforce_local_budget=capability_declared,
-                role_id=role_id, output_schema=output_schema,
-            )
-            result["_stage_material_manifest"] = direct_manifest.to_dict()
-            return result
+        fits = input_size <= capability.max_input_bytes
+        from .research_execution.input_budget import input_measurement
+        measured = input_measurement(self.provider, *_agent_prompt_bundle(
+            agent_id, role_prompt, self.report_language, context_json, prior_artifacts,
+            role_id=role_id, output_schema=output_schema))
+        if measured["exact"] and capability_declared:
+            fits = measured["tokens"] <= capability.available_input_tokens
+            if capability.explicit_max_input_bytes is not None:
+                fits = fits and input_size <= capability.explicit_max_input_bytes
+        if fits or not capability_declared:
+            try:
+                result = self._run_agent(
+                    agent_id,
+                    prompt_path,
+                    context_json,
+                    prior_artifacts,
+                    enforce_local_budget=capability_declared,
+                    role_id=role_id, output_schema=output_schema,
+                )
+            except ProviderError as exc:
+                if exc.code not in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE"}:
+                    raise
+                # A confirmed rejection has no remote candidate to await. Use
+                # a smaller, complete material partition through this same
+                # journal; never resubmit the identical rejected request.
+                capability = ProviderContextCapability(capability.max_input_tokens,
+                    capability.reserved_output_tokens, capability.reserved_repair_tokens,
+                    max(1_024, min(capability.max_input_bytes, input_size // 2)))
+            else:
+                result["_stage_material_manifest"] = direct_manifest.to_dict()
+                return result
 
         routed = route_materials(json.loads(context_json), role)
         gate = routed["material_adequacy"]
@@ -3284,6 +3501,8 @@ class ResearchWorkflow:
         # Store only this non-secret digest, never a second copy of prompts.
         coverage_request_sha256 = recovery_digest({
             "schema": "openthesis.coverage-request-identity.v1",
+            "coverage_policy": "complete-source-spans-output-v2",
+            "output_budget_tokens": self._stage_output_budget("material-coverage"),
             "input_sha256": direct_manifest.input_sha256,
             "model_id": self.model_config.public_id,
             "max_input_bytes": capability.max_input_bytes,
@@ -3388,7 +3607,7 @@ class ResearchWorkflow:
             }
             if item.get("kind") != "financial_fact":
                 entry["raw_text"] = (
-                    "Material covered by the cited lossless coverage capsule."
+                    "Original material was supplied to a recorded partition. The linked capsule contains model findings, not a lossless copy of that original."
                 )
             registry.append(entry)
         lean_context = {
@@ -3397,16 +3616,17 @@ class ResearchWorkflow:
             if key != "evidence"
         }
         lean_context["evidence"] = registry
+        coverage_complete = all(item.get("complete", True) for item in capsules)
         coverage = {
             "schema": "openthesis.stage-coverage.v1",
-            "complete": True,
+            "complete": coverage_complete,
             "partition_count": len(packets),
             "partitions": [
                 {
                     "partition_id": item["partition_id"],
                     "sha256": item["sha256"],
                     "source_evidence_ids": item["source_evidence_ids"],
-                    "status": "complete",
+                    "status": "complete" if item.get("complete", True) else "output_incomplete",
                 }
                 for item in capsules
             ],
@@ -3416,7 +3636,7 @@ class ResearchWorkflow:
         )
         compact_ledger = {
             "schema": coverage["schema"],
-            "complete": True,
+            "complete": coverage_complete,
             "partition_count": len(packets),
             "covered_evidence_ids": sorted(
                 {
@@ -3490,7 +3710,7 @@ class ResearchWorkflow:
         _, manifest = _deduplicated_stage_context(
             context_json,
             agent_id,
-            mode="lossless-coverage",
+            mode="partitioned-material-coverage",
             partition_count=len(packets),
         )
         manifest = StageMaterialManifest(
@@ -3504,6 +3724,10 @@ class ResearchWorkflow:
         result["_stage_material_manifest"] = manifest.to_dict()
         result["_coverage_ledger"] = coverage
         result["_coverage_ledger"]["consolidation_rounds"] = consolidation_rounds
+        if not coverage_complete:
+            result["_output_incomplete"] = {
+                "code": "MODEL_OUTPUT_BUDGET_EXHAUSTED", "state": "pending",
+                "scope": "material-coverage"}
         return result
 
     @staticmethod
@@ -3535,6 +3759,14 @@ class ResearchWorkflow:
         thesis_content: dict[str, Any] | None = None,
     ) -> None:
         self._check_cancelled()
+        # A final body may be identical to a historical revision while this
+        # attempt has published newer progressive revisions. Bind this commit
+        # to its CAS generation so artifact deduplication cannot leave the
+        # progressive head current or confuse a real competing writer.
+        if artifact.artifact_type == "research-report":
+            artifact = self._artifact(run, artifact.artifact_type, artifact.title,
+                {**artifact.content, "publication_generation": publication.report_generation + 1},
+                agent_id=artifact.agent_id)
 
         def thesis_artifact(thesis: dict[str, Any]) -> ResearchArtifact:
             # Pure construction; the repository allocates the version under

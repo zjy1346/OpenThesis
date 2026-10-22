@@ -18,6 +18,152 @@ from openthesis.financials import (
 
 
 class FinancialMetricTests(unittest.TestCase):
+    def test_annual_money_metadata_tracks_exact_fact_and_generation(self) -> None:
+        facts = [
+            {
+                "fact_id": f"{concept}-2025",
+                "concept": concept,
+                "value": value,
+                "fiscal_year": 2025,
+                "fiscal_period": "FY",
+                "filed_at": "2026-03-01",
+                "end_date": "2025-12-31",
+                "accession_number": "annual-2025",
+                "currency": "CNY",
+                "unit_scale": 1.0,
+                "unit_provenance": "explicit",
+                "consolidated_scope": "consolidated",
+                "generation_id": "generation-2025",
+                "usage_status": "canonical_research",
+            }
+            for concept, value in (
+                ("revenue", 100.0), ("operating_income", 35.0), ("net_income", 30.0),
+                ("operating_cash_flow", 25.0), ("capital_expenditure", 5.0),
+                ("assets", 500.0), ("liabilities", 200.0), ("equity", 250.0),
+                ("total_equity", 300.0),
+            )
+        ]
+        metric = calculate_metrics(facts)[0]
+
+        revenue = metric["money_metadata"]["revenue"]
+        self.assertEqual(revenue["fact_id"], "revenue-2025")
+        self.assertEqual(revenue["generation_id"], "generation-2025")
+        self.assertEqual(revenue["evidence_ids"], ["fact:revenue-2025"])
+        self.assertEqual(metric["money_metadata"]["free_cash_flow"]["unit_provenance"], "derived_from_normalized_inputs")
+        self.assertEqual(
+            metric["money_metadata"]["free_cash_flow"]["evidence_ids"],
+            ["fact:operating_cash_flow-2025", "fact:capital_expenditure-2025"],
+        )
+        self.assertIn("equity", metric["money_metadata"])
+        self.assertIn("total_equity", metric["money_metadata"])
+        for concept in ("operating_income", "capital_expenditure"):
+            self.assertEqual(metric["money_metadata"][concept]["evidence_ids"], [f"fact:{concept}-2025"])
+            self.assertEqual(metric["money_metadata"][concept]["generation_id"], "generation-2025")
+
+    def test_fcf_is_not_typed_when_cash_flow_inputs_cross_generations(self) -> None:
+        facts = []
+        for concept, value, generation in (
+            ("operating_cash_flow", 80.0, "generation-a"),
+            ("capital_expenditure", 20.0, "generation-b"),
+        ):
+            facts.append({
+                "fact_id": f"{concept}-2025",
+                "concept": concept,
+                "value": value,
+                "fiscal_year": 2025,
+                "fiscal_period": "FY",
+                "end_date": "2025-12-31",
+                "filed_at": "2026-03-01",
+                "accession_number": "annual-2025",
+                "currency": "USD",
+                "unit_scale": 1.0,
+                "unit_provenance": "explicit",
+                "scope": "consolidated",
+                "generation_id": generation,
+                "usage_status": "canonical_research",
+            })
+
+        metric = calculate_metrics(facts)[0]
+
+        self.assertIsNone(metric["free_cash_flow"])
+        self.assertEqual(metric["free_cash_flow_gap"], "generation_mismatch")
+        self.assertNotIn("free_cash_flow_money", metric)
+        self.assertNotIn("free_cash_flow", metric["money_metadata"])
+
+    def test_pre_persistence_pdf_facts_share_a_source_cohort_for_fcf(self) -> None:
+        facts = []
+        for concept, value in (
+            ("operating_cash_flow", 80.0),
+            ("capital_expenditure", 20.0),
+        ):
+            facts.append({
+                "fact_id": f"{concept}-2025",
+                "concept": concept,
+                "value": value,
+                "fiscal_year": 2025,
+                "fiscal_period": "FY",
+                "end_date": "2025-12-31",
+                "filed_at": "2026-03-01",
+                "accession_number": "annual-2025",
+                "currency": "CNY",
+                "unit_scale": 1.0,
+                "unit_provenance": "explicit_pdf_table_unit",
+                "scope": "consolidated",
+                "parser_version": "pdf-parser-v8",
+                "source_document": "sha256:official-pdf",
+                "generation_id": "",
+                "usage_status": "canonical_research",
+            })
+
+        metric = calculate_metrics(facts)[0]
+
+        self.assertEqual(metric["free_cash_flow"], 60.0)
+        self.assertEqual(
+            metric["money_metadata"]["free_cash_flow"]["unit_provenance"],
+            "derived_from_normalized_inputs",
+        )
+        facts[1]["parser_version"] = "pdf-parser-v9"
+        mismatched = calculate_metrics(facts)[0]
+        self.assertIsNone(mismatched["free_cash_flow"])
+        self.assertEqual(mismatched["free_cash_flow_gap"], "generation_mismatch")
+
+    def test_opposing_net_income_and_cash_flow_growth_is_exposed_with_sources(self) -> None:
+        facts = []
+        values = {
+            2024: {"net_income": 100.0, "operating_cash_flow": 120.0},
+            2025: {"net_income": 120.0, "operating_cash_flow": 110.0},
+        }
+        for year, metrics in values.items():
+            for concept, value in metrics.items():
+                facts.append({
+                    "fact_id": f"{year}-{concept}",
+                    "concept": concept,
+                    "value": value,
+                    "fiscal_year": year,
+                    "fiscal_period": "FY",
+                    "end_date": f"{year}-12-31",
+                    "filed_at": f"{year + 1}-03-01",
+                    "accession_number": f"annual-{year}",
+                    "currency": "USD",
+                    "unit_scale": 1.0,
+                    "unit_provenance": "explicit",
+                    "scope": "consolidated",
+                    "generation_id": f"generation-{year}",
+                    "usage_status": "canonical_research",
+                })
+
+        metric = calculate_metrics(facts)[0]
+
+        self.assertEqual(len(metric["financial_tensions"]), 1)
+        tension = metric["financial_tensions"][0]
+        self.assertEqual(tension["period"], 2025)
+        self.assertAlmostEqual(tension["observations"]["net_income_growth"], 0.2)
+        self.assertAlmostEqual(tension["observations"]["operating_cash_flow_growth"], -1 / 12)
+        self.assertCountEqual(
+            tension["evidence_ids"],
+            ["fact:2024-net_income", "fact:2025-net_income", "fact:2024-operating_cash_flow", "fact:2025-operating_cash_flow"],
+        )
+
     def test_gross_profit_is_derived_from_same_period_revenue_and_cost(self) -> None:
         metrics = calculate_metrics(
             [
@@ -96,15 +242,13 @@ class FinancialMetricTests(unittest.TestCase):
 
         latest = calculate_metrics(facts)[0]
 
-        self.assertAlmostEqual(latest["revenue_growth"], 1.0)
-        self.assertAlmostEqual(latest["operating_income_growth"], 1.0)
-        self.assertAlmostEqual(latest["net_income_growth"], 1.0)
-        self.assertAlmostEqual(latest["operating_cash_flow_growth"], 1.0)
+        for concept in ("revenue", "operating_income", "net_income", "operating_cash_flow"):
+            self.assertIsNone(latest[f"{concept}_growth"])
+            self.assertEqual(len(latest["comparison_versions"][concept]), 2)
         self.assertCountEqual(
-            latest["comparison_fact_ids"],
+            latest["comparison_versions"],
             [
-                "comparator-revenue", "comparator-operating_income",
-                "comparator-net_income", "comparator-operating_cash_flow",
+                "revenue", "operating_income", "net_income", "operating_cash_flow",
             ],
         )
 
@@ -234,6 +378,85 @@ class FinancialMetricTests(unittest.TestCase):
         self.assertGreater(metrics[0]["revenue_growth"], 0)
         self.assertLess(metrics[0]["cash_conversion"], metrics[1]["cash_conversion"])
 
+    def test_cash_conversion_is_period_currency_and_scope_aware(self) -> None:
+        def facts_for(
+            net_income: float,
+            operating_cash_flow: float,
+            *,
+            period: str = "FY",
+            net_currency: str = "CNY",
+            cash_currency: str = "CNY",
+            net_scope: str = "consolidated",
+            cash_scope: str = "consolidated",
+            net_end: str = "2025-12-31",
+            cash_end: str = "2025-12-31",
+        ) -> list[dict[str, object]]:
+            common = {
+                "fiscal_year": 2025,
+                "fiscal_period": period,
+                "filed_at": "2026-03-01",
+                "unit_provenance": "structured_normalized",
+            }
+            return [
+                {"fact_id": "revenue", "concept": "revenue", "value": 500.0,
+                 "currency": "CNY", "unit": "CNY", "scope": "consolidated",
+                 "end_date": "2025-12-31", **common},
+                {"fact_id": "net-income", "concept": "net_income", "value": net_income,
+                 "currency": net_currency, "unit": net_currency, "scope": net_scope,
+                 "end_date": net_end, **common},
+                {"fact_id": "operating-cash-flow", "concept": "operating_cash_flow",
+                 "value": operating_cash_flow, "currency": cash_currency,
+                 "unit": cash_currency, "scope": cash_scope, "end_date": cash_end,
+                 **common},
+            ]
+
+        annual = calculate_metrics(facts_for(-20.0, -12.0))[0]
+        self.assertIsNone(annual["cash_conversion"])
+        self.assertEqual(
+            annual["cash_conversion_status"], "not_applicable_nonpositive_earnings"
+        )
+        summary = deterministic_summary("Fixture", [annual], "zh-CN", "CNY")
+        self.assertIn("不适用（净利润不为正", summary)
+        self.assertIn("净利润", summary)
+        self.assertIn("经营现金流", summary)
+
+        loss_conversion = calculate_metrics(facts_for(20.0, -12.0))[0]
+        self.assertAlmostEqual(loss_conversion["cash_conversion"], -0.6)
+        self.assertEqual(loss_conversion["cash_conversion_status"], "calculated")
+
+        zero_ocf = calculate_metrics(facts_for(20.0, 0.0))[0]
+        self.assertEqual(zero_ocf["cash_conversion"], 0.0)
+
+        scope_mismatch = calculate_metrics(
+            facts_for(20.0, -12.0, cash_scope="parent")
+        )[0]
+        self.assertAlmostEqual(scope_mismatch["cash_conversion"], -0.6)
+        self.assertEqual(scope_mismatch["cash_conversion_status"], "approximate_scope")
+        self.assertIn(
+            "近似值（口径不一致或未核实）",
+            deterministic_summary("Fixture", [scope_mismatch], "zh-CN", "CNY"),
+        )
+
+        currency_mismatch = calculate_metrics(
+            facts_for(20.0, -12.0, cash_currency="USD")
+        )[0]
+        self.assertIsNone(currency_mismatch["cash_conversion"])
+        self.assertEqual(currency_mismatch["cash_conversion_status"], "currency_mismatch")
+
+        period_mismatch = calculate_metrics(
+            facts_for(20.0, -12.0, cash_end="2025-09-30")
+        )[0]
+        self.assertIsNone(period_mismatch["cash_conversion"])
+        self.assertEqual(period_mismatch["cash_conversion_status"], "period_mismatch")
+
+        interim = calculate_interim_metrics(
+            facts_for(-20.0, -12.0, period="H1", net_end="2025-06-30", cash_end="2025-06-30")
+        )[0]
+        self.assertIsNone(interim["cash_conversion"])
+        self.assertEqual(
+            interim["cash_conversion_status"], "not_applicable_nonpositive_earnings"
+        )
+
     def test_annual_growth_never_crosses_a_missing_fiscal_year(self) -> None:
         facts = []
         for year, revenue in ((2026, 160.0), (2024, 120.0), (2023, 100.0), (2022, 80.0)):
@@ -357,10 +580,16 @@ class FinancialMetricTests(unittest.TestCase):
         ]
         interim = calculate_interim_metrics(facts)
         current = next(item for item in interim if item["year"] == 2025)
+        # A fiscal label is not proof of the underlying duration.
+        self.assertIsNone(current["revenue_growth"])
+        for item in facts:
+            item.update(start_date=f"{item['fiscal_year']}-01-01", currency="CNY",
+                        scope="consolidated", statement="income_statement")
+        current = calculate_interim_metrics(facts)[0]
         self.assertEqual(current["comparison_period"], "2024 H1")
         self.assertAlmostEqual(current["revenue_growth"], 0.2)
 
-    def test_same_filing_comparator_has_explicit_metric_priority(self) -> None:
+    def test_differing_comparative_is_not_an_explained_restatement(self) -> None:
         facts = [
             {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
              "fiscal_period": "FY", "filed_at": "2026-03-01", "fact_id": "current"},
@@ -371,13 +600,13 @@ class FinancialMetricTests(unittest.TestCase):
              "usage_status": "comparator"},
         ]
         metric = next(item for item in calculate_metrics(facts) if item["year"] == 2025)
-        self.assertAlmostEqual(metric["revenue_growth"], 0.25)
-        self.assertEqual(metric["comparison_source"], "same_filing_comparator")
-        self.assertEqual(metric["comparison_basis"], "same_filing_comparator")
-        self.assertEqual(metric["comparison_fact_ids"], ["same-filing"])
+        self.assertIsNone(metric["revenue_growth"])
+        self.assertEqual(metric["comparison_gap"], "unresolved_restatement")
+        self.assertEqual({item["fact_id"] for item in metric["comparison_versions"]["revenue"]}, {"history", "same-filing"})
+        self.assertEqual(metric["revenue"], 150)
         self.assertTrue(metric["restatement_available"])
 
-    def test_same_filing_interim_comparator_priority_is_not_filed_at_accidental(self) -> None:
+    def test_differing_interim_comparative_does_not_use_latest_amount_blindly(self) -> None:
         facts = [
             {"concept": "revenue", "value": 150.0, "fiscal_year": 2025,
              "fiscal_period": "H1", "end_date": "2025-06-30",
@@ -390,11 +619,14 @@ class FinancialMetricTests(unittest.TestCase):
              "filed_at": "2026-08-01", "fact_id": "same-filing",
              "usage_status": "comparator"},
         ]
+        for item in facts:
+            item.update(start_date=f"{item['fiscal_year']}-01-01", currency="CNY",
+                        scope="consolidated", statement="income_statement")
         metric = next(item for item in calculate_interim_metrics(facts) if item["year"] == 2025)
-        self.assertAlmostEqual(metric["revenue_growth"], 0.25)
-        self.assertEqual(metric["comparison_source"], "same_filing_comparator")
-        self.assertEqual(metric["comparison_basis"], "same_filing_comparator")
-        self.assertEqual(metric["comparison_fact_ids"], ["same-filing"])
+        self.assertIsNone(metric["revenue_growth"])
+        self.assertEqual(metric["comparison_gap"], "unresolved_restatement")
+        self.assertEqual(len(metric["comparison_versions"]["revenue"]), 2)
+        self.assertEqual(metric["revenue"], 150)
 
     def test_same_filing_comparator_is_not_rendered_as_an_annual_row(self) -> None:
         facts = [
@@ -417,6 +649,9 @@ class FinancialMetricTests(unittest.TestCase):
              "fiscal_period": "H1", "end_date": "2024-06-30", "filed_at": "2026-08-01",
              "fact_id": "same-filing", "usage_status": "comparator"},
         ]
+        for item in facts:
+            item.update(start_date=f"{item['fiscal_year']}-01-01", currency="CNY",
+                        scope="consolidated", statement="income_statement")
         metrics = calculate_interim_metrics(facts)
         self.assertEqual([(item["year"], item["period"]) for item in metrics], [(2025, "H1")])
         self.assertAlmostEqual(metrics[0]["revenue_growth"], 0.25)
@@ -486,6 +721,18 @@ class FinancialMetricTests(unittest.TestCase):
             require_typed=True,
         )
         self.assertNotEqual(result["status"], "valuation_unit_mismatch")
+
+    def test_reverse_dcf_adaptively_solves_beyond_legacy_fixed_range(self) -> None:
+        base = 100.0
+        target = discounted_cash_flow_value(base, 2.0, 0.10, 0.03, 5)
+        implied = implied_fcf_growth(target, base, 0.10, 0.03, 5)
+        self.assertIsNotNone(implied)
+        self.assertAlmostEqual(implied or 0.0, 2.0, places=6)
+        result = reverse_dcf_analysis(
+            [{"year": 2025, "period": "FY", "free_cash_flow": base}],
+            target,
+        )
+        self.assertEqual(result["status"], "extreme_assumption")
 
 
 if __name__ == "__main__":

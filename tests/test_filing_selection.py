@@ -99,7 +99,8 @@ class FilingSelectionTests(unittest.TestCase):
         result = select_research_filings([filing])
         self.assertEqual(len(result.documents), 1)
         self.assertEqual(result.documents[0].period_end, "")
-        self.assertEqual(result.documents[0].revision, "period_end_provisional")
+        self.assertEqual(result.documents[0].revision, "original")
+        self.assertEqual(result.documents[0].period_metadata_status, "unresolved")
 
 
 def _filing(document_id: str, form_type: str, period: str, period_end: str) -> FilingDocument:

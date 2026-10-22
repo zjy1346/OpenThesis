@@ -18,6 +18,7 @@ import {
 
 import { isActiveResearchJob, useWorkbenchSession } from "./app/useWorkbenchSession";
 import { EmptyState, LoadingState, ResearchProgress } from "./components/States";
+import { CoreStartup } from "./components/CoreStartup";
 import { AboutView } from "./features/about/AboutView";
 import { HelpView } from "./features/help/HelpView";
 import { HistoryView } from "./features/history/HistoryView";
@@ -25,6 +26,7 @@ import { ModelCenterView } from "./features/models/ModelCenterView";
 import { OtStudioView } from "./features/ot-studio/OtStudioView";
 import { ReportWorkspace } from "./features/report/ReportWorkspace";
 import { NewResearchView } from "./features/research/NewResearchView";
+import { BudgetGapApproval } from "./features/research/BudgetGapApproval";
 import { SettingsView } from "./features/settings/SettingsView";
 import { ThesisView } from "./features/thesis/ThesisView";
 import { COPY } from "./i18n";
@@ -58,6 +60,8 @@ export default function App() {
     beginResearch,
     retryResearch,
     retryModelStages,
+    approveBudgetGaps,
+    loadResearchCallHistory,
     retrySynthesis,
     retryGrowth,
     retryRecoveryStage,
@@ -67,10 +71,12 @@ export default function App() {
     refreshFinancialReport,
     openFailedDisclosure,
     stopResearch,
+    stopModelCall,
     decideVisionUpload,
     savePreferences,
     refreshBootstrap,
   } = useWorkbenchSession();
+  const storageRecoveryRequired = error?.kind === "storage-recovery-required";
 
   useEffect(() => {
     if (!bootstrap || initialPreferencesApplied.current) return;
@@ -140,6 +146,24 @@ export default function App() {
     help: copy.help,
     about: copy.about,
   };
+  const storageRecoveryPanel = <section className="report-no-content" role="status">
+    <h3>{copy.storageRecoveryTitle}</h3>
+    <p>{copy.storageRecoverySummary}</p>
+  </section>;
+  const reportActionProps = storageRecoveryRequired
+    ? { suppressResearchActions: true }
+    : {
+      onRetryModelStages: retryModelStages,
+      onRetrySynthesis: retrySynthesis,
+      onRetryGrowth: retryGrowth,
+      onRetryRecoveryStage: retryRecoveryStage,
+      onRevalidateSaved: revalidateSaved,
+      onRetryFinancials: retryFinancials,
+      onRebuildFinancials: rebuildFinancials,
+      onRefreshFinancialReport: refreshFinancialReport,
+      onApproveBudgetGaps: approveBudgetGaps,
+      onConfigureCloud: () => setActiveView("models"),
+    };
 
   const navigateTo = (id: ViewId) => {
     setActiveView(id);
@@ -151,7 +175,7 @@ export default function App() {
   // language-specific labels; bootstrap failures fall through to the normal
   // error-visible application shell below.
   if (!bootstrap && !error) {
-    return <div className="bootstrap-shell" role="status" aria-label="OpenThesis">OpenThesis</div>;
+    return <CoreStartup language={language} />;
   }
 
   return (
@@ -203,14 +227,16 @@ export default function App() {
           <div className="status-cluster"><span className="status-dot" /><span>{bootstrap ? `Core ${bootstrap.contract_version}` : copy.loading}</span></div>
         </header>
         {error && error.kind !== "report-unavailable" && <div className="error-banner" role="alert" data-tone={error.kind === "research-failed" && error.code === "NO_FILINGS_AVAILABLE" ? "notice" : undefined}>
-          <span>{error.detail ?? copy.coreUnavailable}</span>
-          <div className="error-actions">
-            {error.kind === "research-failed" && error.code?.startsWith("VISION_") && (
-              <button type="button" onClick={() => setActiveView("settings")}>{copy.openVisionSettings}</button>
-            )}
-            {canRetry && <button type="button" onClick={() => void retryResearch()}>{error.kind === "research-failed" ? copy.retryFetch : copy.retry}</button>}
-            {error.kind === "research-failed" && error.disclosureUrl && <button type="button" onClick={() => void openFailedDisclosure()}><ExternalLink size={14} />{copy.officialDisclosure}</button>}
-          </div>
+          <span>{storageRecoveryRequired ? copy.storageRecoveryRequired : error.detail ?? copy.coreUnavailable}</span>
+          {!storageRecoveryRequired && <div className="error-actions">
+              {error.kind === "research-failed" && error.code?.startsWith("VISION_") && (
+                <button type="button" onClick={() => setActiveView("settings")}>{copy.openVisionSettings}</button>
+              )}
+              {canRetry && <button type="button" onClick={() => void retryResearch()}>{error.kind === "research-failed" ? copy.retryFetch : copy.retry}</button>}
+              {canRetry && error.kind === "research-failed" && error.code === "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED" &&
+                <button type="button" onClick={() => void retryResearch(true)}>{language === "en" ? "Research available material only" : language === "zh-Hant" ? "僅用現有資料研究" : "仅用现有资料研究"}</button>}
+              {error.kind === "research-failed" && error.disclosureUrl && <button type="button" onClick={() => void openFailedDisclosure()}><ExternalLink size={14} />{copy.officialDisclosure}</button>}
+          </div>}
         </div>}
         {bootstrap && bootstrap.interrupted_runs > 0 && (
           <div className="recovery-banner" role="status">
@@ -243,9 +269,14 @@ export default function App() {
               visionApprovalDecline: copy.visionApprovalDecline,
             }}
             onCancel={() => void stopResearch()}
+            onCancelCall={(requestId, attemptId) => void stopModelCall(requestId, attemptId)}
+            loadCallHistory={loadResearchCallHistory}
             onVisionDecision={(approved) => void decideVisionUpload(approved)}
           />
         )}
+        {isActiveResearchJob(job) && job.run_id && !storageRecoveryRequired && <BudgetGapApproval runId={job.run_id} callPlan={job.call_plan}
+          language={bootstrap?.preferences.ui_language ?? language}
+          onApprove={(planDigest, gapIds) => approveBudgetGaps(job.run_id!, planDigest, gapIds)} />}
         <section className="report-stage" aria-label={copy.report}>
           {activeView === "settings" && bootstrap ? (
             <SettingsView language={language} preferences={bootstrap.preferences} copy={copy} onSave={savePreferences} />
@@ -253,6 +284,8 @@ export default function App() {
             <ModelCenterView language={language} />
           ) : activeView === "ot-studio" ? (
             <OtStudioView language={language} onOpenModelCenter={() => setActiveView("models")} />
+          ) : activeView === "new-research" && storageRecoveryRequired ? (
+            storageRecoveryPanel
           ) : activeView === "new-research" && bootstrap ? (
             <NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={() => setActiveView("models")} onOpenVisionSettings={() => setActiveView("settings")} onSavePreferences={savePreferences} onStart={startNewResearch} />
           ) : activeView === "history" && bootstrap ? (
@@ -264,18 +297,22 @@ export default function App() {
             <HelpView language={language} copy={copy} />
           ) : activeView === "about" && bootstrap ? (
             <AboutView bootstrap={bootstrap} copy={copy} />
+          ) : storageRecoveryRequired && !report ? (
+            storageRecoveryPanel
           ) : !bootstrap ? (
             <LoadingState label={copy.loading} />
-          ) : report && reportLoadState.status === "failed" && reportLoadState.run_id === report.run_id && reportLoadState.preserving_previous ? (
+          ) : report && reportLoadState.status === "failed" && reportLoadState.run_id === report.run_id && reportLoadState.preserving_previous && !storageRecoveryRequired ? (
             <>
               <div className="report-status report-status-partial" role="alert">
                 <span>{copy.reportPreviousVersion}</span>
                 <button type="button" onClick={() => void retryReportRead()}>{copy.retryReportRead}</button>
               </div>
-              <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRevalidateSaved={revalidateSaved} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+              <ReportWorkspace report={report} copy={copy} {...reportActionProps} />
             </>
           ) : report ? (
-            <ReportWorkspace report={report} copy={copy} onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onRetryGrowth={retryGrowth} onRetryRecoveryStage={retryRecoveryStage} onRevalidateSaved={revalidateSaved} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials} onRefreshFinancialReport={refreshFinancialReport} onConfigureCloud={() => setActiveView("models")} />
+            <ReportWorkspace report={report} copy={copy} {...reportActionProps} />
+          ) : storageRecoveryRequired ? (
+            storageRecoveryPanel
           ) : reportLoadState.status === "loading" || bootstrap.recent_runs.length > 0 && reportLoadState.status === "idle" ? (
             <LoadingState label={copy.reportReading} />
           ) : reportLoadState.status === "failed" ? (

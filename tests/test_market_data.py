@@ -201,7 +201,8 @@ class MarketDataAdapterTests(unittest.TestCase):
             ],
         )
         self.assertEqual(filings[0].period_end, "2025-03-31")
-        self.assertEqual(filings[0].revision, "period_end_verified")
+        self.assertEqual(filings[0].revision, "original")
+        self.assertEqual(filings[0].period_metadata_status, "discovered")
 
     def test_hkex_anchor_titles_ignore_earnings_release_neighbors(self) -> None:
         company = CnInfoAdapter(_Transport()).resolve("300750")[0]
@@ -573,6 +574,44 @@ class MarketDataAdapterTests(unittest.TestCase):
         filings = adapter.list_financial_filings(company)
 
         self.assertIn("annual-2024", {item.accession_number for item in filings})
+
+    def test_cninfo_pagination_is_coverage_driven_beyond_ten_pages(self) -> None:
+        class DeepAnnualTransport(_Transport):
+            def post_form(self, url: str, fields: dict[str, str]):
+                if "hisAnnouncement" not in url:
+                    return super().post_form(url, fields)
+                if fields.get("category") != "category_ndbg_szsh;":
+                    return {"totalAnnouncement": 0, "announcements": []}
+                page = int(fields.get("pageNum", "1"))
+                if page <= 10:
+                    return {
+                        "totalAnnouncement": 301,
+                        "announcements": [
+                            {
+                                "announcementId": f"noise-{page}-{index}",
+                                "announcementTitle": f"宁德时代：年度报告摘要更正 {page}-{index}",
+                                "announcementTime": 1774828800000 - page * 100 - index,
+                                "adjunctUrl": f"finalpage/2026/noise-{page}-{index}.PDF",
+                            }
+                            for index in range(30)
+                        ],
+                    }
+                return {
+                    "totalAnnouncement": 301,
+                    "announcements": [{
+                        "announcementId": "deep-annual-2024",
+                        "announcementTitle": "宁德时代：2024年年度报告",
+                        "announcementTime": 1743292800000,
+                        "adjunctUrl": "finalpage/2025/deep-annual-2024.PDF",
+                    }],
+                }
+
+        adapter = CnInfoAdapter(DeepAnnualTransport())
+        company = adapter.resolve("300750")[0]
+
+        filings = adapter.list_financial_filings(company, limit=1)
+
+        self.assertIn("deep-annual-2024", {item.accession_number for item in filings})
 
     def test_cninfo_queries_annual_reports_separately_from_periodic_noise(self) -> None:
         class AnnualFirstTransport(_Transport):

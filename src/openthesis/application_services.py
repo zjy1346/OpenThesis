@@ -143,90 +143,11 @@ class ResearchOrchestrator:
         if isinstance(request, ResearchPreparationRequest):
             if self.new_research_preparer is None:
                 raise ValueError("RESEARCH_PREPARER_NOT_CONFIGURED")
-            # Overlap only source-independent work and only the existing
-            # primary run. No extra comparison, paid retry, or new lifecycle.
-            source_futures = []
-            source_deadlines = {}
-            source_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="source-research")
-
-            def source_ready(subject, filings):
-                if source_futures or request.existing_run is None or cancelled():
-                    return
-                if getattr(request.selected_pack, "pack_id", "") != "official.long-term-fundamentals":
-                    return
-                frozen_run = deepcopy(request.existing_run)
-                frozen_run.company = subject
-                # A model's timeout bounds one network invocation, not source
-                # indexing + generation + semantic verification together.
-                # Reuse the existing recovery task allowance as a separate
-                # absolute deadline; every wire still has its original limit.
-                deadline = time.monotonic() + self.source_task_budget_seconds
-
-                def source_work():
-                    evidence = cached_filing_evidence(self.storage, filings, cancel_check=cancelled, deadline=deadline)
-                    if cancelled() or not has_sourced_disclosure(evidence):
-                        return
-                    workflow = self.create(request.selected_pack, request.models[0], cancel_check=cancelled,
-                        report_language=request.report_language, ui_language=request.ui_language,
-                        parallel_agents=request.parallel_agents, agent_progress=agent_progress)
-                    scope = getattr(getattr(workflow, "provider", None), "for_request_budget", None)
-                    if callable(scope):
-                        workflow.provider = scope(deadline, cancelled)
-                    prefetch = getattr(workflow, "prefetch_source_stages", None)
-                    if callable(prefetch):
-                        prefetch(frozen_run, evidence)
-                future = source_executor.submit(source_work)
-                source_futures.append(future)
-                source_deadlines[future] = deadline
-
-            try:
-                prepared = self.new_research_preparer.prepare(
-                    request, cancel_check=cancelled, progress=preparation_progress,
-                    sources_ready=source_ready)
-                for future in source_futures:
-                    try:
-                        while True:
-                            if cancelled():
-                                raise ResearchCancelled()
-                            remaining = source_deadlines[future] - time.monotonic()
-                            if remaining <= 0 and not future.done():
-                                # A transport that ignored its request budget
-                                # cannot hold the whole research lifecycle.
-                                # Receipt/request identity remains journal-owned;
-                                # later generation publication fences this owner.
-                                future.cancel()
-                                raise FutureTimeout()
-                            try:
-                                future.result(timeout=max(0.0, min(.05, remaining)))
-                                break
-                            except FutureTimeout:
-                                if future.done():
-                                    raise
-                    except (ResearchCancelled, CancelledError, ResearchPublicationConflict):
-                        raise
-                    except Exception as error:
-                        # Durable request/checkpoint retains any received body;
-                        # the full graph performs exact-scope local recovery.
-                        # An early optional path cannot block final preparation.
-                        # Record a code, never exception text/credentials. This
-                        # is not a terminal report or a factual success flag.
-                        code = getattr(error, "code", "")
-                        if isinstance(error, FutureTimeout):
-                            code = "SOURCE_PREFETCH_TASK_TIMEOUT"
-                        if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,95}", code):
-                            code = "SOURCE_PREFETCH_LOCAL_FAILED"
-                        self.storage.save_artifact(ResearchArtifact(
-                            artifact_id=uuid4().hex,
-                            run_id=request.existing_run.run_id, artifact_type="source-prefetch-diagnostic",
-                            title="Source preparation requires local recovery", agent_id="source-prefetch",
-                            content={"code": code,
-                                     "error_type": type(error).__name__,
-                                     "next_action": "check_saved_source_stage_candidate"}))
-            finally:
-                # Never join an ignored cancellation/deadline indefinitely.
-                # Production native gateways are killable; stale generation
-                # CAS prevents a non-cooperative late worker from publishing.
-                source_executor.shutdown(wait=all(future.done() for future in source_futures), cancel_futures=True)
+            # Native parsing and authorized OCR may overlap inside preparation.
+            # Paid research starts only after its immutable captured result is
+            # returned. An acquisition notification is not a material snapshot.
+            prepared = self.new_research_preparer.prepare(
+                request, cancel_check=cancelled, progress=preparation_progress)
             if prepared.coverage is not None and disclosure_coverage is not None:
                 disclosure_coverage(prepared.coverage)
             request = prepared.request
@@ -312,6 +233,7 @@ class ResearchOrchestrator:
         )
         workflow.manual_authorization_id = request.manual_authorization_id
         workflow.local_revalidation = request.local_only
+        workflow.budget_gap_resume = request.budget_only
         if request.target == "synthesis":
             return workflow.retry_synthesis(request.run, deepcopy(list(request.artifacts)),
                                             deepcopy(list(request.facts)))

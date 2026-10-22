@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from openthesis.report_html import render_research_html
-from openthesis.reporting import render_research_run
+from openthesis.reporting import _render_value, render_research_run
 from openthesis.report_projection import project_report_diagnostics, project_report_value
 
 
@@ -41,6 +42,118 @@ def _artifacts() -> list[dict[str, object]]:
 
 
 class ReportProjectionSchemaTests(unittest.TestCase):
+    def test_claim_identity_metadata_never_changes_claim_body_shape(self) -> None:
+        body = "美团2025年度营业收入为3675亿元。"
+        projected = project_report_value(
+            {
+                "claims": [{
+                    "text": body,
+                    "kind": "fact",
+                    "company_cik": "HK:SEHK:03690.HK",
+                    "concept": "revenue",
+                    "period": "2025-12-31",
+                    "unit": "CNY",
+                    "entity": "美团",
+                }],
+            },
+            include_technical=False,
+        )
+
+        claim = projected["claims"][0]
+        self.assertEqual(claim["text"], body)
+        self.assertIsInstance(claim["text"], str)
+        markdown = render_research_run(
+            "run-safe-id",
+            [{
+                "artifact_type": "research-report",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {"report": projected},
+            }],
+            "zh-CN",
+            include_technical=False,
+        )
+        self.assertIn(body, markdown)
+        self.assertNotIn("HK:SEHK:03690.HK", markdown)
+
+    def test_moat_projection_is_path_aware_and_renderer_is_total(self) -> None:
+        payload = {
+            "business_model": {
+                "possible_moats": [
+                    {
+                        "kind": "cost_advantage",
+                        "description": "规模降低单位成本。",
+                        "durability": "high",
+                    }
+                ]
+            }
+        }
+
+        projected = project_report_value(
+            payload, include_technical=False, section="business_model"
+        )
+
+        moat = projected["business_model"]["possible_moats"][0]
+        self.assertEqual(moat["kind"], "cost_advantage")
+        self.assertEqual(moat["description"], "规模降低单位成本。")
+        self.assertEqual(moat["durability"], "high")
+        self.assertTrue(_render_value([{}], "zh-CN", 0))
+
+    def test_direct_html_resolves_structured_company_identity(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "title": "确定性财务概览",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "company": {"name": "宁德时代", "ticker": "300750.SZ"},
+                    "metrics": [],
+                    "evidence": [],
+                },
+            }
+        ]
+
+        html = render_research_html("run-identity", artifacts, "zh-CN")
+
+        self.assertIn("宁德时代", html)
+        self.assertIn("300750.SZ", html)
+        self.assertNotIn(">公司研究报告<", html)
+
+    def test_markdown_resolves_structured_company_identity(self) -> None:
+        artifacts = [
+            {
+                "artifact_type": "deterministic-financial-summary",
+                "title": "确定性财务概览",
+                "agent_id": "calculation-engine",
+                "model_id": "deterministic",
+                "content": {
+                    "company": {"name": "宁德时代", "ticker": "300750.SZ"},
+                    "metrics": [],
+                    "evidence": [],
+                },
+            }
+        ]
+
+        markdown = render_research_run("run-identity", artifacts, "zh-CN")
+
+        self.assertIn("宁德时代", markdown)
+        self.assertIn("300750.SZ", markdown)
+
+    def test_html_isolates_one_malformed_section(self) -> None:
+        original = project_report_value
+
+        def fail_one(value: object, **kwargs: object) -> object:
+            if kwargs.get("section") == "business_model":
+                raise ValueError("fixture failure")
+            return original(value, **kwargs)
+
+        with patch("openthesis.reporting.project_report_value", side_effect=fail_one):
+            html = render_research_html("run-isolated", _artifacts(), "en-US")
+
+        self.assertIn("This section could not be displayed", html)
+        self.assertIn("收入增长", html)
+
     def test_nontechnical_financial_sections_keep_public_accounting_risk_fields(self) -> None:
         payload = {
             "financial_quality": {
@@ -132,13 +245,115 @@ class ReportProjectionSchemaTests(unittest.TestCase):
         self.assertNotIn("[ , ]", projected["summary"])
         self.assertIn("Growth", projected["summary"])
 
-    def test_unknown_safe_text_in_typed_section_has_readable_fallback(self) -> None:
+    def test_unknown_text_extension_is_kept_in_extension_container(self) -> None:
         projected = project_report_value(
             {"scenarios": [{"summary": "Base", "analyst_note": "Watch demand elasticity."}]},
             include_technical=False,
             section="scenarios",
         )
-        self.assertIn("Watch demand elasticity.", projected["scenarios"][0]["text"])
+        self.assertEqual(projected["scenarios"][0]["summary"], "Base")
+        self.assertEqual(
+            projected["scenarios"][0]["extensions"],
+            [{"field": "analyst note", "text": "Watch demand elasticity.", "context": "Base"}],
+        )
+
+    def test_explicit_body_field_is_supported_without_unknown_field_fallback(self) -> None:
+        projected = project_report_value(
+            {"business_model": {"body": "The company earns revenue from subscriptions."}},
+            include_technical=False,
+            section="business_model",
+        )
+        self.assertEqual(
+            projected["business_model"]["body"],
+            "The company earns revenue from subscriptions.",
+        )
+
+    def test_typed_sections_keep_registered_prose_and_record_evidence(self) -> None:
+        projected = project_report_value(
+            {
+                "counterarguments": [{
+                    "title": "Capital intensity",
+                    "counterargument": "Expansion consumes substantial capital.",
+                    "evidence_ids": ["filing:valid", "fact:missing"],
+                    "source_note": "The filing attributes spending to new capacity.",
+                    "analyst_context": "The effect may persist for two years.",
+                }],
+            },
+            include_technical=False,
+            section="counterarguments",
+            available_evidence={"filing:valid"},
+        )
+        item = projected["counterarguments"][0]
+        self.assertEqual(item["counterargument"], "Expansion consumes substantial capital.")
+        self.assertNotIn("source_note", item)
+        self.assertNotIn("analyst_context", item)
+        self.assertEqual(item["evidence_count"], 1)
+
+    def test_implied_expectations_project_and_render_semantic_percentage_ranges(self) -> None:
+        report = {
+            "implied_expectations": {
+                "summary": "The valuation assumes durable growth.",
+                "revenue_cagr_range": [0.12, 0.16],
+                "operating_margin_range": [0.24, 0.28],
+                "probability_range": [0.4, 0.6],
+                "market_assumption": "Demand remains resilient.",
+                "sensitivity_note": "Higher reinvestment lowers near-term cash flow.",
+            }
+        }
+        markdown = render_research_run(
+            "expectations-run",
+            [{
+                "artifact_type": "research-report",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {"report": report},
+            }],
+            "en",
+        )
+        html = render_research_html(
+            "expectations-run",
+            [{
+                "artifact_type": "research-report",
+                "agent_id": "research-synthesizer",
+                "model_id": "test:model",
+                "content": {"report": report},
+            }],
+            "en",
+        )
+        for rendered in (markdown, html):
+            self.assertIn("12%–16%", rendered)
+            self.assertIn("24%–28%", rendered)
+            self.assertIn("40%–60%", rendered)
+            self.assertIn("Demand remains resilient.", rendered)
+            self.assertIn("Higher reinvestment lowers near-term cash flow.", rendered)
+
+    def test_nested_implied_expectation_analysis_survives_projection_to_markdown(self) -> None:
+        nested_analysis = "The base case assumes revenue growth normalizes after capacity expansion."
+        report = {
+            "implied_expectations": {
+                "summary": "The valuation embeds sustained growth.",
+                "scenarios": {
+                    "base": {
+                        "analysis": {
+                            "revenue_path": nested_analysis,
+                            "evidence_basis": "Company guidance and disclosed capacity ramp.",
+                        }
+                    }
+                },
+            }
+        }
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test:model",
+            "content": {"report": report},
+        }]
+
+        markdown = render_research_run("nested-expectations", artifacts, "en")
+        html = render_research_html("nested-expectations", artifacts, "en")
+
+        self.assertIn(nested_analysis, markdown)
+        self.assertIn(nested_analysis, html)
 
     def test_required_sections_have_localized_missing_content_in_all_languages(self) -> None:
         artifacts = [{
@@ -214,6 +429,50 @@ class ReportProjectionSchemaTests(unittest.TestCase):
         self.assertIn("低置信度", markdown)
         self.assertNotIn("High confidence", html)
         self.assertIn("secret_protocol", project_report_diagnostics(artifacts[0]["content"]["report"]))
+
+    def test_malformed_claim_text_list_never_leaks_python_repr(self) -> None:
+        narrative = "美团2021年度营业收入为1791.28亿元人民币。"
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test:model",
+            "content": {"report": {"claims": [{
+                "text": [narrative, "HK:SEHK:03690.HK", "revenue", "2021-12-31", "CNY", "FY"],
+                "kind": "fact",
+                "confidence": 0.9,
+            }]}},
+        }]
+
+        markdown = render_research_run("malformed-claim", artifacts, "zh-CN")
+        html = render_research_html("malformed-claim", artifacts, "zh-CN")
+
+        for rendered in (markdown, html):
+            self.assertNotIn(narrative, rendered)
+            self.assertNotIn("['美团", rendered)
+            self.assertNotIn("HK:SEHK:03690.HK", rendered)
+            self.assertNotIn("'revenue'", rendered)
+            self.assertIn("正文文本字段类型错误，内容未显示", rendered)
+
+    def test_removed_internal_references_do_not_leave_empty_parentheses(self) -> None:
+        artifacts = [{
+            "artifact_type": "research-report",
+            "agent_id": "research-synthesizer",
+            "model_id": "test:model",
+            "content": {"report": {
+                "counterarguments": [{
+                    "title": "Cash flow risk",
+                    "counterargument": "Operating cash flow turned negative (filing:private-2025, ).",
+                    "severity": "high",
+                }],
+            }},
+        }]
+        markdown = render_research_run("empty-citation-shell", artifacts, "en")
+        html = render_research_html("empty-citation-shell", artifacts, "en")
+        for rendered in (markdown, html):
+            self.assertNotIn("filing:private-2025", rendered)
+            self.assertNotIn("()", rendered)
+            self.assertNotIn("(, )", rendered)
+        self.assertNotIn("- - **", markdown)
 
     def test_english_projection_uses_english_labels_and_technical_mode_keeps_audit_fields(self) -> None:
         artifacts = [{"artifact_type": "research-report", "agent_id": "research-synthesizer", "model_id": "test:model", "content": {"report": {

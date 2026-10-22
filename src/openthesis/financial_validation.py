@@ -227,7 +227,7 @@ class FinancialValidator:
 
                 expected_kind = (
                     QuantityKind.RATIO
-                    if fact.concept == "reported_roe"
+                    if fact.concept in {"reported_roe", "reported_roe_excluding_nonrecurring"}
                     else QuantityKind.SHARES
                     if fact.concept == "shares_outstanding"
                     else QuantityKind.MONEY
@@ -308,7 +308,7 @@ class FinancialValidator:
                         return "normalization_period_column_mismatch"
                 if float(normalized) != float(fact.value):
                     return "normalized_amount_does_not_match_fact"
-                if fact.concept != "reported_roe" and float(Decimal(lineage.scale)) != float(fact.unit_scale):
+                if fact.concept not in {"reported_roe", "reported_roe_excluding_nonrecurring"} and float(Decimal(lineage.scale)) != float(fact.unit_scale):
                     return "normalization_scale_does_not_match_fact"
                 for evidence_id in lineage.unit_evidence_ids:
                     ref = source_evidence_by_id.get(evidence_id)
@@ -363,7 +363,7 @@ class FinancialValidator:
                 continue
             if (
                 fact.currency
-                and fact.concept not in {"reported_roe"}
+                and fact.concept not in {"reported_roe", "reported_roe_excluding_nonrecurring"}
                 and fact.statement in {"income_statement", "balance_sheet", "cash_flow"}
                 and fact.source_document
                 and fact.parser_version
@@ -392,16 +392,27 @@ class FinancialValidator:
             if not fact.accession_number or not fact.source_url or not fact.raw_text:
                 isolate(fact, "provenance_missing")
             statement_expected = _STATEMENT_FOR.get(fact.concept)
-            if statement_expected and fact.statement != statement_expected and fact.concept != "reported_roe":
+            if statement_expected and fact.statement != statement_expected and fact.concept not in {"reported_roe", "reported_roe_excluding_nonrecurring"}:
                 isolate(fact, "statement_mismatch")
             if (
-                fact.concept == "reported_roe"
+                fact.concept in {"reported_roe", "reported_roe_excluding_nonrecurring"}
                 and fact.unit_provenance not in {"explicit_percent", "explicit_ratio"}
             ):
                 # A reported ROE is a ratio, but its source display may be a
                 # percentage or a decimal. Keep the field out of trusted
                 # research until the source explicitly establishes which.
                 isolate(fact, "ratio_unit_unknown")
+            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept in {
+                "reported_roe", "reported_roe_excluding_nonrecurring"
+            }:
+                ratio_label = normalize_financial_label(fact.reported_concept)
+                adjusted = any(term in ratio_label for term in (
+                    "扣非", "扣除非经常", "扣除非經常", "excludingnonrecurring"))
+                expected_ratio = "reported_roe_excluding_nonrecurring" if adjusted else "reported_roe"
+                if (expected_ratio != fact.concept
+                    or not any(term in ratio_label for term in ("净资产收益", "淨資產收益", "returnonequity"))
+                    or any(term in ratio_label for term in ("每股收益", "earningspershare"))):
+                    isolate(fact, "ratio_source_concept_mismatch")
             ref = (evidence_map or {}).get(fact.fact_id)
             inline_issue = inline_source_issue(fact, ref, source_evidence_by_id)
             if inline_issue:
@@ -542,7 +553,7 @@ class FinancialValidator:
             if (
                 fact.parser_version.startswith("financial-ingestion-ast")
                 and fact.concept in _STATEMENT_FOR
-                and fact.concept != "reported_roe"
+                and fact.concept not in {"reported_roe", "reported_roe_excluding_nonrecurring"}
                 and fact.unit_provenance == "unknown"
             ):
                 # Optional money fields (notably total equity) are no safer

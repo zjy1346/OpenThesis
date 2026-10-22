@@ -1,18 +1,20 @@
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+const INITIALIZATION_DEADLINE_SECONDS: u64 = 120;
+const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(INITIALIZATION_DEADLINE_SECONDS);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -21,9 +23,158 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// The Tauri command is intentionally the only public seam. Process startup,
 /// JSON-RPC framing, response correlation, and restart-on-transport-failure are
 /// hidden here so another desktop adapter can reuse the same lifecycle rules.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct BackendState {
-    process: Mutex<Option<BackendProcess>>,
+    process: Arc<Mutex<Option<BackendProcess>>>,
+    initialization: Arc<Mutex<InitializationState>>,
+}
+
+impl BackendState {
+    fn begin_initialization(&self) -> Instant {
+        let started_at = Instant::now();
+        if let Ok(mut state) = self.initialization.lock() {
+            state.phase = InitializationPhase::Starting;
+            state.started_at = Some(started_at);
+            state.elapsed_seconds = 0;
+            state.safe_failure_code = None;
+            state.stage = None;
+            state.completed_units = None;
+            state.total_units = None;
+        }
+        started_at
+    }
+
+    fn finish_initialization(&self) {
+        if let Ok(mut state) = self.initialization.lock() {
+            state.elapsed_seconds = state
+                .started_at
+                .take()
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(state.elapsed_seconds);
+            state.phase = InitializationPhase::Ready;
+            state.safe_failure_code = None;
+        }
+    }
+
+    fn fail_initialization(&self, code: SafeFailureCode) {
+        if let Ok(mut state) = self.initialization.lock() {
+            state.elapsed_seconds = state
+                .started_at
+                .take()
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(state.elapsed_seconds);
+            state.phase = InitializationPhase::Failed;
+            state.safe_failure_code = Some(code);
+        }
+    }
+
+    fn initialization_snapshot(&self) -> BackendInitializationSnapshot {
+        match self.initialization.lock() {
+            Ok(state) => BackendInitializationSnapshot {
+                phase: state.phase,
+                elapsed_seconds: state
+                    .started_at
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(state.elapsed_seconds),
+                deadline_seconds: INITIALIZATION_DEADLINE_SECONDS,
+                safe_failure_code: state.safe_failure_code,
+                stage: state.stage.clone(),
+                completed_units: state.completed_units,
+                total_units: state.total_units,
+            },
+            Err(_) => BackendInitializationSnapshot {
+                phase: InitializationPhase::Failed,
+                elapsed_seconds: 0,
+                deadline_seconds: INITIALIZATION_DEADLINE_SECONDS,
+                safe_failure_code: Some(SafeFailureCode::StatusUnavailable),
+                stage: None,
+                completed_units: None,
+                total_units: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InitializationPhase {
+    #[default]
+    Idle,
+    Starting,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SafeFailureCode {
+    SpawnFailed,
+    ProcessExited,
+    StartupTimeout,
+    RequestTimeout,
+    TransportFailure,
+    ProtocolFailure,
+    StartupFailure,
+    StatusUnavailable,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackendInitializationSnapshot {
+    phase: InitializationPhase,
+    elapsed_seconds: u64,
+    deadline_seconds: u64,
+    safe_failure_code: Option<SafeFailureCode>,
+    stage: Option<String>,
+    completed_units: Option<u64>,
+    total_units: Option<u64>,
+}
+
+#[derive(Default)]
+struct InitializationState {
+    phase: InitializationPhase,
+    started_at: Option<Instant>,
+    elapsed_seconds: u64,
+    safe_failure_code: Option<SafeFailureCode>,
+    stage: Option<String>,
+    completed_units: Option<u64>,
+    total_units: Option<u64>,
+}
+
+fn record_initialization_progress(state: &Arc<Mutex<InitializationState>>, line: &str) {
+    let Some(body) = line.strip_prefix("OT_STARTUP ") else {
+        return;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(body) else {
+        return;
+    };
+    let Some(stage) = record.get("stage").and_then(Value::as_str) else {
+        return;
+    };
+    if !matches!(
+        stage,
+        "checking_schema"
+            | "checking_integrity"
+            | "backing_up"
+            | "migrating_schema"
+            | "backfilling_facts"
+            | "building_read_models"
+            | "storage_ready"
+            | "preparing_services"
+            | "ready"
+    ) {
+        return;
+    }
+    if let Ok(mut status) = state.lock() {
+        if !matches!(status.phase, InitializationPhase::Starting) {
+            return;
+        }
+        status.stage = Some(stage.to_string());
+        let completed = record.get("completed_units").and_then(Value::as_u64);
+        let total = record.get("total_units").and_then(Value::as_u64);
+        let valid = matches!((completed,total), (Some(done),Some(all)) if all > 0 && done <= all && all <= 1_000_000_000);
+        status.completed_units = if valid { completed } else { None };
+        status.total_units = if valid { total } else { None };
+    }
 }
 
 struct BackendProcess {
@@ -44,6 +195,7 @@ enum BackendError {
 struct StartupFailure {
     message: String,
     retryable: bool,
+    safe_failure_code: SafeFailureCode,
 }
 
 impl StartupFailure {
@@ -51,28 +203,80 @@ impl StartupFailure {
         Self {
             message: message.into(),
             retryable: false,
+            safe_failure_code: SafeFailureCode::StartupFailure,
         }
     }
 
-    fn transient(message: impl Into<String>) -> Self {
+    fn fatal_with_code(message: impl Into<String>, safe_failure_code: SafeFailureCode) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            safe_failure_code,
+        }
+    }
+
+    fn transient(message: impl Into<String>, safe_failure_code: SafeFailureCode) -> Self {
         Self {
             message: message.into(),
             retryable: true,
+            safe_failure_code,
         }
     }
 }
 
+fn startup_retry_allowed(failure: &StartupFailure, attempt: usize) -> bool {
+    attempt == 0
+        && failure.retryable
+        && matches!(
+            failure.safe_failure_code,
+            SafeFailureCode::SpawnFailed | SafeFailureCode::ProcessExited
+        )
+}
+
 impl BackendProcess {
-    fn start(app: &AppHandle) -> Result<Self, StartupFailure> {
+    fn start(
+        app: &AppHandle,
+        initialization_deadline: Instant,
+        initialization: Arc<Mutex<InitializationState>>,
+    ) -> Result<Self, StartupFailure> {
+        if Instant::now() >= initialization_deadline {
+            return Err(StartupFailure::fatal_with_code(
+                "research core initialization deadline expired",
+                SafeFailureCode::StartupTimeout,
+            ));
+        }
         let mut command = backend_command(app).map_err(StartupFailure::fatal)?;
         configure_model_gateway_environment(app, &mut command).map_err(StartupFailure::fatal)?;
         configure_backend_command(&mut command);
         let mut child = command
+            .env("OPENTHESIS_STARTUP_PROGRESS", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|_| StartupFailure::transient("research core could not be started (spawn)"))?;
+            .map_err(|_| {
+                StartupFailure::transient(
+                    "research core could not be started (spawn)",
+                    SafeFailureCode::SpawnFailed,
+                )
+            })?;
+        if let Some(stderr) = child.stderr.take() {
+            // Dedicated stderr telemetry; stdout still has exactly one reader.
+            // Drain unknown logging without retaining it or exposing secrets.
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                loop {
+                    let mut line = String::new();
+                    match Read::by_ref(&mut reader).take(2049).read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line.len() <= 2048 && line.ends_with('\n') => {
+                            record_initialization_progress(&initialization, &line)
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
         let stdin = child.stdin.take().ok_or_else(|| {
             stop_child(&mut child);
             StartupFailure::fatal("research core input is unavailable")
@@ -106,7 +310,11 @@ impl BackendProcess {
             responses,
         };
         let hello = process
-            .request_with_timeout("system.hello".to_string(), json!({}), STARTUP_TIMEOUT)
+            .request_with_timeout(
+                "system.hello".to_string(),
+                json!({}),
+                initialization_deadline.saturating_duration_since(Instant::now()),
+            )
             .map_err(startup_failure_from_backend)?;
         validate_hello_result(&hello).map_err(StartupFailure::fatal)?;
         Ok(process)
@@ -152,14 +360,7 @@ impl BackendProcess {
             return Err(BackendError::Protocol);
         }
         if let Some(error) = response.get("error") {
-            let code = error
-                .get("code")
-                .and_then(Value::as_i64)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(BackendError::Rpc(format!(
-                "research core request failed ({code})"
-            )));
+            return Err(BackendError::Rpc(safe_rpc_failure(error)));
         }
         response
             .get("result")
@@ -168,21 +369,50 @@ impl BackendProcess {
     }
 }
 
+fn safe_rpc_failure(error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error.get("message").and_then(Value::as_str);
+    // Preserve only host-owned actionable codes needed by the UI. Arbitrary
+    // exception strings can contain stored data, filesystem paths or secrets.
+    if matches!(
+        (code, message),
+        (Some(-32040), Some("STORAGE_HEALTH_RECOVERY_REQUIRED"))
+            | (Some(-32010), Some("MODEL_BUDGET_PLAN_CHANGED"))
+            | (Some(-32010), Some("MODEL_BUDGET_GAP_CHANGED"))
+            | (Some(-32010), Some("CORE_OPERATION_BUSY"))
+            | (Some(-32010), Some("CORE_OPERATION_EXPIRED"))
+    ) {
+        return message.unwrap().to_string();
+    }
+    format!(
+        "research core request failed ({})",
+        code.map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
 fn startup_failure_from_backend(error: BackendError) -> StartupFailure {
     match error {
-        BackendError::Transport(_) => {
-            StartupFailure::transient("research core startup transport failed")
-        }
-        BackendError::Exited => StartupFailure::transient("research core exited during startup"),
-        BackendError::NoResponse => {
-            StartupFailure::transient("research core did not respond to startup handshake")
-        }
-        BackendError::InvalidJson => {
-            StartupFailure::fatal("research core returned invalid startup JSON")
-        }
-        BackendError::Protocol | BackendError::Rpc(_) => {
-            StartupFailure::fatal("research core startup protocol error")
-        }
+        BackendError::Transport(_) => StartupFailure::fatal_with_code(
+            "research core startup transport failed",
+            SafeFailureCode::TransportFailure,
+        ),
+        BackendError::Exited => StartupFailure::transient(
+            "research core exited during startup",
+            SafeFailureCode::ProcessExited,
+        ),
+        BackendError::NoResponse => StartupFailure::fatal_with_code(
+            "research core did not respond to startup handshake",
+            SafeFailureCode::StartupTimeout,
+        ),
+        BackendError::InvalidJson => StartupFailure::fatal_with_code(
+            "research core returned invalid startup JSON",
+            SafeFailureCode::ProtocolFailure,
+        ),
+        BackendError::Protocol | BackendError::Rpc(_) => StartupFailure::fatal_with_code(
+            "research core startup protocol error",
+            SafeFailureCode::ProtocolFailure,
+        ),
     }
 }
 
@@ -195,13 +425,19 @@ fn validate_hello_result(response: &Value) -> Result<(), String> {
     }
     let desktop_build: Value = serde_json::from_str(include_str!("../resources/build-info.json"))
         .map_err(|_| "desktop build identity is invalid".to_string())?;
-    let expected = desktop_build.get("build_id").and_then(Value::as_str).unwrap_or("unknown");
-    let actual = result.get("build_info")
+    let expected = desktop_build
+        .get("build_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let actual = result
+        .get("build_info")
         .and_then(|value| value.get("build_id"))
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     if expected != "development" && expected != actual {
-        return Err(format!("mixed application components: desktop build {expected}, research core build {actual}"));
+        return Err(format!(
+            "mixed application components: desktop build {expected}, research core build {actual}"
+        ));
     }
     Ok(())
 }
@@ -260,37 +496,70 @@ impl Drop for BackendProcess {
 }
 
 #[tauri::command]
-pub(crate) fn backend_request(
+pub(crate) async fn backend_request(
     app: AppHandle,
     state: State<'_, BackendState>,
     method: String,
     params: Value,
 ) -> Result<Value, String> {
-    let mut process = state
-        .process
-        .lock()
-        .map_err(|_| "research core state is unavailable".to_string())?;
+    let backend_state = state.inner().clone();
+    drop(state);
+    run_backend_blocking(move || backend_request_blocking(app, backend_state, method, params))
+        .await?
+}
+
+#[tauri::command]
+pub(crate) fn backend_initialization_status(
+    state: State<'_, BackendState>,
+) -> BackendInitializationSnapshot {
+    state.initialization_snapshot()
+}
+
+async fn run_backend_blocking<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|_| "research core request worker stopped unexpectedly".to_string())
+}
+
+fn backend_request_blocking(
+    app: AppHandle,
+    state: BackendState,
+    method: String,
+    params: Value,
+) -> Result<Value, String> {
+    let mut process = state.process.lock().map_err(|_| {
+        state.fail_initialization(SafeFailureCode::StartupFailure);
+        "research core state is unavailable".to_string()
+    })?;
     if process.is_none() {
-        let mut last_failure = None;
+        let initialization_deadline = state.begin_initialization() + INITIALIZATION_TIMEOUT;
+        let mut last_failure: Option<StartupFailure> = None;
         for attempt in 0..2 {
-            match BackendProcess::start(&app) {
+            match BackendProcess::start(&app, initialization_deadline, state.initialization.clone())
+            {
                 Ok(started) => {
                     *process = Some(started);
+                    state.finish_initialization();
                     break;
                 }
-                Err(failure) if failure.retryable && attempt == 0 => {
-                    last_failure = Some(failure.message);
+                Err(failure) if startup_retry_allowed(&failure, attempt) => {
+                    last_failure = Some(failure);
                 }
                 Err(failure) => {
-                    last_failure = Some(failure.message);
+                    last_failure = Some(failure);
                     break;
                 }
             }
         }
         if process.is_none() {
-            return Err(
-                last_failure.unwrap_or_else(|| "research core could not be started".to_string())
-            );
+            let startup_failure = last_failure
+                .unwrap_or_else(|| StartupFailure::fatal("research core could not be started"));
+            state.fail_initialization(startup_failure.safe_failure_code);
+            return Err(startup_failure.message);
         }
     }
     let result = process
@@ -299,26 +568,41 @@ pub(crate) fn backend_request(
         .request(method, params);
     match result {
         Ok(value) => Ok(value),
-        Err(BackendError::Rpc(message)) => Err(message),
-        Err(BackendError::Transport(message)) => {
+        Err(error) => Err(backend_request_error(error, &state, &mut process)),
+    }
+}
+
+fn backend_request_error(
+    error: BackendError,
+    state: &BackendState,
+    process: &mut Option<BackendProcess>,
+) -> String {
+    match error {
+        BackendError::Rpc(message) => message,
+        BackendError::Transport(message) => {
             *process = None;
-            Err(message)
+            state.fail_initialization(SafeFailureCode::TransportFailure);
+            message
         }
-        Err(BackendError::Exited) => {
+        BackendError::Exited => {
             *process = None;
-            Err("research core stopped unexpectedly".to_string())
+            state.fail_initialization(SafeFailureCode::ProcessExited);
+            "research core stopped unexpectedly".to_string()
         }
-        Err(BackendError::NoResponse) => {
+        BackendError::NoResponse => {
             *process = None;
-            Err("research core did not respond".to_string())
+            state.fail_initialization(SafeFailureCode::RequestTimeout);
+            "research core did not respond".to_string()
         }
-        Err(BackendError::InvalidJson) => {
+        BackendError::InvalidJson => {
             *process = None;
-            Err("research core returned an invalid response".to_string())
+            state.fail_initialization(SafeFailureCode::ProtocolFailure);
+            "research core returned an invalid response".to_string()
         }
-        Err(BackendError::Protocol) => {
+        BackendError::Protocol => {
             *process = None;
-            Err("research core returned an invalid protocol response".to_string())
+            state.fail_initialization(SafeFailureCode::ProtocolFailure);
+            "research core returned an invalid protocol response".to_string()
         }
     }
 }
@@ -463,12 +747,159 @@ fn sidecar_candidates(
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_sidecar_runtime, sidecar_candidates, startup_failure_from_backend,
-        validate_debug_python, validate_explicit_sidecar_path, validate_hello_result,
-        BackendError,
+        prepare_sidecar_runtime, run_backend_blocking, sidecar_candidates,
+        startup_failure_from_backend, startup_retry_allowed, validate_debug_python,
+        validate_explicit_sidecar_path, validate_hello_result, BackendError, BackendState,
+        SafeFailureCode, StartupFailure,
     };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn actionable_rpc_codes_survive_without_leaking_arbitrary_messages() {
+        for (code, message) in [
+            (-32040, "STORAGE_HEALTH_RECOVERY_REQUIRED"),
+            (-32010, "MODEL_BUDGET_PLAN_CHANGED"),
+            (-32010, "MODEL_BUDGET_GAP_CHANGED"),
+            (-32010, "CORE_OPERATION_BUSY"),
+            (-32010, "CORE_OPERATION_EXPIRED"),
+        ] {
+            assert_eq!(
+                super::safe_rpc_failure(&serde_json::json!({"code": code, "message": message})),
+                message
+            );
+        }
+        assert_eq!(
+            super::safe_rpc_failure(&serde_json::json!({"code": -32603,
+            "message": "private-key-and-local-file"})),
+            "research core request failed (-32603)"
+        );
+        assert_eq!(
+            super::safe_rpc_failure(&serde_json::json!({"code": -32603,
+            "message": "STORAGE_HEALTH_RECOVERY_REQUIRED"})),
+            "research core request failed (-32603)"
+        );
+    }
+
+    #[test]
+    fn startup_progress_accepts_only_host_stages_and_bounded_counters() {
+        let state = BackendState::default();
+        state.begin_initialization();
+        super::record_initialization_progress(
+            &state.initialization,
+            "OT_STARTUP {\"stage\":\"backing_up\",\"completed_units\":4,\"total_units\":10}\n",
+        );
+        let status = state.initialization_snapshot();
+        assert_eq!(status.stage.as_deref(), Some("backing_up"));
+        assert_eq!(status.completed_units, Some(4));
+        super::record_initialization_progress(
+            &state.initialization,
+            "OT_STARTUP {\"stage\":\"secret-provider-url\",\"total_units\":100}\n",
+        );
+        assert_eq!(
+            state.initialization_snapshot().stage.as_deref(),
+            Some("backing_up")
+        );
+        super::record_initialization_progress(&state.initialization, "OT_STARTUP {\"stage\":\"migrating_schema\",\"completed_units\":20,\"total_units\":10}\n");
+        assert_eq!(state.initialization_snapshot().completed_units, None);
+        state.finish_initialization();
+        super::record_initialization_progress(
+            &state.initialization,
+            "OT_STARTUP {\"stage\":\"checking_schema\"}\n",
+        );
+        assert_eq!(
+            state.initialization_snapshot().stage.as_deref(),
+            Some("migrating_schema")
+        );
+    }
+
+    #[test]
+    fn initialization_snapshot_is_readable_while_process_io_mutex_is_held() {
+        let state = BackendState::default();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let lock_state = state.clone();
+        let lock_worker = thread::spawn(move || {
+            let _process_guard = lock_state.process.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let snapshot_state = state.clone();
+        let snapshot_worker = thread::spawn(move || {
+            snapshot_tx
+                .send(snapshot_state.initialization_snapshot())
+                .unwrap();
+        });
+        let snapshot_result = snapshot_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        lock_worker.join().unwrap();
+        snapshot_worker.join().unwrap();
+
+        let snapshot = snapshot_result.expect("status snapshot must not wait on process I/O");
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["phase"], "idle");
+        assert_eq!(value["elapsed_seconds"], 0);
+        assert_eq!(value["deadline_seconds"], 120);
+        assert!(value["safe_failure_code"].is_null());
+    }
+
+    #[test]
+    fn startup_retry_is_limited_to_one_confirmed_spawn_or_exit_failure() {
+        let spawn_failure = StartupFailure::transient("spawn failed", SafeFailureCode::SpawnFailed);
+        let exited_failure = startup_failure_from_backend(BackendError::Exited);
+        let healthy_timeout = startup_failure_from_backend(BackendError::NoResponse);
+        let transport_failure =
+            startup_failure_from_backend(BackendError::Transport("send failed".to_string()));
+
+        assert!(startup_retry_allowed(&spawn_failure, 0));
+        assert!(!startup_retry_allowed(&spawn_failure, 1));
+        assert!(startup_retry_allowed(&exited_failure, 0));
+        assert!(!startup_retry_allowed(&healthy_timeout, 0));
+        assert!(!startup_retry_allowed(&transport_failure, 0));
+    }
+
+    #[test]
+    fn initialization_snapshot_reports_safe_failure_code_and_deadline() {
+        let state = BackendState::default();
+        state.begin_initialization();
+        state.fail_initialization(SafeFailureCode::StartupTimeout);
+
+        let value = serde_json::to_value(state.initialization_snapshot()).unwrap();
+        assert_eq!(value["phase"], "failed");
+        assert_eq!(value["deadline_seconds"], 120);
+        assert_eq!(value["safe_failure_code"], "startup_timeout");
+        assert!(value["elapsed_seconds"].as_u64().is_some());
+    }
+
+    #[test]
+    fn blocking_backend_io_does_not_starve_async_status_polling() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = tauri::async_runtime::spawn(run_backend_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            17
+        }));
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let poll = tauri::async_runtime::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            "status poll ran"
+        });
+        assert_eq!(
+            tauri::async_runtime::block_on(poll).unwrap(),
+            "status poll ran"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(tauri::async_runtime::block_on(worker).unwrap().unwrap(), 17);
+    }
 
     #[test]
     fn packaged_resource_precedes_portable_directory() {
@@ -596,8 +1027,13 @@ mod tests {
                 "research core exited during startup",
             ),
             (
+                BackendError::Transport("send failed".to_string()),
+                false,
+                "research core startup transport failed",
+            ),
+            (
                 BackendError::NoResponse,
-                true,
+                false,
                 "research core did not respond to startup handshake",
             ),
             (

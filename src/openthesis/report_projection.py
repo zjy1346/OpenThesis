@@ -7,11 +7,15 @@ from typing import Any
 
 from .financials import format_money
 from .i18n import EN, ZH_HANT, normalize_language
+from .research_response import ROOT_METADATA_FIELDS, response_parts
 
 
 _LOGGER = logging.getLogger(__name__)
-_EXTENSIBLE_PROSE_LIMIT = 128
-_EXTENSIBLE_PROSE_LENGTH = 8_000
+_EXTENSION_MAX_DEPTH = 64
+_EXTENSION_SECRET_FIELD_RE = re.compile(
+    r"(?i)(?:api[_-]?key|(?:access|refresh|session|bearer|provider)?[_-]?token|"
+    r"secret|password|credential|authorization|cookie|private[_-]?key|signed[_-]?url)"
+)
 
 
 _INTERNAL_FIELDS = frozenset(
@@ -45,6 +49,7 @@ _REPORT_FIELDS = frozenset(
         "confidence", "title", "argument", "counterargument", "severity",
         "summary", "body", "analysis", "conclusion", "strengths", "concerns",
         "text_format_warning",
+        "extensions", "context", "field", "evidence_context",
         "risks", "unknowns", "possible_moats", "assumptions", "assumption",
         "financial_analysis", "accounting_risk", "information_gaps",
         "mechanism", "category", "maturity_stage", "time_horizon_years",
@@ -148,6 +153,9 @@ _FIELD_LABELS: dict[str, tuple[str, str]] = {
     "equity": ("归属于母公司股东权益", "Equity Attributable to Owners"),
     "total_equity": ("所有者权益合计", "Total Equity"),
     "text": ("结论", "Conclusion"),
+    "extensions": ("补充分析", "Additional Analysis"),
+    "field": ("分析类型", "Analysis Field"),
+    "context": ("情景上下文", "Scenario Context"),
     "kind": ("类型", "Type"),
     "base": ("基准情景", "Base Case"),
     "bear": ("悲观情景", "Bear Case"),
@@ -175,6 +183,7 @@ _FIELD_LABELS_HANT = {
     "summary": "摘要", "analysis": "分析", "claims": "主要結論", "unknowns": "資訊缺口",
     "possible_moats": "潛在護城河", "risks": "主要風險", "conclusion": "結論",
     "description": "說明", "durability": "持續性",
+    "extensions": "補充分析", "field": "分析類型", "context": "情境上下文",
     "name": "名稱", "cagr": "複合增速", "market_assumption": "市場假設",
     "sensitivity_note": "敏感性說明", "revenue_path": "收入路徑",
     "evidence_basis": "證據基礎", "value": "數值", "current": "當前值",
@@ -310,13 +319,14 @@ _PATH_VALUE_FIELDS = {
 }
 _NESTED_TYPED_FIELDS = {
     "possible_moats": {"kind", "description", "durability", "summary", "text", "title"},
+    "extensions": {"field", "text", "context", "evidence_count"},
 }
 _TYPED_SECTION_FIELDS = {
     "management_and_capital_allocation": {"summary", "text", "body", "analysis", "conclusion", "management", "capital_allocation", "risks", "limitations"},
     "existing_growth_engines": {"summary", "text", "body", "analysis", "conclusion", "mechanism", "risks", "limitations"},
     "industry_changes_and_value_allocation": {"summary", "text", "body", "analysis", "conclusion", "industry_changes", "value_allocation", "risks", "limitations"},
     "source_risk_review": {"summary", "text", "body", "analysis", "conclusion", "risks", "limitations", "information_gaps"},
-    "valuation_and_sensitivity": {"summary", "text", "body", "analysis", "conclusion", "valuation", "sensitivity", "assumptions", "limitations", "applicability", "reason", "currency"},
+    "valuation_and_sensitivity": {"summary", "text", "body", "analysis", "conclusion", "valuation", "sensitivity", "assumptions", "limitations", "applicability", "reason", "currency", "discount_rate", "terminal_growth_rate", "horizon_years"},
     "evidence_and_methodology": {"summary", "text", "body", "analysis", "methodology", "limitations"},
     "executive_summary": {"summary", "text", "body", "analysis", "conclusion"},
     "claims": {"text", "conclusion", "argument", "kind", "confidence", "title", "text_format_warning"},
@@ -328,7 +338,7 @@ _TYPED_SECTION_FIELDS = {
     "invalidation_conditions": {"title", "condition", "text", "body", "trigger", "confidence"},
     "leading_indicators": {"title", "indicator", "metric", "text", "body", "confidence"},
     "unresolved_questions": {"title", "question", "text", "body", "confidence"},
-    "scenarios": {"summary", "body", "analysis", "conclusion", "base", "bear", "bull", "name", "cagr", "probability", "probability_range", "revenue_cagr_range", "operating_margin_range", "assumptions", "text"},
+    "scenarios": {"summary", "body", "analysis", "conclusion", "base", "bear", "bull", "name", "cagr", "probability", "probability_range", "revenue_cagr_range", "operating_margin_range", "assumptions", "text", "extensions"},
     "thesis": {"summary", "body", "analysis", "conclusion", "text", "claims", "assumptions", "confidence"},
     "implied_expectations": {
         "summary", "body", "analysis", "conclusion", "text", "assumptions", "scenarios",
@@ -364,6 +374,169 @@ _REQUIRED_QUALITATIVE_SECTIONS = (
     "unresolved_questions",
 )
 _MISSING = object()
+
+
+def _safe_extension_field(name: str, allowed: Any = None, *, root: bool = False) -> bool:
+    normalized = name.casefold().strip()
+    if (not name.strip()
+            or normalized.startswith("_")
+            or normalized in _INTERNAL_FIELDS
+            or normalized in ROOT_METADATA_FIELDS
+            or (root and normalized in _REPORT_FIELDS.union(_FIELD_LABELS))
+            or (root and allowed is not None and name in allowed)
+            or _EXTENSION_SECRET_FIELD_RE.search(name)):
+        return False
+    return True
+
+
+def _extension_path_label(parts: tuple[str, ...]) -> str:
+    labels: list[str] = []
+    for part in parts:
+        if part.startswith("[") and labels:
+            labels[-1] += part
+        else:
+            labels.append(re.sub(r"[_-]+", " ", part).strip())
+    return " › ".join(label for label in labels if label)
+
+
+def _extension_omissions(
+    value: Any,
+    path: str,
+    *,
+    depth: int = 0,
+    parent_key: str | None = None,
+    container_key: str | None = None,
+) -> tuple[str, ...]:
+    """Locate nested extension values that cannot safely become prose.
+
+    Unknown numeric/boolean values are deliberately not projected as trusted
+    analysis. Their exact paths remain visible to report diagnostics. The
+    depth limit protects recursive rendering and is likewise diagnostic, not a
+    silent truncation.
+    """
+    if depth > _EXTENSION_MAX_DEPTH:
+        return (path,)
+    if isinstance(value, dict):
+        omitted: list[str] = []
+        for key, child in value.items():
+            name = str(key)
+            if not _safe_extension_field(name):
+                continue
+            child_path = f"{path}.{name}" if path else name
+            omitted.extend(_extension_omissions(
+                child,
+                child_path,
+                depth=depth + 1,
+                parent_key=name,
+                container_key=container_key,
+            ))
+        return tuple(omitted)
+    if isinstance(value, (list, tuple)):
+        omitted = []
+        for index, child in enumerate(value):
+            omitted.extend(_extension_omissions(
+                child,
+                f"{path}[{index}]",
+                depth=depth + 1,
+                parent_key=f"[{index}]",
+                container_key=container_key,
+            ))
+        return tuple(omitted)
+    if isinstance(value, str):
+        projected = _project_scalar(value, parent_key=parent_key, container_key=container_key)
+        return () if isinstance(projected, str) and projected.strip() else (path,)
+    return (path,)
+
+
+def _project_extension_records(
+    name: str,
+    value: Any,
+    *,
+    context: str,
+    evidence_count: int,
+    container_key: str | None,
+    available_evidence: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Flatten safe nested professional prose into renderer-readable paths."""
+    records: list[dict[str, Any]] = []
+
+    def visit(
+        child: Any,
+        parts: tuple[str, ...],
+        *,
+        depth: int,
+        local_context: str,
+        local_evidence_count: int,
+    ) -> None:
+        path = _extension_path_label(parts)
+        if depth > _EXTENSION_MAX_DEPTH:
+            record: dict[str, Any] = {
+                "field": path,
+                "text": "Additional nested analysis is pending review; the original candidate was retained but could not be projected past the safe nesting limit.",
+            }
+            if local_context:
+                record["context"] = local_context
+            if local_evidence_count:
+                record["evidence_count"] = local_evidence_count
+            records.append(record)
+            return
+        if isinstance(child, dict):
+            nested_context = _extension_context(child, parts[-1] if parts else None) or local_context
+            nested_evidence_count = local_evidence_count
+            references = child.get("evidence_ids")
+            if isinstance(references, (list, tuple)) and available_evidence is not None:
+                nested_evidence_count = max(
+                    nested_evidence_count,
+                    len({str(item).strip() for item in references if str(item).strip() in available_evidence}),
+                )
+            for key, item in child.items():
+                key_name = str(key)
+                if not _safe_extension_field(key_name):
+                    continue
+                visit(
+                    item,
+                    (*parts, key_name),
+                    depth=depth + 1,
+                    local_context=nested_context,
+                    local_evidence_count=nested_evidence_count,
+                )
+            return
+        if isinstance(child, (list, tuple)):
+            for index, item in enumerate(child):
+                visit(
+                    item,
+                    (*parts, f"[{index}]"),
+                    depth=depth + 1,
+                    local_context=local_context,
+                    local_evidence_count=local_evidence_count,
+                )
+            return
+        if not isinstance(child, str) or not child.strip():
+            return
+        cleaned = _project_scalar(
+            child, parent_key=parts[-1] if parts else name, container_key=container_key
+        )
+        if not isinstance(cleaned, str) or not cleaned.strip():
+            return
+        record = {"field": path, "text": cleaned.strip()}
+        if local_context:
+            record["context"] = local_context
+        if local_evidence_count:
+            record["evidence_count"] = local_evidence_count
+        records.append(record)
+
+    visit(value, (name,), depth=0, local_context=context, local_evidence_count=evidence_count)
+    return records
+
+
+def _extension_context(value: dict[str, Any], parent_key: str | None) -> str:
+    for key in ("name", "title", "summary"):
+        item = value.get(key)
+        if isinstance(item, str) and item.strip() and len(item) <= 512:
+            return item.strip()
+    if parent_key in {"base", "bear", "bull"}:
+        return parent_key
+    return ""
 
 
 def resolve_report_identity(
@@ -510,6 +683,9 @@ def _project_value(
         allowed = _NESTED_TYPED_FIELDS.get(
             parent_key or "", _TYPED_SECTION_FIELDS.get(parent_key or "")
         )
+        extension_source: dict[str, Any] = value
+        if root_section == "scenarios":
+            extension_source, _metadata, _diagnostics = response_parts(value)
         projected: dict[str, Any] = {}
         extensible_nested_expectations = root_section == "implied_expectations"
         unknown_evidence = {
@@ -542,7 +718,39 @@ def _project_value(
                     if str(item).strip() in available_evidence
                 }
             )
-        for key, child in value.items():
+        extensions = []
+        if root_section in _TYPED_SECTION_FIELDS:
+            context = _extension_context(extension_source, parent_key)
+            evidence_references = set()
+            for evidence_field in (
+                "evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids"
+            ):
+                references = extension_source.get(evidence_field)
+                if isinstance(references, (list, tuple)) and available_evidence is not None:
+                    evidence_references.update(
+                        str(item).strip() for item in references
+                        if str(item).strip() in available_evidence
+                    )
+            for name, child in extension_source.items():
+                field_name = str(name)
+                if not _safe_extension_field(field_name, allowed, root=True):
+                    continue
+                if not isinstance(child, (str, dict, list, tuple)):
+                    continue
+                extensions.extend(
+                    _project_extension_records(
+                        field_name,
+                        child,
+                        context=context,
+                        evidence_count=len(evidence_references),
+                        container_key=parent_key,
+                        available_evidence=available_evidence,
+                    )
+                )
+            if extensions:
+                projected["extensions"] = extensions
+
+        for key, child in extension_source.items():
             name = str(key)
             # Evidence counts are derived above from registered evidence IDs;
             # never copy model-supplied count values back over that result.
@@ -551,6 +759,7 @@ def _project_value(
             if (
                 name in _INTERNAL_FIELDS
                 or name.startswith("_")
+                or (root_section == "scenarios" and name in ROOT_METADATA_FIELDS)
                 or (
                     name not in _REPORT_FIELDS.union(_FIELD_LABELS)
                     and not (allowed is not None and name in allowed)
@@ -766,42 +975,79 @@ def project_report_diagnostics(value: Any, *, include_technical: bool = False) -
         path: str,
         *,
         root_section: str = "",
+        parent_key: str = "",
         section_depth: int = 0,
     ) -> None:
         if isinstance(item, dict):
+            allowed = _NESTED_TYPED_FIELDS.get(
+                parent_key, _TYPED_SECTION_FIELDS.get(parent_key)
+            )
             for key, child in item.items():
                 name = str(key)
                 child_path = f"{path}.{name}" if path else name
                 section = root_section or (name if name in _TYPED_SECTION_FIELDS else "")
-                depth = (
-                    0 if not root_section and section
-                    else section_depth + 1 if root_section
-                    else section_depth
-                )
-                section_field_is_unknown = bool(
-                    root_section
-                    and section_depth == 0
+                if not root_section and section:
+                    walk(
+                        child,
+                        child_path,
+                        root_section=section,
+                        parent_key=section,
+                        section_depth=0,
+                    )
+                    continue
+                nested_extension = bool(
+                    root_section in _TYPED_SECTION_FIELDS
                     and root_section != "claims"
-                    and root_section in _TYPED_SECTION_FIELDS
-                    and name not in _TYPED_SECTION_FIELDS[root_section]
+                    and name not in _INTERNAL_FIELDS
+                    and name not in ROOT_METADATA_FIELDS
+                    and not name.startswith("_")
+                    and not _EXTENSION_SECRET_FIELD_RE.search(name)
+                    and (
+                        name not in _REPORT_FIELDS.union(_FIELD_LABELS)
+                        or (allowed is not None and name not in allowed)
+                    )
+                    and not (allowed is not None and name in allowed)
                 )
+                if nested_extension:
+                    if (
+                        _safe_extension_field(name, allowed, root=True)
+                        and isinstance(child, (str, dict, list, tuple))
+                    ):
+                        unknown.extend(_extension_omissions(
+                            child,
+                            child_path,
+                            parent_key=name,
+                            container_key=root_section,
+                        ))
+                    else:
+                        unknown.append(child_path)
+                    continue
                 if (
                     name not in _INTERNAL_FIELDS
+                    and name not in ROOT_METADATA_FIELDS
                     and not name.startswith("_")
-                    and (
-                        name not in _FIELD_LABELS
-                        and name not in _REPORT_FIELDS
-                        or section_field_is_unknown
+                    and not (
+                        root_section in _TYPED_SECTION_FIELDS
+                        and _EXTENSION_SECRET_FIELD_RE.search(name)
                     )
+                    and name not in _FIELD_LABELS
+                    and name not in _REPORT_FIELDS
                 ):
                     unknown.append(child_path)
-                walk(child, child_path, root_section=section, section_depth=depth)
+                walk(
+                    child,
+                    child_path,
+                    root_section=root_section,
+                    parent_key=name,
+                    section_depth=section_depth + 1 if root_section else section_depth,
+                )
         elif isinstance(item, (list, tuple)):
             for index, child in enumerate(item):
                 walk(
                     child,
                     f"{path}[{index}]",
                     root_section=root_section,
+                    parent_key=parent_key,
                     section_depth=section_depth,
                 )
 

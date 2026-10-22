@@ -373,6 +373,7 @@ export function ModelCenterView({ language }: { language: Language }) {
         enabled: model.enabled,
         capabilities: model.capabilities,
         timeout_seconds: timeout,
+        context_window_hint: model.context_window_hint,
       });
       setNotice(text.timeoutSaved);
       await reload();

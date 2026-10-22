@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import unittest
@@ -66,7 +67,9 @@ class FinancialCheckpointTests(unittest.TestCase):
                 return ()
 
             engine = FinancialIngestionEngine(checkpoint_dir=Path(directory) / "cp")
-            with patch("openthesis.financial_ingestion._candidate_financial_pages", return_value=None), \
+            from openthesis.financial_sources.pdf_document_units import PdfDocumentContext
+            with patch("openthesis.financial_ingestion._candidate_financial_pages_with_diagnostic", return_value=(None, None)), \
+                    patch("openthesis.financial_ingestion.read_document_context", return_value=PdfDocumentContext(page_texts=("",) * 10)), \
                     patch("openthesis.financial_ingestion._pdf_page_count", return_value=10), \
                     patch("openthesis.financial_checkpoint.run_checkpointed_windows", side_effect=run_stub):
                 _facts, _refs, diagnostics = engine.parse_local_pdf_resumable(
@@ -108,11 +111,14 @@ class FinancialCheckpointTests(unittest.TestCase):
                 (PdfWindow(0, (1,)),),
                 _large_result_window_worker,
                 max_retries=0,
-                timeout_seconds=1.0,
+                # This is a pipe-drain regression test, not a one-second
+                # performance benchmark. Keep a hard deadline while allowing
+                # Windows process scheduling headroom under the full suite.
+                timeout_seconds=5.0,
             )
         self.assertEqual(len(completed), 1)
         self.assertEqual(len(completed[0].context["serialized_table_context"]), 512 * 1024)
-        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertLess(time.monotonic() - started, 7.0)
 
     def test_context_is_carried_only_from_successful_prior_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -401,8 +407,13 @@ class FinancialCheckpointTests(unittest.TestCase):
             (_PeriodColumn(2025, 120.0, 100.0, 140.0, "CNY", 1000.0),
              _PeriodColumn(2024, 240.0, 220.0, 260.0, "CNY", 1000.0)),
             17, 1, "explicit",
+            statement_evidence="合并利润表",
+            statement_evidence_page=16,
+            statement_evidence_bbox=(10.5, 20.25, 300.75, 400.125),
         )
-        restored = _checkpoint_context_from_dict(_checkpoint_context_to_dict(context))
+        serialized = json.loads(json.dumps(_checkpoint_context_to_dict(context)))
+        self.assertIsInstance(serialized["statement_evidence_bbox"], list)
+        restored = _checkpoint_context_from_dict(serialized)
         self.assertEqual(restored, context)
 
         seen: list[dict[str, object]] = []

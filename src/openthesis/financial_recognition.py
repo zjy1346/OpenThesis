@@ -30,6 +30,7 @@ from .vision_financials import (
 
 class RecognitionState(str, Enum):
     COMPLETE = "COMPLETE"
+    PARTIAL = "PARTIAL"
     BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
@@ -105,8 +106,10 @@ class FinancialRecognitionCoordinator:
         elapsed = max(0.0, time.monotonic() - started)
         if cancel():
             state = RecognitionState.CANCELLED
-        elif dataset.allow_ai:
+        elif dataset.allow_ai and view.research_ready:
             state = RecognitionState.COMPLETE
+        elif view.research_ready:
+            state = RecognitionState.PARTIAL
         elif dataset.resolved_facts:
             state = RecognitionState.BLOCKED
         else:

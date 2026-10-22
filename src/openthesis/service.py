@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import base64
 import binascii
 import hashlib
@@ -225,6 +227,10 @@ class _FinancialReportRefreshError(RuntimeError):
 class _ResearchJob:
     job_id: str
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    generation: int = 0
+    revision: int = 0
+    terminal_write_revision: int | None = field(default=None, repr=False)
+    pre_terminal_snapshot: dict[str, Any] | None = field(default=None, repr=False)
     state: str = "queued"
     message: str = ""
     percent: int = 0
@@ -273,6 +279,14 @@ class _ResearchJob:
             self.engine_active_seconds += elapsed
         self.timing_started_at = now
 
+    def visible_snapshot(self) -> dict[str, Any]:
+        # A short job lock must not contain SQLite I/O, but a terminal status
+        # cannot promise completion while the worker still owns its final
+        # write. Keep the last non-terminal view until that write commits.
+        if self.terminal_write_revision is not None and self.pre_terminal_snapshot is not None:
+            return deepcopy(self.pre_terminal_snapshot)
+        return self.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         now = self.finished_at or time.perf_counter()
         timings = dict(self.stage_timings)
@@ -294,6 +308,7 @@ class _ResearchJob:
         )
         return {
             "job_id": self.job_id,
+            "revision": self.revision,
             "state": self.state,
             "message": self.message,
             "percent": self.percent,
@@ -345,8 +360,11 @@ class AppService:
         market_quote_adapter_factory: Callable[[Storage], Any | None] | None = None,
         financial_ingestion_engine: FinancialIngestionEngine | None = None,
         vision_adapter_factory: Callable[[VisionFallbackConfig], VisionFinancialSourceAdapter] | None = None,
+        initialization_progress=None,
     ):
-        self.storage = Storage(data_dir)
+        self.storage = Storage(data_dir, initialization_progress=initialization_progress) if initialization_progress else Storage(data_dir)
+        if initialization_progress:
+            initialization_progress("preparing_services")
         self.interrupted_run_count = self.storage.interrupt_running_runs()
         self._continuity = ResearchContinuityCoordinator(self.storage)
         self.app_version = app_version
@@ -419,6 +437,8 @@ class AppService:
         self._jobs_lock = threading.Lock()
         self._recovery_planner = ResearchRecoveryPlanner()
         self._active_recoveries: dict[tuple[str, str], tuple[threading.Event, str]] = {}
+        if initialization_progress:
+            initialization_progress("ready")
 
     def _configure_official_network(self, value: str) -> None:
         policy = _parse_official_network_policy(value)
@@ -582,6 +602,7 @@ class AppService:
             "company_search_contract": SEARCH_CONTRACT,
             "app_version": self.app_version,
             "build_info": build_info,
+            "storage_health": dict(self.storage.maintenance_status),
             "capabilities": [
                 "app.bootstrap",
                 "settings.update",
@@ -598,6 +619,10 @@ class AppService:
                 "research.start_financial_retry",
                 "research.start_financial_rebuild",
                 "research.get_report",
+                "rpc.start",
+                "rpc.result",
+                "research.extend_budget",
+                "research.call_history",
                 "research.financial_diagnostics",
                 "research.start",
                 "research.market_snapshot",
@@ -610,33 +635,34 @@ class AppService:
                 "research.refresh_financial_report",
                 "research.status",
                 "research.cancel",
+                "research.cancel_model_call",
                 "research.vision_decision",
             ],
         }
 
-    def bootstrap(self) -> dict[str, Any]:
+    def bootstrap(self, *, minimal: bool = False) -> dict[str, Any]:
+        if minimal:
+            self.storage.start_background_maintenance()
         return {
             **self.hello(),
             "preferences": self.preferences(),
-            "recent_runs": self.list_research_runs(limit=20),
-            "common_companies": self.common_companies(),
+            "recent_runs": [] if minimal else self.list_research_runs(limit=20),
+            "common_companies": [] if minimal else self.common_companies(),
             "market_catalog": self.market_catalog(),
-            "research_packs": self.research_packs(),
+            "research_packs": [] if minimal else self.research_packs(),
             "interrupted_runs": self.interrupted_run_count,
         }
 
     def preferences(self) -> dict[str, str]:
-        stored_ui = self.storage.get_setting("ui_language", "")
-        stored_mode = self.storage.get_setting("ui_language_mode", "")
+        stored = self.storage.get_settings({**PREFERENCE_DEFAULTS, "ui_language": "", "ui_language_mode": "", "report_language": ""})
+        stored_ui = stored["ui_language"]
+        stored_mode = stored["ui_language_mode"]
         mode = stored_mode or ("manual" if stored_ui else "system")
         system_tag = locale.getlocale()[0] or "en"
         system_language = resolve_system_language((system_tag,))
         ui_language = resolve_ui_language(mode, stored_ui or system_language, (system_language,))
-        report_stored = self.storage.get_setting("report_language", "")
-        return {
-            key: self.storage.get_setting(key, default)
-            for key, default in PREFERENCE_DEFAULTS.items()
-        } | {
+        report_stored = stored["report_language"]
+        return stored | {
             "ui_language": ui_language,
             "ui_language_mode": mode,
             "report_language": normalize_language(report_stored or ui_language),
@@ -877,33 +903,11 @@ class AppService:
             raise OfficialNetworkError("SEC directory is unavailable", code="SOURCE_NETWORK_UNAVAILABLE") from error
 
     def list_research_runs(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        bounded_limit = min(200, max(1, int(limit)))
-        summaries: list[dict[str, Any]] = []
-        for row in self.storage.list_runs(limit=bounded_limit):
-            payload = _decode_payload(row.get("payload_json"))
-            company = payload.get("company", {})
-            if not isinstance(company, dict):
-                company = {}
-            company, currency_confirmation = _reporting_currency_identity(self.storage, company, payload)
-            summaries.append(
-                {
-                    "run_id": row["run_id"],
-                    "ticker": row["ticker"],
-                    "company_name": row["name"],
-                    "status": row["status"],
-                    "started_at": row["started_at"],
-                    "completed_at": row["completed_at"],
-                    "report_language": normalize_language(
-                        str(payload.get("report_language", "zh-CN"))
-                    ),
-                    "market": str(company.get("market", "US")),
-                    "exchange": str(company.get("exchange", "")),
-                    "listing_currency": str(company.get("listing_currency", "USD")),
-                    "reporting_currency": str(company.get("reporting_currency") or ""),
-                    "reporting_currency_confirmation": currency_confirmation,
-                    "industry_support": str(company.get("industry_support", "standard")),
-                }
-            )
+        from .storage_read_models import list_run_summaries
+        with self.storage.connect() as db:
+            summaries = list_run_summaries(db, limit)
+        for summary in summaries:
+            summary["report_language"] = normalize_language(str(summary.get("report_language", "zh-CN")))
         return summaries
 
     def delete_research_run(self, run_id: str) -> dict[str, Any]:
@@ -1139,8 +1143,14 @@ class AppService:
             }
             read_diagnostics.append({"code": "RECOVERY_METADATA_UNAVAILABLE", "location": "retry-metadata"})
 
+        try:
+            call_plan = self.storage.model_call_plan(run_id)
+        except Exception:
+            call_plan = None
+            read_diagnostics.append({"code": "MODEL_PLAN_METADATA_UNAVAILABLE", "location": "model-call-plan"})
         return {
             "run_id": run_id,
+            "call_plan": call_plan,
             "ticker": run["ticker"],
             "company_name": run["name"],
             "status": run["status"],
@@ -1177,6 +1187,22 @@ class AppService:
             "markdown": report_read.markdown,
             "html": report_read.html,
         }
+
+    def extend_model_budget(self, run_id: str, expected_digest: str, gap_ids: list[str]) -> dict:
+        if (not isinstance(run_id, str) or not run_id or not isinstance(expected_digest, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", expected_digest)
+                or not isinstance(gap_ids, list) or not 1 <= len(gap_ids) <= 100
+                or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in gap_ids)
+                or len(set(gap_ids)) != len(gap_ids)):
+            raise ValueError("MODEL_BUDGET_APPROVAL_INVALID")
+        from .research_execution.call_budget import extend_plan
+        try:
+            with self.storage.connect() as db:
+                return extend_plan(db, run_id, expected_digest, gap_ids)
+        except ValueError as error:
+            if str(error) in {"MODEL_BUDGET_PLAN_CHANGED", "MODEL_BUDGET_GAP_CHANGED"}:
+                raise ServiceConfigurationError(str(error)) from error
+            raise
 
     def financial_diagnostics(self, run_id: str) -> dict[str, Any]:
         """Return a bounded, exportable diagnostic snapshot for one run.
@@ -1348,7 +1374,8 @@ class AppService:
             name=f"openthesis-financial-{job.job_id[:8]}",
             daemon=True,
         ).start()
-        return job.snapshot()
+        with self._jobs_lock:
+            return job.visible_snapshot()
 
     def _run_financial_retry_job(
         self, job: _ResearchJob, run_id: str, force: bool
@@ -1407,6 +1434,12 @@ class AppService:
             retry = report.get("financial_retry", {})
             operation_status = str(retry.get("status", "failed"))
             succeeded = operation_status == "succeeded"
+            partial = operation_status == "partial"
+            completed = succeeded or (partial and retry.get("research_can_continue") is True
+                and retry.get("updated_artifacts") and not any(code in str(retry.get("error", ""))
+                for code in ("FILING_REPORT_REFRESH_FAILED", "FINANCIAL_REPAIR_INTERNAL_ERROR",
+                             "REPORT_REVISION_CONFLICT", "FINANCIAL_GENERATION_CONFLICT",
+                             "RESEARCH_RUN_SNAPSHOT_CONFLICT")))
             # The use case owns classification. Do not relabel a local host,
             # configuration or source outage as financial inconsistency.
             classified = continuity_financial_outcome({"latest": {
@@ -1418,15 +1451,19 @@ class AppService:
                 "FILING_DATA_QUALITY_FAILED")
             self._update_job(
                 job,
-                state="completed" if succeeded else "failed",
-                stage="completed" if succeeded else "financial-validation",
+                state="completed" if completed else "failed",
+                stage="completed" if completed else "financial-validation",
                 percent=100,
                 operation_result=dict(retry) if isinstance(retry, dict) else {},
                 recovery_outcome=recovery,
-                error_code=None if succeeded else failure_code,
+                error_code=None if completed else failure_code,
                 message=(
                     _ui_message(language, "Financial refresh completed", "财务数据刷新完成", "財務資料刷新完成")
                     if succeeded
+                    else _ui_message(language,
+                        "Financial refresh completed with localized verification gaps; research can continue",
+                        "财报更新完成，部分指标待核验，可继续研究",
+                        "財報更新完成，部分指標待核驗，可繼續研究") if completed
                     else _research_data_message(failure_code, language)
                 ),
             )
@@ -1695,8 +1732,15 @@ class AppService:
         )
 
     def retry_research_model_stages(
-        self, run_id: str, model: dict[str, Any] | None = None
+        self, run_id: str, model: dict[str, Any] | None = None, *, budget_only: bool = False
     ) -> dict[str, Any]:
+        if type(budget_only) is not bool:
+            raise ValueError("RESEARCH_BUDGET_RESUME_INVALID")
+        if budget_only:
+            with self.storage.connect() as db:
+                if not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND state='approved'", (run_id,)).fetchone():
+                    raise ValueError("MODEL_BUDGET_APPROVAL_REQUIRED")
+            return self._retry_research_model_stages_once(run_id, model, budget_only=True)
         return self._execute_recovery_plan(
             run_id,
             target="model-stages",
@@ -1764,6 +1808,7 @@ class AppService:
         *, resume_target: str = "model-stages",
         manual_authorization_id: str = "",
         local_only: bool = False,
+        budget_only: bool = False,
     ) -> dict[str, Any]:
         """Resume failed base agents without repeating previously trusted work.
 
@@ -1837,6 +1882,7 @@ class AppService:
             parallel_agents=bool(research_configuration.get("parallel_agents", True)),
             manual_authorization_id=manual_authorization_id,
             local_only=local_only,
+            budget_only=budget_only,
         ))
         return self.get_report(run_id, language=run.report_language)
 
@@ -1930,17 +1976,39 @@ class AppService:
             name=f"openthesis-research-{job.job_id[:8]}",
             daemon=True,
         ).start()
-        return job.snapshot()
+        with self._jobs_lock:
+            return job.visible_snapshot()
 
     def get_research_status(self, job_id: str) -> dict[str, Any]:
         with self._jobs_lock:
             job = self._jobs.get(job_id)
-            if job is None:
-                saved = self.storage.get_research_job(job_id)
-                if saved is not None:
-                    return saved
+            snapshot = job.visible_snapshot() if job is not None else None
+        if snapshot is None:
+            snapshot = self.storage.get_research_job(job_id)
+            if snapshot is None:
                 raise KeyError("research job not found")
-            return job.snapshot()
+        progress = self.storage.model_call_progress(snapshot.get("run_id") or "")
+        # Storage work is outside the job lock. Re-copy the latest memory
+        # revision rather than returning an older running/cancel state.
+        with self._jobs_lock:
+            current = self._jobs.get(job_id)
+            if current is not None:
+                snapshot = current.visible_snapshot()
+        snapshot["model_calls"] = progress["calls"]
+        snapshot["call_plan"] = self.storage.model_call_plan(snapshot.get("run_id") or "")
+        snapshot["status_revision"] = f"{snapshot.get('revision', 0)}:{progress['revision']}"
+        return snapshot
+
+    def cancel_model_call(self, job_id: str, request_id: str, attempt_id: str) -> dict:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state not in {"queued", "running"}:
+                raise ValueError("MODEL_CALL_NOT_ACTIVE")
+            accepted = self.storage.model_activity.request_cancel(job.run_id, request_id, attempt_id)
+            if not accepted:
+                raise ValueError("MODEL_CALL_NOT_ACTIVE")
+        # This only stops local waiting. Remote billing/termination is unknown.
+        return self.get_research_status(job_id)
 
     def cancel_research(self, job_id: str) -> dict[str, Any]:
         with self._jobs_lock:
@@ -1948,11 +2016,13 @@ class AppService:
             if job is None:
                 raise KeyError("research job not found")
             job.cancel_event.set()
+            job.revision += 1
             if job.vision_approval_pending:
                 # Wake an approval waiter immediately; the callback checks the
                 # cancellation flag before allowing any upload.
                 job.vision_approval_event.set()
             if job.state in {"queued", "running"}:
+                job.generation += 1
                 job.state = "cancelling"
                 job.cancel_requested = True
                 job.stage = "cancelling"
@@ -1965,7 +2035,7 @@ class AppService:
                 for agent_id, state in list(job.agent_states.items()):
                     if state in {"queued", "running"}:
                         job.agent_states[agent_id] = "cancelled"
-            return job.snapshot()
+            return job.visible_snapshot()
 
     def vision_decision(self, job_id: str, approved: bool) -> dict[str, Any]:
         """Resolve a session-only failed-page upload approval request."""
@@ -1976,14 +2046,26 @@ class AppService:
             if job.stage != "vision-approval" or not job.vision_approval_pending:
                 raise ValueError("vision upload approval is not pending")
             job.vision_approval = bool(approved)
+            job.revision += 1
             job.vision_approval_pending = False
             job.vision_approval_event.set()
-            return job.snapshot()
+            return job.visible_snapshot()
 
-    def _update_job(self, job: _ResearchJob, *, active_only: bool = False, **updates: Any) -> None:
+    def _update_job(
+        self,
+        job: _ResearchJob,
+        *,
+        active_only: bool = False,
+        expected_generation: int | None = None,
+        **updates: Any,
+    ) -> None:
         with self._jobs_lock:
+            if expected_generation is not None and job.generation != expected_generation:
+                return
             if active_only and (job.cancel_event.is_set() or job.state not in {"queued", "running"}):
                 return
+            if updates.get("state") in {"completed", "failed", "cancelled"} and job.terminal_write_revision is None:
+                job.pre_terminal_snapshot = job.snapshot()
             if "percent" in updates:
                 updates["percent"] = max(job.percent, min(100, max(0, int(updates["percent"]))))
             if updates.get("stage_total") is not None:
@@ -2005,7 +2087,17 @@ class AppService:
                 job.finished_at = time.perf_counter()
             for key, value in updates.items():
                 setattr(job, key, value)
-            self.storage.save_research_job(job.snapshot())
+            job.revision += 1
+            snapshot = job.snapshot()
+            terminal = snapshot["state"] in {"completed", "failed", "cancelled"}
+            if terminal:
+                job.terminal_write_revision = snapshot["revision"]
+        self.storage.save_research_job(snapshot)
+        if terminal:
+            with self._jobs_lock:
+                if job.terminal_write_revision == snapshot["revision"]:
+                    job.terminal_write_revision = None
+                    job.pre_terminal_snapshot = None
 
     def _ingestion_progress(
         self,
@@ -2038,6 +2130,7 @@ class AppService:
             filing_states = {key: dict(value) for key, value in job.filing_states.items()}
             filing_id = str(detail["filing_id"])
             filing_states[filing_id] = {
+                **filing_states.get(filing_id, {}),
                 "filing_id": filing_id,
                 "label": str(detail.get("label") or filing_id),
                 "status": str(detail.get("status") or stage),
@@ -2047,10 +2140,18 @@ class AppService:
                 "window_total": detail.get("window_total"),
                 "last_activity_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
+            for field in ("processing_state", "availability", "roles", "candidate_count", "admitted_count",
+                          "quarantined_count", "issue_codes", "source_hash", "accession_number", "period_end", "fiscal_period",
+                          "page_count", "native_text_page_count", "indexed_page_count", "window_total",
+                          "completed_window_count", "parse_elapsed_seconds", "failure_stage", "root_error_code",
+                          "attempt_count", "cache_reused", "recognized_statements", "extracted_pages"):
+                if field in detail:
+                    filing_states[filing_id][field] = deepcopy(detail[field])
             updates["filing_states"] = filing_states
         self._update_job(job, **updates)
 
     def _run_research(self, job: _ResearchJob, request: dict[str, Any]) -> None:
+        progress_generation = job.generation
         preferences = self.preferences()
         ui_language = normalize_language(preferences["ui_language"])
         report_language = normalize_language(preferences["report_language"])
@@ -2066,6 +2167,7 @@ class AppService:
             return
         self._update_job(
             job,
+            active_only=True,
             state="running",
             stage="preparing",
             message=_ui_message(ui_language, "Preparing research data", "正在准备研究数据", "正在準備研究資料"),
@@ -2196,6 +2298,7 @@ class AppService:
                 parallel_agents=parallel_agents, annual_history_years=history_years,
                 existing_run=job.run, recovery_session_id=str(request.get("_financial_recovery_session_id", "")),
                 job_id=job.job_id,
+                allow_partial_research=request.get("allow_partial_research", False),
                 policy_source=(
                     "manual_override"
                     if isinstance(request.get("valuation"), dict)
@@ -2206,6 +2309,9 @@ class AppService:
 
             def agent_progress(agent_id: str, state: str) -> None:
                 with self._jobs_lock:
+                    if (job.generation != progress_generation or job.cancel_event.is_set()
+                            or job.state not in {"queued", "running"}):
+                        return
                     job.agent_states[agent_id] = state
                     if parallel_agents and agent_id in {"financial-analyst", "business-analyst", "accounting-risk-analyst",
                                                          "source-industry-analysis", "source-risk-analysis"}:
@@ -2234,6 +2340,8 @@ class AppService:
                                   f"比較模型 {event.model_index}/{event.comparison_count}："))
                 self._update_job(
                     job,
+                    active_only=True,
+                    expected_generation=progress_generation,
                     state="running",
                     message=f"{prefix}{event.message}",
                     stage=_workflow_stage(event.model_percent, comparison=event.model_index > 0),
@@ -2416,6 +2524,7 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_FORMAT_UNSUPPORTED": "已找到官方公告，但当前版本无法从中生成可用的财务数据。",
             "FILING_DATA_QUALITY_FAILED": "已获取官方披露文件，但关键财务字段未通过一致性校验。为避免错误数据进入 AI，本次研究已停止。",
             "FILING_DATA_QUALITY_PARTIAL": "财务资料已重建，但仍有字段未通过校验；已保留可验证数据。",
+            "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED": "资料处理已结束，但必要财务期间尚无可用数据。原件和可用披露已保存，尚未调用研究模型。可继续修复财报，或明确选择仅用现有资料研究（报告会保留这些缺口）。",
             "FILING_REPORT_REFRESH_FAILED": "财务资料已重建，但报告刷新失败；可单独重试报告刷新。",
             "SCANNED_IMAGE_FILING_DETECTED": "已定位到疑似扫描版合并财报页面。请在模型中心配置具备视觉能力的解析方式并授权这些页面后重试；未授权前不会上传页面。",
             "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "当前文件疑似包含图片版财报，但无法安全定位合并报表页。未上传任何页面；请人工核对或更换可解析的官方文件后重试。",
@@ -2453,6 +2562,7 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_FORMAT_UNSUPPORTED": "Official disclosures were found, but this version could not produce usable financial data from them.",
             "FILING_DATA_QUALITY_FAILED": "Official disclosures were retrieved, but critical financial fields failed consistency checks. Research stopped before any data was sent to AI.",
             "FILING_DATA_QUALITY_PARTIAL": "Financial data was rebuilt, but some fields remain unverified; validated data was preserved.",
+            "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED": "Preparation finished, but required financial periods have no usable data. Originals and available disclosures were saved; no research model was called. Repair the financial sources, or explicitly research only the available material with these gaps disclosed.",
             "FILING_REPORT_REFRESH_FAILED": "Financial data was rebuilt, but report refresh failed; retry report refresh separately.",
             "SCANNED_IMAGE_FILING_DETECTED": "Scanned consolidated-statement pages were located. Configure and authorize a vision-capable parser, then retry; no pages are uploaded without approval.",
             "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "The filing appears image-based, but consolidated-statement pages could not be located safely. Nothing was uploaded; verify the filing manually or use a parseable official file.",
@@ -2490,6 +2600,7 @@ def _research_data_message(code: str, language: str) -> str:
             "FILING_FORMAT_UNSUPPORTED": "已找到官方披露，但目前版本無法從中產生可用的財務資料。",
             "FILING_DATA_QUALITY_FAILED": "已取得官方披露，但關鍵財務欄位未通過一致性檢查。為避免錯誤資料送入 AI，本次研究已停止。",
             "FILING_DATA_QUALITY_PARTIAL": "財務資料已重建，但仍有欄位未通過校驗；已保留可驗證資料。",
+            "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED": "資料處理已結束，但必要財務期間尚無可用資料。原件與可用披露已儲存，尚未呼叫研究模型。可繼續修復財報，或明確選擇僅用現有資料研究（報告會保留這些缺口）。",
             "FILING_REPORT_REFRESH_FAILED": "財務資料已重建，但報告刷新失敗；可單獨重試報告刷新。",
             "SCANNED_IMAGE_FILING_DETECTED": "已定位疑似掃描版合併財報頁面。請在模型中心設定具備視覺能力的解析方式並授權這些頁面後重試；未獲授權前不會上傳頁面。",
             "SCANNED_IMAGE_LAYOUT_UNRESOLVED": "目前檔案疑似包含圖片版財報，但無法安全定位合併報表頁面。未傳送任何頁面；請人工核對或更換可解析的官方檔案後重試。",
@@ -2671,13 +2782,13 @@ def _latest_sec_verified_group(
             # baseline.  Let the ordered loop continue to the prior complete
             # FY instead of leaking a unit from another accession.
             continue
-        canonical = FinancialPipeline(engine).prepare(
+        admitted = FinancialPipeline(engine).prepare(
             FinancialResearchSnapshot.from_facts(
                 replace(subject, reporting_currency=reporting_currency), [filing], group_facts,
             ), CompilationPolicy(reporting_currency=reporting_currency),
-        ).canonical_dataset
-        if canonical.allow_ai and canonical.research_facts:
-            return tuple(canonical.research_facts)
+        )
+        if admitted.model_ready:
+            return admitted.facts
     return None
 
 
@@ -2879,6 +2990,7 @@ def _model_config_from_request(value: Any) -> ModelConfig:
         role=role,
         timeout_seconds=600,
         connection_id=_normalize_model_connection_id(value.get("connection_id")),
+        context_window_hint=value.get("context_window_hint"),
     )
 
 
@@ -3754,20 +3866,25 @@ def _canonical_retry_snapshot(
             facts.append(FinancialFact(**item))
         except (TypeError, ValueError):
             continue
-    canonical = FinancialPipeline(None).prepare(FinancialResearchSnapshot.from_facts(
+    admitted = FinancialPipeline(None).prepare(FinancialResearchSnapshot.from_facts(
         company, filings, facts,
         evidence=tuple(EvidenceRef(**row) for row in saved.get("evidence", ())),
-    ), CompilationPolicy(reporting_currency=company.reporting_currency)).canonical_dataset
-    if not canonical.allow_ai or not canonical.research_facts:
+    ), CompilationPolicy(reporting_currency=company.reporting_currency))
+    if not admitted.model_ready:
         return unavailable("FINANCIAL_DATA_QUALITY_FAILED")
     snapshot = payload.get("data_snapshot", {})
     expected = snapshot.get("financial_fact_ids_sha256") if isinstance(snapshot, dict) else None
     if not expected:
         return unavailable("FINANCIAL_SNAPSHOT_STALE")
-    actual = _canonical_snapshot_digest(sorted(item.fact_id for item in canonical.research_facts))
+    actual = _canonical_snapshot_digest(sorted(item.fact_id for item in admitted.facts))
     if str(expected) != actual:
         return unavailable("FINANCIAL_SNAPSHOT_STALE")
-    return tuple(canonical.research_facts)
+    expected_semantics = snapshot.get("financial_semantics_sha256")
+    if expected_semantics:
+        from .application.research_snapshot import financial_semantics_digest
+        if str(expected_semantics) != financial_semantics_digest(admitted.fact_dicts):
+            return unavailable("FINANCIAL_SNAPSHOT_STALE")
+    return admitted.facts
 
 
 def _reporting_currency_identity(

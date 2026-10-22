@@ -44,7 +44,20 @@ class ClaimValidation:
     repairability: str
 
     def to_dict(self):
-        return asdict(self)
+        return {**asdict(self), **claim_presentation(self.state, self.normalized_claim)}
+
+
+def claim_presentation(state: str, claim: Any) -> dict[str, Any]:
+    """Host-owned display status, independent of financial admission."""
+    body = claim if isinstance(claim, dict) else {}
+    has_text = any(isinstance(body.get(key), str) and body[key].strip()
+                   for key in ("text", "conclusion", "argument"))
+    return {
+        "display_eligible": has_text and state != "contradicted",
+        "display_state": "verified" if state in {"numeric_verified", "text_supported"}
+                         else "conflict" if state == "contradicted" else "pending_verification",
+        "calculation_eligible": state == "numeric_verified",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +147,9 @@ class ClaimRepairContract:
         if digest(candidate) != plan.candidate_digest:
             raise ValueError("CLAIM_REPAIR_CANDIDATE_STALE")
         entries = [{**asdict(target), "original_claim": read_pointer(candidate, target.path)} for target in plan.targets]
-        return user_prompt + "\n\n[OpenThesis claim-path-repair-v1]\n" + json.dumps({
+        # Targeted evidence is provided by the host contract. Copying the
+        # original full research prompt makes a local patch cost a full study.
+        return "[OpenThesis claim-path-repair-v1]\n" + json.dumps({
             "candidate_digest": plan.candidate_digest, "validator_version": plan.validator_version,
             "targets": entries,
             "repair_material": self.repair_material(plan.targets) if self.repair_material else {},

@@ -315,6 +315,7 @@ def readiness_for_report_artifact(
     *,
     failed: bool = False,
     run_status: str = "",
+    trusted_nodes=None,
 ) -> dict[str, Any] | None:
     """Use the persisted shared result, or conservatively assess legacy data."""
     if not isinstance(artifact, dict):
@@ -362,15 +363,16 @@ def readiness_for_report_artifact(
                                if isinstance(record, dict) and record.get("evidence_id")} if isinstance(evidence, list) else {}
                 elif item_type == "deterministic-valuation":
                     valuation = payload
-            verification = content.get("verification")
+            from .report_content import coverage_content_view
+            coverage_report, verification = coverage_content_view(artifact, artifacts, trusted_nodes=trusted_nodes)
             coverage = ResearchCoverageContract().assess(
-                content.get("report", content), verification,
+                coverage_report, verification,
                 evidence_records=sources, metrics=metrics, valuation=valuation, company=company,
                 financial_period_coverage=financial_period_coverage,
             )
             mode = str(content.get("mode", ""))
             readiness = assess_report_readiness(
-                content.get("report", content), verification,
+                coverage_report, verification,
                 missing_stages=() if mode == "ot-workflow" else missing_research_stages(artifacts),
                 financial_evidence_count=financial_source_evidence_count(artifacts),
                 allow_complete=mode in {"synthesized", "ot-workflow"}, coverage=coverage,

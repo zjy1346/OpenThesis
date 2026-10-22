@@ -15,7 +15,13 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from openthesis.domain import Company, EvidenceRef, FilingDocument, FinancialFact
+from openthesis.domain import (
+    Company,
+    EvidenceRef,
+    FilingDocument,
+    FinancialFact,
+    FinancialNormalizationLineage,
+)
 from openthesis.financial_ingestion import (
     FinancialIngestionEngine,
     FinancialGroupValidation,
@@ -38,7 +44,6 @@ from openthesis.financial_ingestion import (
     _known_label,
     _revenue_group_total_rows,
     _net_income_candidate_allowed,
-    _net_income_candidate_priority,
     _is_narrative_date_header,
     _LABELS,
     _attribution_context,
@@ -56,9 +61,11 @@ from openthesis.financial_ingestion import (
     _PDF_PARSER_VERSION,
     parse_financial_pages,
 )
-from openthesis.financial_compiler import CompilerPolicy, FinancialFactCompiler, _prefetch_vision_batches
+from openthesis.financial_pipeline import (CollectionPolicy as CompilerPolicy, FinancialCandidatePipeline as FinancialFactCompiler)
+from openthesis.financial_sources import _prefetch_vision_batches
 from openthesis.financial_compatibility import FinancialRulesSnapshot
 from openthesis.financials import calculate_interim_metrics
+from openthesis.financial_taxonomy import profit_row_concept
 from openthesis.market_financials import FinancialValidation, ValidationStatus
 from openthesis.vision_financials import VisionExtractionResult, VisionFallbackConfig, VisionPageRequest
 
@@ -66,7 +73,9 @@ from openthesis.vision_financials import VisionExtractionResult, VisionFallbackC
 CATL_SOURCE_URL = "https://static.cninfo.com.cn/finalpage/2026-03-10/1225002214.PDF"
 CATL_EXPECTED = {
     "revenue": 423_701_834_000.0,
-    "net_income": 72_201_282_000.0,
+    "net_income": 76_786_309_000.0,
+    "parent_net_income": 72_201_282_000.0,
+    "minority_interest_profit": 4_585_027_000.0,
     "operating_cash_flow": 133_219_982_000.0,
     "assets": 974_827_544_000.0,
     "liabilities": 603_801_220_000.0,
@@ -139,6 +148,16 @@ def _filing(document_id: str = "cninfo:1225002214", *, period: str = "FY", end: 
     return FilingDocument(document_id, _company().security_id, document_id.split(":")[-1], "ANNUAL_REPORT" if period == "FY" else "INTERIM_REPORT", period, end, f"{filed_year}-03-09T16:00:00+00:00", "2025年年度报告" if period == "FY" else "2026年半年度报告", CATL_SOURCE_URL, local_path=path, content_hash="hash")
 
 
+def _write_minimal_pdf_fixture(path: Path) -> Path:
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    with path.open("wb") as output:
+        writer.write(output)
+    return path
+
+
 def _hk_company(symbol: str, name: str, issuer: str, standard: str) -> Company:
     return Company(f"HK:SEHK:{symbol}", symbol, name, "SEHK", issuer, "HK", f"HK:SEHK:{symbol}", "CNY", "CNY", standard)
 
@@ -163,20 +182,41 @@ def _core(filing: FilingDocument, scale: float = 1.0) -> tuple[FinancialFact, ..
 def _pdf_core_with_evidence(
     filing: FilingDocument, scale: float = 1.0,
 ) -> tuple[list[FinancialFact], list[EvidenceRef]]:
-    """Build a parser-shaped batch with explicit ingest/fact identity links."""
+    """Build a parser-shaped batch with explicit row and unit proofs.
+
+    This is deliberately a structured-provider fixture, not a bare list of
+    numbers: every monetary value has a source-row relation and a bound unit
+    declaration, matching the admission contract used by real providers.
+    """
 
     facts = [
-        replace(fact, fact_id=f"ingest:fixture-{index}")
+        replace(
+            fact,
+            fact_id=f"ingest:fixture-{index}",
+            parser_version="official-structured-fixture-v1",
+            normalization_lineage=FinancialNormalizationLineage(
+                raw_value=str(fact.value),
+                scale="1",
+                normalized_value=str(fact.value),
+                quantity_kind="money",
+                currency=fact.currency,
+                unit_evidence_ids=(f"unit:fixture-{index}",),
+            ),
+        )
         for index, fact in enumerate(_core(filing, scale), 1)
     ]
-    refs = [
-        EvidenceRef(
+    refs: list[EvidenceRef] = []
+    for index, fact in enumerate(facts, 1):
+        refs.append(EvidenceRef(
             f"fact:fixture-{index}", filing.document_id, filing.source_url,
             fact.concept, f"page:{fact.source_page or 0}", fact.raw_text,
             filing.filed_at, filing.content_hash, fact.source_bbox,
-        )
-        for index, fact in enumerate(facts, 1)
-    ]
+        ))
+        refs.append(EvidenceRef(
+            f"unit:fixture-{index}", filing.document_id, filing.source_url,
+            "Explicit unit declaration", f"page:{fact.source_page or 0}",
+            "Unit: CNY", filing.filed_at, filing.content_hash, fact.source_bbox,
+        ))
     return facts, refs
 
 
@@ -186,22 +226,147 @@ def _row(*cells: tuple[str, float, float]) -> PdfRowAST:
     return PdfRowAST(parsed, 10, (min(c.x0 for c in parsed), 10, max(c.x1 for c in parsed), 20))
 
 
-def _formal_rows(title: str = "Consolidated balance sheet") -> tuple[PdfRowAST, ...]:
+def _formal_rows(
+    title: str = "Consolidated balance sheet", *, unit_text: str = ""
+) -> tuple[PdfRowAST, ...]:
+    title_cells = [(title, 10, 180)]
+    if unit_text:
+        title_cells.append((unit_text, 200, 350))
     return (
-        _row((title, 10, 180)),
+        _row(*title_cells),
         _row(("2025", 100, 140), ("2024", 220, 260)),
         _row(("Revenue", 10, 80), ("100", 100, 140), ("90", 220, 260)),
     )
 
 
 class FinancialIngestionEngineTests(unittest.TestCase):
+    def _assert_profit_split(
+        self,
+        values: dict[str, FinancialFact],
+        *,
+        total: float,
+        parent: float,
+        minority: float,
+        pages: dict[str, int],
+        fiscal_year: int,
+        fiscal_period: str,
+        end_date: str,
+        unit_scale: float,
+        currency: str = "CNY",
+    ) -> None:
+        expected = {
+            "net_income": total,
+            "parent_net_income": parent,
+            "minority_interest_profit": minority,
+        }
+        for concept, number in expected.items():
+            fact = values[concept]
+            self.assertAlmostEqual(fact.value, number, places=2)
+            self.assertEqual(
+                (
+                    fact.fiscal_year,
+                    fact.fiscal_period,
+                    fact.end_date,
+                    fact.consolidated_scope,
+                    fact.currency,
+                    fact.unit_scale,
+                    fact.source_page,
+                ),
+                (fiscal_year, fiscal_period, end_date, "consolidated", currency, unit_scale, pages[concept]),
+            )
+            self.assertTrue(fact.source_bbox and fact.raw_text and fact.statement)
+        self.assertAlmostEqual(
+            values["net_income"].value,
+            values["parent_net_income"].value + values["minority_interest_profit"].value,
+            places=2,
+        )
+
+    def test_public_projection_keeps_hidden_comparator_out_of_primary_facts(self) -> None:
+        filing = _filing("projection-comparator", end="2025-12-31")
+        current = _core(filing)
+        comparator = replace(
+            current[0],
+            fact_id=f"{current[0].fact_id}:comparator",
+            value=900.0,
+            fiscal_year=2024,
+            start_date="2024-01-01",
+            period_start="2024-01-01",
+            end_date="2024-12-31",
+            usage_status="comparator",
+        )
+        source = InMemoryFinancialSource({
+            filing.document_id: (*current, comparator),
+        })
+        with patch(
+            "openthesis.financial_ingestion._parse_local_pdfs_bounded",
+            return_value={filing.document_id: ([], [], None)},
+        ):
+            dataset = FinancialIngestionEngine().ingest(
+                _company(), [filing], structured_sources=(source,)
+            )
+
+        self.assertEqual(dataset.status, ValidationStatus.VERIFIED)
+        self.assertEqual({fact.fiscal_year for fact in dataset.accepted_facts}, {2025})
+        self.assertEqual(
+            {fact.concept: fact.value for fact in dataset.accepted_facts}["revenue"],
+            1000.0,
+        )
+        self.assertTrue(any(
+            group.identity[1] == "2024-12-31"
+            for group in dataset.group_validations
+        ))
+
+    def test_public_projection_keeps_explicit_prior_filing_for_yoy_metrics(self) -> None:
+        latest = _filing("q1-2026", period="Q1", end="2026-03-31")
+        prior = _filing("q1-2025", period="Q1", end="2025-03-31")
+        source = InMemoryFinancialSource({
+            latest.document_id: _core(latest),
+            prior.document_id: _core(prior),
+        })
+        with patch(
+            "openthesis.financial_ingestion._parse_local_pdfs_bounded",
+            return_value={
+                latest.document_id: ([], [], None),
+                prior.document_id: ([], [], None),
+            },
+        ):
+            dataset = FinancialIngestionEngine().ingest(
+                _company(), [latest, prior], structured_sources=(source,)
+            )
+
+        self.assertEqual(
+            {fact.fiscal_year for fact in dataset.accepted_facts},
+            {2025, 2026},
+            msg={
+                "accepted": [
+                    (fact.accession_number, fact.end_date, fact.fiscal_period, fact.usage_status)
+                    for fact in dataset.accepted_facts
+                ],
+                "groups": [
+                    (
+                        group.identity,
+                        group.validation.status.value,
+                        group.validation.issues,
+                        [fact.concept for fact in group.validation.accepted],
+                    )
+                    for group in dataset.group_validations
+                ],
+                "diagnostics": dataset.diagnostics,
+            },
+        )
+
     def test_pdf_candidates_bind_shuffled_evidence_by_canonical_relation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "facts.pdf"
             path.write_bytes(b"pdf")
             filing = _filing("shuffled", path=str(path))
             first = replace(_fact(filing, "revenue", 100.0), fact_id="ingest:alpha", raw_text="Revenue alpha")
-            second = replace(_fact(filing, "assets", 200.0), fact_id="ingest:beta", raw_text="Assets beta")
+            # Keep the shuffled identity test source-valid: the beta evidence
+            # is deliberately on page 2, so its fact must name that same page.
+            second = replace(
+                _fact(filing, "assets", 200.0), source_page=2,
+                fact_id="ingest:beta", raw_text="Assets beta",
+            )
             first_ref = EvidenceRef(
                 "fact:alpha", filing.document_id, filing.source_url, "Revenue",
                 "page:1", "Revenue alpha", filing.filed_at,
@@ -295,7 +460,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                 Page("净资产收益率及每股收益 加权平均净资产收益率（%）"),
             ]
 
-        with patch("pypdf.PdfReader", return_value=Reader()):
+        with patch("pypdf.PdfReader", return_value=Reader()), \
+                patch(
+                    "openthesis.financial_ingestion.mp.current_process",
+                    return_value=types.SimpleNamespace(daemon=True),
+                ):
             selected = _candidate_financial_pages("annual.pdf")
         self.assertEqual(selected, frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10}))
 
@@ -336,7 +505,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         document = Document()
         fake_pdfium = type("Pdfium", (), {"PdfDocument": staticmethod(lambda _path: document)})
         with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
-                patch("pypdf.PdfReader") as reader:
+                patch("pypdf.PdfReader") as reader, \
+                patch(
+                    "openthesis.financial_ingestion.mp.current_process",
+                    return_value=types.SimpleNamespace(daemon=True),
+                ):
             selected = _candidate_financial_pages("annual.pdf")
         self.assertEqual(selected, frozenset({1, 2, 3, 4, 5, 6, 7}))
         self.assertTrue(document.closed)
@@ -369,7 +542,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
 
         fake_pdfium = type("Pdfium", (), {"PdfDocument": staticmethod(lambda _path: IncompleteDocument())})
         with patch.dict(sys.modules, {"pypdfium2": fake_pdfium}), \
-                patch("pypdf.PdfReader", return_value=PdfReader()):
+                patch("pypdf.PdfReader", return_value=PdfReader()), \
+                patch(
+                    "openthesis.financial_ingestion.mp.current_process",
+                    return_value=types.SimpleNamespace(daemon=True),
+                ):
             selected = _candidate_financial_pages("annual.pdf")
         self.assertEqual(selected, frozenset({1, 2, 3}))
 
@@ -660,6 +837,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             def parse(self, _path, _company, item, _manifest, **_kwargs):
                 calls.append(item.document_id)
                 fact = _fact(item, "revenue", 100)
+                fact.parser_version = _PDF_PARSER_VERSION
                 return [fact], [self._evidence_for_fact(fact, item)]
 
             manifests = {filing.document_id: _manifest_for(filing)}
@@ -689,6 +867,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             engine = FinancialIngestionEngine(cache_dir=cache_dir)
             key = engine._parse_cache_key(str(path), _company(), filing, filing.content_hash)
             fact = _fact(filing, "revenue", 100)
+            fact.parser_version = _PDF_PARSER_VERSION
             engine._store_parse_cache(key, [fact], [])
             payload_path = cache_dir / f"{key}.json"
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -747,8 +926,10 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                 filing.content_hash = f"hash-{index}"
                 paths.append(path)
                 filings.append(filing)
-            duplicate = _filing("parallel-duplicate", path=str(paths[0]))
-            duplicate.content_hash = filings[0].content_hash
+            # A repeated input must carry the exact same filing identity.  A
+            # different accession/document id with the same bytes is a
+            # separate original and must not exercise the cache de-dup path.
+            duplicate = replace(filings[0])
             filings.append(duplicate)
 
             engine = FinancialIngestionEngine()
@@ -770,6 +951,30 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertLessEqual(maximum, 3)
             self.assertEqual(calls, [f"parallel-{index}" for index in range(6)])
             self.assertEqual(len(dataset.manifest), 7)
+
+    def test_same_bytes_with_distinct_filing_identity_are_parsed_independently(self) -> None:
+        """Content equality must not merge distinct official filing identities."""
+        calls: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "identity-a.pdf"
+            second_path = Path(directory) / "identity-b.pdf"
+            first_path.write_bytes(b"same-official-bytes")
+            second_path.write_bytes(b"same-official-bytes")
+            first = _filing("identity-a", path=str(first_path))
+            second = _filing("identity-b", path=str(second_path))
+            self.assertEqual(first.content_hash, second.content_hash)
+
+            engine = FinancialIngestionEngine()
+
+            def parse(path, company, filing, manifest):
+                calls.append(filing.document_id)
+                return [], []
+
+            with patch.object(engine, "_parse_pdf_ast", side_effect=parse):
+                dataset = engine.ingest(_company(), [first, second])
+
+        self.assertEqual(calls, [first.document_id, second.document_id])
+        self.assertEqual(len(dataset.manifest), 2)
 
     def test_bounded_pdf_helper_skips_cancelled_unstarted_work(self) -> None:
         cancel = threading.Event()
@@ -895,8 +1100,10 @@ class FinancialIngestionEngineTests(unittest.TestCase):
 
         filing = _filing("mapped-scan", path="placeholder.pdf")
         config = VisionFallbackConfig(enabled=True, consent=True, max_pages=20)
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
-            actual = filing.__class__(**{**filing.to_dict(), "local_path": handle.name})
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = _write_minimal_pdf_fixture(Path(directory) / "mapped-scan.pdf")
+            actual = replace(filing, local_path=str(source_path),
+                             content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest())
             with patch("pypdf.PdfReader", Reader), patch("pypdf.PdfWriter", Writer):
                 selected = _vision_failed_pages(
                     actual, config, ("balance_sheet_core_missing",), ()
@@ -953,7 +1160,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                         scope="consolidated", entity=subject.name, market="CN_A",
                         statement=statement, period_start=start_date,
                         consolidated_scope="consolidated", currency="CNY",
-                        unit_scale=1.0, unit_provenance="explicit",
+                        unit_scale=1.0, unit_provenance="vision_explicit",
                         source_document=source_filing.primary_document,
                         source_page=source_page,
                         raw_text=f"verified fixture {concept} {value}",
@@ -985,7 +1192,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
                     timeout_seconds=180,
                 ),
             )
-        self.assertEqual(set(uploaded_pages), {120, 121, 122, 123, 124, 127, 128})
+        selected_pages = set(uploaded_pages)
+        required_statement_pages = {120, 121, 122, 123, 124, 127, 128}
+        self.assertTrue(required_statement_pages.issubset(selected_pages))
+        self.assertLessEqual(len(selected_pages), 20)
+        self.assertEqual(len(uploaded_pages), len(selected_pages))
         self.assertEqual(
             dataset.status,
             ValidationStatus.VERIFIED,
@@ -1036,18 +1247,28 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             if fact.concept == "operating_cash_flow"
             and fact.end_date == "2025-12-31"
         ]
-        self.assertEqual(len(ocf), 1)
-        self.assertEqual(ocf[0].consolidated_scope, "consolidated")
-        self.assertAlmostEqual(ocf[0].value, 2_171_648_865.00, places=2)
-        self.assertNotEqual(ocf[0].value, -2_062_782_904.35)
+        self.assertEqual(len(ocf), 2)
+        ocf_by_scope = {
+            scope: [fact for fact in ocf if fact.consolidated_scope == scope]
+            for scope in ("consolidated", "parent")
+        }
+        self.assertEqual({fact.consolidated_scope for fact in ocf}, {"consolidated", "parent"})
+        self.assertTrue(all(len(scoped) == 1 for scoped in ocf_by_scope.values()))
+        self.assertAlmostEqual(ocf_by_scope["consolidated"][0].value, 2_171_648_865.00, places=2)
+        self.assertNotEqual(ocf_by_scope["consolidated"][0].value, -2_062_782_904.35)
         prior_ocf = [
             fact for fact in facts
             if fact.concept == "operating_cash_flow"
             and fact.end_date == "2024-12-31"
         ]
-        self.assertEqual(len(prior_ocf), 1)
-        self.assertEqual(prior_ocf[0].usage_status, "comparator")
-        self.assertNotEqual(prior_ocf[0].fact_id, ocf[0].fact_id)
+        prior_by_scope = {
+            scope: [fact for fact in prior_ocf if fact.consolidated_scope == scope]
+            for scope in ("consolidated", "parent")
+        }
+        self.assertEqual({fact.consolidated_scope for fact in prior_ocf}, {"consolidated", "parent"})
+        self.assertTrue(all(len(scoped) == 1 for scoped in prior_by_scope.values()))
+        self.assertTrue(all(fact.usage_status == "comparator" for fact in prior_ocf))
+        self.assertNotEqual(prior_by_scope["consolidated"][0].fact_id, ocf_by_scope["consolidated"][0].fact_id)
 
     def test_pdf_prescan_falls_back_to_full_parse_when_statement_index_is_incomplete(self) -> None:
         class Page:
@@ -1098,8 +1319,10 @@ class FinancialIngestionEngineTests(unittest.TestCase):
 
         filing = _filing("cninfo:vision-boundary", path="placeholder.pdf")
         config = VisionFallbackConfig(enabled=True, consent=True, max_pages=20)
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
-            actual = filing.__class__(**{**filing.to_dict(), "local_path": handle.name})
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = _write_minimal_pdf_fixture(Path(directory) / "vision-boundary.pdf")
+            actual = replace(filing, local_path=str(source_path),
+                             content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest())
             with patch("pypdf.PdfReader", Reader), patch("pypdf.PdfWriter", Writer):
                 selected = _vision_failed_pages(
                     actual, config, ("balance_sheet_core_missing",), ()
@@ -1135,13 +1358,63 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         filing = _filing("cninfo:vision-missing-cash", path="placeholder.pdf")
         existing = [fact for fact in _core(filing) if fact.statement != "cash_flow"]
         config = VisionFallbackConfig(enabled=True, consent=True, max_pages=20)
-        with tempfile.NamedTemporaryFile(suffix=".pdf") as handle:
-            actual = filing.__class__(**{**filing.to_dict(), "local_path": handle.name})
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = _write_minimal_pdf_fixture(Path(directory) / "vision-missing-cash.pdf")
+            actual = replace(filing, local_path=str(source_path),
+                             content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest())
             with patch("pypdf.PdfReader", Reader), patch("pypdf.PdfWriter", Writer):
                 selected = _vision_failed_pages(
                     actual, config, ("cash_flow_core_missing",), existing
                 )
         self.assertEqual([page.original_page for page in selected], [5, 6])
+
+    def test_vision_page_selection_adds_bounded_segment_and_capex_note_pages(self) -> None:
+        class Page:
+            def __init__(self, text: str):
+                self.text = text
+            def extract_text(self):
+                return self.text
+
+        pages = [
+            Page("Consolidated income statement"),
+            Page("Revenue and profit continued"),
+            Page("Consolidated balance sheet"),
+            Page("Assets and liabilities continued"),
+            Page("Consolidated statement of cash flows"),
+            Page("Operating cash flow continued"),
+            Page("Note 28: Business segment information; segment revenue by operating segment"),
+            Page("Note 31: Purchases of property, plant and equipment and capital expenditure"),
+            Page("Unrelated shareholder meeting schedule and contact information"),
+        ]
+
+        class Reader:
+            def __init__(self, _path):
+                self.pages = pages
+
+        class Writer:
+            def add_page(self, _page):
+                pass
+            def write(self, buffer):
+                buffer.write(b"page")
+
+        filing = _filing("cninfo:vision-related-notes", path="placeholder.pdf")
+        config = VisionFallbackConfig(enabled=True, consent=True, max_pages=8)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = _write_minimal_pdf_fixture(Path(directory) / "vision-related-notes.pdf")
+            actual = replace(filing, local_path=str(source_path),
+                             content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest())
+            with patch("pypdf.PdfReader", Reader), patch("pypdf.PdfWriter", Writer):
+                selected = _vision_failed_pages(
+                    actual,
+                    config,
+                    ("income_statement_core_missing", "cash_flow_core_missing"),
+                    (),
+                )
+        selected_numbers = [page.original_page for page in selected]
+        self.assertIn(7, selected_numbers)
+        self.assertIn(8, selected_numbers)
+        self.assertNotIn(9, selected_numbers)
+        self.assertLessEqual(len(selected), 8)
 
     def test_vision_prefetch_runs_two_filings_concurrently_and_preserves_order(self) -> None:
         filings = [_filing("vision-prefetch-1"), _filing("vision-prefetch-2")]
@@ -1350,6 +1623,53 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(by_end["2023-12-31"]["status"], "accepted")
         self.assertEqual(profile.rejected_periods[0]["period_end"], "2022-12-31")
         self.assertTrue(all(item["end_date"] != "2022-12-31" for item in profile.fact_dicts))
+
+    def test_rejected_same_filing_comparator_does_not_reject_verified_target_period(self) -> None:
+        """A broken comparative column must not quarantine the filing's target column."""
+
+        filing = _filing("cninfo:target-with-bad-comparator", end="2025-12-31")
+        target_facts = _core(filing)
+        target_group = FinancialGroupValidation(
+            (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"),
+            FinancialValidation(
+                ValidationStatus.VERIFIED,
+                (),
+                frozenset(fact.concept for fact in target_facts),
+                accepted=target_facts,
+            ),
+        )
+        comparator_facts = tuple(
+            replace(
+                fact,
+                fact_id=f"{fact.fact_id}:bad-comparator",
+                fiscal_year=2024,
+                end_date="2024-12-31",
+                usage_status="comparator",
+                validation_status=ValidationStatus.REJECTED.value,
+            )
+            for fact in target_facts
+        )
+        comparator_group = FinancialGroupValidation(
+            (filing.accession_number, "2024-12-31", "FY", "consolidated", "CNY"),
+            FinancialValidation(
+                ValidationStatus.REJECTED,
+                ("balance_sheet_imbalance",),
+                frozenset(fact.concept for fact in comparator_facts),
+                quarantined=comparator_facts,
+            ),
+        )
+
+        profile = build_financial_profile(
+            target_facts,
+            (target_group, comparator_group),
+            "CNY",
+            selected_filings=(filing,),
+        )
+
+        self.assertEqual({fact["end_date"] for fact in profile.fact_dicts}, {"2025-12-31"})
+        self.assertEqual(profile.period_continuity[0]["status"], "accepted")
+        self.assertEqual(profile.period_continuity[0]["period_end"], "2025-12-31")
+        self.assertFalse(profile.rejected_periods)
     def test_page_context_summary_does_not_leak_to_next_page(self) -> None:
         summary_rows = (_row(("加权平均净资产收益率", 10, 180), ("20%", 220, 260)),)
         summary = _page_sections(None, "加权平均净资产收益率", summary_rows, 1, "CNY")
@@ -1364,7 +1684,10 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(second, ())
 
     def test_formal_table_continuation_inherits_for_two_pages_then_resets(self) -> None:
-        first = _page_sections(None, "Consolidated balance sheet thousand CNY", _formal_rows(), 1, "CNY")
+        first = _page_sections(
+            None, "Consolidated balance sheet thousand CNY",
+            _formal_rows(unit_text="Unit: CNY thousand"), 1, "CNY",
+        )
         self.assertEqual(first[-1].context.multiplier, 1000.0)
         second = _page_sections(first[-1].context, "", (_formal_rows()[2],), 2, "CNY")
         self.assertTrue(second and second[0].inherited)
@@ -1376,13 +1699,16 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(fourth, ())
 
     def test_parent_title_splits_same_page_table_boundary(self) -> None:
-        rows = _formal_rows()[:2] + (_formal_rows()[2],) + _formal_rows("资产负债表")[0:1] + (_formal_rows()[2],)
+        rows = _formal_rows(unit_text="Unit: CNY thousand") + _formal_rows("资产负债表")[0:1] + (_formal_rows()[2],)
         sections = _page_sections(None, "Consolidated balance sheet 资产负债表", rows, 1, "CNY")
         self.assertEqual([(s.context.statement, s.context.scope) for s in sections], [("balance_sheet", "consolidated"), ("balance_sheet", "parent")])
         self.assertNotIn("Parent balance sheet", sections[0].rows[-1].text)
 
     def test_missing_unit_on_continuation_does_not_override_explicit_scale(self) -> None:
-        first = _page_sections(None, "Consolidated balance sheet thousand CNY", _formal_rows(), 1, "CNY")
+        first = _page_sections(
+            None, "Consolidated balance sheet thousand CNY",
+            _formal_rows(unit_text="Unit: CNY thousand"), 1, "CNY",
+        )
         second = _page_sections(first[-1].context, "", (_formal_rows()[2],), 2, "CNY")
         self.assertTrue(second)
         self.assertEqual(second[0].context.multiplier, 1000.0)
@@ -1399,20 +1725,24 @@ class FinancialIngestionEngineTests(unittest.TestCase):
 
     def test_explicit_table_unit_has_explicit_provenance(self) -> None:
         sections = _page_sections(
-            None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY"
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 1, "CNY",
         )
         self.assertTrue(sections)
         self.assertEqual(sections[0].context.unit_provenance, "explicit")
 
     def test_new_parent_table_resets_unit_provenance(self) -> None:
-        first = _page_sections(None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY")
+        first = _page_sections(
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 1, "CNY",
+        )
         second = _page_sections(
             first[0].context, "母公司利润表", _formal_rows("母公司利润表"), 2, "CNY"
         )
         self.assertTrue(second)
         self.assertEqual(second[0].context.unit_provenance, "unknown")
 
-    def test_unknown_pdf_unit_provenance_is_fatal_for_core_fact(self) -> None:
+    def test_unknown_pdf_unit_provenance_quarantines_all_monetary_facts(self) -> None:
         filing = _filing("unknown-pdf-unit")
         facts = list(_core(filing))
         for fact in facts:
@@ -1425,6 +1755,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         )
         self.assertEqual(result.validation.status, ValidationStatus.REJECTED)
         self.assertIn("unit_provenance_missing", result.validation.issues)
+        self.assertFalse(result.validation.accepted)
+        self.assertEqual(
+            {fact.fact_id for fact in result.validation.quarantined},
+            {fact.fact_id for fact in facts},
+        )
 
     def test_eps_bare_yuan_does_not_reset_untitled_continuation_unit(self) -> None:
         bare_scale, bare_currency, bare_explicit = _explicit_unit_info(
@@ -1439,7 +1774,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         first = _page_sections(
             None,
             "合并利润表 单位：人民币千元",
-            _formal_rows("合并利润表"),
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"),
             1,
             "CNY",
         )
@@ -1460,7 +1795,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
 
     def test_titled_income_continuation_inherits_unit_and_period_context(self) -> None:
         first_rows = (
-            _row(("合并利润表", 10, 180)),
+            _row(("合并利润表", 10, 180), ("单位：人民币千元", 200, 350)),
             _row(("2021", 100, 140), ("2020", 220, 260)),
             _row(("净利润", 10, 80), ("100", 100, 140), ("90", 220, 260)),
         )
@@ -1484,7 +1819,10 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertTrue(continuation[0].inherited)
 
     def test_same_statement_without_continuation_title_does_not_inherit_unit(self) -> None:
-        first = _page_sections(None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY")
+        first = _page_sections(
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 1, "CNY",
+        )
         second = _page_sections(
             first[0].context, "合并利润表", _formal_rows("合并利润表"), 2, "CNY"
         )
@@ -1492,8 +1830,37 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(second[0].context.multiplier, 1.0)
         self.assertFalse(second[0].context.unit_explicit)
 
+    def test_consolidated_financial_chapter_unit_crosses_statement_boundary(self) -> None:
+        income = _page_sections(
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 10, "CNY",
+        )[0].context
+        balance = _page_sections(
+            income, "合并资产负债表", _formal_rows("合并资产负债表"),
+            12, "CNY", chapter_unit=income,
+        )
+        self.assertTrue(balance)
+        self.assertEqual(balance[0].context.multiplier, 1000.0)
+        self.assertEqual(balance[0].context.unit_provenance, "chapter_inherited")
+
+    def test_chapter_unit_never_leaks_into_parent_statement(self) -> None:
+        income = _page_sections(
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 10, "CNY",
+        )[0].context
+        parent = _page_sections(
+            income, "母公司资产负债表", _formal_rows("母公司资产负债表"),
+            11, "CNY", chapter_unit=income,
+        )
+        self.assertTrue(parent)
+        self.assertEqual(parent[0].context.multiplier, 1.0)
+        self.assertEqual(parent[0].context.unit_provenance, "unknown")
+
     def test_changed_scope_does_not_inherit_continuation_unit(self) -> None:
-        first = _page_sections(None, "合并利润表 单位：人民币千元", _formal_rows("合并利润表"), 1, "CNY")
+        first = _page_sections(
+            None, "合并利润表 单位：人民币千元",
+            _formal_rows("合并利润表", unit_text="单位：人民币千元"), 1, "CNY",
+        )
         second = _page_sections(
             first[0].context, "母公司利润表（续）", _formal_rows("母公司利润表"), 2, "CNY"
         )
@@ -1502,7 +1869,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(second[0].context.multiplier, 1.0)
         self.assertFalse(second[0].context.unit_explicit)
 
-    def test_same_statement_unit_scale_mismatch_is_fatal(self) -> None:
+    def test_same_statement_unit_scale_mismatch_isolates_only_affected_facts(self) -> None:
         filing = _filing("scale-mismatch")
         facts = list(_core(filing))
         revenue = _fact(
@@ -1516,8 +1883,14 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         facts[facts.index(next(item for item in facts if item.concept == "net_income"))] = net_income
         identity = (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY")
         result = FinancialIngestionEngine().validate_group(facts, identity)
-        self.assertEqual(result.validation.status, ValidationStatus.REJECTED)
+        self.assertEqual(result.validation.status, ValidationStatus.READY_WITH_WARNINGS)
         self.assertIn("statement_unit_scale_inconsistent", result.validation.issues)
+        accepted = {fact.concept for fact in result.validation.accepted}
+        self.assertNotIn("revenue", accepted)
+        self.assertNotIn("net_income", accepted)
+        self.assertIn("operating_cash_flow", accepted)
+        self.assertIn("assets", accepted)
+        self.assertTrue(result.validation.quarantined)
 
     def test_mixed_normalized_sources_do_not_trigger_unit_scale_issue(self) -> None:
         filing = _filing("mixed-source")
@@ -1548,6 +1921,110 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected.text, "24.91%")
         self.assertTrue(_is_summary_page("", rows))
+
+    def test_wrapped_total_equity_keeps_comparator_and_never_uses_share_capital(self) -> None:
+        def positioned_row(top: float, *cells: tuple[str, float, float]) -> PdfRowAST:
+            parsed = tuple(
+                PdfCellAST(text, x0, top, x0 + width, top + 8)
+                for text, x0, width in cells
+            )
+            return PdfRowAST(
+                parsed,
+                top,
+                (
+                    min(cell.x0 for cell in parsed),
+                    top,
+                    max(cell.x1 for cell in parsed),
+                    top + 8,
+                ),
+            )
+
+        rows = (
+            positioned_row(0, ("合并资产负债表", 90, 120)),
+            positioned_row(14, ("单位：元", 90, 45)),
+            positioned_row(
+                28,
+                ("项目", 90, 30),
+                ("2025年12月31日", 315, 95),
+                ("2024年12月31日", 436, 95),
+            ),
+            positioned_row(
+                42,
+                ("资产总计", 90, 40),
+                ("303,834,844,021.44", 315, 95),
+                ("298,944,579,918.70", 436, 95),
+            ),
+            positioned_row(
+                56,
+                ("负债合计", 90, 40),
+                ("49,875,590,112.37", 315, 95),
+                ("56,933,264,798.10", 436, 95),
+            ),
+            positioned_row(70, ("所有者权益（或股东权益）：", 90, 140)),
+            positioned_row(
+                84,
+                ("实收资本（或股本）", 100, 95),
+                ("37", 254, 12),
+                ("1,252,270,215.00", 326, 85),
+                ("1,256,197,800.00", 447, 85),
+            ),
+            positioned_row(100, ("所有者权益（或股东权", 110.9, 105)),
+            positioned_row(
+                107,
+                ("253,959,253,909.07", 315.8, 95),
+                ("242,011,315,120.60", 436.4, 95),
+            ),
+            positioned_row(114, ("益）合计", 89.9, 42)),
+        )
+
+        class FakePage:
+            def extract_words(self, **_kwargs):
+                return [
+                    {
+                        "text": cell.text,
+                        "x0": cell.x0,
+                        "top": cell.top,
+                        "x1": cell.x1,
+                        "bottom": cell.bottom,
+                    }
+                    for row in rows
+                    for cell in row.cells
+                ]
+
+            def extract_text(self):
+                return "\n".join(row.text for row in rows)
+
+        class FakePdf:
+            pages = (FakePage(),)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        company = _company()
+        filing = _filing("wrapped-equity-comparator", path="fixture.pdf")
+        with patch("pdfplumber.open", return_value=FakePdf()):
+            facts, _evidence = FinancialIngestionEngine().extract_pdf_candidates(
+                "fixture.pdf",
+                company,
+                filing,
+                candidate_pages=frozenset({1}),
+            )
+
+        total_equity = [fact for fact in facts if fact.concept == "total_equity"]
+        self.assertFalse(
+            [fact for fact in total_equity if "实收资本" in fact.raw_text],
+            "an equity-section heading must not make share capital a total-equity fact",
+        )
+        prior_total = [
+            fact for fact in total_equity
+            if fact.end_date == "2024-12-31" and fact.usage_status == "comparator"
+        ]
+        self.assertEqual(len(prior_total), 1)
+        self.assertAlmostEqual(prior_total[0].value, 242_011_315_120.60, places=2)
+        self.assertIn("益）合计", prior_total[0].raw_text)
 
     def test_formal_statement_candidate_outranks_summary_candidate(self) -> None:
         filing = _filing("rank")
@@ -1703,15 +2180,13 @@ class FinancialIngestionEngineTests(unittest.TestCase):
     def test_ifrs_generic_profit_is_a_net_income_candidate(self) -> None:
         fact = _fact(_filing("generic-profit"), "net_income", 100)
         fact.reported_concept = "Profit for the year"
-        self.assertEqual(_net_income_candidate_priority(fact), 1)
+        self.assertEqual(profit_row_concept(fact.reported_concept), "net_income")
         self.assertIn("profit for the year", {item.casefold() for item in _LABELS["net_income"]})
 
-    def test_ifrs_attributable_profit_outranks_generic_profit(self) -> None:
-        generic = _fact(_filing("generic-profit"), "net_income", 100)
-        generic.reported_concept = "Profit for the year"
-        attributable = _fact(_filing("generic-profit"), "net_income", 120)
-        attributable.reported_concept = "Profit attributable to owners"
-        self.assertGreater(_net_income_candidate_priority(attributable), _net_income_candidate_priority(generic))
+    def test_ifrs_attributable_profit_has_a_distinct_parent_concept(self) -> None:
+        self.assertEqual(profit_row_concept("Profit for the year"), "net_income")
+        self.assertEqual(profit_row_concept("Profit attributable to owners"), "parent_net_income")
+        self.assertEqual(profit_row_concept("Profit attributable to non-controlling interests"), "minority_interest_profit")
 
     def test_narrative_date_header_is_not_a_financial_row(self) -> None:
         text = "The segment results and revenue information for the years ended December 31, 2025 and 2024 are as follows"
@@ -1731,6 +2206,9 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertTrue(_net_income_candidate_allowed("Attributable to: Equity holders of the Company 224,842"))
         self.assertFalse(_net_income_candidate_allowed("Earnings per share for profit attributable to equity holders of the Company"))
         self.assertFalse(_net_income_candidate_allowed("Basic and diluted EPS attributable to equity holders of the Company"))
+        self.assertEqual(profit_row_concept("Equity holders of the Company", "Attributable to:"), "parent_net_income")
+        self.assertIsNone(profit_row_concept("Earnings per share for profit attributable to equity holders of the Company"))
+        self.assertIsNone(profit_row_concept("Basic and diluted EPS attributable to equity holders of the Company"))
 
     def test_byd_formal_context_preserves_scope_unit_and_parser_version(self) -> None:
         """Formal statement context is not replaced by a later parent table."""
@@ -1745,7 +2223,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             "2021 Annual Report", "https://example.invalid/byd-2021.pdf",
         )
         rows = (
-            _row(("合并利润表", 10, 180)),
+            _row(("合并利润表", 10, 180), ("单位：人民币千元", 200, 350)),
             _row(("2021", 220, 280), ("2020", 320, 380)),
             _row(("Revenue", 10, 120), ("216142395", 220, 280), ("156000000", 320, 380)),
         )
@@ -1769,7 +2247,7 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(revenue.value, 216142395000.0)
         self.assertEqual(revenue.unit_scale, 1_000.0)
         self.assertEqual(revenue.unit_provenance, "explicit")
-        self.assertEqual(revenue.parser_version, _PDF_PARSER_VERSION)
+        self.assertEqual(revenue.parser_version, "financial-ingestion-compat-v1")
 
     def test_pdf_ast_emits_same_filing_comparator_with_column_provenance(self) -> None:
         """Both statement columns are facts; the prior column is not dropped."""
@@ -2244,6 +2722,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertEqual(selected.text, "803,964,958")
         self.assertEqual(columns[0].center, 450)
 
+    def test_duplicate_year_prefers_issuer_restated_column(self) -> None:
+        rows = (
+            _row(("2024（调整前）", 300, 360), ("2024（调整后）", 430, 500), ("2023", 520, 570)),
+            _row(("营业收入", 20, 120), ("90", 300, 360), ("100", 430, 500), ("80", 520, 570)),
+        )
+        columns = _period_columns(rows, "CNY")
+        selected = _select_period_cell(rows[1], 120, columns, 2024)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.text, "100")
+        self.assertIn("调整后", next(item for item in columns if item.year == 2024).header)
+
     def test_missing_one_core_statement_keeps_verified_fields_with_warning(self) -> None:
         filing = _filing("partial")
         facts = list(_core(filing))
@@ -2295,17 +2784,42 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         self.assertTrue(any(f.accession_number == "good" for f in dataset.accepted_facts))
         self.assertTrue(dataset.validation.quarantined)
 
-    def test_structured_source_has_priority_and_failure_falls_back_to_pdf(self) -> None:
+    def test_conflicting_structured_amount_cannot_override_real_pdf_source(self) -> None:
         path = _official_pdf("OPENTHESIS_CATL_2025_PDF", "CN_A_SZSE_300750.SZ/1225002214.pdf")
         if not Path(path).is_file():
             self.skipTest("set OPENTHESIS_CATL_2025_PDF to run the official PDF integration test")
         filing = _filing(path=path)
-        source = InMemoryFinancialSource({filing.document_id: _core(filing)}, failure_by_document={})
+        # A structured batch is only an admissible official-source candidate
+        # when its identity includes the bytes actually being parsed.  The
+        # generic fixture uses a sentinel hash, which intentionally cannot
+        # stand in for this real-PDF source contract.
+        filing.content_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        structured_facts, structured_refs = _pdf_core_with_evidence(filing)
+        source = InMemoryFinancialSource(
+            {filing.document_id: tuple(structured_facts)},
+            {filing.document_id: tuple(structured_refs)},
+            failure_by_document={},
+        )
         dataset = FinancialIngestionEngine().ingest(_company(), [filing], structured_sources=(source,))
-        self.assertEqual(dataset.accepted_facts[0].value, 1000)
+        # These deliberately synthetic 1000-yuan rows disagree with the
+        # original PDF. Structured provenance is not permission to override
+        # an unresolved original-source conflict in the common compiler.
+        self.assertFalse(any(fact.concept == "revenue" for fact in dataset.accepted_facts))
+        self.assertTrue(any(fact.concept == "revenue" for fact in dataset.validation.quarantined))
+        self.assertTrue(any("candidate_conflict" in issue
+            for group in dataset.group_validations for issue in group.validation.issues))
+
+    def test_failed_structured_source_keeps_independently_proven_pdf_facts(self) -> None:
+        path = _official_pdf("OPENTHESIS_CATL_2025_PDF", "CN_A_SZSE_300750.SZ/1225002214.pdf")
+        if not Path(path).is_file():
+            self.skipTest("set OPENTHESIS_CATL_2025_PDF to run the official PDF integration test")
+        filing = _filing(path=path)
+        filing.content_hash = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         failed = InMemoryFinancialSource({}, failure_by_document={filing.document_id: "structured_timeout"})
         fallback = FinancialIngestionEngine().ingest(_company(), [filing], structured_sources=(failed,))
         self.assertTrue(any(f.concept == "revenue" for f in fallback.accepted_facts))
+        self.assertTrue(all(f.value != 1000 and f.source_document == filing.primary_document
+                            for f in fallback.accepted_facts if f.concept == "revenue"))
         self.assertTrue(any("structured_timeout" in item for item in fallback.diagnostics))
 
     def test_structured_full_concepts_but_bad_quality_falls_back_to_pdf(self) -> None:
@@ -2322,11 +2836,14 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         pdf_facts = list(_core(filing))
         with patch.object(engine, "_parse_pdf_ast", return_value=(pdf_facts, [])):
             dataset = engine.ingest(_company(), [filing], structured_sources=(Adapter(),))
-        # A conflicting source value is quarantined by the canonical
-        # compiler; it must not silently fall back or overwrite the PDF
-        # candidate with a last-write-wins result.
-        self.assertEqual(dataset.status.value, "REJECTED")
-        self.assertFalse(dataset.accepted_facts)
+        # The mismatched total-equity identity is isolated while safe
+        # statement siblings survive; the bad structured value is not
+        # overwritten by a competing PDF value.
+        self.assertEqual(dataset.status.value, "READY_WITH_WARNINGS")
+        accepted = {fact.concept: fact for fact in dataset.accepted_facts}
+        self.assertTrue({"revenue", "net_income", "operating_cash_flow", "equity"}.issubset(accepted))
+        self.assertNotIn("total_equity", accepted)
+        self.assertTrue(dataset.validation.quarantined)
         self.assertTrue(any("compiler_quality_gate_failed" in item for item in dataset.diagnostics))
 
     def test_public_engine_parses_real_catl_pdf_with_statement_provenance(self) -> None:
@@ -2343,6 +2860,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertTrue(values[concept].source_page)
             self.assertTrue(values[concept].raw_text)
             self.assertTrue(values[concept].statement)
+        self._assert_profit_split(
+            values,
+            total=76_786_309_000.0,
+            parent=72_201_282_000.0,
+            minority=4_585_027_000.0,
+            pages={concept: 117 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1000.0,
+        )
         self.assertEqual(dataset.validation.status.value, "VERIFIED")
         self.assertTrue(any(ref.bbox for ref in dataset.evidence))
 
@@ -2354,7 +2882,16 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         filing = FilingDocument("cninfo:1225037057", company.security_id, "1225037057", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-03-27", "中芯国际2025年年度报告", "https://static.cninfo.com.cn/finalpage/2026-03-27/1225037057.PDF", local_path=path)
         dataset = FinancialIngestionEngine().ingest(company, [filing])
         values = {fact.concept: fact for fact in dataset.accepted_facts}
-        expected = {"revenue": 67_323_192_000.0, "net_income": 5_040_734_000.0, "operating_cash_flow": 20_080_979_000.0, "assets": 367_718_196_000.0, "liabilities": 121_355_828_000.0, "equity": 150_823_788_000.0}
+        expected = {
+            "revenue": 67_323_192_000.0,
+            "net_income": 7_208_910_000.0,
+            "parent_net_income": 5_040_734_000.0,
+            "minority_interest_profit": 2_168_176_000.0,
+            "operating_cash_flow": 20_080_979_000.0,
+            "assets": 367_718_196_000.0,
+            "liabilities": 121_355_828_000.0,
+            "equity": 150_823_788_000.0,
+        }
         self.assertEqual(dataset.status.value, "VERIFIED")
         for concept, number in expected.items():
             self.assertIn(concept, values)
@@ -2363,6 +2900,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertEqual(values[concept].consolidated_scope, "consolidated")
             self.assertEqual(values[concept].currency, "CNY")
             self.assertTrue(values[concept].source_page)
+        self._assert_profit_split(
+            values,
+            total=7_208_910_000.0,
+            parent=5_040_734_000.0,
+            minority=2_168_176_000.0,
+            pages={concept: 127 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1000.0,
+        )
 
     def test_public_engine_parses_real_jinbo_annual_pdf(self) -> None:
         path = _official_pdf("OPENTHESIS_JINBO_2025_PDF", "CN_A_BSE_832982.BJ/1225267792.pdf")
@@ -2372,7 +2920,16 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         filing = FilingDocument("cninfo:1225267792", company.security_id, "1225267792", "ANNUAL_REPORT", "FY", "2025-12-31", "2026-04-29", "2025年年度报告", "https://static.cninfo.com.cn/finalpage/2026-04-29/1225267792.PDF", local_path=path)
         dataset = FinancialIngestionEngine().ingest(company, [filing])
         values = {fact.concept: fact for fact in dataset.accepted_facts}
-        expected = {"revenue": 1_595_372_919.28, "net_income": 652_128_968.10, "operating_cash_flow": 630_002_189.99, "assets": 2_583_855_317.33, "liabilities": 690_125_814.23, "equity": 1_895_253_856.52}
+        expected = {
+            "revenue": 1_595_372_919.28,
+            "net_income": 645_710_506.58,
+            "parent_net_income": 652_128_968.10,
+            "minority_interest_profit": -6_418_461.52,
+            "operating_cash_flow": 630_002_189.99,
+            "assets": 2_583_855_317.33,
+            "liabilities": 690_125_814.23,
+            "equity": 1_895_253_856.52,
+        }
         self.assertEqual(dataset.status.value, "VERIFIED")
         for concept, number in expected.items():
             self.assertIn(concept, values)
@@ -2381,6 +2938,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertEqual(values[concept].consolidated_scope, "consolidated")
             self.assertEqual(values[concept].currency, "CNY")
             self.assertTrue(values[concept].source_page)
+        self._assert_profit_split(
+            values,
+            total=645_710_506.58,
+            parent=652_128_968.10,
+            minority=-6_418_461.52,
+            pages={concept: 91 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1.0,
+        )
 
     def test_public_engine_parses_real_moutai_annual_pdf(self) -> None:
         path = _cn_acceptance_pdf(
@@ -2400,16 +2968,60 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             "https://static.cninfo.com.cn/finalpage/2026-04-17/1225114741.PDF",
             local_path=path,
         )
-        dataset = FinancialIngestionEngine().ingest(company, [filing])
+        engine = FinancialIngestionEngine()
+        original_collect = engine.collect_candidate_batches
+        captured_collection = {}
+
+        def collect_candidates(*args, **kwargs):
+            collection = original_collect(*args, **kwargs)
+            captured_collection["value"] = collection
+            return collection
+
+        engine.collect_candidate_batches = collect_candidates  # type: ignore[method-assign]
+        dataset = engine.ingest(company, [filing])
+        collection = captured_collection["value"]
+        parsed_candidates = [
+            candidate.fact
+            for batch in collection.batches_by_document[filing.document_id]
+            for candidate in batch.candidates
+        ]
+        prior_total_equity = [
+            fact for fact in parsed_candidates
+            if fact.concept == "total_equity"
+            and fact.end_date == "2024-12-31"
+            and fact.usage_status == "comparator"
+        ]
+        prior_equity_by_scope = {
+            scope: [fact for fact in prior_total_equity if fact.consolidated_scope == scope]
+            for scope in ("consolidated", "parent")
+        }
+        self.assertEqual({fact.consolidated_scope for fact in prior_total_equity}, {"consolidated", "parent"})
+        self.assertTrue(all(len(scoped) == 1 for scoped in prior_equity_by_scope.values()))
+        self.assertAlmostEqual(prior_equity_by_scope["consolidated"][0].value, 242_011_315_120.60, places=2)
+        self.assertFalse(any("实收资本" in fact.raw_text for fact in prior_total_equity))
         values = {fact.concept: fact for fact in dataset.accepted_facts}
         expected = {
-            "revenue": 172_054_171_890.91,
-            "net_income": 82_320_067_101.68,
+            "revenue": 168_838_102_514.79,
+            "total_operating_revenue": 172_054_171_890.91,
+            "interest_revenue": 3_216_069_376.12,
+            "finance_interest_income": 842_988_240.60,
+            "net_income": 85_310_324_833.67,
+            "parent_net_income": 82_320_067_101.68,
+            "minority_interest_profit": 2_990_257_731.99,
             "operating_cash_flow": 61_522_204_989.35,
             "assets": 303_834_844_021.44,
             "liabilities": 49_875_590_112.37,
             "equity": 244_637_811_032.18,
             "total_equity": 253_959_253_909.07,
+        }
+        corrected_source_pages = {
+            "revenue": 61,
+            "total_operating_revenue": 61,
+            "interest_revenue": 61,
+            "finance_interest_income": 61,
+            "net_income": 62,
+            "parent_net_income": 62,
+            "minority_interest_profit": 62,
         }
         self.assertEqual(dataset.status.value, "VERIFIED")
         for concept, number in expected.items():
@@ -2420,6 +3032,19 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertEqual(values[concept].currency, "CNY")
             self.assertTrue(values[concept].source_page)
             self.assertTrue(values[concept].raw_text)
+            if concept in corrected_source_pages:
+                self.assertEqual(values[concept].source_page, corrected_source_pages[concept])
+        self._assert_profit_split(
+            values,
+            total=85_310_324_833.67,
+            parent=82_320_067_101.68,
+            minority=2_990_257_731.99,
+            pages={concept: 62 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1.0,
+        )
 
     def test_public_engine_parses_real_wuliangye_annual_pdf(self) -> None:
         path = _cn_acceptance_pdf(
@@ -2444,7 +3069,11 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         values = {fact.concept: fact for fact in dataset.accepted_facts}
         expected = {
             "revenue": 40_528_509_770.23,
-            "net_income": 8_954_257_202.51,
+            # The consolidated net profit is distinct from the attributable
+            # parent profit; the latter is one of the following split rows.
+            "net_income": 9_317_113_184.68,
+            "parent_net_income": 8_954_257_202.51,
+            "minority_interest_profit": 362_855_982.17,
             "operating_cash_flow": 29_706_259_919.13,
             "assets": 189_984_270_815.47,
             "liabilities": 67_803_587_170.33,
@@ -2460,6 +3089,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertEqual(values[concept].currency, "CNY")
             self.assertTrue(values[concept].source_page)
             self.assertTrue(values[concept].raw_text)
+        self._assert_profit_split(
+            values,
+            total=9_317_113_184.68,
+            parent=8_954_257_202.51,
+            minority=362_855_982.17,
+            pages={concept: 57 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1.0,
+        )
 
     def test_public_engine_parses_real_tencent_annual_pdf(self) -> None:
         path = _acceptance_pdf(
@@ -2484,7 +3124,9 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         values = {fact.concept: fact for fact in dataset.accepted_facts}
         expected = {
             "revenue": 751_766_000_000.0,
-            "net_income": 224_842_000_000.0,
+            "net_income": 229_801_000_000.0,
+            "parent_net_income": 224_842_000_000.0,
+            "minority_interest_profit": 4_959_000_000.0,
             "operating_cash_flow": 303_052_000_000.0,
             "assets": 2_038_986_000_000.0,
             "liabilities": 797_921_000_000.0,
@@ -2492,7 +3134,8 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             "total_equity": 1_241_065_000_000.0,
         }
         expected_pages = {
-            "revenue": 130, "net_income": 130, "assets": 132,
+            "revenue": 130, "net_income": 130, "parent_net_income": 130,
+            "minority_interest_profit": 130, "assets": 132,
             "equity": 133, "total_equity": 133, "liabilities": 134,
             "operating_cash_flow": 139,
         }
@@ -2511,6 +3154,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertTrue(fact.source_bbox)
             self.assertTrue(fact.raw_text)
             self.assertTrue(fact.statement)
+        self._assert_profit_split(
+            values,
+            total=229_801_000_000.0,
+            parent=224_842_000_000.0,
+            minority=4_959_000_000.0,
+            pages={concept: 130 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1_000_000.0,
+        )
 
     def test_public_engine_parses_real_meituan_annual_pdf(self) -> None:
         path = _acceptance_pdf("OPENTHESIS_MEITUAN_2025_PDF", "HK_HKEX_03690.HK/2026042400179.pdf", "03690.HK_2026042400179.pdf")
@@ -2520,8 +3174,8 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         url = "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0424/2026042400179.pdf"
         dataset = FinancialIngestionEngine().ingest(company, [_hk_filing(company, "2026042400179", "2025-12-31", "2026-04-24", "FY 2025 Annual Report", url, path)])
         values = {fact.concept: fact for fact in dataset.accepted_facts}
-        expected = {"revenue": 364_854_746_000.0, "net_income": -23_355_015_000.0, "assets": 346_910_280_000.0, "liabilities": 195_922_428_000.0, "equity": 151_045_913_000.0, "total_equity": 150_987_852_000.0, "operating_cash_flow": -13_815_001_000.0}
-        pages = {"revenue": 212, "net_income": 212, "assets": 214, "equity": 214, "total_equity": 214, "liabilities": 215, "operating_cash_flow": 220}
+        expected = {"revenue": 364_854_746_000.0, "net_income": -23_354_194_000.0, "parent_net_income": -23_355_015_000.0, "assets": 346_910_280_000.0, "liabilities": 195_922_428_000.0, "equity": 151_045_913_000.0, "total_equity": 150_987_852_000.0, "operating_cash_flow": -13_815_001_000.0}
+        pages = {"revenue": 212, "net_income": 212, "parent_net_income": 212, "assets": 214, "equity": 214, "total_equity": 214, "liabilities": 215, "operating_cash_flow": 220}
         self.assertEqual(dataset.status.value, "VERIFIED")
         self.assertEqual(dataset.manifest[0].period_end, "2025-12-31")
         for concept, number in expected.items():
@@ -2560,7 +3214,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         profile = build_financial_profile(dataset.accepted_facts, dataset.group_validations, "CNY")
         metrics = next(item for item in profile.metrics if item["year"] == 2022)
         self.assertAlmostEqual(metrics["operating_margin"], -0.026462001, places=8)
-        self.assertAlmostEqual(metrics["free_cash_flow"], 5_680_144_000.0)
+        self.assertAlmostEqual(
+            metrics["free_cash_flow"], 5_680_144_000.0,
+            msg=(
+                "Expected validated same-filing OCF less capex; facts were: "
+                + repr([
+                    fact.to_dict() for fact in dataset.accepted_facts
+                    if fact.concept in {"operating_cash_flow", "capital_expenditure"}
+                    and fact.fiscal_year == 2022
+                ])
+            ),
+        )
 
     def test_public_engine_parses_real_byd_annual_pdf(self) -> None:
         path = _acceptance_pdf("OPENTHESIS_BYD_2025_PDF", "HK_HKEX_01211.HK/2026032703008.pdf", "01211.HK_2026032703008.pdf")
@@ -2570,8 +3234,22 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         url = "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0327/2026032703008.pdf"
         dataset = FinancialIngestionEngine().ingest(company, [_hk_filing(company, "2026032703008", "2025-12-31", "2026-03-27", "FY 2025 Annual Report", url, path)])
         values = {fact.concept: fact for fact in dataset.accepted_facts}
-        expected = {"revenue": 803_964_958_000.0, "net_income": 32_619_022_000.0, "assets": 883_729_883_000.0, "liabilities": 625_190_698_000.0, "equity": 246_274_606_000.0, "total_equity": 258_539_185_000.0, "operating_cash_flow": 59_135_544_000.0}
-        pages = {"revenue": 144, "net_income": 144, "assets": 141, "equity": 143, "total_equity": 143, "liabilities": 142, "operating_cash_flow": 148}
+        expected = {
+            "revenue": 803_964_958_000.0,
+            "net_income": 33_760_758_000.0,
+            "parent_net_income": 32_619_022_000.0,
+            "minority_interest_profit": 1_141_736_000.0,
+            "assets": 883_729_883_000.0,
+            "liabilities": 625_190_698_000.0,
+            "equity": 246_274_606_000.0,
+            "total_equity": 258_539_185_000.0,
+            "operating_cash_flow": 59_135_544_000.0,
+        }
+        pages = {
+            "revenue": 144, "net_income": 144, "parent_net_income": 144,
+            "minority_interest_profit": 144, "assets": 141, "equity": 143,
+            "total_equity": 143, "liabilities": 142, "operating_cash_flow": 148,
+        }
         self.assertEqual(dataset.status.value, "VERIFIED")
         self.assertEqual(dataset.manifest[0].period_end, "2025-12-31")
         for concept, number in expected.items():
@@ -2579,6 +3257,17 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertAlmostEqual(fact.value, number)
             self.assertEqual((fact.currency, fact.unit_scale, fact.consolidated_scope, fact.source_page), ("CNY", 1000.0, "consolidated", pages[concept]))
             self.assertTrue(fact.source_bbox and fact.raw_text and fact.statement)
+        self._assert_profit_split(
+            values,
+            total=33_760_758_000.0,
+            parent=32_619_022_000.0,
+            minority=1_141_736_000.0,
+            pages={concept: 144 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="FY",
+            end_date="2025-12-31",
+            unit_scale=1000.0,
+        )
 
     def test_public_engine_parses_real_byd_q1_comparison_pair(self) -> None:
         company = _hk_company("01211.HK", "BYD Company", "HKEX:01211", "CAS")
@@ -2638,7 +3327,9 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         )
         expected_2026 = {
             "revenue": 150_225_314_000.0,
-            "net_income": 4_084_551_000.0,
+            "net_income": 4_010_931_000.0,
+            "parent_net_income": 4_084_551_000.0,
+            "minority_interest_profit": -73_620_000.0,
             "operating_cash_flow": 2_790_305_000.0,
             "assets": 902_076_965_000.0,
             "liabilities": 639_956_542_000.0,
@@ -2650,6 +3341,33 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertAlmostEqual(fact.value, expected)
             self.assertEqual((fact.currency, fact.unit_scale, fact.consolidated_scope), ("CNY", 1.0, "consolidated"))
             self.assertTrue(fact.source_page and fact.source_bbox and fact.raw_text)
+
+        self._assert_profit_split(
+            {concept: grouped[(2026, "Q1", concept)] for concept in (
+                "net_income", "parent_net_income", "minority_interest_profit",
+            )},
+            total=4_010_931_000.0,
+            parent=4_084_551_000.0,
+            minority=-73_620_000.0,
+            pages={concept: 13 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2026,
+            fiscal_period="Q1",
+            end_date="2026-03-31",
+            unit_scale=1.0,
+        )
+        self._assert_profit_split(
+            {concept: grouped[(2025, "Q1", concept)] for concept in (
+                "net_income", "parent_net_income", "minority_interest_profit",
+            )},
+            total=9_443_140_000.0,
+            parent=9_154_985_000.0,
+            minority=288_155_000.0,
+            pages={concept: 17 for concept in ("net_income", "parent_net_income", "minority_interest_profit")},
+            fiscal_year=2025,
+            fiscal_period="Q1",
+            end_date="2025-03-31",
+            unit_scale=1.0,
+        )
 
         interim = calculate_interim_metrics([
             {
@@ -2679,8 +3397,21 @@ class FinancialIngestionEngineTests(unittest.TestCase):
         url = "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0618/2026061800844.pdf"
         dataset = FinancialIngestionEngine().ingest(company, [_hk_filing(company, "2026061800844", "2026-03-31", "2026-06-18", "FY 2026 Annual Report", url, path)])
         values = {fact.concept: fact for fact in dataset.accepted_facts}
-        expected = {"revenue": 1_023_670_000_000.0, "net_income": 103_592_000_000.0, "assets": 1_909_570_000_000.0, "liabilities": 783_300_000_000.0, "total_equity": 1_118_425_000_000.0, "operating_cash_flow": 76_213_000_000.0}
-        pages = {"revenue": 183, "net_income": 183, "assets": 185, "liabilities": 185, "total_equity": 186, "operating_cash_flow": 190}
+        expected = {
+            "revenue": 1_023_670_000_000.0,
+            "net_income": 102_127_000_000.0,
+            "parent_net_income": 103_592_000_000.0,
+            "minority_interest_profit": -1_465_000_000.0,
+            "assets": 1_909_570_000_000.0,
+            "liabilities": 783_300_000_000.0,
+            "total_equity": 1_118_425_000_000.0,
+            "operating_cash_flow": 76_213_000_000.0,
+        }
+        pages = {
+            "revenue": 183, "net_income": 184, "parent_net_income": 183,
+            "minority_interest_profit": 183, "assets": 185, "liabilities": 185,
+            "total_equity": 186, "operating_cash_flow": 190,
+        }
         self.assertEqual(dataset.status.value, "VERIFIED")
         self.assertEqual(dataset.manifest[0].period_end, "2026-03-31")
         for concept, number in expected.items():
@@ -2688,6 +3419,21 @@ class FinancialIngestionEngineTests(unittest.TestCase):
             self.assertAlmostEqual(fact.value, number)
             self.assertEqual((fact.currency, fact.unit_scale, fact.consolidated_scope, fact.source_page), ("CNY", 1_000_000.0, "consolidated", pages[concept]))
             self.assertTrue(fact.source_bbox and fact.raw_text and fact.statement)
+        self._assert_profit_split(
+            values,
+            total=102_127_000_000.0,
+            parent=103_592_000_000.0,
+            minority=-1_465_000_000.0,
+            pages={
+                "net_income": 184,
+                "parent_net_income": 183,
+                "minority_interest_profit": 183,
+            },
+            fiscal_year=2026,
+            fiscal_period="FY",
+            end_date="2026-03-31",
+            unit_scale=1_000_000.0,
+        )
 
 
 if __name__ == "__main__":

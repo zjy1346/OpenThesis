@@ -4,15 +4,16 @@ use crate::model_center::{
     ModelCenter, ModelCenterState,
 };
 use crate::provider_registry;
+use crate::model_stream::{ProviderStreamDecoder, StreamFormat};
 use base64::Engine as _;
-use reqwest::blocking::{Client, Response};
+use reqwest::{Client, Response};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, State};
 use zeroize::{Zeroize, Zeroizing};
@@ -24,11 +25,18 @@ const MAX_PROVIDER_ERROR_CHARS: usize = 800;
 #[derive(Clone)]
 pub(crate) struct ModelGateway {
     center: Arc<ModelCenter>,
+    events: Option<Arc<GatewayEventSink>>,
+    max_output_tokens: Option<u32>,
 }
 
 impl ModelGateway {
     pub(crate) fn new(center: Arc<ModelCenter>) -> Self {
-        Self { center }
+        Self { center, events: None, max_output_tokens: None }
+    }
+
+    fn with_output_token_budget(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     pub(crate) fn discover_models(
@@ -78,8 +86,7 @@ impl ModelGateway {
             provider.models_path.unwrap_or("/models"),
         )?;
         let request = authorize(client.get(url), secret_ref)?;
-        let response = request
-            .send()
+        let response = tauri::async_runtime::block_on(async { request.send().await })
             .map_err(|_| GatewayError::network("Model discovery could not reach the provider."))?;
         let payload = read_json_response(response, secret_ref)?;
         let ids = if connection.provider_id == "ollama" {
@@ -170,7 +177,7 @@ impl ModelGateway {
     ) -> Result<GatewayGenerateResult, GatewayError> {
         if system_prompt.len() + user_prompt.len() > 7 * 1024 * 1024 {
             return Err(GatewayError::new(
-                "MODEL_PROMPT_TOO_LARGE",
+                "MODEL_REQUEST_BODY_TOO_LARGE",
                 "The model prompt exceeds the gateway limit.",
                 false,
             ));
@@ -430,7 +437,15 @@ impl ModelGateway {
         if json_mode {
             payload["response_format"] = json!({"type": "json_object"});
         }
-        let response = match post_json(client, &url, &payload, secret) {
+        let output_budget_support = self.max_output_tokens.map(|tokens| {
+            provider_registry::apply_output_token_budget(
+                &model.provider_id,
+                &model.model_id,
+                &mut payload,
+                tokens,
+            )
+        });
+        let response = match self.post_text(client, &url, &mut payload, secret, &model.provider_id) {
             Err(error)
                 if json_mode && allow_format_fallback && response_format_is_unsupported(&error) =>
             {
@@ -438,7 +453,7 @@ impl ModelGateway {
                     .as_object_mut()
                     .expect("gateway payload is an object")
                     .remove("response_format");
-                post_json(client, &url, &payload, secret)?
+                self.post_text(client, &url, &mut payload, secret, &model.provider_id)?
             }
             result => result?,
         };
@@ -446,7 +461,10 @@ impl ModelGateway {
             &response,
             "The provider response did not contain message.content.",
         )?;
-        Ok(self.result(model, content, finish_reason))
+        let mut result = self.result(model, content, finish_reason);
+        result.meta.apply_usage(&response);
+        apply_output_budget_receipt(&mut result.meta, output_budget_support);
+        Ok(result)
     }
 
     fn generate_ollama(
@@ -473,7 +491,15 @@ impl ModelGateway {
         if let Some(temperature) = model.temperature {
             payload["options"] = json!({"temperature": temperature});
         }
-        let response = post_json(client, &url, &payload, secret)?;
+        let output_budget_support = self.max_output_tokens.map(|tokens| {
+            provider_registry::apply_output_token_budget(
+                &model.provider_id,
+                &model.model_id,
+                &mut payload,
+                tokens,
+            )
+        });
+        let response = self.post_text(client, &url, &mut payload, secret, &model.provider_id)?;
         let content = response
             .pointer("/message/content")
             .and_then(Value::as_str)
@@ -489,7 +515,10 @@ impl ModelGateway {
             .get("done_reason")
             .and_then(Value::as_str)
             .map(str::to_string);
-        Ok(self.result(model, content, finish_reason))
+        let mut result = self.result(model, content, finish_reason);
+        result.meta.apply_usage(&response);
+        apply_output_budget_receipt(&mut result.meta, output_budget_support);
+        Ok(result)
     }
 
     fn result(
@@ -520,9 +549,83 @@ impl ModelGateway {
                 free_verified_at: model.free_verified_at,
                 temperature: model.temperature,
                 timeout_seconds: model.timeout_seconds,
+                output_budget_tokens: None,
+                output_budget_wire_field: None,
+                output_budget_semantics: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+                reasoning_tokens: None,
+                answer_tokens: None,
             },
             content,
         }
+    }
+
+    fn post_text(
+        &self, client: &Client, url: &reqwest::Url, payload: &mut Value,
+        secret: Option<&str>, provider_id: &str,
+    ) -> Result<Value, GatewayError> {
+        let Some(events) = self.events.as_ref() else {
+            return post_json(client, url, payload, secret);
+        };
+        let protocol = provider_registry::text_stream_protocol(provider_id);
+        if protocol.is_some() {
+            payload["stream"] = json!(true);
+            // These adapters explicitly document include_usage. Do not send it
+            // to an arbitrary endpoint merely labelled OpenAI-compatible.
+            if provider_registry::stream_requests_usage(provider_id) {
+                payload["stream_options"] = json!({"include_usage": true});
+            }
+        }
+        events.activity("connecting", 0);
+        let request = authorize(client.post(url.clone()).json(payload), secret)?;
+        let mut response = tauri::async_runtime::block_on(async { request.send().await })
+            .map_err(|_| GatewayError::network("The model provider could not be reached."))?;
+        events.activity("waiting_response", 0);
+        if !response.status().is_success() {
+            return read_json_response(response, secret);
+        }
+        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        let format = match protocol {
+            Some("sse") if content_type.contains("text/event-stream") => StreamFormat::Sse,
+            Some("ndjson") if content_type.contains("ndjson") || content_type.contains("jsonl") => StreamFormat::Ndjson,
+            _ => return read_json_response(response, secret),
+        };
+        let mut decoder = ProviderStreamDecoder::new(format)
+            .with_reasoning_fields(provider_registry::stream_reasoning_fields(provider_id));
+        loop {
+            let previous_length = decoder.partial_content().len();
+            let chunk = match tauri::async_runtime::block_on(async { response.chunk().await }) {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(error) => {
+                    events.preserve_partial(decoder.partial_content());
+                    return Err(GatewayError::new(
+                        if error.is_timeout() { "MODEL_TIMEOUT" } else { "MODEL_STREAM_INTERRUPTED" },
+                        "The remote stream did not complete within this request; submission outcome is unknown.", false));
+                }
+            };
+            match decoder.push(&chunk) {
+                Ok(activity) => {
+                    let added = &decoder.partial_content()[previous_length..];
+                    if !added.is_empty() { events.frame("content", json!({"text": added})); }
+                    for item in activity { events.activity(item.kind, item.bytes); }
+                },
+                Err(code) => {
+                    events.preserve_partial(decoder.partial_content());
+                    return Err(GatewayError::new(code, "The remote stream could not be completed.", false));
+                }
+            }
+            if decoder.is_complete() { break; }
+        }
+        let partial = decoder.partial_content().to_string();
+        decoder.finish().map_err(|code| {
+            events.preserve_partial(&partial);
+            GatewayError::new(code, "The remote stream has no confirmed terminal record.", false)
+        })
     }
 
     pub(crate) fn rotate_connection_secret(
@@ -673,6 +776,15 @@ impl ModelGateway {
                     free_verified_at: None,
                     temperature: None,
                     timeout_seconds: 30,
+                    output_budget_tokens: None,
+                    output_budget_wire_field: None,
+                    output_budget_semantics: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    reasoning_tokens: None,
+                    answer_tokens: None,
                 },
                 capabilities: Vec::new(),
                 warnings: Vec::new(),
@@ -945,6 +1057,67 @@ pub struct GatewayResponseMeta {
     pub free_verified_at: Option<i64>,
     pub temperature: Option<f64>,
     pub timeout_seconds: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_wire_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_budget_semantics: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default)]
+    pub answer_tokens: Option<u64>,
+}
+
+fn apply_output_budget_receipt(
+    meta: &mut GatewayResponseMeta,
+    support: Option<provider_registry::OutputTokenBudgetSupport>,
+) {
+    if let Some(provider_registry::OutputTokenBudgetSupport::Applied(applied)) = support {
+        meta.output_budget_tokens = Some(applied.applied_tokens);
+        meta.output_budget_wire_field = Some(applied.wire_field.to_string());
+        meta.output_budget_semantics = Some(applied.semantics.to_string());
+    }
+}
+
+impl GatewayResponseMeta {
+    fn apply_usage(&mut self, response: &Value) {
+        // Missing is unknown, not zero. A cache miss is not a cache write.
+        let integer = |paths: &[&str]| paths.iter().find_map(|path|
+            response.pointer(path).and_then(Value::as_u64));
+        let ollama = self.provider_id == "ollama";
+        self.input_tokens = integer(if ollama { &["/prompt_eval_count"] } else { &["/usage/prompt_tokens"] });
+        self.output_tokens = integer(if ollama { &["/eval_count"] } else { &["/usage/completion_tokens"] });
+        self.reasoning_tokens = match self.provider_id.as_str() {
+            "openai" | "deepseek" | "qwen" | "openrouter" => integer(&["/usage/completion_tokens_details/reasoning_tokens"]),
+            _ => None,
+        };
+        // Only a separately reported text counter proves visible-answer usage.
+        // completion - reasoning is not safe with audio/prediction categories.
+        self.answer_tokens = match self.provider_id.as_str() {
+            "openai" => integer(&["/usage/completion_tokens_details/text_tokens"]),
+            _ => None,
+        };
+        self.cache_read_input_tokens = match self.provider_id.as_str() {
+            "deepseek" => integer(&["/usage/prompt_cache_hit_tokens"]),
+            "ollama" => integer(&["/prompt_eval_cached_count"]),
+            "qwen" | "kimi_cn" | "kimi_global" => integer(&["/usage/prompt_tokens_details/cached_tokens", "/usage/cached_tokens"]),
+            "openai" | "glm" | "openrouter" => integer(&["/usage/prompt_tokens_details/cached_tokens"]),
+            _ => None,
+        };
+        self.cache_write_input_tokens = match self.provider_id.as_str() {
+            "openai" | "kimi_cn" | "kimi_global" | "openrouter" => integer(&["/usage/prompt_tokens_details/cache_write_tokens"]),
+            _ => None,
+        };
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1161,9 +1334,9 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 fn authorize(
-    request: reqwest::blocking::RequestBuilder,
+    request: reqwest::RequestBuilder,
     secret: Option<&str>,
-) -> Result<reqwest::blocking::RequestBuilder, GatewayError> {
+) -> Result<reqwest::RequestBuilder, GatewayError> {
     if let Some(secret) = secret {
         let mut bearer = Zeroizing::new(String::with_capacity(secret.len() + 7));
         bearer.push_str("Bearer ");
@@ -1188,14 +1361,18 @@ fn post_json(
     secret: Option<&str>,
 ) -> Result<Value, GatewayError> {
     let request = authorize(client.post(url.clone()).json(payload), secret)?;
-    let response = request
-        .send()
+    let response = tauri::async_runtime::block_on(async { request.send().await })
         .map_err(|_| GatewayError::network("The model provider could not be reached."))?;
     read_json_response(response, secret)
 }
 
 fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value, GatewayError> {
+    tauri::async_runtime::block_on(read_json_response_async(response, secret))
+}
+
+async fn read_json_response_async(mut response: Response, secret: Option<&str>) -> Result<Value, GatewayError> {
     let status = response.status();
+    let host = response.url().host_str().unwrap_or("").to_string();
     let retry_after_seconds = if status.as_u16() == 429 {
         response
             .headers()
@@ -1205,6 +1382,20 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
     } else {
         None
     };
+    if matches!(status.as_u16(), 401 | 403) {
+        let (code, retryable) = match status.as_u16() {
+            401 | 403 => ("MODEL_UNAUTHORIZED", false),
+            _ => unreachable!(),
+        };
+        let mut error = GatewayError::new(
+            code,
+            format!("The provider returned HTTP {}.", status.as_u16()),
+            retryable,
+        );
+        error.retry_after_seconds = retry_after_seconds;
+        error.http_status = Some(status.as_u16());
+        return Err(error);
+    }
     if status.is_redirection() {
         return Err(GatewayError::new(
             "MODEL_REDIRECT_BLOCKED",
@@ -1212,7 +1403,7 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             false,
         ));
     }
-    if response
+    if status.is_success() && response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES)
     {
@@ -1222,11 +1413,30 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             false,
         ));
     }
-    let mut body = Vec::new();
-    response
-        .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| GatewayError::network("The provider response could not be read."))?;
+    let error_body = !status.is_success();
+    let limit = if error_body { 64 * 1024 } else { MAX_PROVIDER_RESPONSE_BYTES } as usize;
+    let read_body = async move {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+            if body.len() + chunk.len() > limit {
+                body.zeroize();
+                return Err(());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    };
+    // Unlike a detached blocking reader, dropping this timed-out future also
+    // drops the response and aborts its body. No lingering 600-second reader.
+    let mut body = if error_body {
+        // Reserve 500ms of the two-second error budget for dispatch and
+        // classification; the body future is dropped on expiry.
+        tokio::time::timeout(Duration::from_millis(1500), read_body).await
+            .ok().and_then(Result::ok).unwrap_or_default()
+    } else {
+        read_body.await.map_err(|_| GatewayError::new("MODEL_RESPONSE_TOO_LARGE",
+            "The provider response was incomplete or exceeded the gateway limit.", false))?
+    };
     if body.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
         body.zeroize();
         return Err(GatewayError::new(
@@ -1248,6 +1458,12 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             .take(MAX_PROVIDER_ERROR_CHARS)
             .collect::<String>();
         let lowered_detail = detail.to_ascii_lowercase();
+        let provider_error = serde_json::from_str::<Value>(&detail).ok();
+        let error_code = provider_error.as_ref().and_then(|value| value.pointer("/error/code"));
+        let quota_exhausted = matches!(error_code.and_then(Value::as_str),
+            Some("insufficient_quota" | "quota_exceeded" | "billing_hard_limit_reached"))
+            || host == "open.bigmodel.cn" && (error_code.and_then(Value::as_str) == Some("1308")
+                || error_code.and_then(Value::as_u64) == Some(1308));
         let context_capacity = [
             "context_length_exceeded",
             "maximum context length",
@@ -1260,7 +1476,9 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
         .any(|marker| lowered_detail.contains(marker));
         let code = match status.as_u16() {
             401 | 403 => "MODEL_UNAUTHORIZED",
+            413 => "MODEL_REQUEST_BODY_TOO_LARGE",
             408 => "MODEL_TIMEOUT",
+            429 if quota_exhausted => "MODEL_QUOTA_EXHAUSTED",
             429 => "MODEL_RATE_LIMITED",
             value if value >= 500 => "MODEL_PROVIDER_UNAVAILABLE",
             _ if context_capacity => "MODEL_CONTEXT_CAPACITY",
@@ -1274,13 +1492,11 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
             }
             _ => "MODEL_HTTP_ERROR",
         };
-        let retryable =
-            matches!(status.as_u16(), 408 | 409 | 425 | 429) || status.is_server_error();
-        let message = if detail.trim().is_empty() {
-            format!("The provider returned HTTP {}.", status.as_u16())
-        } else {
-            format!("The provider returned HTTP {}: {}", status.as_u16(), detail)
-        };
+        let retryable = !quota_exhausted &&
+            (matches!(status.as_u16(), 408 | 409 | 425 | 429) || status.is_server_error());
+        // Error body is only classification input, never user-visible request
+        // echoes, provider debug traces, credentials or private prompt text.
+        let message = format!("The provider returned HTTP {} ({code}).", status.as_u16());
         let mut error = GatewayError::new(code, message, retryable);
         error.retry_after_seconds = retry_after_seconds;
         error.http_status = Some(status.as_u16());
@@ -1298,11 +1514,12 @@ fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value,
 }
 
 fn parse_retry_after_seconds(value: &str) -> Option<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|seconds| seconds.max(1))
+    if let Ok(seconds) = value.trim().parse::<u64>() { return Some(seconds.max(1)); }
+    let date = httpdate::parse_http_date(value.trim()).ok()?;
+    match date.duration_since(std::time::SystemTime::now()) {
+        Ok(wait) => Some(wait.as_secs().saturating_add(u64::from(wait.subsec_nanos() > 0)).max(1)),
+        Err(_) => Some(1),
+    }
 }
 
 fn response_format_is_unsupported(error: &GatewayError) -> bool {
@@ -1351,6 +1568,54 @@ fn parse_openai_compatible_message(
     Ok((content.to_string(), finish_reason.map(str::to_string)))
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GatewayEventContext {
+    protocol: String,
+    request_id: String,
+    run_id: String,
+    stage_id: String,
+    generation: u64,
+    attempt_id: String,
+}
+
+struct GatewayEventSink {
+    context: GatewayEventContext,
+    seq: Mutex<u64>,
+    partial: Mutex<Option<String>>,
+}
+
+impl GatewayEventSink {
+    fn new(context: GatewayEventContext) -> Result<Self, GatewayError> {
+        if context.protocol != "model-events-v1" ||
+            [&context.request_id, &context.run_id, &context.stage_id, &context.attempt_id]
+                .iter().any(|value| value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)) {
+            return Err(GatewayError::new("MODEL_GATEWAY_PROTOCOL_ERROR", "Invalid event identity.", false));
+        }
+        Ok(Self { context, seq: Mutex::new(0), partial: Mutex::new(None) })
+    }
+
+    fn frame(&self, kind: &str, data: Value) {
+        let Ok(mut seq) = self.seq.lock() else { return; };
+        *seq += 1;
+        let frame = json!({"protocol": "model-events-v1", "context": self.context,
+                           "seq": *seq, "kind": kind, "data": data});
+        let mut stdout = std::io::stdout().lock();
+        let _ = serde_json::to_writer(&mut stdout, &frame);
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+    }
+
+    fn activity(&self, state: &str, bytes: usize) {
+        self.frame("activity", json!({"state": state, "bytes": bytes}));
+    }
+
+    fn preserve_partial(&self, content: &str) {
+        if !content.is_empty() {
+            if let Ok(mut partial) = self.partial.lock() { *partial = Some(content.to_string()); }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct GatewayCliRequest {
@@ -1366,6 +1631,10 @@ struct GatewayCliRequest {
     image_base64: String,
     #[serde(default)]
     wire_contract: String,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    event_context: Option<GatewayEventContext>,
 }
 
 fn default_json_mode() -> bool {
@@ -1383,12 +1652,16 @@ struct GatewayCliResponse {
 
 pub fn run_model_gateway_stdio() -> i32 {
     let request = read_cli_request();
+    let events = match request.as_ref().ok().and_then(|value| value.event_context.clone()) {
+        Some(context) => GatewayEventSink::new(context).ok().map(Arc::new),
+        None => None,
+    };
     let wire_contract = match request.as_ref().map(|value| value.operation.as_str()) {
         Ok("generate") => "text-single-request-v1",
         Ok("vision") => "vision-single-request-v1",
         _ => "",
     };
-    let response = match request.and_then(run_cli_request) {
+    let response = match request.and_then(|request| run_cli_request_with_events(request, events.clone())) {
         Ok(result) => GatewayCliResponse {
             ok: true,
             wire_contract,
@@ -1402,6 +1675,11 @@ pub fn run_model_gateway_stdio() -> i32 {
             error: Some(error),
         },
     };
+    if let Some(events) = events {
+        let partial = events.partial.lock().ok().and_then(|value| value.clone());
+        events.frame("terminal", json!({"response": response, "partial_content": partial}));
+        return 0;
+    }
     let mut stdout = std::io::stdout().lock();
     if serde_json::to_writer(&mut stdout, &response).is_err()
         || stdout.write_all(b"\n").is_err()
@@ -1441,10 +1719,32 @@ fn read_cli_request() -> Result<GatewayCliRequest, GatewayError> {
         )
     });
     bytes.zeroize();
-    parsed
+    let request: GatewayCliRequest = parsed?;
+    validate_output_token_budget(request.max_output_tokens)?;
+    Ok(request)
+}
+
+fn validate_output_token_budget(max_output_tokens: Option<u32>) -> Result<(), GatewayError> {
+    if max_output_tokens == Some(0) {
+        Err(GatewayError::new(
+            "MODEL_GATEWAY_PROTOCOL_ERROR",
+            "The output-token budget must be a positive integer.",
+            false,
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn run_cli_request(request: GatewayCliRequest) -> Result<GatewayGenerateResult, GatewayError> {
+    run_cli_request_with_events(request, None)
+}
+
+fn run_cli_request_with_events(request: GatewayCliRequest, events: Option<Arc<GatewayEventSink>>) -> Result<GatewayGenerateResult, GatewayError> {
+    validate_output_token_budget(request.max_output_tokens)?;
+    if request.event_context.is_some() && events.is_none() {
+        return Err(GatewayError::new("MODEL_GATEWAY_PROTOCOL_ERROR", "Invalid event identity.", false));
+    }
     // This contract has exactly one wire attempt. Its Python owner persists
     // authorization, debit and intent before any compatible format fallback.
     let required_contract = match request.operation.as_str() {
@@ -1470,7 +1770,14 @@ fn run_cli_request(request: GatewayCliRequest) -> Result<GatewayGenerateResult, 
         .map_err(GatewayError::configuration)?;
     let center =
         Arc::new(ModelCenter::new(db_path, platform_vault()).map_err(GatewayError::configuration)?);
-    let gateway = ModelGateway::new(center);
+    let mut gateway = ModelGateway::new(center).with_output_token_budget(
+        if request.operation == "generate" {
+            request.max_output_tokens
+        } else {
+            None
+        },
+    );
+    gateway.events = events;
     match request.operation.as_str() {
         "generate" => gateway.generate_once(
             &request.configured_model_id,
@@ -1495,14 +1802,18 @@ fn run_cli_request(request: GatewayCliRequest) -> Result<GatewayGenerateResult, 
     }
 }
 #[tauri::command]
-pub fn model_gateway_discover_connection(
+pub async fn model_gateway_discover_connection(
     app: AppHandle,
     state: State<'_, ModelCenterState>,
     connection_id: String,
 ) -> Result<Vec<DiscoveredModel>, GatewayError> {
     let center = state.get(&app).map_err(GatewayError::configuration)?;
-    let gateway = ModelGateway::new(center.clone());
-    match gateway.discover_models(&connection_id) {
+    let worker_center = center.clone();
+    let worker_connection = connection_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move ||
+        ModelGateway::new(worker_center).discover_models(&worker_connection)).await
+        .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Model discovery worker stopped.", false))?;
+    match result {
         Ok(models) => {
             let _ = center.mark_connection_status(&connection_id, "ready", None);
             Ok(models)
@@ -1519,7 +1830,7 @@ pub fn model_gateway_discover_connection(
 }
 
 #[tauri::command]
-pub fn model_gateway_rotate_connection_secret(
+pub async fn model_gateway_rotate_connection_secret(
     app: AppHandle,
     state: State<'_, ModelCenterState>,
     connection_id: String,
@@ -1527,27 +1838,33 @@ pub fn model_gateway_rotate_connection_secret(
 ) -> Result<ConnectionSummary, GatewayError> {
     let center = state.get(&app).map_err(GatewayError::configuration)?;
     let secret = Zeroizing::new(secret);
-    ModelGateway::new(center).rotate_connection_secret(&connection_id, secret.as_str())
+    tauri::async_runtime::spawn_blocking(move ||
+        ModelGateway::new(center).rotate_connection_secret(&connection_id, secret.as_str())).await
+        .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Credential update worker stopped.", false))?
 }
 #[tauri::command]
-pub fn model_gateway_test_connection(
+pub async fn model_gateway_test_connection(
     app: AppHandle,
     state: State<'_, ModelCenterState>,
     connection_id: String,
     model_id: Option<String>,
 ) -> Result<GatewayTestResult, GatewayError> {
     let center = state.get(&app).map_err(GatewayError::configuration)?;
-    ModelGateway::new(center).test_connection(&connection_id, model_id.as_deref())
+    tauri::async_runtime::spawn_blocking(move ||
+        ModelGateway::new(center).test_connection(&connection_id, model_id.as_deref())).await
+        .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Connection test worker stopped.", false))?
 }
 
 #[tauri::command]
-pub fn model_gateway_test_model(
+pub async fn model_gateway_test_model(
     app: AppHandle,
     state: State<'_, ModelCenterState>,
     configured_model_id: String,
 ) -> Result<GatewayTestResult, GatewayError> {
     let center = state.get(&app).map_err(GatewayError::configuration)?;
-    ModelGateway::new(center).test_model(&configured_model_id)
+    tauri::async_runtime::spawn_blocking(move ||
+        ModelGateway::new(center).test_model(&configured_model_id)).await
+        .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Model test worker stopped.", false))?
 }
 
 #[cfg(test)]
@@ -1557,6 +1874,8 @@ mod tests {
     use crate::model_center::{SaveConfiguredModelInput, SaveConnectionInput};
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Instant;
     use tempfile::tempdir;
 
     fn center() -> Arc<ModelCenter> {
@@ -1610,6 +1929,140 @@ mod tests {
 
     fn one_response_server(status: &str, body: &str) -> String {
         response_server(status, body, 1)
+    }
+
+    fn recorded_wire_server(content_type: &str, body: String) -> (reqwest::Url, mpsc::Receiver<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = reqwest::Url::parse(&format!("http://{}/chat", listener.local_addr().unwrap())).unwrap();
+        let content_type = content_type.to_string();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut request = vec![0; length];
+            reader.read_exact(&mut request).unwrap();
+            sender.send(serde_json::from_slice(&request).unwrap()).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        (url, receiver)
+    }
+
+    #[test]
+    fn documented_provider_policies_preserve_full_requests_and_decode_their_wire() {
+        for provider in ["openai", "deepseek", "qwen", "kimi_cn", "kimi_global", "glm", "openrouter", "ollama", "gemini", "custom"] {
+            let framing = provider_registry::text_stream_protocol(provider);
+            let answer = "完整研究正文，不缩短。";
+            let (content_type, body) = match framing {
+                Some("ndjson") => ("application/x-ndjson", format!("{}\n{}\n",
+                    json!({"message":{"content":answer},"done":false}),
+                    json!({"message":{"content":""},"done":true,"done_reason":"stop","prompt_eval_count":11,"eval_count":5}))),
+                Some("sse") => ("text/event-stream", format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]}),
+                    if matches!(provider, "openrouter" | "glm" | "kimi_cn" | "kimi_global" | "deepseek") {
+                        json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":5}})
+                    } else { json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}) })),
+                _ => ("application/json", json!({"choices":[{"message":{"content":answer},"finish_reason":"stop"}]}).to_string()),
+            };
+            let (url, receiver) = recorded_wire_server(content_type, body);
+            let mut gateway = ModelGateway::new(center());
+            gateway.events = Some(Arc::new(GatewayEventSink::new(GatewayEventContext {
+                protocol: "model-events-v1".into(), request_id: format!("request:{provider}"), run_id: "test-run".into(),
+                stage_id: "financial-analyst".into(), generation: 1, attempt_id: "attempt".into(),
+            }).unwrap()));
+            let mut payload = json!({"model":"kept-model", "messages":[{"role":"system","content":"full system"},{"role":"user","content":"full original evidence"}]});
+            let value = gateway.post_text(&Client::new(), &url, &mut payload, None, provider).unwrap();
+            let content = if provider == "ollama" { value.pointer("/message/content") } else { value.pointer("/choices/0/message/content") };
+            assert_eq!(content.and_then(Value::as_str), Some(answer), "{provider}");
+            let sent = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(sent["messages"][1]["content"], "full original evidence");
+            assert_eq!(sent["model"], "kept-model");
+            assert_eq!(sent.get("stream").and_then(Value::as_bool).unwrap_or(false), framing.is_some(), "{provider}");
+            assert_eq!(sent.pointer("/stream_options/include_usage").and_then(Value::as_bool),
+                provider_registry::stream_requests_usage(provider).then_some(true), "{provider}");
+        }
+    }
+
+    #[test]
+    fn supplier_cache_usage_is_not_inferred_from_misses_or_other_adapters() {
+        let (center, id) = configured_custom("http://127.0.0.1:9".into(), None);
+        let model = center.configured_model_runtime(&id).unwrap();
+        let gateway = ModelGateway::new(center);
+        let response = json!({"usage":{"prompt_tokens":100,"completion_tokens":25,"prompt_cache_hit_tokens":7,
+            "prompt_cache_miss_tokens":93,"cached_tokens":9,"prompt_tokens_details":{"cached_tokens":11,"cache_write_tokens":13},
+            "completion_tokens_details":{"reasoning_tokens":5,"text_tokens":20}},
+            "prompt_eval_count":101,"eval_count":26,"prompt_eval_cached_count":17});
+        for (provider, read, write) in [("openai",Some(11),Some(13)),("deepseek",Some(7),None),
+            ("qwen",Some(11),None),("kimi_cn",Some(11),Some(13)),("kimi_global",Some(11),Some(13)),
+            ("glm",Some(11),None),("openrouter",Some(11),Some(13)),("ollama",Some(17),None),
+            ("gemini",None,None),("custom",None,None)] {
+            let mut meta = gateway.result(&model, String::new(), None).meta;
+            meta.provider_id = provider.into();
+            meta.apply_usage(&response);
+            assert_eq!(meta.cache_read_input_tokens, read, "{provider}");
+            assert_eq!(meta.cache_write_input_tokens, write, "{provider}");
+            assert_eq!(meta.input_tokens, Some(if provider == "ollama" {101} else {100}));
+            assert_eq!(meta.reasoning_tokens, if ["openai", "deepseek", "qwen", "openrouter"].contains(&provider) {Some(5)} else {None});
+            assert_eq!(meta.answer_tokens, if provider == "openai" {Some(20)} else {None});
+            meta.apply_usage(&json!({}));
+            assert_eq!(meta.input_tokens, None);
+            assert_eq!(meta.cache_read_input_tokens, None);
+            assert_eq!(meta.cache_write_input_tokens, None);
+            assert_eq!(meta.reasoning_tokens, None);
+            assert_eq!(meta.answer_tokens, None);
+        }
+    }
+
+    #[test]
+    fn known_quota_exhaustion_is_not_retryable_rate_limiting() {
+        let endpoint = one_response_server("429 Too Many Requests", r#"{"error":{"code":"insufficient_quota","message":"private echoed input"}}"#);
+        let (center, id) = configured_custom(endpoint, None);
+        let error = ModelGateway::new(center).generate_once(&id,"system","user",true).unwrap_err();
+        assert_eq!(error.code, "MODEL_QUOTA_EXHAUSTED");
+        assert!(!error.retryable);
+        assert_eq!(error.http_status, Some(429));
+        assert!(!error.message.contains("private"));
+    }
+
+    fn stalled_error_response_server(
+        status: &str,
+        retry_after: Option<&str>,
+    ) -> (String, mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let retry_after = retry_after
+            .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+            .unwrap_or_default();
+        let (release, wait_for_release) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                line.clear();
+            }
+            let partial_body =
+                r#"{"error":{"message":"gateway-secret private-provider-body"}}"#;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: 4096\r\nConnection: keep-alive\r\n\r\n{partial_body}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            let _ = wait_for_release.recv_timeout(Duration::from_secs(4));
+        });
+        (format!("http://{address}"), release, server)
     }
 
     fn sequenced_response_server(responses: &[(&str, &str)]) -> String {
@@ -1690,15 +2143,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_errors_redact_a_secret_even_if_the_server_echoes_it() {
+    fn provider_auth_errors_do_not_echo_a_secret_response_body() {
         let endpoint = one_response_server("401 Unauthorized", "gateway-secret");
         let (center, model_id) = configured_custom(endpoint, Some("gateway-secret"));
         let error = ModelGateway::new(center)
             .generate(&model_id, "system", "user", true)
             .unwrap_err();
         assert_eq!(error.code, "MODEL_UNAUTHORIZED");
+        assert_eq!(error.message, "The provider returned HTTP 401.");
         assert!(!error.message.contains("gateway-secret"));
-        assert!(error.message.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1738,6 +2191,44 @@ mod tests {
         assert_eq!(error.code, "MODEL_RATE_LIMITED");
         assert_eq!(error.retry_after_seconds, Some(19));
         assert!(error.retryable);
+    }
+
+    #[test]
+    fn authorization_and_rate_limit_headers_fail_before_a_stalled_error_body() {
+        for (status, code, retry_after, expected_retry_after, retryable, http_status) in [
+            ("401 Unauthorized", "MODEL_UNAUTHORIZED", None, None, false, 401),
+            ("403 Forbidden", "MODEL_UNAUTHORIZED", None, None, false, 403),
+            (
+                "429 Too Many Requests",
+                "MODEL_RATE_LIMITED",
+                Some("19"),
+                Some(19),
+                true,
+                429,
+            ),
+        ] {
+            let (endpoint, release, server) =
+                stalled_error_response_server(status, retry_after);
+            let (center, model_id) = configured_custom(endpoint, Some("gateway-secret"));
+            let started = Instant::now();
+            let error = ModelGateway::new(center)
+                .generate(&model_id, "system", "user", true)
+                .unwrap_err();
+            let elapsed = started.elapsed();
+            let _ = release.send(());
+            server.join().unwrap();
+
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "{status} took {elapsed:?} while its response body remained open"
+            );
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.retry_after_seconds, expected_retry_after);
+            assert_eq!(error.http_status, Some(http_status));
+            assert!(!error.message.contains("gateway-secret"));
+            assert!(!error.message.contains("private-provider-body"));
+        }
     }
 
     #[test]
@@ -2000,11 +2491,189 @@ mod tests {
             image_media_type: "image/png".into(),
             image_base64: "unused".into(),
             wire_contract: String::new(),
+            max_output_tokens: None,
+            event_context: None,
         };
         assert_eq!(
             run_cli_request(request).unwrap_err().code,
             "MODEL_GATEWAY_PROTOCOL_ERROR"
         );
+    }
+
+    #[test]
+    fn cli_output_budget_is_optional_positive_integer_and_zero_is_rejected_early() {
+        let base = json!({
+            "operation": "generate",
+            "configured_model_id": "missing",
+            "system_prompt": "system",
+            "user_prompt": "user",
+            "json_mode": false,
+            "wire_contract": "text-single-request-v1"
+        });
+        let absent: GatewayCliRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(absent.max_output_tokens, None);
+
+        let mut positive = base.clone();
+        positive["max_output_tokens"] = json!(8192);
+        let parsed: GatewayCliRequest = serde_json::from_value(positive).unwrap();
+        assert_eq!(parsed.max_output_tokens, Some(8192));
+
+        for invalid in [json!(-1), json!(1.5), json!("8192"), json!(4294967296u64)] {
+            let mut request = base.clone();
+            request["max_output_tokens"] = invalid;
+            assert!(serde_json::from_value::<GatewayCliRequest>(request).is_err());
+        }
+
+        let mut zero = base;
+        zero["max_output_tokens"] = json!(0);
+        let request: GatewayCliRequest = serde_json::from_value(zero).unwrap();
+        let error = run_cli_request(request).unwrap_err();
+        assert_eq!(error.code, "MODEL_GATEWAY_PROTOCOL_ERROR");
+    }
+
+    #[test]
+    fn scoped_output_budget_reaches_only_the_selected_text_request() {
+        let response = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let (capped_endpoint, capped_receiver) = recorded_wire_server("application/json", response.into());
+        let (uncapped_endpoint, uncapped_receiver) = recorded_wire_server("application/json", response.into());
+        let (center, model_id) = configured_custom(capped_endpoint.to_string(), None);
+        let mut capped_model = center.configured_model_runtime(&model_id).unwrap();
+        capped_model.provider_id = "openai".into();
+        capped_model.model_id = "gpt-5.6-sol".into();
+        let mut uncapped_model = capped_model.clone();
+        uncapped_model.endpoint = uncapped_endpoint.to_string();
+        let full_user_prompt = "evidence-fragment:".repeat(2048);
+
+        let base_gateway = ModelGateway::new(center);
+        let scoped_gateway = base_gateway.clone().with_output_token_budget(Some(321));
+        let capped_result = scoped_gateway
+            .generate_openai_compatible(
+                &Client::new(), &capped_model, None, "system", &full_user_prompt, false, false,
+            )
+            .unwrap();
+        let uncapped_result = base_gateway
+            .generate_openai_compatible(
+                &Client::new(), &uncapped_model, None, "system", "user", false, false,
+            )
+            .unwrap();
+
+        let capped_payload = capped_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let uncapped_payload = uncapped_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(capped_payload["max_completion_tokens"], 321);
+        assert_eq!(capped_payload["messages"][1]["content"], full_user_prompt);
+        assert_eq!(capped_payload["messages"][0]["content"], "system");
+        assert!(uncapped_payload.get("max_completion_tokens").is_none());
+        assert!(uncapped_payload.get("max_tokens").is_none());
+        assert_eq!(capped_result.meta.output_budget_tokens, Some(321));
+        assert_eq!(capped_result.meta.output_budget_wire_field.as_deref(), Some("max_completion_tokens"));
+        assert_eq!(capped_result.meta.output_budget_semantics.as_deref(), Some("total_generated_tokens_including_reasoning"));
+        assert_eq!(uncapped_result.meta.output_budget_tokens, None);
+        assert_eq!(
+            serde_json::to_value(capped_result.meta).unwrap()["output_budget_tokens"],
+            321
+        );
+        assert!(serde_json::to_value(uncapped_result.meta)
+            .unwrap()
+            .get("output_budget_tokens")
+            .is_none());
+    }
+
+    #[test]
+    fn provider_output_budget_keys_are_observed_on_local_http_wires() {
+        let (center, configured_model_id) =
+            configured_custom("http://127.0.0.1:9".into(), None);
+        let response = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        for (provider, model_id, requested, expected) in [
+            ("openai", "gpt-5.6-sol", 200_000, Some(("max_completion_tokens", 128_000))),
+            ("openai", "gpt-5.6-terra", 131_072, Some(("max_completion_tokens", 128_000))),
+            ("deepseek", "deepseek-v4-flash", 500_000, Some(("max_tokens", 393_216))),
+            ("qwen", "qwen3.5-plus", 131_072, Some(("max_completion_tokens", 65_536))),
+            ("qwen", "qwen3.8-max", 200_000, Some(("max_completion_tokens", 131_072))),
+            ("qwen", "qwen3.7-plus", 131_072, Some(("max_completion_tokens", 131_072))),
+            ("qwen", "qwen3.7-flash", 98_304, Some(("max_completion_tokens", 98_304))),
+            ("kimi_cn", "kimi-k2.5", 131_072, None),
+            ("kimi_global", "kimi-k2.5", 131_072, None),
+            ("openrouter", "openai/gpt-4", 131_072, None),
+            ("gemini", "gemini-3.7-flash", 131_072, None),
+            ("glm", "glm-5.2", 131_072, None),
+            ("custom", "private-model", 131_072, None),
+            ("qwen", "unclassified-qwen-model", 131_072, None),
+            ("qwen", "qwen-plus", 131_072, None),
+        ] {
+            let (endpoint, receiver) = recorded_wire_server("application/json", response.into());
+            let mut model = center
+                .configured_model_runtime(&configured_model_id)
+                .unwrap();
+            model.provider_id = provider.into();
+            model.model_id = model_id.into();
+            model.endpoint = endpoint.to_string();
+            let gateway = ModelGateway::new(center.clone()).with_output_token_budget(Some(requested));
+            let result = gateway
+                .generate_openai_compatible(
+                    &Client::new(), &model, None, "system", "evidence", false, false,
+                )
+                .unwrap();
+            let sent = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            match expected {
+                Some(("max_completion_tokens", actual_tokens)) => {
+                    assert_eq!(sent["max_completion_tokens"], actual_tokens, "{provider}/{model_id}");
+                    assert!(sent.get("max_tokens").is_none(), "{provider}/{model_id}");
+                    assert_eq!(result.meta.output_budget_tokens, Some(actual_tokens));
+                    assert_eq!(result.meta.output_budget_wire_field.as_deref(), Some("max_completion_tokens"));
+                    assert_eq!(result.meta.output_budget_semantics.as_deref(), Some("total_generated_tokens_including_reasoning"));
+                }
+                Some(("max_tokens", actual_tokens)) => {
+                    assert_eq!(sent["max_tokens"], actual_tokens, "{provider}/{model_id}");
+                    assert!(sent.get("max_completion_tokens").is_none(), "{provider}/{model_id}");
+                    assert_eq!(result.meta.output_budget_tokens, Some(actual_tokens));
+                    assert_eq!(result.meta.output_budget_wire_field.as_deref(), Some("max_tokens"));
+                    assert_eq!(result.meta.output_budget_semantics.as_deref(), Some("total_generated_tokens_including_reasoning"));
+                }
+                _ => {
+                    assert!(sent.get("max_tokens").is_none(), "{provider}/{model_id}");
+                    assert!(sent.get("max_completion_tokens").is_none(), "{provider}/{model_id}");
+                    assert_eq!(result.meta.output_budget_tokens, None);
+                    assert_eq!(result.meta.output_budget_wire_field, None);
+                    assert_eq!(result.meta.output_budget_semantics, None);
+                }
+            }
+        }
+
+        let (endpoint, receiver) = recorded_wire_server(
+            "application/json",
+            r#"{"message":{"content":"ok"},"done_reason":"stop"}"#.into(),
+        );
+        let mut ollama_model = center
+            .configured_model_runtime(&configured_model_id)
+            .unwrap();
+        ollama_model.provider_id = "ollama".into();
+        ollama_model.model_id = "qwen3:8b".into();
+        ollama_model.endpoint = endpoint.to_string();
+        ollama_model.temperature = Some(0.4);
+        let result = ModelGateway::new(center)
+            .with_output_token_budget(Some(456))
+            .generate_ollama(
+                &Client::new(), &ollama_model, None, "system", "evidence", false,
+            )
+            .unwrap();
+        let sent = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(sent.pointer("/options/temperature"), Some(&json!(0.4)));
+        assert!(sent.get("max_tokens").is_none());
+        assert!(sent.get("max_completion_tokens").is_none());
+        assert!(sent.pointer("/options/num_predict").is_none());
+        assert_eq!(result.meta.output_budget_tokens, None);
+    }
+
+    #[test]
+    fn oversized_local_prompt_uses_body_error_without_truncating_or_sending() {
+        let prompt = "original-material".repeat(7 * 1024 * 1024 / 17 + 1);
+        let prompt_len = prompt.len();
+        let error = ModelGateway::new(center())
+            .generate_once("missing-model", "", &prompt, false)
+            .unwrap_err();
+        assert_eq!(error.code, "MODEL_REQUEST_BODY_TOO_LARGE");
+        assert_eq!(prompt.len(), prompt_len);
+        assert!(error.message.contains("exceeds the gateway limit"));
     }
 
     #[test]
@@ -2018,6 +2687,8 @@ mod tests {
             image_media_type: String::new(),
             image_base64: String::new(),
             wire_contract: String::new(),
+            max_output_tokens: None,
+            event_context: None,
         };
         assert_eq!(
             run_cli_request(request).unwrap_err().code,
@@ -2060,7 +2731,7 @@ mod tests {
         let (center, model_id) = configured_vision(endpoint);
         let png = base64::engine::general_purpose::STANDARD
             .encode([0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-        let result = ModelGateway::new(center)
+        let result = ModelGateway::new(center).with_output_token_budget(Some(123))
             .generate_vision_with_format(
                 &model_id,
                 "entire-system",
@@ -2074,6 +2745,9 @@ mod tests {
         assert_eq!(result.content, r#"{"facts":[]}"#);
         let payload = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(payload.get("response_format").is_none());
+        assert!(payload.get("max_tokens").is_none());
+        assert!(payload.get("max_completion_tokens").is_none());
+        assert!(payload.pointer("/options/num_predict").is_none());
         assert_eq!(payload["messages"][0]["content"], "entire-system");
         assert_eq!(payload["messages"][1]["content"][0]["text"], "entire-user");
         assert_eq!(

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Building2, ExternalLink } from "lucide-react";
 import { MarketReadiness, FxDetails } from './MarketReadiness';
 import { modelEligibility } from "../../modelEligibility";
@@ -131,6 +131,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   onSavePreferences: (value: Partial<Preferences>) => Promise<Preferences>;
   onStart: (request: ResearchRequest) => Promise<void>;
 }) {
+  const parallelHintId = useId();
   const [profile, setProfile] = useState(bootstrap.preferences.sec_contact_profile || "personal");
   const [email, setEmail] = useState(bootstrap.preferences.sec_contact_email || "");
   const [market, setMarket] = useState<Market>(bootstrap.preferences.research_market || "US");
@@ -166,6 +167,18 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [downloadFilings, setDownloadFilings] = useState(true);
   const [packId, setPackId] = useState(bootstrap.research_packs[0]?.pack_id ?? "");
   const [packs, setPacks] = useState<ResearchPackSummary[]>(bootstrap.research_packs);
+  useEffect(() => {
+    if (bootstrap.research_packs.length === 0) return;
+    // The user may open this view after minimal bootstrap, before packs arrive.
+    // Merge the late defaults without losing an in-flight local installation
+    // or resetting a selection the user has already made.
+    setPacks((current) => {
+      const known = new Set(current.map((pack) => pack.pack_id));
+      const added = bootstrap.research_packs.filter((pack) => !known.has(pack.pack_id));
+      return added.length ? [...current, ...added] : current;
+    });
+    setPackId((current) => current || bootstrap.research_packs[0]?.pack_id || "");
+  }, [bootstrap.research_packs]);
   const [packMessage, setPackMessage] = useState("");
   const [marketCap, setMarketCap] = useState("");
   const [marketPrice, setMarketPrice] = useState("");
@@ -238,6 +251,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       configured_model_id: model.configured_model_id,
       connection_id: model.connection_id,
       configuration_version: model.configuration_version ?? 1,
+      context_window_hint: model.context_window_hint,
       role,
     } : undefined;
   };
@@ -538,8 +552,13 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
                 <span><strong>{model.alias}</strong><small>{model.model_id}{isFreeModel(model) ? " · Free" : ""}</small></span>
               </label>)}
             </fieldset>}
-            <label className="check-row"><input type="checkbox" checked={parallelAgents} onChange={(event) => setParallelAgents(event.target.checked)} />{copy.parallelAgents}</label>
-            <p className="field-caption">{copy.parallelAgentsHint}</p>
+            <label className="check-row"><input type="checkbox" checked={parallelAgents} aria-describedby={parallelHintId} onChange={(event) => setParallelAgents(event.target.checked)} />{copy.parallelAgents}</label>
+            <p className="field-caption" id={parallelHintId}>{copy.parallelAgentsHint}</p>
+            <p className="field-caption" data-testid="research-call-plan">{bootstrap.preferences.ui_language === "en"
+              ? "Call plan: one generation per stage; at most one automatic model repair per stage and two across the research run. Verification is batched over deduplicated sources and shares the run budget. Token and cost estimates are not supplier bills; unknown usage remains reserved."
+              : bootstrap.preferences.ui_language === "zh-Hant"
+                ? "呼叫計畫：每階段生成一次；自動模型修復每階段最多一次，全研究合計最多兩次。核驗按去重來源分批，並共用研究預算。Token／費用估算不等於供應商帳單；未知用量保留預算預留。"
+                : "调用计划：每阶段生成一次；自动模型修复每阶段最多一次，全研究合计最多两次。核验按去重来源分批，并共用研究预算。Token／费用估算不等于供应商账单；未知用量保留预算预留。"}</p>
           </> : <div className="model-picker-empty" role="status">
             <p>{modelLoadError || copy.modelsEmpty}</p>
             <button className="secondary-button" type="button" onClick={onOpenModelCenter}>{copy.modelCenter}</button>

@@ -73,12 +73,15 @@ class ResearchResumeRequest:
     parallel_agents: bool = False
     manual_authorization_id: str = ""
     local_only: bool = False
+    budget_only: bool = False
 
     def __post_init__(self) -> None:
         if self.target not in MODEL_RESUME_TARGETS:
             raise ValueError("MODEL_RECOVERY_TARGET_INVALID")
         if type(self.local_only) is not bool:
             raise ValueError("RESEARCH_LOCAL_REVALIDATION_INVALID")
+        if type(self.budget_only) is not bool or self.budget_only and (self.local_only or self.manual_authorization_id):
+            raise ValueError("RESEARCH_BUDGET_RESUME_INVALID")
         if not self.model.enabled and not self.local_only:
             raise ValueError("an enabled model is required")
         if not self.run.run_id:

@@ -9,13 +9,16 @@ from pathlib import Path
 
 from openthesis.demo import DEMO_COMPANY, demo_facts
 from openthesis.domain import FinancialFact, ResearchArtifact, ResearchRun, RunStatus, utc_now_iso, FilingDocument, EvidenceRef
-from openthesis.financial_ingestion import FinancialGroupValidation
+from openthesis.financial_ingestion import FinancialGroupValidation, _PDF_PARSER_VERSION
 from openthesis.market_financials import FinancialValidation, ValidationStatus
-from openthesis.storage import Storage
+from openthesis.storage import DERIVED_PIPELINE_CONTRACT, SCHEMA_VERSION, Storage
 from openthesis.markets import build_company
 
 
 class StorageTests(unittest.TestCase):
+    def test_derived_contract_tracks_current_pdf_parser(self) -> None:
+        self.assertEqual(DERIVED_PIPELINE_CONTRACT["parser"], _PDF_PARSER_VERSION)
+
     def test_connections_enable_concurrency_pragmas_and_rollback_failed_transactions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))
@@ -104,6 +107,56 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(groups[0]["derived_version"], "financial-facts-v3")
             self.assertEqual(storage.get_validation_groups_audit(company.security_id), groups)
 
+    def test_validation_group_role_roundtrips_without_accession_level_ambiguity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("role-co", "ROLE", reporting_currency="CNY")
+            storage.save_company(company)
+            target = self._fact(company.security_id)
+            comparator = replace(
+                target,
+                fact_id="rich-fact-comparator",
+                fiscal_year=2024,
+                end_date="2024-12-31",
+                usage_status="comparator",
+                validation_status=ValidationStatus.REJECTED.value,
+            )
+            target_validation = FinancialValidation(
+                ValidationStatus.VERIFIED, (), frozenset({"revenue"}), (target,), ()
+            )
+            comparator_validation = FinancialValidation(
+                ValidationStatus.REJECTED,
+                ("balance_sheet_imbalance",),
+                frozenset({"revenue"}),
+                (),
+                (comparator,),
+            )
+            storage.replace_financial_ingestion(
+                company.security_id,
+                [target.accession_number],
+                [target],
+                [comparator],
+                [
+                    FinancialGroupValidation(
+                        (target.accession_number, "2025-12-31", "FY", "consolidated", "CNY"),
+                        target_validation,
+                        "target",
+                    ),
+                    FinancialGroupValidation(
+                        (target.accession_number, "2024-12-31", "FY", "consolidated", "CNY"),
+                        comparator_validation,
+                        "comparator",
+                    ),
+                ],
+            )
+
+            groups = storage.get_validation_groups(company.security_id)
+
+            self.assertEqual(
+                {(item["period_end"], item["role"]) for item in groups},
+                {("2025-12-31", "target"), ("2024-12-31", "comparator")},
+            )
+
     def test_unit_provenance_roundtrips_and_unknown_stays_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = Storage(Path(directory))
@@ -140,6 +193,103 @@ class StorageTests(unittest.TestCase):
                 company.security_id, [filing.accession_number], [], [], [], []
             )
             self.assertEqual(storage.get_financial_evidence(filing.document_id), [])
+
+    def test_incomplete_or_sparse_same_source_candidate_never_replaces_active_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Storage(Path(directory))
+            company = build_company("600519.SH", "Moutai", reporting_currency="CNY")
+            storage.save_company(company)
+            filing = FilingDocument(
+                "doc-generation", company.security_id, "acc-generation", "ANNUAL_REPORT", "FY",
+                "2025-12-31", "2026-03-01", "annual.pdf", "https://example.test/report",
+                content_hash="same-source-hash",
+            )
+            storage.save_filings([filing])
+            concepts = ("revenue", "net_income", "operating_cash_flow", "assets")
+            rich_facts = [
+                replace(
+                    self._fact(company.security_id),
+                    fact_id=f"generation-{concept}",
+                    concept=concept,
+                    accession_number="acc-generation",
+                    parser_version="financial-ingestion-ast-v8",
+                )
+                for concept in concepts
+            ]
+            validation = FinancialValidation(
+                ValidationStatus.VERIFIED, (), frozenset(concepts), tuple(rich_facts), (),
+            )
+            group = FinancialGroupValidation(
+                (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"),
+                validation,
+            )
+            first = storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], rich_facts, [], [group], [],
+                generation_id="generation-good", parser_version="financial-ingestion-ast-v8",
+                source_hashes={filing.accession_number: "same-source-hash"},
+                complete_accessions={filing.accession_number},
+            )
+            self.assertEqual(first["state"], "promoted")
+            captured = storage.get_financial_research_snapshot(company.security_id)
+            self.assertEqual(captured["generations"][filing.accession_number], "generation-good")
+            self.assertEqual(
+                {item["generation_id"] for item in captured["facts"]},
+                {"generation-good"},
+            )
+
+            sparse = [rich_facts[0]]
+            sparse_validation = FinancialValidation(
+                ValidationStatus.VERIFIED, (), frozenset({"revenue"}), tuple(sparse), (),
+            )
+            sparse_group = FinancialGroupValidation(
+                (filing.accession_number, filing.period_end, "FY", "consolidated", "CNY"),
+                sparse_validation,
+            )
+            second = storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], sparse, [], [sparse_group], [],
+                generation_id="generation-sparse", parser_version="financial-ingestion-ast-v8",
+                source_hashes={filing.accession_number: "same-source-hash"},
+                complete_accessions={filing.accession_number},
+            )
+            self.assertEqual(second["state"], "investigate")
+            self.assertEqual({item["concept"] for item in storage.get_facts(company.security_id)}, set(concepts))
+            sparse_audit = storage.get_facts_audit(company.security_id)
+            self.assertTrue(any(
+                item["fact_id"] == "generation-revenue"
+                and item["generation_id"] == "generation-sparse"
+                and item["usage_status"] == "candidate_audit"
+                for item in sparse_audit
+            ))
+            still_active = storage.get_financial_research_snapshot(company.security_id)
+            self.assertEqual(still_active["generations"][filing.accession_number], "generation-good")
+            self.assertEqual(
+                {item["generation_id"] for item in still_active["facts"]},
+                {"generation-good"},
+            )
+            with storage.connect() as db:
+                self.assertEqual(
+                    db.execute(
+                        "SELECT generation_id FROM financial_active_generations WHERE company_cik = ? AND accession_number = ?",
+                        (company.security_id, filing.accession_number),
+                    ).fetchone()[0],
+                    "generation-good",
+                )
+                self.assertEqual(
+                    db.execute(
+                        "SELECT state FROM financial_ingestion_candidates WHERE generation_id = ?",
+                        ("generation-sparse",),
+                    ).fetchone()[0],
+                    "investigate",
+                )
+
+            third = storage.replace_financial_ingestion(
+                company.security_id, [filing.accession_number], [], [], [], [],
+                generation_id="generation-incomplete", parser_version="financial-ingestion-ast-v8",
+                source_hashes={filing.accession_number: "same-source-hash"},
+                complete_accessions=set(),
+            )
+            self.assertEqual(third["state"], "incomplete")
+            self.assertEqual({item["concept"] for item in storage.get_facts(company.security_id)}, set(concepts))
 
     def test_filings_and_financial_retry_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -366,7 +516,7 @@ class StorageTests(unittest.TestCase):
             with storage.connect() as migrated:
                 metadata = dict(migrated.execute("SELECT key, value FROM metadata").fetchall())
                 group_columns = {row[1] for row in migrated.execute("PRAGMA table_info(financial_validation_groups)")}
-            self.assertEqual(metadata["schema_version"], "11")
+            self.assertEqual(metadata["schema_version"], str(SCHEMA_VERSION))
             self.assertEqual(metadata["derived_rebuild_required"], "1")
             self.assertIn("derived_version", group_columns)
             self.assertEqual(storage.get_facts("legacy-v10"), [])
@@ -381,7 +531,7 @@ class StorageTests(unittest.TestCase):
             restarted = Storage(data_dir)
             with restarted.connect() as stable:
                 metadata_again = dict(stable.execute("SELECT key, value FROM metadata").fetchall())
-            self.assertEqual(metadata_again["schema_version"], "11")
+            self.assertEqual(metadata_again["schema_version"], str(SCHEMA_VERSION))
             self.assertEqual(metadata_again["derived_rebuild_required"], "1")
             self.assertEqual(restarted.get_facts("legacy-v10"), [])
             self.assertEqual(len(restarted.get_validation_groups_audit("legacy-v10")), 1)
@@ -574,7 +724,7 @@ class StorageTests(unittest.TestCase):
             storage.save_run(run)
             self.assertEqual(storage.interrupt_running_runs(), 1)
             recovered = storage.list_runs()[0]
-            self.assertEqual(recovered["status"], RunStatus.CANCELLED.value)
+            self.assertEqual(recovered["status"], RunStatus.PARTIAL.value)
             self.assertTrue(recovered["completed_at"])
             self.assertEqual(storage.interrupt_running_runs(), 0)
 

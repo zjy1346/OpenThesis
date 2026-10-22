@@ -21,9 +21,39 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _ABSENT = object()
 _INTEGER_META = frozenset({"credential_version", "connection_configuration_version",
     "model_configuration_version", "configuration_version", "content_length",
-    "free_verified_at", "timeout_seconds"})
+    "free_verified_at", "timeout_seconds", "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens",
+    "output_budget_tokens"})
+_OPTIONAL_USAGE_META = frozenset({"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens"})
 _STRING_META = frozenset({"configured_model_id", "connection_id", "provider_id", "model_id",
-    "alias", "endpoint_host", "finish_reason", "billing_class", "free_source_url", "refusal"})
+    "alias", "endpoint_host", "finish_reason", "billing_class", "free_source_url", "refusal",
+    "output_budget_wire_field", "output_budget_semantics"})
+_USAGE_ALIASES = {
+    "input_tokens": "input_tokens", "prompt_tokens": "input_tokens",
+    "output_tokens": "output_tokens", "completion_tokens": "output_tokens",
+    "cache_read_input_tokens": "cache_read_input_tokens", "cached_tokens": "cache_read_input_tokens",
+    "cache_write_input_tokens": "cache_write_input_tokens",
+    "cache_creation_input_tokens": "cache_write_input_tokens",
+    "reasoning_tokens": "reasoning_tokens", "answer_tokens": "answer_tokens",
+}
+_USAGE_DETAIL_GROUPS = {
+    "input_tokens_details": {
+        "cached_tokens": "cache_read_input_tokens",
+        "cache_read_input_tokens": "cache_read_input_tokens",
+        "cache_write_tokens": "cache_write_input_tokens",
+        "cache_write_input_tokens": "cache_write_input_tokens",
+        "cache_creation_tokens": "cache_write_input_tokens",
+    },
+    "prompt_tokens_details": {
+        "cached_tokens": "cache_read_input_tokens",
+        "cache_read_input_tokens": "cache_read_input_tokens",
+        "cache_write_tokens": "cache_write_input_tokens",
+        "cache_write_input_tokens": "cache_write_input_tokens",
+        "cache_creation_tokens": "cache_write_input_tokens",
+    },
+    "output_tokens_details": {"reasoning_tokens": "reasoning_tokens", "answer_tokens": "answer_tokens"},
+    "completion_tokens_details": {"reasoning_tokens": "reasoning_tokens", "answer_tokens": "answer_tokens"},
+}
 
 
 def redact_response_text(text: str) -> tuple[str, list[dict]]:
@@ -127,6 +157,59 @@ def safe_response_content(value: Any, issues: list[dict], *, path: str = "$", de
     return _ABSENT
 
 
+def _normalize_usage(value: Any, receipt: dict, issues: list[dict]) -> None:
+    """Keep a small typed set of provider counters; never retain raw usage maps."""
+    base = "$.receipt.metadata.usage"
+    if not isinstance(value, dict):
+        issues.append({"code": "MODEL_RESPONSE_META_TYPE_INVALID", "path": base})
+        return
+
+    def add_count(name: str, nested: Any, path: str) -> None:
+        if nested is not None and not (type(nested) is int and nested >= 0):
+            issues.append({"code": "MODEL_RESPONSE_META_TYPE_INVALID", "path": path})
+            return
+        if name not in receipt["metadata"]:
+            # Direct normalized metadata, when supplied by the host adapter,
+            # takes precedence over a provider's nested raw usage object.
+            receipt["metadata"][name] = nested
+
+    def isolate(name: Any, path: str, *, secret: bool = False) -> None:
+        issues.append({"code": "MODEL_RESPONSE_SECRET_FIELD_ISOLATED" if secret else
+                       "MODEL_RESPONSE_USAGE_FIELD_ISOLATED", "path": path})
+
+    for raw_name, nested in value.items():
+        path = base + "." + str(raw_name)
+        if not isinstance(raw_name, str):
+            isolate(raw_name, base)
+            continue
+        normalized = raw_name.casefold()
+        if sensitive_candidate_field(raw_name):
+            isolate(raw_name, path, secret=True)
+            continue
+        if normalized in _USAGE_DETAIL_GROUPS:
+            if not isinstance(nested, dict):
+                issues.append({"code": "MODEL_RESPONSE_META_TYPE_INVALID", "path": path})
+                continue
+            allowed = _USAGE_DETAIL_GROUPS[normalized]
+            for detail_name, detail_value in nested.items():
+                detail_path = path + "." + str(detail_name)
+                if not isinstance(detail_name, str):
+                    isolate(detail_name, path)
+                    continue
+                canonical = allowed.get(detail_name.casefold())
+                if canonical is None:
+                    isolate(detail_name, detail_path,
+                            secret=sensitive_candidate_field(detail_name))
+                else:
+                    add_count(canonical, detail_value, detail_path)
+            continue
+        canonical = _USAGE_ALIASES.get(normalized)
+        if canonical is None:
+            isolate(raw_name, path)
+        else:
+            add_count(canonical, nested, path)
+
+
 def received_response(content: dict, metadata: Any, *, expected_model_id: str = "",
                       expected_connection_id: str = "") -> ModelResponse:
     """Normalize a received candidate; explicit transport identity conflicts fail."""
@@ -134,9 +217,14 @@ def received_response(content: dict, metadata: Any, *, expected_model_id: str = 
     metadata = metadata if isinstance(metadata, dict) else {}
     receipt = {"schema": RESPONSE_SCHEMA, "response_received": True, "metadata": {}, "extensions": {}}
     for name, value in metadata.items():
+        if not isinstance(name, str):
+            issues.append({"code": "MODEL_RESPONSE_META_KEY_INVALID", "path": "$.receipt.metadata"})
+            continue
+        if name == "usage":
+            continue
         path = "$.receipt.metadata." + str(name)
         if name in _INTEGER_META:
-            if value is None and name == "free_verified_at":
+            if value is None and (name in {"free_verified_at", "output_budget_tokens"} or name in _OPTIONAL_USAGE_META):
                 receipt["metadata"][name] = None
             elif type(value) is int and value >= 0:
                 receipt["metadata"][name] = value
@@ -170,6 +258,8 @@ def received_response(content: dict, metadata: Any, *, expected_model_id: str = 
                 receipt["extensions"].update(safe)
             else:
                 issues.append({"code": "MODEL_RESPONSE_OPTIONAL_META_LIMIT", "path": path})
+    if "usage" in metadata:
+        _normalize_usage(metadata["usage"], receipt, issues)
     for name, expected in (("configured_model_id", expected_model_id),
                            ("connection_id", expected_connection_id)):
         if expected and name in metadata and metadata[name] != expected:
@@ -197,7 +287,8 @@ def response_record(value: Any) -> tuple[dict, dict]:
         response = value
     elif "_response_meta" in value:
         response = received_response({key: nested for key, nested in value.items()
-                                      if key != "_response_meta"}, value.get("_response_meta"))
+                                      if key not in {"_response_meta", "_response_receipt"}},
+                                     value.get("_response_meta"))
     else:
         issues: list[dict] = []
         clean = safe_response_content(value, issues)
@@ -206,7 +297,8 @@ def response_record(value: Any) -> tuple[dict, dict]:
             # Historical non-gateway callers retain their exact body/digest.
             return clean, receipt
         response = ModelResponse(clean, receipt, issues)
-    content = {key: nested for key, nested in response.items() if key != "_response_meta"}
+    content = {key: nested for key, nested in response.items()
+               if key not in {"_response_meta", "_response_receipt"}}
     return {"schema": RESPONSE_SCHEMA, "content": content,
             "receipt": deepcopy(response.receipt), "diagnostics": deepcopy(response.diagnostics)}, response.receipt
 

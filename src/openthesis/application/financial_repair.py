@@ -31,6 +31,9 @@ class FinancialRetryResult:
     freshness: str = "fresh"
     next_action: str = ""
     recovery_outcome: dict[str, Any] | None = None
+    research_can_continue: bool = False
+    capabilities: tuple[tuple[str, bool], ...] = ()
+    scoped_issues: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {"mode": self.mode, "targets": list(self.targets), "downloaded": list(self.downloaded),
@@ -38,6 +41,9 @@ class FinancialRetryResult:
             "error": self.error, "updated_artifacts": list(self.updated_artifacts),
             "terminal_state": self.terminal_state, "diagnostics": list(self.diagnostics),
             "freshness": self.freshness, "next_action": self.next_action,
+            "research_can_continue": self.research_can_continue,
+            "capabilities": dict(self.capabilities),
+            "scoped_issues": list(self.scoped_issues),
             "recovery_outcome": json.loads(json.dumps(self.recovery_outcome, allow_nan=False))
                 if self.recovery_outcome else None}
 
@@ -135,4 +141,8 @@ class FinancialRepairer:
             error=error, updated_artifacts=updated, terminal_state=terminal_state or outcome.state.value,
             diagnostics=tuple(sorted(set(diagnostics))), freshness=freshness,
             next_action=next(iter(outcome.next_actions), "") or (prepared.discovery.next_action if prepared else ""),
-            recovery_outcome=outcome.to_dict())
+            recovery_outcome=outcome.to_dict(),
+            research_can_continue=bool(prepared and prepared.view.research_ready),
+            capabilities=prepared.view.capabilities if prepared else (),
+            scoped_issues=tuple(prepared.view.canonical_dataset.coverage.get("scoped_issues", ()))
+                if prepared else ())

@@ -12,11 +12,11 @@ import math
 import re
 from typing import Any, Mapping, Sequence
 
-from .research_section_validation import proven_content_nodes
+from .research_section_validation import proven_content_nodes, is_structural_content_path
 from .financials import read_metric_period
 
 
-CONTRACT_VERSION = "openthesis.research-coverage.v4-analysis-presentation"
+CONTRACT_VERSION = "openthesis.research-coverage.v5-local-retention"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,13 +48,14 @@ OBLIGATIONS = (
 )
 
 _METADATA_KEYS = frozenset({
-    "evidence_ids", "source_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
+    "evidence_ids", "source_ids", "source_evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
     "unknown_evidence_ids", "claim_id", "fact_id", "document_id", "source_id", "role", "kind",
     "status", "confidence", "probability", "currency", "unit", "fiscal_year", "fiscal_period",
     "end_date", "period_end", "page", "pages", "url", "source_url", "name", "title",
     "complete", "verification", "verified", "evidence_count", "materiality", "applicability",
     "method", "schema_version", "contract_version", "mode", "scenario_eligibility",
-    "claims", "claim_ids", "input_claim_ids", "type", "label", "severity",
+    "claims", "claim_ids", "input_claim_ids", "type", "label", "severity", "as_of",
+    "supporting_evidence_count", "contradicting_evidence_count",
 })
 _NON_ANALYSIS_ROLES = frozenset({"notice", "placeholder", "source", "unknown"})
 
@@ -162,7 +163,7 @@ def _references(value: Any) -> set[str]:
     found: set[str] = set()
     if isinstance(value, dict):
         for key, child in value.items():
-            if key in {"evidence_ids", "source_ids", "supporting_evidence_ids", "contradicting_evidence_ids"}:
+            if key in {"evidence_ids", "source_ids", "source_evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids"}:
                 if isinstance(child, (list, tuple)):
                     found.update(item for item in child if isinstance(item, str) and item)
             elif not str(key).startswith("_"):
@@ -233,7 +234,8 @@ class ResearchCoverageContract:
         proof = verification if isinstance(verification, dict) else {}
         # Global counters describe the attempt, not each section's trust.
         # Consume only independently produced, body-bound local proofs.
-        nodes = proven_content_nodes(value, proof.get("section_validation"))
+        nodes = tuple(node for node in proven_content_nodes(value, proof.get("section_validation"))
+                      if not is_structural_content_path(node["source_path"]))
         known = set(evidence_records)
         financial = {key for key, record in evidence_records.items()
                      if isinstance(record, dict) and record.get("kind") == "financial_fact"}
@@ -318,6 +320,9 @@ class ResearchCoverageContract:
                 issues.append("source_links_unregistered")
             unproven = (analysis is not None and _unproven_analysis(
                 analysis, path, {node["path"] for node in local_nodes}))
+            pending_validation = any(node.get("validation_state") == "partial" for node in local_nodes)
+            if pending_validation:
+                issues.append("generated_content_pending_verification")
             if analysis is not None and (not local_nodes or unproven):
                 issues.append("local_content_proof_missing")
 
@@ -340,15 +345,22 @@ class ResearchCoverageContract:
                     rows.append(ObligationCoverage(requirement.obligation_id, "not_applicable", path,
                                 tuple(sorted(sources)), (), "financial_beta_ordinary_fcf_valuation"))
                     continue
-                if not isinstance(valuation, dict) or valuation.get("status") not in {"ok", "extreme_assumption"}:
-                    issues.append("verified_valuation_unavailable")
+                from .valuation_claims import intrinsic_sensitivity_is_usable
+                independent_sensitivity = (requirement.source_kind == "sensitivity" and isinstance(valuation, dict)
+                    and intrinsic_sensitivity_is_usable(valuation.get("intrinsic_analysis")))
+                if not independent_sensitivity and (not isinstance(valuation, dict) or valuation.get("status") not in {"ok", "extreme_assumption"}):
+                    intrinsic = valuation.get("intrinsic_analysis") if isinstance(valuation, dict) else None
+                    issues.append("verified_intrinsic_sensitivity_unavailable:" + str(intrinsic.get("reason", "inputs_missing"))
+                        if requirement.source_kind == "sensitivity" and isinstance(intrinsic, dict) else "verified_valuation_unavailable")
                 elif requirement.source_kind == "sensitivity":
-                    sensitivity = valuation.get("sensitivity")
+                    sensitivity = valuation["intrinsic_analysis"]["sensitivity"] if independent_sensitivity else valuation.get("sensitivity")
                     if (not isinstance(sensitivity, (list, tuple)) or not sensitivity
                             or any(not isinstance(item, dict) or not _finite(item.get("equity_value"))
                                    or not _finite(item.get("fcf_growth")) for item in sensitivity)):
                         issues.append("verified_sensitivity_unavailable")
             state = ("fulfilled" if not issues else "missing_analysis" if analysis is None
+                     else "missing_source_data" if any(issue.startswith("verified_") for issue in issues)
+                     else "generated_unverified" if pending_validation
                      else "verification_failed" if unknown or not local_nodes or unproven
                      else "missing_evidence" if not sources else "missing_source_data")
             rows.append(ObligationCoverage(requirement.obligation_id, state, path,

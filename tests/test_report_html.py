@@ -22,6 +22,10 @@ def sample_artifacts() -> list[dict[str, object]]:
                         "operating_margin": 0.373,
                         "net_income": 28_090_000_000,
                         "operating_cash_flow": 64_090_000_000,
+                        "cash_conversion": 64_090_000_000 / 28_090_000_000,
+                        "cash_conversion_status": "calculated",
+                        "cash_conversion_scope": "consolidated",
+                        "cash_conversion_formula": "operating_cash_flow / net_income",
                         "capital_expenditure": 10_000_000_000,
                         "free_cash_flow": 54_090_000_000,
                     }
@@ -78,6 +82,25 @@ def sample_artifacts() -> list[dict[str, object]]:
 
 
 class HtmlReportTests(unittest.TestCase):
+    def test_empty_artifacts_show_recovery_state_not_a_report_shell(self) -> None:
+        report = render_research_html("run-empty", [], "en")
+        self.assertIn("No usable research report is available", report)
+        self.assertNotIn("Long-term company research", report)
+        self.assertNotIn('id="financials"', report)
+
+    def test_stage_artifacts_without_final_report_are_labeled_incomplete(self) -> None:
+        report = render_research_html(
+            "run-stage-only",
+            [{"artifact_type": "deterministic-financial-summary", "content": {"metrics": []}}],
+            "zh-CN",
+        )
+        self.assertIn("尚未生成最终综合报告", report)
+
+    def test_cash_conversion_and_its_scope_are_visible_in_html(self) -> None:
+        html = render_research_html("run-id", sample_artifacts())
+        self.assertIn("现金利润转化率", html)
+        self.assertIn("经营现金流 ÷ 净利润；合并口径。", html)
+
     def test_html_staged_context_capacity_callout_is_localized_and_keeps_byte_budget(self) -> None:
         artifacts = [{
             "artifact_type": "research-report",
@@ -106,7 +129,9 @@ class HtmlReportTests(unittest.TestCase):
             self.assertIn(phrase, report)
             self.assertIn("36,327", report)
             self.assertIn("36,000", report)
-            self.assertIn("conservative UTF-8 byte upper bound", report) if language == "en" else None
+            if language == "en":
+                self.assertIn("UTF-8 byte shape estimate", report)
+                self.assertIn("not an official token count or a safe upper bound", report)
 
         normal = [{
             "artifact_type": "research-report",
@@ -310,7 +335,10 @@ class HtmlReportTests(unittest.TestCase):
         self.assertNotIn("Missing required report sections", report)
         self.assertIn('class="confidence-group confidence-high"', report)
         self.assertIn('class="confidence-group confidence-medium"', report)
-        self.assertIn('class="confidence-group confidence-unknown"', report)
+        # Missing confidence is not a confidence score: preserve the claim as
+        # an ungrouped conclusion instead of presenting a synthetic tier.
+        self.assertNotIn('class="confidence-group confidence-unknown"', report)
+        self.assertIn("订单能见度不足。", report)
         self.assertLess(report.index("confidence-high"), report.index("confidence-medium"))
         self.assertIn("阶段性研究报告", report)
 

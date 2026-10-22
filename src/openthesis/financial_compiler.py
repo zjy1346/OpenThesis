@@ -429,13 +429,14 @@ class FinancialFactCompiler:
                     status = "PARTIAL" if rejected else "INCOMPLETE"
                 elif status == ValidationStatus.READY_WITH_WARNINGS.value:
                     status = "INCOMPLETE"
-                # The group is the sole owner of validation state.  Facts
-                # emitted by an extractor must never retain a stale default
-                # (or a stronger state from a previous projection).
-                accepted = tuple(replace(fact, validation_status=status) for fact in accepted)
+                # Cell admission and cohort completeness are different facts.
+                # Only validator-accepted cells reach here; a missing sibling
+                # cannot revoke their evidence. Extractor flags are not trusted.
+                accepted = tuple(replace(fact, validation_status=ValidationStatus.VERIFIED.value)
+                                 for fact in accepted)
                 resolved.extend(accepted)
                 quarantined.extend(
-                    replace(fact, validation_status=status) for fact in rejected
+                    replace(fact, validation_status=ValidationStatus.REJECTED.value) for fact in rejected
                 )
                 accepted_ids = {fact.fact_id for fact in accepted}
                 selected_evidence.extend(
@@ -580,6 +581,10 @@ class FinancialFactCompiler:
                     not filing_end
                     or len(comparator_end) < 10
                     or comparator_end[5:] == filing_end[5:]
+                    or (item.accepted and all(fact.statement == "balance_sheet"
+                                             for fact in item.accepted)
+                        and comparator_end.endswith("-12-31")
+                        and comparator_end < filing_end)
                 )
             )
 
@@ -658,6 +663,7 @@ class FinancialFactCompiler:
             item for item in validations
             if item.identity[2].upper() != "FY"
             and identity_in_scope(item.identity)
+            and not is_same_filing_comparator(item)
         )
         interim_candidates = tuple(
             item for item in interim_all_candidates
@@ -689,12 +695,9 @@ class FinancialFactCompiler:
         # filing is the only discovered document for that period.
         comparator_validations: tuple[FactGroupValidation, ...] = tuple(
             item for item in validations
-            if item.status == ValidationStatus.VERIFIED.value
+            if item.status in usable_group_statuses and item.accepted
             and is_same_filing_comparator(item)
             and comparator_identity_compatible(item)
-            and concepts_cover_profile(
-                (fact.concept for fact in item.accepted), required_concepts
-            )
         )
         def comparator_targets_research_lane(item: FactGroupValidation) -> bool:
             identity = item.identity
@@ -712,13 +715,7 @@ class FinancialFactCompiler:
         if incompatible_same_filing_comparator:
             diagnostics.append("same_filing_comparator_identity_mismatch")
         interim_comparator_complete = latest_interim_validation is None
-        if (
-            latest_interim_validation is not None
-            and latest_interim_validation.status == ValidationStatus.VERIFIED.value
-            and concepts_cover_profile(
-                (fact.concept for fact in latest_interim_validation.accepted), required_concepts
-            )
-        ):
+        if latest_interim_validation is not None:
             latest_period = latest_interim_validation.identity[2].upper()
             latest_year = int(latest_interim_validation.identity[1][:4])
             same_filing_prior = tuple(
@@ -738,15 +735,14 @@ class FinancialFactCompiler:
             )
             prior_verified = tuple(
                 item for item in prior_all
-                if item.status == ValidationStatus.VERIFIED.value
-                and concepts_cover_profile(
-                    (fact.concept for fact in item.accepted), required_concepts
-                )
+                if item.status in usable_group_statuses and item.accepted
             )
-            if prior_verified and not same_filing_prior:
-                prior = max(prior_verified, key=authority_key)
-                if not any(item.identity == prior.identity for item in comparator_validations):
-                    comparator_validations = (*comparator_validations, prior)
+            if prior_verified:
+                # Retain genuine alternative versions for each metric's
+                # conflict check; do not hide one behind a group-wide winner.
+                for prior in prior_verified:
+                    if not any(item.identity == prior.identity for item in comparator_validations):
+                        comparator_validations = (*comparator_validations, prior)
                 interim_comparator_complete = True
             elif not same_filing_prior:
                 interim_comparator_complete = False
@@ -755,7 +751,7 @@ class FinancialFactCompiler:
             return tuple(
                 replace(
                     fact,
-                    validation_status=item.status,
+                    validation_status=ValidationStatus.VERIFIED.value,
                     extraction_status="extracted",
                     usage_status=usage,
                     provenance_status="verified",
@@ -771,6 +767,15 @@ class FinancialFactCompiler:
         interim_facts = cohort_facts(interim_validations, "canonical_research")
         comparator_facts = cohort_facts(comparator_validations, "comparator")
         research_facts = annual_facts + interim_facts + comparator_facts
+        from .financial_comparatives import build_comparison_bindings
+        comparison_bindings = build_comparison_bindings(research_facts)
+        if latest_interim_validation is not None:
+            current_ids = {fact.fact_id for fact in interim_facts
+                           if fact.statement in {"income_statement", "cash_flow"}}
+            flow_bindings = [item for item in comparison_bindings
+                             if item.current_fact_id in current_ids]
+            interim_comparator_complete = bool(flow_bindings) and all(
+                item.status == "available" for item in flow_bindings)
         unit_evidence_by_id = {ref.evidence_id: ref for batch in batches for ref in batch.evidence}
 
         def independently_declared_unit(fact: FinancialFact) -> bool:
@@ -831,9 +836,32 @@ class FinancialFactCompiler:
                 return True
             return False
 
-        comparator_unit_mismatch = any(comparator_unit_conflicts(fact) for fact in comparator_facts)
+        mismatched_comparator_ids = {fact.fact_id for fact in comparator_facts
+                                     if comparator_unit_conflicts(fact)}
+        comparator_unit_mismatch = bool(mismatched_comparator_ids)
         if comparator_unit_mismatch:
             diagnostics.append("same_filing_comparator_unit_mismatch")
+            isolated = tuple(fact for fact in comparator_facts if fact.fact_id in mismatched_comparator_ids)
+            quarantined.extend(replace(fact, validation_status=ValidationStatus.REJECTED.value)
+                               for fact in isolated)
+            resolved = [fact for fact in resolved if fact.fact_id not in mismatched_comparator_ids]
+            comparator_facts = tuple(fact for fact in comparator_facts
+                                     if fact.fact_id not in mismatched_comparator_ids)
+            research_facts = annual_facts + interim_facts + comparator_facts
+            validations = [replace(item,
+                accepted=tuple(fact for fact in item.accepted if fact.fact_id not in mismatched_comparator_ids),
+                quarantined=(*item.quarantined, *(fact for fact in item.accepted
+                                                if fact.fact_id in mismatched_comparator_ids)),
+                status="PARTIAL", issues=(*item.issues, "same_filing_comparator_unit_mismatch"))
+                if any(fact.fact_id in mismatched_comparator_ids for fact in item.accepted)
+                else item for item in validations]
+            for fact_id in mismatched_comparator_ids:
+                compiler_issues_by_fact.setdefault(fact_id, []).append("same_filing_comparator_unit_mismatch")
+            comparison_bindings = build_comparison_bindings(research_facts)
+            if latest_interim_validation is not None:
+                flow_bindings = [item for item in comparison_bindings if item.current_fact_id in current_ids]
+                interim_comparator_complete = bool(flow_bindings) and all(
+                    item.status == "available" for item in flow_bindings)
         # A comparative column is an issuer's restatement of a prior period,
         # not a replacement for the separately filed historical fact.  Keep
         # both auditable values, but surface a deterministic conflict when
@@ -861,6 +889,9 @@ class FinancialFactCompiler:
                 str(comparative.scope or comparative.consolidated_scope or "").casefold(),
                 str(comparative.currency or comparative.unit or "").upper(),
                 str(comparative.statement or "").casefold(),
+                "" if comparative.statement == "balance_sheet" else str(comparative.start_date or comparative.period_start or ""),
+                "" if comparative.statement == "balance_sheet" else str(comparative.fiscal_period).upper(),
+                comparative.dimensions,
             )
             for historical in historical_facts_all:
                 historical_key = (
@@ -870,6 +901,9 @@ class FinancialFactCompiler:
                     str(historical.scope or historical.consolidated_scope or "").casefold(),
                     str(historical.currency or historical.unit or "").upper(),
                     str(historical.statement or "").casefold(),
+                    "" if historical.statement == "balance_sheet" else str(historical.start_date or historical.period_start or ""),
+                    "" if historical.statement == "balance_sheet" else str(historical.fiscal_period).upper(),
+                    historical.dimensions,
                 )
                 if (
                     key != historical_key
@@ -962,7 +996,29 @@ class FinancialFactCompiler:
             "target_group_count": len(target_validations),
             "target_complete_group_count": len(target_complete),
             "fact_validation_records": fact_validation_records,
+            "comparison_bindings": tuple(item.to_dict() for item in comparison_bindings),
+            "scoped_issues": tuple({
+                "source_accession": item.identity[0], "period_end": item.identity[1],
+                "fiscal_period": item.identity[2], "scope": item.identity[3],
+                "currency": item.identity[4],
+                "fact_ids": tuple(fact.fact_id for fact in item.quarantined),
+                "concepts": tuple(sorted({fact.concept for fact in item.quarantined})),
+                "missing_concepts": tuple(sorted(missing_profile_concepts(
+                    (fact.concept for fact in item.accepted), required_concepts))),
+                "issues": item.issues,
+                "capability_scope": "dependent_metrics_only",
+            } for item in validations if item.issues),
         }
+        by_fact_id = {fact.fact_id: fact for fact in resolved}
+        coverage["scoped_issues"] += tuple({
+            "source_accession": str(by_fact_id[item["fact_ids"][0]].accession_number),
+            "period_end": str(by_fact_id[item["fact_ids"][0]].end_date),
+            "fiscal_period": str(by_fact_id[item["fact_ids"][0]].fiscal_period),
+            "concepts": (item["concept"],), "fact_ids": item["fact_ids"],
+            "issues": ("same_filing_restatement_conflict",),
+            "capability_scope": "dependent_comparisons_only",
+        } for item in conflicts if item.get("reason") == "restatement_conflict"
+            and item.get("fact_ids") and item["fact_ids"][0] in by_fact_id)
         if candidate_resolutions:
             coverage["candidate_resolutions"] = tuple(candidate_resolutions)
         if continuity_issues:

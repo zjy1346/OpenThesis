@@ -20,6 +20,23 @@ describe("report presentation", () => {
     expect(screen.getByText("Reporting currency: Unconfirmed")).toBeInTheDocument();
     expect(screen.queryByText("Listing and reporting currency: HKD")).not.toBeInTheDocument();
   });
+  it("offers budget-gap continuation only after explicit approval and keeps the report visible on failure", async () => {
+    const approve = vi.fn().mockRejectedValue(new Error("MODEL_BUDGET_PLAN_CHANGED"));
+    render(<ReportWorkspace copy={COPY.en} onApproveBudgetGaps={approve} report={{ run_id: "budget-run", ticker: "1211", company_name: "Fixture",
+      status: "partial", report_language: "en", markdown: "Saved report body", html: "", call_plan: {
+        plan_digest: "digest-1", max_calls: 3, max_input_estimate: 8_000, max_output_tokens: 20_000,
+        pending_budget_gaps: [{ gap_id: "gap-growth", stage_id: "growth-opportunities", purpose: "generation", input_estimate: 1234,
+          output_limit: 4096, diagnostic_code: "MODEL_RUN_CALL_BUDGET_EXHAUSTED" }],
+      } }} />);
+
+    expect(screen.getByText("Growth opportunities · Generation")).toBeInTheDocument();
+    expect(approve).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Approve additional budget and continue gaps" }));
+
+    await waitFor(() => expect(approve).toHaveBeenCalledWith("budget-run", "digest-1", ["gap-growth"]));
+    expect(await screen.findByText(/The plan changed or approval did not complete/)).toHaveAttribute("role", "alert");
+    expect(screen.getByText("Saved report body")).toBeInTheDocument();
+  });
   it("exposes saved-content revalidation without a model-retry plan or configured model", async () => {
     const local = vi.fn(async () => undefined);
     render(<ReportWorkspace copy={COPY.en} onRevalidateSaved={local} report={{ run_id: "local", ticker: "1211", company_name: "Fixture",
@@ -54,7 +71,7 @@ describe("report presentation", () => {
     await waitFor(() => expect(button).toBeEnabled());
     fireEvent.click(button);
     await waitFor(() => expect(resume).toHaveBeenCalledWith("model-stages", {
-      configured_model_id: "m", connection_id: "c", configuration_version: 3, role: "primary",
+      configured_model_id: "m", connection_id: "c", configuration_version: 3, role: "primary", context_window_hint: null,
     }, "frozen-plan", true));
   });
   it("moves the generated Chinese report preamble out of the document body", () => {
@@ -186,7 +203,7 @@ describe("report presentation", () => {
     expect(recovery?.querySelector(".synthesis-capacity-action-button")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: COPY.en.retrySynthesis })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: COPY.en.synthesisCapacityRetry }));
-    await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", connection_id: "c2", configuration_version: 4, role: "primary" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledWith({ configured_model_id: "large", connection_id: "c2", configuration_version: 4, role: "primary", context_window_hint: 200_000 }));
   });
 
   it("lets any persisted failed model stage resume with the selected model and fresh plan hash", async () => {
@@ -206,7 +223,7 @@ describe("report presentation", () => {
     fireEvent.click(screen.getByRole("button", { name: COPY.en.recoveryRetry }));
     await waitFor(() => expect(resume).toHaveBeenCalledWith(
       "counter-analysis",
-      { configured_model_id: "selected", connection_id: "c2", configuration_version: 4, role: "primary" },
+      { configured_model_id: "selected", connection_id: "c2", configuration_version: 4, role: "primary", context_window_hint: 200_000 },
       "plan-current",
     ));
   });
@@ -301,10 +318,51 @@ describe("report presentation", () => {
     }} copy={COPY.en} onRetryFinancials={vi.fn(async () => undefined)} />);
 
     expect(screen.getByText("Failed reports: 2025")).toBeInTheDocument();
-    expect(screen.getByText("Failed fields: revenue")).toBeInTheDocument();
+    expect(screen.getByText("Failed fields: Revenue")).toBeInTheDocument();
     expect(screen.getByText("Failed stage: Financial validation")).toBeInTheDocument();
     expect(screen.getByText(/Official filing retrieval or parsing did not complete/)).toBeInTheDocument();
     expect(screen.queryByText(/FILING_DATA_QUALITY_FAILED/)).not.toBeInTheDocument();
+  });
+
+  it.each(["en", "zh-CN", "zh-Hant"] as const)("explains localized partial financial refresh in %s", (language) => {
+    const copy = COPY[language];
+    render(<ReportWorkspace report={{
+      run_id: "run", ticker: "688981", company_name: "Fixture", status: "partial", report_language: language,
+      financial_retry: { mode: "retry", targets: ["2026H1"], downloaded: [], accepted: ["revenue"],
+        rejected: ["roe"], status: "partial", error: "quality:reported_roe", research_can_continue: true,
+        updated_artifacts: ["deterministic-financial-summary", "research-report"],
+        scoped_issues: [{ source_accession: "filing", period_end: "2026-06-30", fiscal_period: "H1",
+          concepts: ["reported_roe"], fact_ids: ["roe"], issues: ["conflict"], capability_scope: "dependent_metrics_only" }] },
+      financial_status: { state: "warning", retryable: true, history_years: 1, expected_periods: [],
+        available_periods: [], missing_periods: [], nodes: [], issues: [], attempt_count: 1,
+        last_stage: "filing-validation", last_error: "", updated_at: "", next_action: "none",
+        model_calls: 0, token_delta: 0 }, markdown: "# Retained research", html: "",
+    }} copy={copy} />);
+    expect(screen.getByText(copy.financialPartialResearchAvailable)).toBeInTheDocument();
+    expect(screen.getByText(`${copy.financialFailedFields}: ${copy.financialMetricLabels.reported_roe}`)).toBeInTheDocument();
+    expect(screen.getByLabelText(copy.financialStageStatus)).toHaveTextContent(copy.financialStagePartial);
+    expect(screen.getByLabelText(copy.financialStageStatus)).toHaveTextContent(`${copy.financialStageRefresh}: ${copy.financialStageDone}`);
+  });
+
+  it("renders historical partial financial results without updated_artifacts", () => {
+    const legacyFinancialRetry = {
+      mode: "retry", targets: ["2025"], downloaded: ["2025"], accepted: [], rejected: ["roe"],
+      status: "partial", error: "quality:reported_roe", research_can_continue: true,
+    } as unknown as import("../../types").ResearchReport["financial_retry"];
+    render(<ReportWorkspace report={{
+      run_id: "legacy-partial", ticker: "688981", company_name: "Fixture", status: "partial",
+      report_language: "en", financial_retry: legacyFinancialRetry,
+      financial_status: { state: "warning", retryable: true, history_years: 1,
+        expected_periods: ["2025"], available_periods: [], missing_periods: ["2025"],
+        nodes: [], issues: [], attempt_count: 1, last_stage: "filing-validation", last_error: "",
+        updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0 },
+      markdown: "# Retained report", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByRole("heading", { name: "Retained report" })).toBeInTheDocument();
+    expect(screen.getByLabelText(COPY.en.financialStageStatus)).toHaveTextContent(
+      `${COPY.en.financialStageValidation}: ${COPY.en.financialStagePartial}`,
+    );
   });
 
   it("exports a diagnostics snapshot through the dedicated JSON path", async () => {

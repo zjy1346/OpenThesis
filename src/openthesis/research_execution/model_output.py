@@ -288,6 +288,11 @@ def repairable_fields(candidate: Any, contract: ModelOutputContract | None) -> t
             or candidate.get("structured_output_valid") is not True
             or candidate.get("_response_error") not in (None, "")):
         return ()
+    if isinstance(candidate.get("analysis_refs"), list):
+        # Named findings are resolved by the host before the business gate.
+        # Missing raw section keys here do not justify a paid regeneration.
+        # Invalid IDs remain pending at that gate, never verified by this flag.
+        return ()
     meta = candidate.get("_response_meta")
     if isinstance(meta, dict):
         reason = meta.get("finish_reason")
@@ -299,7 +304,9 @@ def repairable_fields(candidate: Any, contract: ModelOutputContract | None) -> t
 def field_repair_prompt(user_prompt: str, contract: ModelOutputContract,
                         fields: tuple[str, ...]) -> str:
     rules = [asdict(field) for field in contract.fields if field.name in fields]
-    return user_prompt + (
+    from .repair_context import repair_context
+    targeted = json.dumps(repair_context(user_prompt, fields), ensure_ascii=False, separators=(",", ":"))
+    return targeted + (
         "\n\n[OpenThesis model-field-repair-v1]\n"
         "The previous response omitted or mistyped only the following top-level fields. "
         "For this repair response return ONLY {\"section_patches\": {...}}, with exactly "

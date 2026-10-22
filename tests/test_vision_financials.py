@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
+import os
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.request import AbstractHTTPHandler, Request
 
 from pypdf import PdfWriter
@@ -16,17 +18,36 @@ from openthesis.vision_financials import (
     MineruFlashAdapter,
     VisionHttpResponse,
     VisionFallbackConfig,
+    VisionAdapterError,
     MINERU_UPLOAD_PROTOCOL_VERSION,
     VisionExtractionResult,
     VisionPageRequest,
     VisionUploadPlan,
     VisionTaskCoordinator,
     UrllibVisionTransport,
+    _run_pdfium_isolated,
     vision_task_key,
     default_pdf_to_png,
     parse_vision_json,
     parse_vision_markdown,
 )
+
+
+def _pdfium_test_process_exit() -> None:
+    os._exit(73)
+
+
+def _pdfium_test_process_sleep(seconds: float) -> bytes:
+    time.sleep(seconds)
+    return b"late-result"
+
+
+def _pdfium_test_process_raise(secret_path: str) -> bytes:
+    raise OSError(secret_path)
+
+
+def _pdfium_test_process_return(value: bytes) -> bytes:
+    return value
 
 
 def _company() -> Company:
@@ -59,6 +80,15 @@ def _page(number: int = 130, payload: bytes = b"opaque-page-bytes") -> VisionPag
     return VisionPageRequest(number, payload)
 
 
+def _explicit_financial_markdown(rows: str) -> bytes:
+    return (
+        "Consolidated financial statements\n"
+        "Year ended 2025-12-31\n"
+        "Unit: RMB million\n"
+        f"{rows}"
+    ).encode()
+
+
 def _config(**changes) -> VisionFallbackConfig:
     values = {
         "enabled": True,
@@ -89,11 +119,14 @@ class RecordingVisionProvider:
                     "value": page,
                     "currency": "CNY",
                     "unit_scale": 1,
+                    "unit_text": "CNY",
                     "statement": "income_statement",
                     "scope": "consolidated",
+                    "scope_text": "Consolidated Income Statement",
                     "period_end": "2025-12-31",
+                    "period_text": "Period ended 2025-12-31",
                     "original_page": page,
-                    "raw_text": f"Revenue {page}",
+                    "raw_text": f"Consolidated Income Statement; Period ended 2025-12-31; Unit: CNY; Revenue {page}",
                 }
             ],
             "_response_meta": {
@@ -158,8 +191,10 @@ class BoundedVisionAdapter:
                     "concept": "revenue", "value": page.original_page,
                     "currency": "CNY", "unit_scale": 1,
                     "statement": "income_statement", "scope": "consolidated",
+                    "unit_text": "CNY", "scope_text": "Consolidated",
+                    "period_text": "Period ended 2025-12-31",
                     "period_end": "2025-12-31", "original_page": page.original_page,
-                    "raw_text": f"Revenue {page.original_page}",
+                    "raw_text": f"Consolidated Income Statement; Period ended 2025-12-31; Unit: CNY; Revenue {page.original_page}",
                 }]},
                 company, filing, pages,
             )
@@ -291,7 +326,9 @@ class VisionFinancialTests(unittest.TestCase):
             VisionHttpResponse(200, json.dumps({"code": 0, "data": {"task_id": "task-1", "file_url": "https://upload.example/page"}}).encode()),
             VisionHttpResponse(200),
             VisionHttpResponse(200, json.dumps({"state": "done", "data": {"markdown_url": "https://download.example/result.md"}}).encode()),
-            VisionHttpResponse(200, b"Unit: RMB million\nRevenue 751,766\nTotal assets 2,038,986\nTotal liabilities 797,921\nTotal equity 1,241,065"),
+            VisionHttpResponse(200, _explicit_financial_markdown(
+                "Revenue 751,766\nTotal assets 2,038,986\nTotal liabilities 797,921\nTotal equity 1,241,065"
+            )),
         )
         seen = []
         config = _config(
@@ -444,12 +481,19 @@ class VisionFinancialTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 2)
         self.assertEqual({fact.source_page for fact in result.facts}, {130, 131})
         self.assertEqual(len({fact.fact_id for fact in result.facts}), 2)
-        self.assertTrue(
-            all(
-                ref.evidence_id == f"fact:{fact.fact_id}"
-                for fact, ref in zip(result.facts, result.evidence)
-            )
-        )
+        refs_by_id = {ref.evidence_id: ref for ref in result.evidence}
+        hashes_by_page = {page.original_page: page.content_hash for page in pages}
+        for fact in result.facts:
+            row_ref = refs_by_id[f"fact:{fact.fact_id}"]
+            self.assertEqual(row_ref.locator, f"page:{fact.source_page}")
+            self.assertEqual(row_ref.content_hash, _filing().content_hash)
+            proof = next(ref for ref in result.evidence if ref.evidence_id in fact.classification_evidence_ids)
+            self.assertEqual(json.loads(proof.excerpt)["page_hash"], hashes_by_page[fact.source_page])
+            self.assertTrue(fact.normalization_lineage.unit_evidence_ids)
+            for unit_id in fact.normalization_lineage.unit_evidence_ids:
+                unit_ref = refs_by_id[unit_id]
+                self.assertEqual(unit_ref.locator, row_ref.locator)
+                self.assertEqual(unit_ref.content_hash, row_ref.content_hash)
         self.assertIn("VISION_MODEL_GATEWAY_COMPLETED", result.diagnostics)
 
     def test_gateway_errors_are_mapped_without_response_payloads(self):
@@ -470,6 +514,47 @@ class VisionFinancialTests(unittest.TestCase):
         rendered = default_pdf_to_png(buffer.getvalue())
         self.assertTrue(rendered.startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertLessEqual(len(rendered), 8 * 1024 * 1024)
+
+    def test_pdfium_child_exit_is_bounded_and_next_document_can_continue(self):
+        result, error = _run_pdfium_isolated(
+            _pdfium_test_process_exit, timeout_seconds=5
+        )
+        self.assertIsNone(result)
+        self.assertEqual(error, "PDFIUM_WORKER_EXIT")
+
+        result, error = _run_pdfium_isolated(
+            _pdfium_test_process_return, b"second-document", timeout_seconds=5
+        )
+        self.assertEqual(result, b"second-document")
+        self.assertIsNone(error)
+
+    def test_pdfium_child_timeout_terminates_and_returns_stable_code(self):
+        started = time.monotonic()
+        result, error = _run_pdfium_isolated(
+            _pdfium_test_process_sleep, 5.0, timeout_seconds=0.5
+        )
+        self.assertIsNone(result)
+        self.assertEqual(error, "PDFIUM_WORKER_TIMEOUT")
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_pdfium_worker_diagnostic_never_echoes_local_path(self):
+        secret_path = "C:/Users/private/financials/report.pdf"
+        result, error = _run_pdfium_isolated(
+            _pdfium_test_process_raise, secret_path, timeout_seconds=5
+        )
+        self.assertIsNone(result)
+        self.assertEqual(error, "PDFIUM_WORKER_ERROR")
+        self.assertNotIn(secret_path, str(error))
+
+    def test_default_renderer_maps_worker_timeout_without_payload_details(self):
+        with patch(
+            "openthesis.vision_financials._run_pdfium_isolated",
+            return_value=(None, "PDFIUM_WORKER_TIMEOUT"),
+        ):
+            with self.assertRaises(VisionAdapterError) as raised:
+                default_pdf_to_png(b"private-pdf-bytes")
+        self.assertEqual(raised.exception.code, "VISION_IMAGE_RENDER_TIMEOUT")
+        self.assertNotIn("private-pdf-bytes", str(raised.exception))
 
     def test_json_scales_raw_values_and_non_natural_fy_start(self):
         page = _page(183, b"page")
@@ -492,11 +577,14 @@ class VisionFinancialTests(unittest.TestCase):
                         "value": 1023670,
                         "currency": "CNY",
                         "unit_scale": 1000000,
+                        "unit_text": "RMB million",
                         "statement": "income_statement",
                         "scope": "consolidated",
+                        "scope_text": "Consolidated statement",
                         "period_end": "2026-03-31",
+                        "period_text": "Year ended 2026-03-31",
                         "original_page": 183,
-                        "raw_text": "Revenue 1,023,670",
+                        "raw_text": "Consolidated statement; Year ended 2026-03-31; Unit: RMB million; Revenue 1,023,670",
                     }
                 ]
             },
@@ -506,10 +594,19 @@ class VisionFinancialTests(unittest.TestCase):
         )
         self.assertEqual(result.facts[0].value, 1_023_670_000_000)
         self.assertEqual(result.facts[0].start_date, "2025-04-01")
+        fact = result.facts[0]
+        self.assertEqual(fact.parser_version, "vision-json-v4")
+        self.assertEqual(fact.normalization_lineage.raw_value, "1023670")
+        self.assertEqual(fact.normalization_lineage.normalized_value, "1023670000000")
+        unit_id = fact.normalization_lineage.unit_evidence_ids[0]
+        unit_ref = next(ref for ref in result.evidence if ref.evidence_id == unit_id)
+        self.assertEqual(unit_ref.locator, "page:183")
+        self.assertEqual(unit_ref.excerpt, "RMB million")
 
     def test_markdown_candidates_keep_page_hash_and_candidate_status(self):
         result = parse_vision_markdown(
-            "Unit: RMB million\nRevenue 751,766\nTotal assets 2,038,986\n"
+            "Consolidated Income Statement\nYear ended 2025-12-31\nUnit: RMB million\nRevenue 751,766\n"
+            "Consolidated Balance Sheet\nYear ended 2025-12-31\nUnit: RMB million\nTotal assets 2,038,986\n"
             "Total liabilities 797,921\nTotal equity 1,241,065",
             _company(),
             _filing(),
@@ -523,8 +620,52 @@ class VisionFinancialTests(unittest.TestCase):
         self.assertTrue(
             all(fact.source_page == 130 and fact.unit_scale == 1_000_000 for fact in result.facts)
         )
+        self.assertTrue(all(fact.normalization_lineage for fact in result.facts))
+        self.assertTrue(all(fact.parser_version == "vision-markdown-v4" for fact in result.facts))
+        self.assertGreater(len(result.evidence), len(result.facts))
         self.assertTrue(all(ref.content_hash for ref in result.evidence))
         self.assertIn("VISION_CANDIDATES_ONLY", result.diagnostics)
+
+    def test_json_response_preserves_decimal_tokens_and_rejects_pre_rounded_float_candidates(self):
+        payload = VisionHttpResponse(200, b'{"value":0.1234567890123456789}').json()
+        self.assertEqual(str(payload["value"]), "0.1234567890123456789")
+        filing = _filing()
+        result = parse_vision_json(
+            {"facts": [{
+                "concept": "revenue", "value": 1.25, "currency": "HKD",
+                "unit_scale": 1, "unit_text": "HKD", "statement": "income_statement",
+                "scope": "consolidated", "scope_text": "Consolidated statement",
+                "period_end": filing.period_end, "period_text": f"Year ended {filing.period_end}",
+                "original_page": 130,
+                "raw_text": f"Consolidated statement; Year ended {filing.period_end}; Unit: HKD; Revenue 1.25",
+            }]},
+            _company(), filing, [_page()],
+        )
+        self.assertEqual(result.facts, ())
+        self.assertEqual(len(result.evidence), 1)
+        self.assertTrue(result.evidence[0].evidence_id.startswith("observation:"))
+
+    def test_json_retains_custom_or_ambiguous_numbers_only_as_unverified_observations(self):
+        page = _page(183, b"note-page")
+        filing = FilingDocument(
+            "hkex:ali", _company().security_id, "ali", "ANNUAL_REPORT", "FY",
+            "2026-03-31", "2026-06-18", "2026 Annual Report",
+            "https://example.invalid/ali.pdf",
+        )
+        raw_text = "Segment margin 24.6%; unit context unclear"
+        result = parse_vision_json(
+            {"facts": [{
+                "concept": "segment_margin", "value": 0.246, "currency": "CNY",
+                "unit_scale": 1, "statement": "income_statement", "scope": "consolidated",
+                "period_end": "2026-03-31", "original_page": 183, "raw_text": raw_text,
+            }]},
+            _company(), filing, [page],
+        )
+        self.assertEqual(result.facts, ())
+        self.assertEqual(len(result.evidence), 1)
+        self.assertTrue(result.evidence[0].evidence_id.startswith("observation:"))
+        self.assertIn("Unverified visual observation", result.evidence[0].title)
+        self.assertIn("24.6%", result.evidence[0].excerpt)
 
     def test_coordinator_keeps_distinct_pages_with_same_hash_and_preserves_order(self):
         adapter = BoundedVisionAdapter()
@@ -567,24 +708,24 @@ class VisionFinancialTests(unittest.TestCase):
         self.assertEqual(result.error_code, "VISION_RECOVERY_BLOCKED")
         self.assertEqual(adapter.calls, [])
 
-    def test_mineru_retries_one_recoverable_server_error(self):
+    def test_mineru_does_not_retry_unknown_create_outcome(self):
         transport = QueueVisionTransport(
             VisionHttpResponse(503),
             VisionHttpResponse(200, json.dumps({"code": 0, "data": {"task_id": "task-1", "file_url": "https://upload.example/page"}}).encode()),
             VisionHttpResponse(200),
             VisionHttpResponse(200, json.dumps({"state": "done", "data": {"markdown_url": "https://download.example/result.md"}}).encode()),
-            VisionHttpResponse(200, b"Unit: RMB million\nRevenue 1"),
+            VisionHttpResponse(200, _explicit_financial_markdown("Revenue 1")),
         )
         result = MineruFlashAdapter(transport, sleep=lambda _: None).extract(
             _company(), _filing(), [_page()], _config(provider="mineru_flash", configured_model_id=""),
         )
-        self.assertIsNone(result.error_code)
-        self.assertEqual([call["method"] for call in transport.calls], ["POST", "POST", "PUT", "GET", "GET"])
+        self.assertEqual(result.error_code, "VISION_HTTP_ERROR")
+        self.assertEqual([call["method"] for call in transport.calls], ["POST"])
 
     def test_mineru_reuses_journal_remote_task_without_upload(self):
         transport = QueueVisionTransport(
             VisionHttpResponse(200, json.dumps({"state": "done", "data": {"markdown_url": "https://download.example/result.md"}}).encode()),
-            VisionHttpResponse(200, b"Unit: RMB million\nRevenue 1"),
+            VisionHttpResponse(200, _explicit_financial_markdown("Revenue 1")),
         )
         journal = MemoryVisionJournal()
         page = _page()
@@ -612,8 +753,11 @@ class VisionFinancialTests(unittest.TestCase):
         )
         self.assertNotEqual(batch, per_page)
 
-    def test_mineru_created_task_is_recovery_blocked_without_network(self):
-        transport = QueueVisionTransport()
+    def test_mineru_created_task_is_queried_without_reupload(self):
+        transport = QueueVisionTransport(
+            VisionHttpResponse(200, json.dumps({"state": "done", "data": {"markdown_url": "https://download.example/result.md"}}).encode()),
+            VisionHttpResponse(200, _explicit_financial_markdown("Revenue 1")),
+        )
         journal = MemoryVisionJournal()
         page = _page()
         key = vision_task_key(
@@ -631,9 +775,9 @@ class VisionFinancialTests(unittest.TestCase):
             _company(), _filing(), [page],
             _config(provider="mineru_flash", configured_model_id=""),
         )
-        self.assertEqual(result.error_code, "VISION_RECOVERY_BLOCKED")
-        self.assertEqual(transport.calls, [])
-        self.assertEqual(journal.rows[key]["status"], "created")
+        self.assertIsNone(result.error_code)
+        self.assertEqual([call["method"] for call in transport.calls], ["GET", "GET"])
+        self.assertEqual(journal.rows[key]["status"], "completed")
         self.assertEqual(journal.rows[key]["remote_task_id"], "created-only")
 
     def test_mineru_transport_upgrade_does_not_reuse_failed_legacy_upload(self):
@@ -657,7 +801,7 @@ class VisionFinancialTests(unittest.TestCase):
             VisionHttpResponse(200, json.dumps({
                 "state": "done", "data": {"markdown_url": "https://download.example/result.md"},
             }).encode()),
-            VisionHttpResponse(200, b"Unit: RMB million\nRevenue 1"),
+            VisionHttpResponse(200, _explicit_financial_markdown("Revenue 1")),
         )
 
         result = MineruFlashAdapter(

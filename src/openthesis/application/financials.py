@@ -14,6 +14,7 @@ import uuid
 from ..domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from ..financial_admission import FinancialResearchView
 from ..financial_contracts import CompilationPolicy, GapStageKind
+from ..financial_compiler import CoveragePlanner, concepts_cover_profile
 from ..financial_pipeline import FinancialResearchSnapshot, disclosed_reporting_currency
 from ..market_financials import FinancialValidation, ValidationStatus
 from ..financial_contracts import FinancialGroupValidation
@@ -326,15 +327,18 @@ class OfficialFinancialPreparer:
         return view, generations
 
     def _healthy_accessions(self, subject, filings, view):
+        pending_mappings = self.pipeline.pending_local_mappings(subject, filings)
         return {
             filing.accession_number for filing in filings
-            if self.acquisition.verified_cache(filing) is not None
+            if filing.accession_number not in pending_mappings
+            and self.acquisition.verified_cache(filing) is not None
             and any(group.identity[0] == filing.accession_number
                     and group.identity[1] == filing.period_end
                     and group.identity[2] == filing.fiscal_period
                     and group.identity[3] == "consolidated"
                     and group.identity[4] == subject.reporting_currency
-                    and group.status == ValidationStatus.VERIFIED.value
+                    and concepts_cover_profile((fact.concept for fact in group.accepted),
+                                               CoveragePlanner().plan(subject).required_concepts)
                     for group in view.canonical_dataset.validations)
         }
 

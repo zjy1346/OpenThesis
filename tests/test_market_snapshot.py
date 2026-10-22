@@ -611,7 +611,10 @@ def test_capture_uses_verified_quote_and_fresh_cache_without_second_call() -> No
 
 
 def test_conflicting_sources_are_not_silently_selected() -> None:
-    module = MarketSnapshotModule(adapters=(FixtureAdapter("a", price=100, cap=1e9), FixtureAdapter("b", price=120, cap=1e9)))
+    module = MarketSnapshotModule(
+        adapters=(FixtureAdapter("a", price=100, cap=1e9), FixtureAdapter("b", price=120, cap=1e9)),
+        clock=lambda: datetime(2026, 9, 8, tzinfo=timezone.utc),
+    )
     result = module.capture(company("AAPL", "US", "USD"))
     assert result.status is SnapshotStatus.CONFLICT
     assert not result.allows_valuation
@@ -621,7 +624,7 @@ def test_price_only_secondary_source_participates_in_conflict_check() -> None:
     module = MarketSnapshotModule(adapters=(
         FixtureAdapter("eastmoney-public", price=100, cap=1e9),
         FixtureAdapter("yahoo-chart", price=130, cap=None),
-    ))
+    ), clock=lambda: datetime(2026, 9, 8, tzinfo=timezone.utc))
     result = module.capture(company("AAPL", "US", "USD"))
     assert result.status is SnapshotStatus.CONFLICT
     assert not result.allows_valuation
@@ -643,6 +646,7 @@ def test_automatic_cross_currency_quote_is_normalized_to_reporting_currency() ->
     module = MarketSnapshotModule(
         adapters=(FixtureAdapter("eastmoney-public", price=300, cap=100_000_000_000, currency="HKD"),),
         fx_adapter=Fx(),
+        clock=lambda: datetime(2026, 9, 8, tzinfo=timezone.utc),
     )
     result = module.capture(company("00700.HK", "HK", "HKD", "CNY"))
     assert result.status is SnapshotStatus.VERIFIED
@@ -706,7 +710,7 @@ def test_reverse_dcf_is_equity_fcfe_and_rejects_lookahead_metric() -> None:
     ]
     result = reverse_dcf_analysis(metrics, 1_000.0, market_as_of="2026-09-07", currency="USD")
     assert result["cash_flow_basis"].startswith("FCFE proxy")
-    assert result["base_fcf_period"] == "2025"
+    assert result["base_fcf_period"] == "2025 FY"
     assert result["equity_market_value"] == 1_000.0
     assert all("enterprise_value" not in row for row in result["sensitivity"])
 

@@ -8,7 +8,7 @@ import math
 from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
-from .financial_comparatives import comparative_amounts_agree
+from .financial_comparatives import comparative_amounts_agree, comparison_binding
 
 
 _ANNUAL_PERIODS = frozenset({"", "FY", "CY", "ANNUAL"})
@@ -471,8 +471,8 @@ def _latest_by_interim_period(
         if concept_key not in filed or rank >= filed[concept_key]:
             matrix[key][concept] = float(fact["value"])
             filed[concept_key] = rank
-        period_starts[key] = max(period_starts.get(key, ""), str(fact.get("start_date", "")))
-        period_ends[key] = max(period_ends.get(key, ""), str(fact.get("end_date", "")))
+        period_starts[key] = max(period_starts.get(key, ""), str(fact.get("start_date") or fact.get("period_start") or ""))
+        period_ends[key] = max(period_ends.get(key, ""), str(fact.get("end_date") or ""))
     return dict(matrix), period_starts, period_ends
 
 
@@ -953,7 +953,7 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
                                return_on_equity_gap="unresolved_restatement")
         typed_money_metadata: dict[str, dict[str, Any]] = {}
         for concept in (
-            "revenue", "net_income", "parent_net_income", "operating_cash_flow", "assets",
+            "revenue", "operating_income", "net_income", "parent_net_income", "operating_cash_flow", "capital_expenditure", "assets",
             "liabilities", "equity", "total_equity",
         ):
             fact_metadata = money_fact_metadata.get((year, concept))
@@ -1118,16 +1118,31 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 operating_cash_flow=operating_cash_flow,
             )
         )
-        comparison_records = [
-            fact for fact in facts
-            if fact.get("fiscal_year") == year - 1
-            and _period(fact.get("fiscal_period")) == period
-        ]
-        previous, comparison_selected, comparison_source, restatement_available, comparison_versions = (
-            _comparison_baseline(previous, comparison_records,
-                current_accessions={concept: str(value.get("accession_number") or "")
-                    for concept, value in money_metadata.items()})
-        )
+        # The compiler, coverage view and model materials use this same
+        # metric-level binding. An H1 label alone never proves a duration.
+        bindings = []
+        previous, comparison_selected, comparison_versions = {}, [], {}
+        for concept in values:
+            current_fact = _selected_period_fact(facts, concept, year, period)
+            if current_fact is None:
+                continue
+            binding = comparison_binding(current_fact, facts)
+            bindings.append(binding.to_dict())
+            if current_fact.get("statement") == "balance_sheet":
+                bindings.append(comparison_binding(current_fact, facts,
+                    relation="previous_year_end").to_dict())
+            if binding.status == "available":
+                previous[concept] = binding.prior_value
+                comparison_selected.extend(item for item in facts
+                    if item.get("fact_id") and item.get("fact_id") == binding.prior_fact_id)
+            elif binding.status == "conflict":
+                comparison_versions[concept] = [item for item in facts
+                    if item.get("fact_id") in binding.candidate_fact_ids]
+        available = [item for item in bindings if item["status"] == "available"]
+        comparison_source = ("same_filing_comparator" if any(
+            item["source"] == "same_filing_comparator" for item in available)
+            else "independent_historical" if available else None)
+        restatement_available = bool(comparison_versions)
         results.append(
             {
                 "year": year,
@@ -1150,6 +1165,7 @@ def calculate_interim_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 ],
                 "restatement_available": restatement_available,
                 "comparison_versions": comparison_versions,
+                "comparison_bindings": bindings,
                 **values,
                 "revenue_growth": growth_rate(revenue, previous.get("revenue")),
                 "revenue_growth_status": "unresolved_restatement" if "revenue" in comparison_versions else growth_status(revenue, previous.get("revenue")),
@@ -1260,6 +1276,66 @@ def discounted_cash_flow_value(
         discount_rate - terminal_growth
     )
     return present_value + terminal_value / ((1 + discount_rate) ** horizon_years)
+
+
+def fcf_sensitivity_analysis(metrics: list[dict[str, Any]], *, currency: str,
+                             discount_rate: float = .10, terminal_growth: float = .03,
+                             horizon_years: int = 5) -> dict[str, Any]:
+    """Price-independent conditional FCFE-proxy sensitivity, not a price fact.
+
+    Reuses the reverse-DCF policy's growth grid and normalized annual inputs.
+    No market quote, debt subtraction or per-share value is manufactured.
+    """
+    parameters = (discount_rate, terminal_growth)
+    if (any(type(value) not in {int, float} or not math.isfinite(value) for value in parameters)
+            or type(horizon_years) is not int or not 1 <= horizon_years <= 100
+            or discount_rate <= terminal_growth or discount_rate <= -1 or terminal_growth <= -1):
+        return {"status": "invalid_parameters", "reason": "invalid_sensitivity_assumptions"}
+    eligible = []
+    for row in metrics:
+        try:
+            period = read_metric_period(row)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if period.period == "FY":
+            eligible.append((row, period))
+    eligible.sort(key=lambda pair: (pair[1].period_end or "", pair[1].year), reverse=True)
+    if not eligible:
+        return {"status": "insufficient_data", "reason": "verified_annual_cash_flow_missing"}
+    row, period = eligible[0]
+    raw = row.get("free_cash_flow_money")
+    if not _has_explicit_normalized_money(raw):
+        return {"status": "insufficient_data", "reason": "normalized_cash_flow_missing"}
+    money = _coerce_money(raw, fallback_currency=currency)
+    if money is None or money.unit_scale != 1 or money.unit_provenance != "normalized" or money.currency != currency:
+        return {"status": "valuation_unit_mismatch", "reason": "cash_flow_currency_or_unit_mismatch"}
+    source_ids = raw.get("evidence_ids", []) if isinstance(raw, dict) else []
+    if (not isinstance(source_ids, list) or len(source_ids) < 2
+            or any(not isinstance(value, str) or not value.startswith("fact:") for value in source_ids)
+            or len(set(source_ids)) != len(source_ids)):
+        return {"status": "insufficient_data", "reason": "cash_flow_sources_missing"}
+    if (raw.get("period") not in (None, "", "FY")
+            or raw.get("period_end") not in (None, "", period.period_end)
+            or row.get("free_cash_flow") is not None and row["free_cash_flow"] != money.normalized_value):
+        return {"status": "insufficient_data", "reason": "cash_flow_identity_conflict"}
+    if money.normalized_value <= 0:
+        return {"status": "insufficient_data", "reason": "non_positive_annual_cash_flow",
+                "base_fcf_period": f"{period.year} FY", "evidence_ids": list(source_ids)}
+    try:
+        sensitivity = [{"fcf_growth": growth, "equity_value": discounted_cash_flow_value(
+            money.normalized_value, growth, discount_rate, terminal_growth, horizon_years)}
+            for growth in (-.05, 0., .05, .10, .15, .20, .30)]
+    except (ValueError, OverflowError, ZeroDivisionError):
+        return {"status": "invalid_parameters", "reason": "sensitivity_not_finite"}
+    if any(not math.isfinite(item["equity_value"]) for item in sensitivity):
+        return {"status": "invalid_parameters", "reason": "sensitivity_not_finite"}
+    return {"schema": "fcfe-proxy-sensitivity-v1", "status": "ok", "currency": currency,
+            "base_free_cash_flow": money.normalized_value, "base_fcf_period": f"{period.year} FY",
+            "discount_rate": discount_rate, "terminal_growth": terminal_growth, "horizon_years": horizon_years,
+            "cash_flow_basis": "FCFE proxy = operating cash flow - capital expenditure",
+            "evidence_ids": list(source_ids), "sensitivity": sensitivity,
+            "per_share_status": "not_computed_requires_verified_share_count",
+            "assumption_status": "conditional_policy_grid_not_a_forecast_or_market_price"}
 
 
 def implied_fcf_growth(
