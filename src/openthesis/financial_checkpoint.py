@@ -21,10 +21,19 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 from .domain import EvidenceRef, FinancialFact
+from .financial_contracts import ROE_ROW_MAPPING_VERSION
 
 
 CHECKPOINT_SCHEMA_VERSION = "financial-window-checkpoint-v1"
 EXHAUSTED_SCHEMA_VERSION = "financial-window-exhausted-v1"
+
+
+def _needs_roe_remap(payload: dict[str, Any]) -> bool:
+    return payload.get("roe_row_mapping_version") != ROE_ROW_MAPPING_VERSION and any(
+        isinstance(fact, dict)
+        and fact.get("concept") in {"reported_roe", "reported_roe_excluding_nonrecurring"}
+        and str(fact.get("parser_version", "")).startswith("financial-ingestion-ast")
+        for fact in payload.get("facts", ()))
 
 
 class WorkerIsolationUnavailable(RuntimeError):
@@ -81,6 +90,7 @@ class WindowCheckpoint:
     def payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.key.schema_version,
+            "roe_row_mapping_version": ROE_ROW_MAPPING_VERSION,
             "key": asdict(self.key),
             "window": asdict(self.window),
             "facts": [fact.to_dict() for fact in self.facts],
@@ -105,14 +115,18 @@ class WindowCheckpointStore:
 
     def save_exhausted(
         self, key: CheckpointKey, *, reason: str, input_fingerprint: str | None = None,
+        failed_window: PdfWindow | None = None,
     ) -> None:
         """Atomically remember a deterministic failure, never a transient one."""
         payload = {
             "schema_version": EXHAUSTED_SCHEMA_VERSION,
+            "roe_row_mapping_version": ROE_ROW_MAPPING_VERSION,
             "key_digest": key.digest,
             "input_fingerprint": input_fingerprint or key.digest,
             "reason": str(reason)[:240],
         }
+        if failed_window is not None:
+            payload["failed_window"] = asdict(failed_window)
         destination = self.exhausted_path(key)
         temporary: Path | None = None
         try:
@@ -135,7 +149,7 @@ class WindowCheckpointStore:
 
     def load_exhausted(
         self, key: CheckpointKey, *, input_fingerprint: str | None = None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Load a marker only when it belongs to the exact current input."""
         try:
             payload = json.loads(self.exhausted_path(key).read_text(encoding="utf-8"))
@@ -146,8 +160,29 @@ class WindowCheckpointStore:
                 or payload.get("input_fingerprint") != expected
             ):
                 return None
+            if payload.get("roe_row_mapping_version") != ROE_ROW_MAPPING_VERSION:
+                # A deterministic stop under an affected old mapping cannot
+                # fence its corrected local retry forever. Inspect only this
+                # document's hash-checked windows, not the cache/library.
+                for path in self.directory.glob(f"{key.digest}-[0-9]*.json"):
+                    try:
+                        envelope = json.loads(path.read_text(encoding="utf-8"))
+                        prior = envelope["payload"]
+                        encoded = json.dumps(prior, ensure_ascii=False, sort_keys=True,
+                                             separators=(",", ":")).encode("utf-8")
+                        if (envelope.get("sha256") == hashlib.sha256(encoded).hexdigest()
+                                and prior.get("key") == asdict(key) and _needs_roe_remap(prior)):
+                            return None
+                    except (OSError, TypeError, ValueError, KeyError):
+                        continue
             reason = payload.get("reason")
-            return {"reason": str(reason)[:240]} if reason else {"reason": "deterministic_failure"}
+            result = {"reason": str(reason)[:240] if reason else "deterministic_failure"}
+            window = payload.get("failed_window")
+            if (isinstance(window, dict) and type(window.get("index")) is int
+                    and window["index"] >= 0 and isinstance(window.get("pages"), list)
+                    and window["pages"] and all(type(page) is int and page > 0 for page in window["pages"])):
+                result["failed_window"] = {"index": window["index"], "pages": sorted(set(window["pages"]))}
+            return result
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
@@ -214,6 +249,11 @@ class WindowCheckpointStore:
                 if actual_pages != tuple(sorted(int(page) for page in expected_pages)):
                     return None
             facts = tuple(self._decode_fact(item) for item in payload.get("facts", ()))
+            # Keep the unchanged page windows usable. Only old windows that
+            # actually contain affected ROE candidates require local reparse;
+            # original files and other checkpoints are not removed.
+            if _needs_roe_remap(payload):
+                return None
             evidence = tuple(self._decode_evidence(item) for item in payload.get("evidence", ()))
             context = payload.get("context", {})
             if not isinstance(context, dict):
@@ -284,11 +324,25 @@ def run_checkpointed_windows(
     """
 
     ordered = tuple(sorted(windows, key=lambda item: item.index))
-    exhausted = store.load_exhausted(key, input_fingerprint=input_fingerprint) if input_fingerprint else None
+    exhausted = store.load_exhausted(key, input_fingerprint=input_fingerprint)
     if exhausted is not None:
-        if progress is not None:
-            progress(0, len(ordered), "exhausted_same_input")
-        return ()
+        # A deterministic failure fences the first missing window for this
+        # exact input, but successful preceding windows remain useful. Return
+        # that contiguous cached prefix without repeating any worker calls.
+        completed_prefix: list[WindowCheckpoint] = []
+        for position, window in enumerate(ordered, start=1):
+            cached = store.load(key, window.index, expected_pages=window.pages)
+            if cached is None:
+                if progress is not None:
+                    progress(position, len(ordered), "exhausted_same_input")
+                break
+            completed_prefix.append(cached)
+            if progress is not None:
+                progress(position, len(ordered), "cache-hit")
+        else:
+            if not ordered and progress is not None:
+                progress(0, 0, "exhausted_same_input")
+        return tuple(completed_prefix)
     results: list[WindowCheckpoint] = []
     current_context: dict[str, Any] = {}
     retry_limit = max(0, int(max_retries))
@@ -335,15 +389,17 @@ def run_checkpointed_windows(
                     # Retrying the same denied host operation cannot repair a
                     # document. Leave it resumable after the host is restored.
                     break
+                if deterministic_failure is not None and deterministic_failure(exc):
+                    store.save_exhausted(
+                        key,
+                        reason=f"{type(exc).__name__}",
+                        input_fingerprint=input_fingerprint or key.digest,
+                        failed_window=window,
+                    )
+                    break
         if last_error is not None:
             if on_failure is not None:
                 on_failure(window, last_error)
-            if deterministic_failure is not None and deterministic_failure(last_error):
-                store.save_exhausted(
-                    key,
-                    reason=f"{type(last_error).__name__}",
-                    input_fingerprint=input_fingerprint or key.digest,
-                )
             if progress is not None:
                 progress(position, len(ordered), "failed")
             # Later windows may depend on the table context at this boundary.

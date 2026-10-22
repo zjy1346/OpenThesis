@@ -67,6 +67,9 @@ class SafeReportAssembler:
         def context_body(node):
             context = " · ".join(str(item["text"]) for item in node.get("context", ()))
             marker = localized("Labelled assumption", "已标注假设", "已標註假設") if node.get("role") == "assumption" else ""
+            if node.get("validation_state") == "partial":
+                marker = localized("Pending verification; not a calculation input.",
+                                   "待核验；不作确定性计算输入。", "待核驗；不作確定性計算輸入。")
             return "\n\n".join(item for item in (context, marker) if item)
 
         def minimum_markdown(node):

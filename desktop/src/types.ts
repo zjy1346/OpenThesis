@@ -158,6 +158,7 @@ export type ModelReference = {
   connection_id?: string;
   configuration_version: number;
   role: ModelRole;
+  context_window_hint?: number | null;
 };
 
 export type ModelSelection = ModelReference;
@@ -349,6 +350,7 @@ export function visionFallbackSelectionFromPolicy(
 }
 
 export type ResearchRequest = {
+  allow_partial_research?: boolean;
   mode: "demo" | "company";
   company?: Company;
   download_filings?: boolean;
@@ -437,6 +439,17 @@ export type FinancialRetryResult = {
   diagnostics?: string[];
   freshness?: string;
   next_action?: string;
+  research_can_continue?: boolean;
+  capabilities?: Record<string, boolean>;
+  scoped_issues?: Array<{
+    source_accession: string;
+    period_end: string;
+    fiscal_period: string;
+    concepts: string[];
+    fact_ids: string[];
+    issues: string[];
+    capability_scope: string;
+  }>;
 };
 
 export type FinancialDiagnostics = {
@@ -475,6 +488,7 @@ export type FinancialDiagnostics = {
 
 export type ResearchReport = {
   run_id: string;
+  call_plan?: ModelCallPlan | null;
   report_contract_version?: string;
   report_revision_id?: string | null;
   report_input_generation?: string;
@@ -588,9 +602,85 @@ export type FilingProgressStatus =
   | "failed"
   | "cancelled"
   | "parsed"
+  | "usable"
+  | "partial"
+  | "historical"
+  | "not-applicable"
+  | "needs-action"
   | (string & {});
 
+export type FilingAvailability =
+  | "complete"
+  | "usable"
+  | "partial"
+  | "none"
+  | "historical"
+  | "not-applicable"
+  | "needs-action"
+  | "needs_action"
+  | (string & {});
+
+export type ModelCallStatus = {
+  physical_attempt?: boolean;
+  reuse_summary?: { local_result_reuses: number; saved_judgments: number };
+  call_plan?: { max_calls: number; max_input_estimate: number | null; max_output_tokens: number } | null;
+  configured_model_id?: string;
+  model_id?: string;
+  alias?: string;
+  provider_id?: string;
+  request_id: string;
+  attempt_id: string;
+  stage_id: string;
+  generation: number;
+  state: string;
+  elapsed_seconds: number;
+  idle_seconds?: number | null;
+  first_content_seconds?: number | null;
+  phase_seconds?: Record<string, number>;
+  content_bytes?: number;
+  reasoning_bytes?: number;
+  remote_status_unconfirmed?: boolean;
+  cancel_requested?: boolean;
+  purpose?: string;
+  diagnostics?: {
+    input_bytes?: number | null;
+    input_tokens_estimate?: number | null;
+    token_counting_method?: string | null;
+    tokenizer?: string | null;
+    context_tokens_hint?: number | null;
+    usage?: Partial<Record<"reasoning_tokens" | "answer_tokens", number | null>>;
+  } | null;
+  usage?: Partial<Record<"input_tokens" | "output_tokens" | "cache_read_input_tokens" | "cache_write_input_tokens", number | null>>;
+};
+
+export type PendingBudgetGap = {
+  gap_id: string;
+  stage_id: string;
+  purpose: string;
+  input_estimate: number;
+  output_limit: number;
+  diagnostic_code: string;
+};
+
+export type ModelCallPlan = {
+  schema?: string;
+  plan_digest: string;
+  max_calls: number;
+  max_input_estimate: number | null;
+  max_output_tokens: number;
+  pending_budget_gaps: PendingBudgetGap[];
+  user_extensions?: Array<{ gap_ids: string[]; approved_at: number }>;
+};
+
+export type ModelCallHistoryPage = {
+  revision: string | number;
+  calls: ModelCallStatus[];
+  next_cursor: string | null;
+};
+
 export type ResearchJob = {
+  revision?: number;
+  status_revision?: string;
   job_id: string;
   state: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
   message: string;
@@ -598,6 +688,8 @@ export type ResearchJob = {
   run_id: string | null;
   stage?: string;
   agent_states?: Record<string, string>;
+  model_calls?: ModelCallStatus[];
+  call_plan?: ModelCallPlan | null;
   completed_agents?: number;
   total_agents?: number;
   cancel_requested?: boolean;
@@ -612,10 +704,28 @@ export type ResearchJob = {
     filing_id: string;
     label: string;
     status: FilingProgressStatus;
+    processing_state?: string;
+    availability?: FilingAvailability;
+    roles?: string[];
+    admitted_count?: number;
+    candidate_count?: number;
+    issue_codes?: string[];
+    source_hash?: string;
+    page_count?: number;
+    native_text_page_count?: number;
+    indexed_page_count?: number;
+    window_total?: number;
+    completed_window_count?: number;
+    parse_elapsed_seconds?: number;
+    failure_stage?: string;
+    root_error_code?: string;
+    attempt_count?: number;
+    cache_reused?: boolean;
+    recognized_statements?: string[];
+    extracted_pages?: number[];
     error_code?: string;
     elapsed_seconds?: number;
     window_index?: number | null;
-    window_total?: number | null;
     last_activity_at?: string;
   }>;
   error_code?: string | null;

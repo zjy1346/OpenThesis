@@ -16,6 +16,19 @@ def canonical_snapshot_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def financial_semantics_digest(facts: Any) -> str:
+    """Bind source/value identity, excluding only admission display statuses.
+
+    Upgrading a cohort from PARTIAL to individually VERIFIED must not rewrite
+    the historical meaning. Values, units, dates, scope and original proof are
+    all retained; fact-ID equality alone cannot excuse a changed amount.
+    """
+    statuses = {"validation_status", "extraction_status", "provenance_status", "derived_version"}
+    rows = [{key: value for key, value in item.items() if key not in statuses} for item in facts]
+    rows.sort(key=lambda item: (str(item.get("fact_id", "")), canonical_snapshot_digest(item)))
+    return canonical_snapshot_digest(rows)
+
+
 def build_research_snapshot(
     company: Company, facts: list[dict[str, Any]], filing_evidence: list[dict[str, Any]],
     pack: Any, report_language: str, parallel_agents: bool, annual_history_years: int,
@@ -29,6 +42,7 @@ def build_research_snapshot(
             "captured_at": utc_now_iso(),
             "company_identity": canonical_snapshot_digest(company.to_dict()),
             "financial_facts_sha256": canonical_snapshot_digest(facts),
+            "financial_semantics_sha256": financial_semantics_digest(facts),
             "financial_fact_count": len(facts),
             "financial_fact_ids_sha256": canonical_snapshot_digest(sorted(
                 str(item.get("fact_id", "")) for item in facts if item.get("fact_id"))),

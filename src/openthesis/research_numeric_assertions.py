@@ -59,10 +59,24 @@ def _quantities(text: str, records: Sequence[Mapping[str, Any]], *, fiscal_year:
     normalized = re.sub(r"(?<![\w])\((\d+(?:,\d{3})*(?:\.\d+)?)\)",
                         r"-\1", normalized)
     year_markers = []
-    for marker in re.finditer(r"(?:(?:\bFY|\bin|\bduring|\bfor|\byear|\bfiscal\s+year)\s*"
-                              r"(?P<prefix_year>(?:19|20|21)\d{2})\b(?!-\d{2}-\d{2})|(?P<suffix_year>(?:19|20|21)\d{2})年)",
-                              normalized, re.I):
-        year_markers.append((marker.start(), marker.end(), marker.group("prefix_year") or marker.group("suffix_year")))
+    fiscal_year_spans = []
+    # Unicode ``\b`` does not mark the boundary between ASCII digits and
+    # Chinese characters: ``FY2025合并`` therefore used to leave 2025 for the
+    # malformed-number scan. Match and retain the actual fiscal-year span so
+    # only that identity token is exempted; nearby amounts remain checkable.
+    year_patterns = (
+        re.compile(r"(?<![A-Za-z0-9_])FY\s*(?P<year>(?:19|20|21)\d{2})(?!\d)(?!\s*(?:元|人民币|人民幣|美元|USD|RMB|CNY))", re.I),
+        re.compile(r"(?<!\d)(?P<year>(?:19|20|21)\d{2})(?:年度|财年|財年|会计年度|會計年度|年)", re.I),
+        re.compile(r"(?:(?:\bin|\bduring|\bfor|\byear|\bfiscal\s+year)\s*"
+                    r"(?P<year>(?:19|20|21)\d{2})(?!\d)(?!-\d{2}-\d{2}))", re.I),
+    )
+    for pattern in year_patterns:
+        for marker in pattern.finditer(normalized):
+            year = marker.group("year")
+            marker_span = (marker.start(), marker.end())
+            year_span = marker.span("year")
+            year_markers.append((*marker_span, year))
+            fiscal_year_spans.append(year_span)
     boundaries = [match.end() for match in re.finditer(r"[;；。!?]|,(?!\d)|\.(?=\s|$)", normalized)]
     # Dates and fiscal labels are identities, not amounts. They may be
     # omitted from amount checks only when explicitly carried by a citation.
@@ -72,12 +86,26 @@ def _quantities(text: str, records: Sequence[Mapping[str, Any]], *, fiscal_year:
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}(?:T.*)?", date):
             normalized = normalized.replace(date[:10], " " * 10)
     years = {str(record.get("fiscal_year")) for record in records if record.get("fiscal_year")}
-    for year in years:
-        normalized = re.sub(rf"\bFY\s*{re.escape(year)}\b", lambda m: " " * len(m.group()), normalized, flags=re.I)
+    # Keep the original text/offsets intact. The recorded spans below prevent
+    # fiscal-year digits from becoming amounts without masking a genuine
+    # amount that happens to repeat the same four digits elsewhere.
     periods = {str(record.get("fiscal_period") or "") for record in records}
+    pairs = {(str(record.get("fiscal_year") or str(record.get("end_date") or "")[:4]), str(record.get("fiscal_period") or "")) for record in records}
+    interim_labels = re.compile(r"(?<![A-Za-z0-9_])(?:(?P<year>(?:19|20|21)\d{2})\s*(?P<period>H[12]|Q[1-4])|(?P<before>H[12]|Q[1-4])\s*(?P<after>(?:19|20|21)\d{2}))(?![A-Za-z0-9_])", re.I)
+    for label in list(interim_labels.finditer(normalized)):
+        year = label.group("year") or label.group("after")
+        period = (label.group("period") or label.group("before")).upper()
+        prefix = normalized[:label.start()].rstrip()
+        suffix = normalized[label.end():].lstrip()
+        if ((year, period) not in pairs or re.search(rf"(?:{_CURRENCY_PATTERN}|[$¥￥])$", prefix, re.I)
+                or re.match(rf"(?:{_CURRENCY_PATTERN}|元|[%％]|[亿億万萬千])", suffix, re.I)):
+            continue
+        year_markers.append((label.start(), label.end(), year))
+        normalized = normalized[:label.start()] + " " * len(label.group()) + normalized[label.end():]
+    year_markers.sort()
     for period in periods:
         if period in {"Q1", "Q2", "Q3", "Q4", "H1", "H2"}:
-            normalized = re.sub(rf"\b{period}\b", " " * len(period), normalized, flags=re.I)
+            normalized = re.sub(rf"(?<![A-Za-z0-9_]){period}(?![A-Za-z0-9_])", " " * len(period), normalized, flags=re.I)
     quantities = []
     matches = list(_QUANTITY.finditer(normalized))
     number_starts = [match.start("number") for match in matches]
@@ -85,6 +113,8 @@ def _quantities(text: str, records: Sequence[Mapping[str, Any]], *, fiscal_year:
     # Check that every numeric token is consumed in full, including a leading
     # decimal point. Dates/fiscal labels above are source-bound exceptions.
     for run in re.finditer(r"(?<!\d)\.?\d[\d,.]*\d|(?<!\d)\d", normalized):
+        if any(start <= run.start() and run.end() <= end for start, end in fiscal_year_spans):
+            continue
         position = bisect_right(number_starts, run.start()) - 1
         if position < 0 or matches[position].end("number") < run.end():
             quantities.append(ProseQuantity(Decimal("NaN"), Decimal(1), "INVALID", "invalid", 0, run.group()))
@@ -146,6 +176,35 @@ def written_percentage_matches(written: str, value: Any) -> bool:
         return False
     return _display_matches(ProseQuantity(number, Decimal(1), "", "ratio",
                             len(written.partition(".")[2]), written), value)
+
+
+def disclosure_quantity_conflicted(text: str, records: Sequence[Mapping[str, Any]]) -> bool:
+    """Prove a changed quantity in an otherwise identical cited disclosure.
+
+    A missing amount anywhere on a page is insufficient. The complete clause
+    skeleton, explicit period, issuer and document must match, and every
+    eligible version of that exact clause must disagree. Semantic paraphrases
+    remain pending for the assertion verifier.
+    """
+    def skeleton(body: str) -> str:
+        return re.sub(r"\s+", " ", _QUANTITY.sub(" <quantity> ", body.translate(_TYPOGRAPHY))).strip().casefold()
+
+    if not _quantities(text, records):
+        return False
+    clauses = []
+    years = set(re.findall(r"(?:19|20)\d{2}", text))
+    for record in records:
+        if (record.get("kind") not in {"filing_text", "disclosure_text"}
+                or not record.get("document_id") or not record.get("company_cik")
+                or not record.get("end_date")):
+            continue
+        source = str(record.get("raw_text") or record.get("excerpt") or record.get("text") or "")
+        source_years = set(re.findall(r"(?:19|20)\d{2}", source))
+        if years != source_years or skeleton(text) != skeleton(source):
+            continue
+        clauses.append(record)
+    identities = {(row.get("company_cik"), row.get("end_date"), row.get("fiscal_period")) for row in clauses}
+    return bool(clauses) and len(identities) == 1 and not numeric_prose_supported(text, clauses)
 
 
 def numeric_prose_supported(text: str, records: Sequence[Mapping[str, Any]], *, fiscal_year: Any = None) -> bool:

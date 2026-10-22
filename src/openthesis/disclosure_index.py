@@ -2,8 +2,9 @@
 
 Financial coordinate extraction and qualitative evidence routing need the same
 PDF text layer.  Keeping it behind this small seam avoids reopening hundreds
-of pages after the financial prepass while a stat-based identity prevents a
-replaced file from reusing stale text.
+of pages after the financial prepass. The reader-version and actual byte hash
+prevent a replaced file from reusing stale text while allowing copies to share
+raw text; disclosure identity remains bound independently by its callers.
 """
 
 from __future__ import annotations
@@ -26,12 +27,11 @@ _PAGE_TEXT_CHARACTERS = 0
 def _identity(path: str | Path) -> tuple | None:
     target = Path(path)
     try:
-        stat = target.stat()
         digest = sha256()
         with target.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
-        return str(target.resolve()), int(stat.st_size), int(stat.st_mtime_ns), digest.hexdigest(), _TEXT_READER_VERSION
+        return digest.hexdigest(), _TEXT_READER_VERSION
     except OSError:
         return None
 

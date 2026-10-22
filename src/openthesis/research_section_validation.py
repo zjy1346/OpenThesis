@@ -1,29 +1,49 @@
 """Evidence-bound section projection, independent of transport and storage.
 
 The caller supplies the same claim validator used by its public research path.
-No global verified-claim count can grant trust to unrelated prose. Rejected raw
-content remains in the caller's candidate journal, never in this projection.
+No global verified-claim count can grant trust to unrelated prose. Known
+conflicts remain in the candidate journal; unverified text stays displayable
+with a host-owned pending status and cannot enter financial calculations.
 """
 from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
 import json
+import math
 import re
 from typing import Any, Callable, Mapping, Sequence
 from .research_claim_dedup import deduplicate_claims
 from .research_assertions import current_assertions, independent_sentences
 
 
-SECTION_PROOF_VERSION = "evidence-bound-sections-v9-analysis-presentation"
-_ASSERTION_PROOF_VERSIONS = {SECTION_PROOF_VERSION, "evidence-bound-sections-v8-assertions"}
+SECTION_PROOF_VERSION = "evidence-bound-sections-v10-local-retention"
+_ASSERTION_PROOF_VERSIONS = {SECTION_PROOF_VERSION, "evidence-bound-sections-v9-analysis-presentation", "evidence-bound-sections-v8-assertions"}
 _READABLE_PROOF_VERSIONS = {*_ASSERTION_PROOF_VERSIONS, "evidence-bound-sections-v7-source-dependencies", "evidence-bound-sections-v6-role-quantities"}
 _VERIFIED = frozenset({"numeric_verified", "text_supported"})
-_REFERENCES = frozenset({"evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
+_REFERENCES = frozenset({"evidence_ids", "source_evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
                          "supporting_evidence", "contradicting_evidence"})
+_OPPOSING_REFERENCES = frozenset({"contradicting_evidence_ids", "contradicting_evidence"})
 _CLAIM_REFERENCES = frozenset({"claim_ids", "input_claim_ids"})
 _LABELS = frozenset({"name", "title", "label", "kind", "type", "confidence", "severity", "role",
-                     "applicability", "method"})
+                     "applicability", "method", "opportunity_id", "time_horizon",
+                     "section_id", "section_ids", "claim_id", "fact_id", "document_id",
+                     "supporting_evidence_count", "contradicting_evidence_count"})
+
+
+def is_structural_content_path(path: str) -> bool:
+    """Old committed identity labels are metadata, never research prose."""
+    from .research_response import ROOT_METADATA_FIELDS
+    root_path = path
+    for wrapper in ("stage.", "report.", "content."):
+        if root_path.startswith(wrapper):
+            root_path = root_path[len(wrapper):]
+            break
+    if re.split(r"[.\[]", root_path, maxsplit=1)[0] in ROOT_METADATA_FIELDS:
+        return True
+    leaf = re.sub(r"\[\d+\]", "", path.rsplit(".", 1)[-1])
+    return leaf in {"section_id", "section_ids", "claim_id", "fact_id", "document_id", "opportunity_id",
+                    "source_evidence_ids", "as_of", "supporting_evidence_count", "contradicting_evidence_count"}
 _SKIP = frozenset({"structured_output_valid", "trusted_channels"})
 _NONFACTUAL = frozenset({"assumption", "forecast", "scenario", "risk", "opinion", "question", "unresolved", "method", "methodology"})
 _FACTUAL_FIELDS = frozenset({"historical_facts", "reported_facts", "actuals", "source_facts"})
@@ -157,6 +177,7 @@ def project_supported_sections(
     merely because another section somewhere in the report was verified.
     """
     rejected: list[dict[str, str]] = []
+    pending: list[dict[str, str]] = []
     kept: list[str] = []
     collected: list[dict[str, Any]] = []
     assumptions: list[str] = []
@@ -165,8 +186,24 @@ def project_supported_sections(
     verified_indices: set[int] = set()
     numeric_verified_indices: set[int] = set()
     checked_by_path: dict[str, list[dict[str, Any]]] = {}
+    contradicted_texts: set[str] = set()
     raw_claim_identities: dict[str, set[str]] = {}
     referenced_claim_ids: set[str] = set()
+    def json_candidate(value: Any, path: str) -> Any:
+        if isinstance(value, Mapping):
+            return {key: json_candidate(child, f"{path}.{key}" if path else key)
+                    for key, child in value.items() if isinstance(key, str)}
+        if isinstance(value, list):
+            return [json_candidate(child, f"{path}[{index}]") for index, child in enumerate(value)]
+        if value is None or isinstance(value, (str, bool, int)) or isinstance(value, float) and math.isfinite(value):
+            return value
+        rejected.append({"path": path, "reason": "invalid_json_value"})
+        return None
+
+    from .research_response import response_parts
+    report, system_metadata, response_diagnostics = response_parts(report)
+    section_keys = [key for key in section_keys if key in report or key == "claims"]
+    report = json_candidate(report, "")
     try:
         encoded = json.dumps(report, sort_keys=True, ensure_ascii=False,
                              allow_nan=False).encode("utf-8")
@@ -178,7 +215,16 @@ def project_supported_sections(
     def reject(path: str, reason: str) -> None:
         rejected.append({"path": path, "reason": reason})
 
-    def accept(path: str, value: Any, refs: list[str], claims: list[dict], role: str) -> None:
+    def support_for(text: str, refs: list[str]):
+        try:
+            return prose_supported(text, refs)
+        except Exception:
+            # A local reviewer failure cannot revoke candidate prose or a
+            # healthy sibling. Never put exception text/prompt in diagnostics.
+            return False
+
+    def accept(path: str, value: Any, refs: list[str], claims: list[dict], role: str,
+               *, issue_code: str = "") -> None:
         # Freeze presentation ancestry as non-substantive metadata. Flattening
         # trusted leaves must not lose opportunity/scenario names or combine
         # different list items. Titles never become evidence for this body.
@@ -216,7 +262,9 @@ def project_supported_sections(
                       "body": deepcopy(value), "context": context, "claim_ids": sorted({claim["claim_id"] for claim in claims
                           if isinstance(claim.get("claim_id"), str)}),
                       "assertion_results": assertions,
-                      "validation_state": "partial" if role == "analysis" else "verified" if role != "assumption" else "labelled"})
+                      "validation_state": "partial" if role == "analysis" else "verified" if role != "assumption" else "labelled",
+                      "display_eligible": True, "calculation_eligible": role == "fact_table",
+                      "issue_code": issue_code})
 
     def checked_claims(value: Any, path: str) -> list[dict[str, Any]]:
         if path in checked_by_path:
@@ -234,10 +282,33 @@ def project_supported_sections(
                         if key not in {"claim_id", "confidence", "section", "section_id", "section_ids"}}
             raw_claim_identities.setdefault(claim["claim_id"], set()).add(
                 json.dumps(identity, sort_keys=True, ensure_ascii=False, allow_nan=False))
-        check = verify_claims(value)
+        try:
+            check = verify_claims(value)
+        except Exception:
+            pending.append({"path": path, "reason": "claim_validation_unavailable"})
+            check = {"normalized_claims": value, "claim_verifications": []}
         normalized = check.get("normalized_claims", value)
         states = {item.get("index"): item.get("state")
                   for item in check.get("claim_verifications", []) if isinstance(item, dict)}
+        # Claim validation and prose validation share the same source snapshot.
+        # A pending claim is not a licence to retain a quantity already proven
+        # inconsistent by the deterministic assertion checker. Unknown support
+        # remains pending; only an explicit contradiction revokes this claim.
+        for index, claim in enumerate(normalized):
+            if not isinstance(claim, dict) or states.get(index) == "contradicted":
+                continue
+            text = next((claim[key].strip() for key in ("text", "conclusion", "argument")
+                         if isinstance(claim.get(key), str) and claim[key].strip()), "")
+            refs = list(dict.fromkeys(ref for key in _REFERENCES - _OPPOSING_REFERENCES
+                for ref in (claim.get(key) if isinstance(claim.get(key), list) else ())
+                if isinstance(ref, str) and ref in available_evidence))
+            if text and support_for(text, refs) == "contradicted":
+                states[index] = "contradicted"
+        for index, claim in enumerate(normalized):
+            if isinstance(claim, dict) and states.get(index) == "contradicted":
+                for key in ("text", "conclusion", "argument"):
+                    if isinstance(claim.get(key), str) and claim[key].strip():
+                        contradicted_texts.add(claim[key].strip())
         valid = []
         for index, claim in enumerate(normalized):
             if isinstance(claim, dict) and states.get(index) in _VERIFIED:
@@ -249,6 +320,14 @@ def project_supported_sections(
                   and str(claim.get("kind", "")).casefold() in _NONFACTUAL):
                 valid.append(deepcopy(claim))
                 assumptions.append(f"{path}[{index}]")
+            elif isinstance(claim, dict) and states.get(index) != "contradicted":
+                display_claim = deepcopy(claim)
+                for key in _REFERENCES:
+                    if isinstance(display_claim.get(key), list):
+                        display_claim[key] = [ref for ref in display_claim[key]
+                                              if isinstance(ref, str) and ref in available_evidence]
+                valid.append(display_claim)
+                pending.append({"path": f"{path}[{index}]", "reason": "claim_pending_verification"})
             else:
                 reject(f"{path}[{index}]", "claim_not_verified")
         collected.extend(valid)
@@ -289,7 +368,7 @@ def project_supported_sections(
         # material for an independently checked, labelled analysis paragraph;
         # they remain absent from accepted claims and all calculators.
         return list(dict.fromkeys(ref for claim in claims if isinstance(claim, dict)
-            for key in _REFERENCES
+            for key in _REFERENCES - _OPPOSING_REFERENCES
             for ref in (claim.get(key) if isinstance(claim.get(key), (list, tuple)) else ())
             if isinstance(ref, str) and ref in available_evidence))
 
@@ -305,36 +384,26 @@ def project_supported_sections(
                 computed.append(path)
                 accept(path, value, [], [], "fact_table")
                 return deepcopy(value)
+            if path.rsplit(".", 1)[-1] != "summary":
+                reject(path, "host_computed_value_conflict")
+                return _ABSENT
         if isinstance(value, Mapping):
             declared_role = value.get("role")
             role_aliases = {"numeric_fact": "fact", "source_summary": "inference",
                             "analysis_inference": "analysis", "hypothesis": "assumption"}
             if isinstance(declared_role, str):
                 declared_role = role_aliases.get(declared_role.casefold(), declared_role.casefold())
-            if declared_role is not None and (not isinstance(declared_role, str)
+            host_computed_wrapper = bool(computed_fields) and all(
+                key == "role" or f"{path}.{key}" in computed_fields
+                and content_digest(child) == content_digest(computed_fields[f"{path}.{key}"])
+                for key, child in value.items())
+            if not host_computed_wrapper and declared_role is not None and (not isinstance(declared_role, str)
                     or declared_role.casefold() not in _NONFACTUAL | {
                         "fact", "calculation", "inference", "analysis", "verified_analysis", "source_quote", "fact_table"}):
-                reject(path + ".role", "content_role_unclassified")
-                # The unknown role governs this object's own assertions, not
-                # a separately sourced child. Do not inherit its locators,
-                # claims or role into children, nor grant its scalar body
-                # trust by silently dropping the unclassified role.
-                independent = {}
-                for key, child in value.items():
-                    if key in _LABELS | _REFERENCES | _CLAIM_REFERENCES | _SKIP | {"claims"} or str(key).startswith("_"):
-                        continue
-                    if isinstance(child, Mapping):
-                        item = visit(child, f"{path}.{key}", [], [])
-                    elif isinstance(child, list):
-                        items = [visit(nested, f"{path}.{key}[{index}]", [], [])
-                                 for index, nested in enumerate(child) if isinstance(nested, Mapping)]
-                        kept_items = [item for item in items if item is not _ABSENT]
-                        item = kept_items if kept_items else _ABSENT
-                    else:
-                        continue
-                    if item is not _ABSENT:
-                        independent[key] = item
-                return independent if independent else _ABSENT
+                # This metadata does not revoke text or independently computed
+                # scalars. It supplies no factual or arithmetic authority.
+                pending.append({"path": path + ".role", "reason": "content_role_unclassified"})
+                declared_role = "analysis"
             kind = str(value.get("kind") or declared_role or "").casefold()
             factual = factual or kind in {"fact", "numeric_fact", "calculation", "fact_table"}
             if kind:
@@ -344,22 +413,25 @@ def project_supported_sections(
             if isinstance(value.get("claims"), list):
                 refs = list(dict.fromkeys([*refs, *source_references(value["claims"])]))
             valid_evidence_references = {}
-            for key in _REFERENCES:
+            if any(key in value for key in _REFERENCES - _OPPOSING_REFERENCES):
+                refs = []  # explicit child references override parent context
+            for key in sorted(_REFERENCES):
                 if key not in value:
                     continue
                 declared = value[key]
                 if not isinstance(declared, list):
-                    reject(path + "." + key, "unknown_or_invalid_evidence")
+                    pending.append({"path": path + "." + key, "reason": "unknown_or_invalid_evidence"})
                     continue
                 valid = list(dict.fromkeys(ref for ref in declared
                     if isinstance(ref, str) and ref in available_evidence))
                 if len(valid) != len(declared):
-                    reject(path + "." + key, "unknown_or_invalid_evidence")
+                    pending.append({"path": path + "." + key, "reason": "unknown_or_invalid_evidence"})
                 # A broken parent locator is not a verdict about independently
                 # sourced children. Only valid locators propagate; every leaf
                 # still has to prove its own assertion against the remainder.
                 valid_evidence_references[key] = valid
-                refs = list(dict.fromkeys([*refs, *valid]))
+                if key not in _OPPOSING_REFERENCES:
+                    refs = list(dict.fromkeys([*refs, *valid]))
             valid_claim_references = {}
             for key in _CLAIM_REFERENCES:
                 if key not in value:
@@ -389,8 +461,21 @@ def project_supported_sections(
                     if valid_evidence_references.get(key):
                         projected[key] = valid_evidence_references[key]
                     continue
+                if key == "as_of":
+                    # A syntactically valid observation timestamp is metadata,
+                    # not a paragraph requiring a semantic model verdict. It
+                    # supplies no price validity or research completeness.
+                    from datetime import datetime
+                    try:
+                        if not isinstance(child, str):
+                            raise ValueError("invalid timestamp")
+                        datetime.fromisoformat(child.replace("Z", "+00:00"))
+                        projected[key] = child
+                    except (TypeError, ValueError):
+                        pending.append({"path": path + ".as_of", "reason": "invalid_observation_timestamp"})
+                    continue
                 if key in _LABELS:
-                    projected[key] = deepcopy(child)
+                    projected[key] = declared_role if key == "role" else deepcopy(child)
                     continue
                 item = visit(child, f"{path}.{key}", refs, local_claims,
                              nonfactual if key not in _FACTUAL_FIELDS else "",
@@ -404,6 +489,16 @@ def project_supported_sections(
                     else:
                         substantive = True
             if not substantive and not has_computed:
+                if local_claims and "claims" in projected and any(
+                        isinstance(claim.get(field), str) and claim[field].strip()
+                        for claim in local_claims for field in ("text", "conclusion", "argument")):
+                    # A claims-only object can still contain readable analysis.
+                    # Keep its original field, not a fabricated summary; this
+                    # alone does not prove that the section's research duty is
+                    # fulfilled or that its numeric claims are calculable.
+                    pending.append({"path": path + ".claims", "reason": "claim_only_analysis_pending_verification"})
+                    accept(path + ".claims", local_claims, refs, local_claims, "analysis")
+                    return projected
                 reject(path, "no_supported_analysis")
                 return _ABSENT
             return projected
@@ -446,12 +541,15 @@ def project_supported_sections(
                     # ignored; only independently checked claims above can
                     # supply refs for admission on the resolved pass.
                     raw_claims = report.get("claims", [])
-                    pending = [claim for claim in raw_claims if isinstance(claim, dict) and text == str(
+                    pending_claims = [claim for claim in raw_claims if isinstance(claim, dict) and text == str(
                         claim.get("text") or claim.get("conclusion") or claim.get("argument") or "").strip()] if isinstance(raw_claims, list) else []
-                    pending_refs = tuple(ref for ref in references(pending) if ref in available_evidence)
+                    pending_refs = tuple(ref for ref in references(pending_claims) if ref in available_evidence)
                     if pending_refs:
-                        prose_supported(text, pending_refs)
-            support = prose_supported(text, refs) if text and refs else False
+                        support_for(text, list(pending_refs))
+            support = "contradicted" if text in contradicted_texts else support_for(text, refs) if text else False
+            if support == "contradicted" and len(independent_sentences(text)) <= 1:
+                reject(path, "source_confirmed_assertion_conflict")
+                return _ABSENT
             # Explicit historical/fact roles never inherit the new analysis
             # presentation policy. Their proof requirement remains unchanged.
             # Unreviewed historical summaries stay pending. Explicit analysis
@@ -461,22 +559,27 @@ def project_supported_sections(
             labelled_reasoning = bool(_HYPOTHETICAL.search(text) or re.search(
                 r"\b(?:because|therefore|suggests?|risk|implies?|may|might)\b|意味着|意味著|风险|風險|因此|有助于|有助於", text, re.I))
             can_present = not factual and (analysis_field or labelled_reasoning)
-            if support and (support != "source_bound_analysis" or can_present):
+            if support and support != "contradicted" and (support != "source_bound_analysis" or can_present):
                 kept.append(path)
                 accept(path, value, refs, owned, "analysis" if support == "source_bound_analysis" else "verified_analysis")
                 return deepcopy(value)
-            if isinstance(value, str) and text and refs:
+            if isinstance(value, str) and text:
                 parts = independent_sentences(text)
                 if len(parts) > 1:
                     retained = []
                     partial = False
                     for index, sentence in enumerate(parts):
-                        supported = prose_supported(sentence, refs)
+                        supported = "contradicted" if sentence in contradicted_texts else support_for(sentence, refs)
+                        if supported == "contradicted":
+                            reject(f"{path}#sentence[{index}]", "source_confirmed_assertion_conflict")
+                            continue
                         if supported and (supported != "source_bound_analysis" or can_present):
                             retained.append(sentence)
                             partial = partial or supported == "source_bound_analysis"
                         else:
-                            reject(f"{path}#sentence[{index}]", "assertion_not_bound_to_supporting_evidence")
+                            retained.append(sentence)
+                            partial = True
+                            pending.append({"path": f"{path}#sentence[{index}]", "reason": "assertion_pending_verification"})
                     if retained:
                         # Join only complete, independently checked sentences;
                         # the original unsplit candidate remains in the journal.
@@ -484,7 +587,12 @@ def project_supported_sections(
                         kept.append(path)
                         accept(path, body, refs, owned, "analysis" if partial else "verified_analysis")
                         return body
-            reject(path, "analysis_not_bound_to_supporting_evidence")
+                    if support == "contradicted":
+                        return _ABSENT
+            if text:
+                pending.append({"path": path, "reason": "assertion_pending_verification"})
+                accept(path, value, refs, owned, "analysis", issue_code="CONTENT_PENDING_VERIFICATION")
+                return deepcopy(value)
             return _ABSENT
         reject(path, "not_analysis")
         return _ABSENT
@@ -505,6 +613,11 @@ def project_supported_sections(
         referenced_claim_ids=referenced_claim_ids)
     safe["claims"] = claims
     safe = rewrite_claim_references(safe, deduplication["claim_id_aliases"])
+    for index, claim in enumerate(safe["claims"]):
+        for field in ("text", "conclusion", "argument"):
+            if isinstance(claim.get(field), str) and claim[field].strip():
+                visit(claim[field], f"claims[{index}].{field}", source_references([claim]), [claim])
+                break
     # Rejected list siblings change projected indices. Bind the retained atom
     # to its final path while retaining the original locator and stable ID.
     available_atoms = list(atoms)
@@ -522,8 +635,11 @@ def project_supported_sections(
                 return
         if isinstance(value, dict):
             for key, child in value.items():
-                if key != "claims":
-                    bind(child, f"{path}.{key}" if path else key)
+                # A claims-only object has its own pending content atom. Other
+                # nested claims remain represented by the global claim list.
+                child_path = f"{path}.{key}" if path else key
+                if key != "claims" or any(node["source_path"] == child_path for node in available_atoms):
+                    bind(child, child_path)
         elif isinstance(value, list):
             for index, child in enumerate(value):
                 bind(child, f"{path}[{index}]")
@@ -531,11 +647,15 @@ def project_supported_sections(
     for section in section_keys:
         if section != "claims" and section in safe:
             bind(safe[section], section)
+    bind(safe["claims"], "claims")
     removed_indices = {index for merge in deduplication["merges"] for index in merge["removed_indices"]}
     return safe, {
         "schema": SECTION_PROOF_VERSION,
+        "system_metadata": system_metadata,
+        "response_diagnostics": response_diagnostics,
         "input_sha256": hashlib.sha256(encoded).hexdigest(),
         "kept_paths": kept, "quarantined_paths": rejected,
+        "pending_paths": pending,
         "assumption_paths": assumptions,
         "computed_paths": computed,
         "nodes": nodes,

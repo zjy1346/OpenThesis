@@ -35,6 +35,32 @@ class ResearchPreparationUnavailable(RuntimeError):
         super().__init__(code)
 
 
+def financial_scope_gaps(facts, filings) -> tuple[dict[str, Any], ...]:
+    """Major table absence in the latest required annual/interim periods.
+
+    This is a paid-research scope question, not an all-files quality gate.
+    Missing one cell/table remains ordinary labelled degradation. Historical
+    siblings cannot silently stand in for a latest period with two or three
+    entire core statements absent.
+    """
+    annual = [item for item in filings if item.period_end and item.fiscal_period in {"FY", "CY", "ANNUAL"}]
+    interim = [item for item in filings if item.period_end and item.fiscal_period not in {"FY", "CY", "ANNUAL"}]
+    targets = [max(items, key=lambda item: item.period_end) for items in (annual, interim) if items]
+    table_concepts = {"income_statement": {"revenue", "net_income", "parent_net_income", "operating_income"},
+                      "balance_sheet": {"assets", "equity", "total_equity", "liabilities"},
+                      "cash_flow": {"operating_cash_flow", "capital_expenditure"}}
+    gaps = []
+    for target in targets:
+        concepts = {fact.get("concept") for fact in facts if fact.get("end_date") == target.period_end
+                    and fact.get("fiscal_period") == target.fiscal_period
+                    and (fact.get("consolidated_scope") or fact.get("scope", "consolidated")) == "consolidated"}
+        missing = [table for table, members in table_concepts.items() if not concepts.intersection(members)]
+        if len(missing) >= 2:
+            gaps.append({"period_end": target.period_end, "fiscal_period": target.fiscal_period,
+                         "missing_statements": missing})
+    return tuple(gaps)
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchPreparationRequest:
     company: Company
@@ -55,8 +81,11 @@ class ResearchPreparationRequest:
     existing_run: ResearchRun | None = None
     recovery_session_id: str = ""
     job_id: str = ""
+    allow_partial_research: bool = False
 
     def __post_init__(self):
+        if type(self.allow_partial_research) is not bool:
+            raise ValueError("RESEARCH_PARTIAL_SCOPE_INVALID")
         if self.mode not in {"company", "demo"}:
             raise ValueError("RESEARCH_MODE_INVALID")
         if (isinstance(self.annual_history_years, bool)
@@ -163,21 +192,35 @@ class NewResearchPreparer:
                                 if state != "promoted")
                 if prepared.currency_lane_ambiguous and not targets:
                     targets = tuple(item.accession_number for item in filings)
+                facts = list(admitted.fact_dicts)
+                evidence = [financial_evidence_record(item) for item in admitted.evidence]
+                disclosure_filings = filings
                 if not admitted.research_ready:
+                    # Financial readiness is not qualitative readiness. Reuse
+                    # only originals whose captured issuer and actual bytes
+                    # still match; a tampered/foreign source never qualifies.
+                    from ..financial_sources.downloads import local_cache_diagnostic
+                    disclosure_filings = tuple(filing for filing in filings
+                        if filing.company_cik in {subject.cik, subject.security_id}
+                        and not local_cache_diagnostic(filing))
+                evidence.extend(bind_compiled_disclosures(
+                    admitted, cached_filing_evidence(self.storage, disclosure_filings,
+                        cancel_check=cancelled)))
+                if not admitted.research_ready and not has_sourced_disclosure(evidence):
                     raise ResearchPreparationUnavailable(
                         scanner_diagnostic_code(admitted.diagnostics)
                         or (prepared.recovery_outcome.diagnostic_code if prepared.recovery_outcome else "")
                         or "FILING_DATA_QUALITY_FAILED", outcome=prepared.recovery_outcome)
-                facts = list(admitted.fact_dicts)
-                evidence = [financial_evidence_record(item) for item in admitted.evidence]
-                evidence.extend(bind_compiled_disclosures(
-                    admitted, cached_filing_evidence(self.storage, filings)))
                 profile, capabilities = admitted.profile, admitted.capability_map
+                scope_gaps = financial_scope_gaps(facts, filings)
                 accessions = {item.accession_number for item in filings}
                 generations = dict(prepared.financial_generations)
-                if not facts or not (profile.metrics or profile.interim_metrics):
+                if not facts or not (profile.metrics or profile.interim_metrics) or scope_gaps:
                     targets = tuple(sorted(accessions))
                     capabilities = {**capabilities, "financial_recovery_pending": True}
+                    if any(model.enabled for model in captured.models) and not captured.allow_partial_research:
+                        raise ResearchPreparationUnavailable("FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED",
+                                                             outcome=prepared.recovery_outcome, coverage=coverage)
                 source_state = {
                     "freshness": prepared.discovery.freshness,
                     "discovery_diagnostics": list(prepared.discovery.diagnostics),
@@ -204,7 +247,8 @@ class NewResearchPreparer:
             generations = {str(item["accession_number"]): str(item["generation_id"])
                            for item in facts if item.get("accession_number") and item.get("generation_id")}
         reproducibility["data_snapshot"].update({
-            "financial_capabilities": capabilities, "financial_generations": generations})
+            "financial_capabilities": capabilities, "financial_generations": generations,
+            "partial_research_scope_authorized": captured.allow_partial_research})
         if source_state is not None:
             reproducibility["data_snapshot"]["official_source_state"] = source_state
         if coverage is not None:
@@ -219,11 +263,14 @@ class NewResearchPreparer:
 
     def _record_unavailable(self, request, company, targets, stage, error):
         key = company.cik if company.market == "US" else company.security_id
+        recovery_run = request.recovery_session_id or (request.existing_run.run_id if request.existing_run else "")
+        if not recovery_run:
+            return  # Preserve the scope error when this entry has no durable run yet.
         for filing in self.storage.get_filings(key):
             if targets and filing.accession_number not in targets:
                 continue
             self.storage.save_financial_recovery_case(
-                run_id=request.recovery_session_id, company_cik=key,
+                run_id=recovery_run, company_cik=key,
                 accession_number=filing.accession_number, document_hash=filing.content_hash,
                 stage=stage, error_code=error.code,
                 next_action=next(iter(error.outcome.next_actions), "repair_required_official_evidence"),

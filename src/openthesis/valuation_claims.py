@@ -122,6 +122,33 @@ def _valuation_is_usable(value: Any) -> bool:
         return False
 
 
+def intrinsic_sensitivity_is_usable(value: Any) -> bool:
+    from .financials import discounted_cash_flow_value
+    if (not isinstance(value, dict) or value.get("schema") != "fcfe-proxy-sensitivity-v1"
+            or value.get("status") != "ok" or not isinstance(value.get("currency"), str)
+            or not re.fullmatch(r"[A-Z]{3}", value["currency"])
+            or not isinstance(value.get("evidence_ids"), list) or len(value["evidence_ids"]) < 2
+            or any(not isinstance(key, str) or not key.startswith("fact:") for key in value["evidence_ids"])
+            or len(set(value["evidence_ids"])) != len(value["evidence_ids"])
+            or value.get("cash_flow_basis") != "FCFE proxy = operating cash flow - capital expenditure"):
+        return False
+    try:
+        if (type(value["base_free_cash_flow"]) not in {int, float} or not math.isfinite(value["base_free_cash_flow"])
+                or value["base_free_cash_flow"] <= 0 or type(value["horizon_years"]) is not int or not 1 <= value["horizon_years"] <= 100
+                or any(type(value.get(key)) not in {int, float} or not math.isfinite(value[key]) for key in ("discount_rate", "terminal_growth"))
+                or value["discount_rate"] <= value["terminal_growth"] or min(value["discount_rate"], value["terminal_growth"]) <= -1):
+            return False
+        rows = value["sensitivity"]
+        return (isinstance(rows, list) and len(rows) == 7
+            and [row.get("fcf_growth") if isinstance(row, dict) else None for row in rows] == [-.05, 0., .05, .10, .15, .20, .30]
+            and all(isinstance(row, dict) and type(row.get("fcf_growth")) in {int, float}
+            and type(row.get("equity_value")) in {int, float} and math.isfinite(row["equity_value"])
+            and math.isclose(row["equity_value"], discounted_cash_flow_value(value["base_free_cash_flow"], row["fcf_growth"],
+                value["discount_rate"], value["terminal_growth"], value["horizon_years"]), rel_tol=1e-10) for row in rows))
+    except (TypeError, ValueError, KeyError, OverflowError, ZeroDivisionError):
+        return False
+
+
 def _sentence_is_negated(sentence: str, cue: re.Match[str]) -> bool:
     # Only consider negation immediately governing the valuation assertion;
     # an unrelated disclaimer elsewhere in a long paragraph must not bless it.
@@ -153,7 +180,9 @@ def _is_unsupported_assertion(sentence: str, valuation: dict[str, Any] | None) -
         percentages = list(_PERCENT.finditer(context))
         money = _MONEY.search(context)
         if not _valuation_is_usable(valuation):
-            if percentages or money or "dcf" in cue.group(0).casefold():
+            # An unquantified DCF limitation or method note is analysis, not
+            # a computed valuation assertion. Quantified claims remain gated.
+            if percentages or money:
                 return True
         elif percentages:
             # The public-facing deterministic calculation is the only source
@@ -174,13 +203,35 @@ def _is_unsupported_assertion(sentence: str, valuation: dict[str, Any] | None) -
 
 
 def _sanitize_value(value: Any, valuation: dict[str, Any] | None,
-                    *, path: str, rejected: list[dict[str, str]]) -> tuple[Any, int]:
+                    *, path: str, rejected: list[dict[str, Any]]) -> tuple[Any, int]:
     if isinstance(value, str):
-        if _is_unsupported_assertion(value, valuation):
-            rejected.append({"path": path, "reason": "unsupported_valuation_assertion",
-                             "content_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()})
-            return _ABSENT, 1
-        return value, 0
+        boundaries = [match.end() for match in re.finditer(r"[。！？!?；;\n]|\.(?=\s|$)", value)]
+        starts = [0, *boundaries]
+        ends = [*boundaries, len(value)]
+        retained: list[str] = []
+        removed_spans = []
+        original_digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        for start, end in zip(starts, ends):
+            sentence = value[start:end]
+            if sentence and _is_unsupported_assertion(sentence, valuation):
+                digest = hashlib.sha256(sentence.encode("utf-8")).hexdigest()
+                removed_spans.append({"start": start, "end": end, "content_sha256": digest})
+                rejected.append({"path": path, "reason": "unsupported_valuation_assertion",
+                                 "content_sha256": digest, "original_content_sha256": original_digest,
+                                 "start": start, "end": end})
+            else:
+                retained.append(sentence)
+        if not removed_spans:
+            return value, 0
+        kept = "".join(retained).strip()
+        # The proof binds the original field and records precisely which
+        # verbatim sentence slices were isolated. Neighboring text is never
+        # rewritten or promoted to a verified financial fact.
+        if kept:
+            rejected[-len(removed_spans)]["removed_spans"] = removed_spans
+            return kept, len(removed_spans)
+        rejected[-len(removed_spans)]["removed_spans"] = removed_spans
+        return _ABSENT, len(removed_spans)
     if isinstance(value, list):
         sanitized: list[Any] = []
         removed = 0
@@ -236,7 +287,7 @@ def _localized_summary(available: bool, language: str, status: str = "") -> str:
 def enforce_valuation_consistency(
     report: Any, valuation: Any, language: str = "zh-CN"
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Quarantine unsupported valuation prose and project only computed values.
+    """Isolate unsupported valuation assertions and project computed values.
 
     Ordinary business and risk analysis is retained. The dedicated valuation
     section is replaced with either deterministic fields or an explicit
@@ -248,13 +299,15 @@ def enforce_valuation_consistency(
         encoded = json.dumps(sanitized, sort_keys=True, ensure_ascii=False, allow_nan=False,
                              separators=(",", ":")).encode("utf-8")
     except (TypeError, ValueError):
-        return {}, {"schema": "valuation-content-proof-v2-whole-leaves", "input_sha256": None,
+        return {}, {"schema": "valuation-content-proof-v3-sentence-spans", "input_sha256": None,
                     "valuation_available": False, "valuation_status": "unavailable",
                     "quarantined_count": 1, "quarantined_paths": ["$"],
                     "quarantined_nodes": [{"path": "$", "reason": "invalid_json_value"}]}
     rejected: list[dict[str, str]] = []
     valuation_value = valuation if isinstance(valuation, dict) else None
     usable = _valuation_is_usable(valuation_value)
+    intrinsic = (valuation_value or {}).get("intrinsic_analysis")
+    intrinsic_usable = intrinsic_sensitivity_is_usable(intrinsic)
     original_section = sanitized.get("implied_expectations")
     source_analysis, _ = _sanitize_value(original_section,
         valuation_value if usable else None, path="implied_expectations", rejected=rejected)
@@ -284,7 +337,7 @@ def enforce_valuation_consistency(
     sensitivity_section = sanitized.get("valuation_and_sensitivity")
     if sensitivity_section is None and isinstance(original_section, dict):
         sensitivity_section = original_section.get("valuation_and_sensitivity")
-    if sensitivity_section is not None:
+    if sensitivity_section is not None or isinstance(intrinsic, dict):
         safe_sensitivity, _ = _sanitize_value(
             sensitivity_section, valuation_value if usable else None,
             path="valuation_and_sensitivity", rejected=rejected,
@@ -295,6 +348,33 @@ def enforce_valuation_consistency(
             projected["sensitivity"] = deepcopy(valuation_value["sensitivity"])
             if valuation_value.get("currency"):
                 projected["currency"] = valuation_value["currency"]
+        elif intrinsic_usable:
+            projected["sensitivity"] = deepcopy(intrinsic["sensitivity"])
+            projected["currency"] = intrinsic["currency"]
+            prior_ids = projected.get("evidence_ids", [])
+            projected["evidence_ids"] = list(dict.fromkeys([*(prior_ids if isinstance(prior_ids, list) else []), *intrinsic["evidence_ids"]]))
+            projected.update(discount_rate=intrinsic["discount_rate"], terminal_growth_rate=intrinsic["terminal_growth"],
+                             horizon_years=intrinsic["horizon_years"])
+            note = {"en": "Conditional FCFE-proxy sensitivity, not a market price or a forecast: operating cash flow less capex. No net-debt subtraction or per-share value is inferred. Growth, discount and terminal rates are explicit policy assumptions, not financial facts.",
+                    "zh-Hant": "以下為條件式股東現金流近似敏感性，不是市場價格或預測：以經營現金流減資本開支為基數，不推定淨債務扣減或每股價值。增長、折現及永續增長率均為明示的政策假設，不是財務事實。",
+                    "zh-CN": "以下为条件式股东现金流近似敏感性，不是市场价格或预测：以经营现金流减资本开支为基数，不推定净债务扣减或每股价值。增长、折现及永续增长率均为明示的政策假设，不是财务事实。"}[normalize_language(language)]
+            prior_notes = projected.get("limitations", [])
+            notes = prior_notes if isinstance(prior_notes, list) else [prior_notes]
+            projected["limitations"] = [*notes, *([] if note in notes else [note])]
+        elif isinstance(intrinsic, dict) and not usable:
+            reasons = {
+                "non_positive_annual_cash_flow": ("The latest complete-year FCFE proxy is not positive; a positive-base perpetuity would be misleading. An older positive year is not substituted.", "最新完整年度的股東現金流近似值不為正，不能據此套用正基數永續估值，也不改用更早的正值年度。", "最新完整年度的股东现金流近似值不为正，不能据此套用正基数永续估值，也不改用更早的正值年度。"),
+                "verified_annual_cash_flow_missing": ("A verified complete-year cash-flow base is missing.", "缺少已核實的完整年度現金流基數。", "缺少已核实的完整年度现金流基数。"),
+                "normalized_cash_flow_missing": ("The cash-flow base lacks verified normalized amounts.", "現金流基數缺少已核實的歸一化金額。", "现金流基数缺少已核实的归一化金额。"),
+                "cash_flow_currency_or_unit_mismatch": ("Cash-flow currency or scale is inconsistent.", "現金流幣別或金額倍率不一致。", "现金流币种或金额倍率不一致。"),
+                "cash_flow_identity_conflict": ("The cash-flow base has a period or amount identity conflict.", "現金流基數的期間或金額身份衝突。", "现金流基数的期间或金额身份冲突。"),
+            }
+            fallback = ("Verified cash-flow sources or valid sensitivity assumptions are missing.", "缺少已核實的現金流來源或有效敏感性假設。", "缺少已核实的现金流来源或有效敏感性假设。")
+            index = 0 if normalize_language(language) == EN else 1 if normalize_language(language) == ZH_HANT else 2
+            note = reasons.get(str(intrinsic.get("reason")), fallback)[index]
+            prior_notes = projected.get("limitations", [])
+            notes = prior_notes if isinstance(prior_notes, list) else [prior_notes]
+            projected["limitations"] = [*notes, *([] if note in notes else [note])]
         sanitized["valuation_and_sensitivity"] = projected
     for key, value in list(sanitized.items()):
         if key in {"implied_expectations", "valuation_and_sensitivity"}:
@@ -308,7 +388,7 @@ def enforce_valuation_consistency(
     return sanitized, {
         "valuation_available": usable,
         "valuation_status": str(valuation_value.get("status", "unavailable")) if valuation_value else "unavailable",
-        "schema": "valuation-content-proof-v2-whole-leaves",
+        "schema": "valuation-content-proof-v3-sentence-spans",
         "input_sha256": hashlib.sha256(encoded).hexdigest(),
         "quarantined_count": len(rejected),
         "quarantined_paths": list(dict.fromkeys(item["path"] for item in rejected)),

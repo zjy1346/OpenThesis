@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -23,6 +24,7 @@ class ProviderError(RuntimeError):
         content_path: str = "",
         safe_receipt: dict | None = None,
         diagnostic_trace_id: str = "",
+        partial_content: str = "",
     ):
         self.retryable = retryable
         self.code = code
@@ -33,6 +35,7 @@ class ProviderError(RuntimeError):
         self.content_path = content_path
         self.safe_receipt = safe_receipt
         self.diagnostic_trace_id = diagnostic_trace_id
+        self.partial_content = partial_content
         super().__init__(message)
 
 
@@ -87,6 +90,12 @@ class ModelConfig:
     role: str = "primary"
     timeout_seconds: int = 180
     connection_id: str = ""
+    context_window_hint: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.context_window_hint is not None and (
+                type(self.context_window_hint) is not int or not 1 <= self.context_window_hint <= 2_147_483_647):
+            raise ValueError("MODEL_CONTEXT_HINT_INVALID")
 
     @property
     def enabled(self) -> bool:
@@ -199,18 +208,58 @@ class RustModelGatewayProvider:
         gateway_path: str | os.PathLike[str] | None = None,
     ):
         self.config = config
+        # This is the selected connection/model configuration, not the
+        # vendor's advertised maximum guessed from a model name. copy(self)
+        # scopes retain it across event/cancellation/budget wrappers.
+        if config.context_window_hint is not None:
+            self.context_window_tokens = config.context_window_hint
         configured_path = gateway_path or os.environ.get("OPENTHESIS_MODEL_GATEWAY_PATH", "")
         self.gateway_path = Path(configured_path) if configured_path else None
         self._cancel_check: Callable[[], bool] | None = None
         self._request_deadline: float | None = None
+        self._event_context: dict | None = None
+        self._activity_callback: Callable[[dict], None] | None = None
+        self._call_cancel_check: Callable[[], bool] | None = None
+        from .research_execution.input_budget import InputBudgetState
+        self._input_budget = InputBudgetState()
+        self._output_budget: int | None = None
+
+    @property
+    def input_bytes_per_token(self) -> float:
+        return self._input_budget.bytes_per_token
+
+    def input_token_measurement(self, system_prompt: str, user_prompt: str) -> dict:
+        return self._input_budget.measure(system_prompt, user_prompt)
+
+    def observe_input_usage(self, **usage) -> None:
+        self._input_budget.observe(**usage)
+
+    def for_output_budget(self, tokens: int):
+        if type(tokens) is not int or not 1 <= tokens <= 2_147_483_647:
+            raise ValueError("MODEL_OUTPUT_BUDGET_INVALID")
+        scoped = copy(self)
+        scoped._output_budget = tokens
+        scoped.reserved_output_tokens = tokens
+        return scoped
 
     def for_request_budget(self, deadline: float, cancel_check=None):
         """Isolated transport budget, without mutating shared model settings."""
-        scoped = RustModelGatewayProvider(self.config, gateway_path=self.gateway_path)
+        scoped = copy(self)
         scoped._request_deadline = deadline
+        scoped._event_context = self._event_context
+        scoped._activity_callback = self._activity_callback
         original_cancel = self._cancel_check
         scoped._cancel_check = lambda: bool((original_cancel and original_cancel())
                                             or (cancel_check and cancel_check()))
+        return scoped
+
+    def for_model_events(self, context: dict, activity=None, call_cancel_check=None):
+        scoped = copy(self)
+        scoped._request_deadline = self._request_deadline
+        scoped._cancel_check = self._cancel_check
+        scoped._event_context = dict(context)
+        scoped._activity_callback = activity
+        scoped._call_cancel_check = call_cancel_check
         return scoped
 
     def set_cancel_check(self, cancel_check: Callable[[], bool] | None) -> None:
@@ -246,6 +295,8 @@ class RustModelGatewayProvider:
             "json_mode": bool(json_mode),
             "wire_contract": "text-single-request-v1",
         }
+        if self._output_budget is not None:
+            request["max_output_tokens"] = self._output_budget
         return self._invoke_gateway(request)
 
     def generate_vision(
@@ -288,11 +339,13 @@ class RustModelGatewayProvider:
         if not self.config.enabled:
             raise ProviderError("未选择已配置模型。", code="MODEL_CONFIGURATION_ERROR")
         path = self._validated_gateway_path()
+        if self._event_context is not None:
+            request = {**request, "event_context": self._event_context}
         encoded = json.dumps(request, ensure_ascii=False).encode("utf-8")
         if len(encoded) > 16 * 1024 * 1024:
             raise ProviderError(
                 "模型请求超过网关大小限制。",
-                code="MODEL_GATEWAY_PROTOCOL_ERROR",
+                code="MODEL_REQUEST_BODY_TOO_LARGE",
             )
         timeout_seconds = max(5, min(600, int(self.config.timeout_seconds))) + 20
         if self._request_deadline is not None:
@@ -310,14 +363,29 @@ class RustModelGatewayProvider:
         if os.name == "nt":
             options["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
-            completed = (
-                self._run_cancellable_gateway(
-                    options["args"], encoded, timeout_seconds,
-                    int(options.get("creationflags", 0)),
+            if self._event_context is not None:
+                from .gateway_events import receive_gateway_process, GatewayFrameError
+                try:
+                    completed = receive_gateway_process(options["args"], encoded, timeout_seconds,
+                        int(options.get("creationflags", 0)), self._event_context,
+                        self._activity_callback, lambda: bool((self._cancel_check and self._cancel_check())
+                            or (self._call_cancel_check and self._call_cancel_check())))
+                except GatewayFrameError as exc:
+                    code = str(exc)
+                    if (code == "MODEL_CANCELLED" and self._call_cancel_check and self._call_cancel_check()
+                            and not (self._cancel_check and self._cancel_check())):
+                        code = "MODEL_CALL_CANCELLED"
+                    raise ProviderError("模型调用未取得完整终态；不会自动重发。", code=code,
+                        retryable=False, partial_content=exc.partial_content) from exc
+            else:
+                completed = (
+                    self._run_cancellable_gateway(
+                        options["args"], encoded, timeout_seconds,
+                        int(options.get("creationflags", 0)),
+                    )
+                    if self._cancel_check is not None
+                    else subprocess.run(**options)
                 )
-                if self._cancel_check is not None
-                else subprocess.run(**options)
-            )
         except subprocess.TimeoutExpired as exc:
             raise ProviderError(
                 "模型网关调用超时。",
@@ -374,6 +442,7 @@ class RustModelGatewayProvider:
                 code=code,
                 retry_after_seconds=retry_after_seconds,
                 http_status=error.get("http_status") if type(error.get("http_status")) is int else None,
+                partial_content=getattr(completed, "partial_content", ""),
             )
         payload = response.get("result")
         if not isinstance(payload, dict):

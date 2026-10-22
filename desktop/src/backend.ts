@@ -24,6 +24,8 @@ import type {
   ThesisVersion,
   FinancialDiagnostics,
   MarketSnapshotPreview,
+  ModelCallHistoryPage,
+  ModelCallPlan,
 } from "./types";
 import type {
   BackendMethod,
@@ -35,11 +37,43 @@ async function request<M extends BackendMethod>(
   method: M,
   params: BackendParams[M],
 ): Promise<BackendResponse<M>> {
-  return invoke<BackendResponse<M>>("backend_request", { method, params });
+  const minimalBootstrap = method === "app.bootstrap" && (params as { minimal?: boolean }).minimal === true;
+  if (!DEFERRED_METHODS.has(method) || minimalBootstrap) return invoke<BackendResponse<M>>("backend_request", { method, params });
+  const job = await invoke<{ job_id: string }>("backend_request", { method: "rpc.start", params: { method, params } });
+  if (!job || typeof job.job_id !== "string" || !job.job_id) throw new Error("CORE_OPERATION_PROTOCOL");
+  const started = performance.now();
+  while (performance.now() - started < 600_000) {
+    const status = await invoke<{ state: string; response?: { result?: BackendResponse<M>; error?: { message?: string } } }>(
+      "backend_request", { method: "rpc.result", params: { job_id: job.job_id } });
+    if (!status || !["pending", "ready"].includes(status.state)) throw new Error("CORE_OPERATION_PROTOCOL");
+    if (status.state === "ready") {
+      if (status.response?.error) throw new Error(status.response.error.message || "CORE_OPERATION_FAILED");
+      if (!status.response || !("result" in status.response)) throw new Error("CORE_OPERATION_PROTOCOL");
+      return status.response.result as BackendResponse<M>;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  throw new Error("CORE_OPERATION_DEADLINE");
 }
 
-export function bootstrapBackend(): Promise<BootstrapResult> {
-  return request("app.bootstrap", {});
+const DEFERRED_METHODS = new Set<BackendMethod>([
+  "app.bootstrap", "research.get_report", "research.financial_diagnostics", "research.retry_synthesis", "research.retry_model_stages",
+  "research.retry_growth", "research.retry_stage", "research.revalidate_saved", "research.refresh_financial_report",
+  "research.retry_financials", "research.rebuild_financials", "research.market_snapshot", "company.search", "ot.suggest", "packs.install",
+]);
+
+export function bootstrapBackend(minimal = false): Promise<BootstrapResult> {
+  return request("app.bootstrap", minimal ? { minimal: true } : {});
+}
+
+export function getBackendInitializationStatus(): Promise<{
+  phase: "idle" | "starting" | "ready" | "failed";
+  elapsed_seconds: number; deadline_seconds: number; safe_failure_code: string | null;
+  stage?: string | null;
+  completed_units?: number | null;
+  total_units?: number | null;
+}> {
+  return invoke("backend_initialization_status");
 }
 
 export function getResearchReport(
@@ -159,6 +193,7 @@ export function saveConfiguredModel(input: {
   enabled: boolean;
   capabilities: string[];
   timeout_seconds?: number;
+  context_window_hint?: number | null;
 }): Promise<ConfiguredModelSummary> {
   return invoke<ConfiguredModelSummary>("model_center_save_configured_model", { input });
 }
@@ -235,8 +270,42 @@ export function retryResearchSynthesis(
 export function retryResearchModelStages(
   runId: string,
   model?: ModelSelection,
+  budgetOnly = false,
 ): Promise<ResearchReport> {
-  return request("research.retry_model_stages", { run_id: runId, ...(model ? { model } : {}) });
+  return request("research.retry_model_stages", {
+    run_id: runId,
+    ...(model ? { model } : {}),
+    ...(budgetOnly ? { budget_only: true } : {}),
+  });
+}
+
+export function extendResearchBudget(
+  runId: string,
+  planDigest: string,
+  gapIds: string[],
+): Promise<ModelCallPlan> {
+  return request("research.extend_budget", {
+    run_id: runId,
+    plan_digest: planDigest,
+    gap_ids: gapIds,
+  });
+}
+
+export function getResearchCallHistory(
+  runId: string,
+  stageId: string,
+  after?: string,
+  limit = 10,
+): Promise<ModelCallHistoryPage> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+    return Promise.reject(new Error("MODEL_HISTORY_PAGE_INVALID"));
+  }
+  return request("research.call_history", {
+    run_id: runId,
+    stage_id: stageId,
+    ...(after ? { after } : {}),
+    limit,
+  });
 }
 
 export function retryResearchGrowth(
@@ -295,6 +364,10 @@ export function getResearchStatus(jobId: string): Promise<ResearchJob> {
 
 export function cancelResearch(jobId: string): Promise<ResearchJob> {
   return request("research.cancel", { job_id: jobId });
+}
+
+export function cancelModelCall(jobId: string, requestId: string, attemptId: string): Promise<ResearchJob> {
+  return request("research.cancel_model_call", { job_id: jobId, request_id: requestId, attempt_id: attemptId });
 }
 
 export function decideVisionUpload(jobId: string, approved: boolean): Promise<ResearchJob> {

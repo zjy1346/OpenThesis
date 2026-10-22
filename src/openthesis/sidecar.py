@@ -3,6 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
+import threading
+import time
+import hashlib
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
 from typing import Any, TextIO
@@ -15,6 +21,15 @@ from .service import (
     _FinancialReportRefreshError,
 )
 from .application.reports import ReportReadError
+from .storage import StorageCorruptionError
+
+
+DEFERRED_METHODS = frozenset({
+    "research.get_report", "research.financial_diagnostics", "research.retry_synthesis",
+    "research.retry_model_stages", "research.retry_growth", "research.retry_stage",
+    "research.revalidate_saved", "research.refresh_financial_report", "research.retry_financials",
+    "research.rebuild_financials", "research.market_snapshot", "company.search", "ot.suggest", "packs.install", "app.bootstrap",
+})
 
 
 class JsonLineServer:
@@ -22,6 +37,9 @@ class JsonLineServer:
 
     def __init__(self, service: AppService):
         self.service = service
+        self._operation_lock = threading.Lock()
+        self._operations: dict[str, dict] = {}
+        self._operations_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="openthesis-rpc-job")
 
     def serve(self, input_stream: TextIO, output_stream: TextIO) -> None:
         for line in input_stream:
@@ -45,7 +63,16 @@ class JsonLineServer:
         except ServiceConfigurationError as exc:
             return _error(request_id, -32010, exc.code)
         except ReportReadError as exc:
+            if self._storage_recovery_required():
+                return _error(request_id, -32040, "STORAGE_HEALTH_RECOVERY_REQUIRED")
             return _error(request_id, -32030, exc.code)
+        except StorageCorruptionError as exc:
+            # Financial row errors are not whole-database recovery signals.
+            # Expose only the allowlisted background health code, never paths
+            # or the persisted exception text from an unrelated corrupt row.
+            if str(exc) == "STORAGE_HEALTH_RECOVERY_REQUIRED":
+                return _error(request_id, -32040, "STORAGE_HEALTH_RECOVERY_REQUIRED")
+            return _error(request_id, -32603, "internal error")
         except (TypeError, ValueError):
             return _error(request_id, -32602, "invalid parameters")
         except KeyError as exc:
@@ -58,8 +85,13 @@ class JsonLineServer:
         except _FinancialReportRefreshError as exc:
             return _error(request_id, -32020, exc.code)
         except Exception:
+            if self._storage_recovery_required():
+                return _error(request_id, -32040, "STORAGE_HEALTH_RECOVERY_REQUIRED")
             return _error(request_id, -32603, "internal error")
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+    def _storage_recovery_required(self) -> bool:
+        return getattr(getattr(self.service, "storage", None), "maintenance_status", {}).get("state") == "recovery_required"
 
     def dispatch(self, request: Any) -> Any:
         if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
@@ -69,10 +101,55 @@ class JsonLineServer:
         if not isinstance(method, str) or not isinstance(params, dict):
             raise ValueError("invalid request")
 
+        if (self._storage_recovery_required()
+                and method not in {"system.hello", "rpc.result", "research.cancel", "research.cancel_model_call"}):
+            # Keep health, existing operation results and cancellation accessible.
+            # Fail before any broad report wrapper can hide this recovery code
+            # or an attempted paid retry can perform more work on a bad store.
+            raise StorageCorruptionError("STORAGE_HEALTH_RECOVERY_REQUIRED")
+
+        if method == "rpc.start":
+            target, arguments = params.get("method"), params.get("params")
+            if target not in DEFERRED_METHODS or not isinstance(arguments, dict):
+                raise ValueError("unsupported background operation")
+            identity = hashlib.sha256(json.dumps([target, arguments], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            now = time.monotonic()
+            with self._operation_lock:
+                for key in list(self._operations):
+                    value = self._operations[key]
+                    if value["state"] != "pending" and value["expires"] <= now:
+                        del self._operations[key]
+                for key, value in self._operations.items():
+                    if value["identity"] == identity and value["state"] == "pending":
+                        return {"job_id": key}
+                if len(self._operations) >= 8:
+                    completed = next((key for key, value in self._operations.items() if value["state"] != "pending"), None)
+                    if completed:
+                        del self._operations[completed]
+                if len(self._operations) >= 8:
+                    raise ServiceConfigurationError("CORE_OPERATION_BUSY")
+                job_id = uuid.uuid4().hex
+                self._operations[job_id] = {"identity": identity, "state": "pending", "expires": now + 660}
+            def execute():
+                response = self._handle_line(json.dumps({"jsonrpc": "2.0", "id": job_id, "method": target, "params": arguments}))
+                with self._operation_lock:
+                    self._operations[job_id].update(state="ready", response=response, expires=time.monotonic() + 60)
+            self._operations_executor.submit(execute)
+            return {"job_id": job_id}
+        if method == "rpc.result":
+            job_id = params.get("job_id")
+            if not isinstance(job_id, str):
+                raise ValueError("job identity is required")
+            with self._operation_lock:
+                row = self._operations.get(job_id)
+                if row is None:
+                    raise ServiceConfigurationError("CORE_OPERATION_EXPIRED")
+                return {"state": row["state"], **({"response": row["response"]} if row["state"] == "ready" else {})}
+
         if method == "system.hello":
             return self.service.hello()
         if method == "app.bootstrap":
-            return self.service.bootstrap()
+            return self.service.bootstrap(minimal=params.get("minimal") is True)
         if method == "settings.update":
             preferences = params.get("preferences")
             if not isinstance(preferences, dict):
@@ -131,11 +208,19 @@ class JsonLineServer:
             )
         if method == "research.list":
             return self.service.list_research_runs(limit=params.get("limit", 50))
+        if method == "research.call_history":
+            run_id = params.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise ValueError("run identity is required")
+            return self.service.storage.model_call_history(run_id, stage_id=params.get("stage_id"),
+                after=params.get("after", ""), limit=params.get("limit", 10))
         if method == "research.delete":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
             return self.service.delete_research_run(run_id)
+        if method == "research.extend_budget":
+            return self.service.extend_model_budget(params.get("run_id"), params.get("plan_digest"), params.get("gap_ids"))
         if method == "research.get_report":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -178,7 +263,7 @@ class JsonLineServer:
                 raise ValueError("run_id is required")
             if model is not None and not isinstance(model, dict):
                 raise ValueError("model must be an object")
-            return self.service.retry_research_model_stages(run_id, model)
+            return self.service.retry_research_model_stages(run_id, model, budget_only=params.get("budget_only", False))
         if method == "research.revalidate_saved":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -248,6 +333,11 @@ class JsonLineServer:
             if not isinstance(job_id, str) or not job_id or not isinstance(approved, bool):
                 raise ValueError("job_id and approved are required")
             return self.service.vision_decision(job_id, approved)
+        if method == "research.cancel_model_call":
+            values = [params.get(key) for key in ("job_id", "request_id", "attempt_id")]
+            if any(not isinstance(value, str) or not value or len(value) > 256 for value in values):
+                raise ValueError("job_id, request_id and attempt_id are required")
+            return self.service.cancel_model_call(*values)
         if method in {"research.status", "research.cancel"}:
             job_id = params.get("job_id")
             if not isinstance(job_id, str) or not job_id:
@@ -279,7 +369,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="OpenThesis desktop sidecar")
     parser.add_argument("--data-dir", type=Path, default=None)
     args = parser.parse_args(argv)
-    service = AppService(args.data_dir or default_data_dir())
+    last_progress = None
+    def progress(stage, completed=None, total=None):
+        nonlocal last_progress
+        if os.environ.get("OPENTHESIS_STARTUP_PROGRESS") != "1":
+            return
+        # Only host-owned stage names/counters leave initialization. Never
+        # send a path, exception, database payload or provider configuration.
+        if stage not in {"checking_schema", "checking_integrity", "backing_up", "migrating_schema", "backfilling_facts",
+                         "building_read_models", "storage_ready", "preparing_services", "ready"}:
+            return
+        valid = type(completed) is int and type(total) is int and 0 <= completed <= total and total > 0
+        signature = (stage, completed * 100 // total if valid else None)
+        if signature == last_progress:
+            return
+        last_progress = signature
+        record = {"stage": stage, "completed_units": completed if valid else None, "total_units": total if valid else None}
+        try:
+            sys.stderr.write("OT_STARTUP " + json.dumps(record, separators=(",", ":")) + "\n")
+            sys.stderr.flush()
+        except OSError:
+            pass
+    service = AppService(args.data_dir or default_data_dir(), initialization_progress=progress)
     JsonLineServer(service).serve(sys.stdin, sys.stdout)
     return 0
 

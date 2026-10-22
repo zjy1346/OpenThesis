@@ -6,6 +6,7 @@ from .financials import (
     deterministic_summary,
     format_money,
     format_percent,
+    format_growth,
     read_metric_period,
     reverse_dcf_disclaimer,
     reverse_dcf_status_text,
@@ -61,6 +62,43 @@ SECTION_LABELS_ZH = {
     "leading_indicators": "领先指标",
     "unresolved_questions": "未解决问题",
 }
+
+
+def _interim_comparison_lines(row: dict[str, Any], language: str, currency: str) -> list[str]:
+    """Display the exact same per-cell bindings used by deterministic math."""
+    labels = {
+        "revenue": ("营业收入", "Revenue"), "net_income": ("净利润", "Net income"),
+        "parent_net_income": ("归母净利润", "Parent net income"),
+        "operating_cash_flow": ("经营现金流", "Operating cash flow"),
+        "assets": ("资产", "Assets"), "liabilities": ("负债", "Liabilities"),
+        "equity": ("归母权益", "Parent equity"), "total_equity": ("总权益", "Total equity"),
+    }
+    traditional_labels = {"revenue": "營業收入", "net_income": "淨利潤", "parent_net_income": "歸母淨利潤",
+        "operating_cash_flow": "經營現金流", "assets": "資產", "liabilities": "負債",
+        "equity": "歸母權益", "total_equity": "總權益"}
+    traditional = normalize_language(language) == ZH_HANT
+    lines = []
+    for binding in row.get("comparison_bindings", ()):
+        if not isinstance(binding, dict) or binding.get("status") != "available":
+            continue
+        concept = str(binding.get("concept", ""))
+        if concept not in labels:
+            continue
+        title = traditional_labels[concept] if traditional else _pick(language, *labels[concept])
+        if binding.get("relation") == "previous_year_end":
+            relation = "較上年末" if traditional else _pick(language, "较上年末", "versus previous year-end")
+        else:
+            relation = _pick(language, "同比", "year over year")
+        current_period = "–".join(str(binding.get(key) or "") for key in ("current_start", "current_end")
+                                  if binding.get(key))
+        prior_period = "–".join(str(binding.get(key) or "") for key in ("prior_start", "prior_end")
+                                if binding.get(key))
+        amounts = f"{format_money(row.get(concept), currency)} / {format_money(binding.get('prior_value'), currency)}"
+        lines.append(f"- {title} · {relation} ({current_period} / {prior_period}): {amounts}")
+    if lines:
+        return ["### 比較口徑與期間" if traditional else _pick(language,
+                "### 比较口径与期间", "### Comparison Basis and Dates"), "", *lines, ""]
+    return []
 
 SECTION_LABELS_EN = {
     "management_and_capital_allocation": "Management and Capital Allocation",
@@ -169,12 +207,12 @@ def staged_context_capacity_notice(
         f"Model input budget: required {format_bytes(required)}; available {format_bytes(available)}.",
     )
     mode = budget_data.get("counting_mode")
-    if mode == "conservative_utf8_byte_upper_bound":
+    if mode in {"estimated_utf8_shape", "conservative_utf8_byte_upper_bound"}:
         counting = _locale_text(
             language,
-            "输入大小按 UTF-8 字节保守上界估算，并非官方精确 token 计数。",
-            "輸入大小按 UTF-8 位元組保守上界估算，並非官方精確 token 計數。",
-            "Input size uses a conservative UTF-8 byte upper bound estimate, not an official exact token count.",
+            "这是 UTF-8 字节形状估算，不是官方 token 计数或模型容量的安全上界。",
+            "這是 UTF-8 位元組形狀估算，不是官方 token 計數或模型容量的安全上界。",
+            "This is a UTF-8 byte shape estimate, not an official token count or a safe upper bound for model capacity.",
         )
     elif mode == "explicit_max_input_bytes":
         counting = _locale_text(
@@ -203,9 +241,9 @@ def staged_context_capacity_notice(
         "counting": counting,
         "retry": _locale_text(
             language,
-            "可选择支持更大上下文的模型，然后仅重试“综合”；无需重新下载财报或重跑其他研究阶段。",
-            "可選擇支援更大上下文的模型，然後僅重試「綜合」；無需重新下載財報或重跑其他研究階段。",
-            "You can choose a model with a larger context window and retry only synthesis; financial filings and other research stages do not need to run again.",
+            "可仅继续未完成的综合分区；若必要的单个原文或请求框架仍超出容量，再更换适合的模型。已完成阶段和原件继续保留。",
+            "可僅繼續未完成的綜合分區；若必要的單個原文或請求框架仍超出容量，再更換適合的模型。已完成階段和原件繼續保留。",
+            "Continue the unfinished synthesis partitions; change models if a necessary indivisible source or request envelope still cannot fit. Completed stages and originals remain available.",
         ),
     }
 
@@ -749,13 +787,13 @@ def _render_markdown_projection(
                         _pick(
                             language,
                             (
-                                f"- 同期收入增长：{format_percent(interim_row.get('revenue_growth'))}"
+                                f"- 同期收入增长：{format_growth(interim_row.get('revenue_growth'), interim_row.get('revenue_growth_status'), language)}"
                                 + (f"（对比 {comparison}）" if comparison else "")
                                 if not comparison_gap
                                 else "- 同期收入增长：缺少或未通过校验的上年同期披露"
                             ),
                             (
-                                f"- Revenue growth: {format_percent(interim_row.get('revenue_growth'))}"
+                                f"- Revenue growth: {format_growth(interim_row.get('revenue_growth'), interim_row.get('revenue_growth_status'), language)}"
                                 + (f" (versus {comparison})" if comparison else "")
                                 if not comparison_gap
                                 else "- Revenue growth: prior-year comparable disclosure is missing or did not pass validation"
@@ -778,6 +816,7 @@ def _render_markdown_projection(
                         "",
                     ]
                 )
+                lines.extend(_interim_comparison_lines(interim_row, language, currency))
             quality = content.get("financial_quality")
             rejected = quality.get("rejected_periods", []) if isinstance(quality, dict) else []
             continuity = quality.get("period_continuity", []) if isinstance(quality, dict) else []

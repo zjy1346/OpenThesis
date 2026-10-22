@@ -14,6 +14,8 @@ describe("platform-neutral backend contract", () => {
       "research.start",
       "research.delete",
       "research.get_report",
+      "research.call_history",
+      "research.extend_budget",
       "settings.update",
     ]));
   });

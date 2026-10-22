@@ -20,7 +20,8 @@ from .domain import (
 )
 
 # Shared source/parser semantics used by both extraction and validation.
-PDF_PARSER_VERSION = "financial-ingestion-ast-v31"
+PDF_PARSER_VERSION = "financial-ingestion-ast-v33"
+ROE_ROW_MAPPING_VERSION = "roe-row-v2"
 STATEMENT_FOR = {
     "revenue": "income_statement", "net_income": "income_statement",
     "total_operating_revenue": "income_statement",
@@ -33,6 +34,7 @@ STATEMENT_FOR = {
     "operating_cash_flow_before_tax": "cash_flow",
     "liabilities": "balance_sheet", "equity": "balance_sheet",
     "total_equity": "balance_sheet", "reported_roe": "summary",
+    "reported_roe_excluding_nonrecurring": "summary",
     "mezzanine_equity": "balance_sheet", "minority_interest_equity": "balance_sheet",
     "profit_before_tax": "income_statement", "profit_after_tax": "income_statement",
     "parent_net_income": "income_statement", "minority_interest_profit": "income_statement",
@@ -635,8 +637,11 @@ class FinancialDataset:
         return {
             "financial_snapshot": current_financials,
             "annual_trend": current_financials and len(annual_years) >= 2,
-            "interim_comparison": bool(self.interim_facts and self.comparator_facts),
-            "model_financial_analysis": self.allow_ai,
+            "interim_comparison": any(item.get("status") == "available"
+                and item.get("current_fact_id") in {fact.fact_id for fact in self.interim_facts}
+                and item.get("concept") in {"revenue", "net_income", "parent_net_income", "operating_cash_flow"}
+                for item in self.coverage.get("comparison_bindings", ())),
+            "model_financial_analysis": current_financials,
             "qualitative_research": True,
         }
 

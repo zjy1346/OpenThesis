@@ -260,6 +260,7 @@ class VisionCandidateExtractor:
     name: str = "vision-fallback"
     period_header_pages_by_document: Mapping[str, Sequence[int]] | None = None
     deadline: float | None = None
+    parser_failed_pages_by_document: Mapping[str, Sequence[int]] | None = None
 
     def extract(self, subject: Company, filing: FilingDocument) -> CandidateBatch:
         from ..financial_ingestion import _vision_failed_pages
@@ -277,7 +278,8 @@ class VisionCandidateExtractor:
             pages = _vision_failed_pages(filing, self.config, issues, existing_facts,
                 cancel_check=self.cancel_check, period_header_pages=(
                     self.period_header_pages_by_document or {}).get(filing.document_id, ()),
-                deadline=deadline)
+                deadline=deadline, parser_failed_pages=(
+                    self.parser_failed_pages_by_document or {}).get(filing.document_id, ()))
         except Exception as exc:
             from ..vision_financials import VisionAdapterError
             if not isinstance(exc, VisionAdapterError):

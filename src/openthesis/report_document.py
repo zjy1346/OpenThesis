@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import copy
+import hashlib
+import json
 from decimal import Decimal, InvalidOperation
 from html import escape
 import math
@@ -66,6 +68,9 @@ class ReportNode:
     source_ids: tuple[str, ...] = ()
     validation_record: ValidationRecord = ValidationRecord()
     materiality: str = "unknown"
+    # Optional presentation link to a chapter-level verification note. Old
+    # serialized nodes and positional constructors keep their prior defaults.
+    verification_note_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,14 +244,36 @@ def _slug(title: str, ordinal: int) -> str:
     return slug or f"section-{ordinal}"
 
 
-def _node_markdown(node: ReportNode) -> str:
+def _verification_note_number(node: ReportNode) -> str:
+    value = node.verification_note_id
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]+", value) else ""
+
+
+def _verification_marker_markdown(node: ReportNode) -> str:
+    number = _verification_note_number(node)
+    return f" [^{number}]" if number else ""
+
+
+def _markdown_literal(value: str) -> str:
+    return escape(value, quote=False).replace("`", r"\`").replace("[", r"\[").replace("]", r"\]")
+
+
+def _node_markdown(node: ReportNode, language: str = EN) -> str:
+    if node.kind == "verification_note":
+        number = _verification_note_number(node)
+        if not number:
+            return ""
+        source_label = "Sources" if language == EN else "來源" if language == ZH_HANT else "来源"
+        source_ids = ", ".join(f"`{_markdown_literal(item)}`" for item in node.source_ids)
+        sources = f" {source_label}: {source_ids}" if source_ids else ""
+        return f"[^{number}]: {_markdown_literal(node.text)}{sources}"
     if node.kind in {"heading", "confidence_heading"}:
         level = 3 if node.kind == "confidence_heading" else min(6, max(1, node.level or 2))
-        return f"{'#' * level} {node.text}"
+        return f"{'#' * level} {node.text}{_verification_marker_markdown(node)}"
     if node.kind == "quote":
-        return f"> {node.text}"
+        return f"> {node.text}{_verification_marker_markdown(node)}"
     if node.kind == "list_item":
-        return f"- {node.text}"
+        return f"- {node.text}{_verification_marker_markdown(node)}"
     if node.kind == "table" and node.rows:
         header, *body = node.rows
         separator = tuple("---" for _ in header)
@@ -255,15 +282,17 @@ def _node_markdown(node: ReportNode) -> str:
             normalized = cell.replace("\r\n", "\n").replace("\r", "\n")
             return normalized.replace("\\", "\\\\").replace("|", "\\|").replace("\n", "<br>")
 
-        return "\n".join(
+        rendered = "\n".join(
             "| " + " | ".join(markdown_cell(cell) for cell in row) + " |"
             for row in (header, separator, *body)
         )
-    return node.text
+        number = _verification_note_number(node)
+        return rendered + (f"\n[^{number}]" if number else "")
+    return node.text + _verification_marker_markdown(node)
 
 
-def _nodes_markdown(nodes: Sequence[ReportNode]) -> str:
-    return "\n\n".join(text for node in nodes if (text := _node_markdown(node)).strip())
+def _nodes_markdown(nodes: Sequence[ReportNode], language: str = EN) -> str:
+    return "\n\n".join(text for node in nodes if (text := _node_markdown(node, language)).strip())
 
 
 def _localized_section_title(key: str, language: str) -> str:
@@ -277,7 +306,16 @@ def _localized_section_title(key: str, language: str) -> str:
 def _scalar_text(value: Any, key: str | None, language: str) -> str:
     from .report_projection import format_report_semantic_value, report_display_value
 
-    formatted = format_report_semantic_value(value, key)
+    if value == "Additional nested analysis is pending review; the original candidate was retained but could not be projected past the safe nesting limit.":
+        return value if language == EN else (
+            "補充巢狀分析尚待檢查；原始候選已保留，但層級超過安全呈現上限。"
+            if language == ZH_HANT else "补充嵌套分析尚待检查；原始候选已保留，但层级超过安全呈现上限。")
+
+    # Historical node proofs store range endpoints as individual leaves.
+    # The declared field still has fractional-rate semantics at that leaf.
+    semantic_key = ('probability' if key in {'probability_range', 'revenue_cagr_range', 'operating_margin_range'}
+                    and isinstance(value, (int, float)) and not isinstance(value, bool) else key)
+    formatted = format_report_semantic_value(value, semantic_key)
     if formatted is not None:
         return formatted
     if isinstance(value, bool):
@@ -346,7 +384,7 @@ _SECTION_RENDER_ORDER: dict[str, tuple[str, ...]] = {
     "balance_sheet": ("summary", "body", "analysis", "conclusion", "assets", "liabilities", "equity", "total_equity", "strengths", "concerns", "risks", "risk_flags", "benign_explanations", "follow_up_questions", "unknowns"),
     "competitive_position": ("summary", "body", "analysis", "conclusion", "possible_moats", "strengths", "concerns", "risks", "unknowns"),
     "counterarguments": ("title", "strongest_counterarguments", "counterargument", "argument", "text", "body", "unsupported_assumptions", "missing_evidence", "claims", "severity", "confidence"),
-    "scenarios": ("summary", "body", "analysis", "conclusion", "base", "bear", "bull", "scenarios", "probability", "probability_range", "assumptions", "text"),
+    "scenarios": ("summary", "body", "analysis", "conclusion", "base", "bear", "bull", "scenarios", "probability", "probability_range", "assumptions", "text", "extensions"),
     "implied_expectations": ("summary", "body", "analysis", "conclusion", "current_price", "share_price", "market_cap", "enterprise_value", "equity_value", "currency", "as_of", "valuation", "valuation_range", "implied_growth", "implied_revenue_growth", "required_growth", "required_return", "expected_return", "revenue_cagr_range", "operating_margin_range", "probability", "probability_range", "discount_rate", "wacc", "terminal_growth_rate", "margin_of_safety", "formula", "source", "evidence", "metrics", "horizon_years", "market_assumption", "sensitivity_note", "assumptions", "scenarios", "confidence"),
     "thesis": ("summary", "body", "analysis", "conclusion", "text", "claims", "assumptions", "confidence"),
     "invalidation_conditions": ("title", "condition", "text", "body", "trigger", "confidence"),
@@ -374,6 +412,7 @@ _NESTED_RENDER_FIELDS: dict[str, tuple[str, ...]] = {
     "bear": ("summary", "text", "body", "analysis", "conclusion", "probability", "probability_range", "revenue_cagr_range", "operating_margin_range", "assumptions", "invalidation_conditions", "leading_indicators"),
     "bull": ("summary", "text", "body", "analysis", "conclusion", "probability", "probability_range", "revenue_cagr_range", "operating_margin_range", "assumptions", "invalidation_conditions", "leading_indicators"),
     "scenarios": ("title", "name", "base", "bear", "bull", "summary", "text", "body", "analysis", "conclusion", "probability", "probability_range", "cagr", "revenue_cagr_range", "operating_margin_range", "assumptions", "invalidation_conditions", "leading_indicators"),
+    "extensions": ("field", "text", "context", "evidence_count"),
     "analysis": ("revenue_path", "evidence_basis", "summary", "text", "body", "conclusion"),
     "metrics": ("title", "metric", "summary", "text", "value", "current", "required", "unit", "source", "as_of", "confidence"),
     "evidence": ("title", "text", "description", "source", "as_of", "confidence"),
@@ -395,9 +434,10 @@ def _typed_section_nodes(section: str, value: Any, language: str) -> tuple[Repor
 
     def ordered_keys(item: dict[str, Any], fields: tuple[str, ...] | frozenset[str]) -> tuple[str, ...]:
         preferred = order if fields is allowed else fields
+        effective_fields = {*fields, "extensions"}
         return tuple(
-            key for key in dict.fromkeys((*preferred, *sorted(fields)))
-            if key in fields and key in item
+            key for key in dict.fromkeys((*preferred, *sorted(effective_fields)))
+            if key in effective_fields and key in item
         )
 
     def scalar_node(item: Any, field: str, depth: int) -> list[ReportNode]:
@@ -534,13 +574,14 @@ def _section(
     diagnostic_code: str = "",
     is_substantive: bool | None = None,
     completeness: str = "unknown",
+    language: str = EN,
 ) -> SectionBlock:
     immutable_nodes = _section_node_semantics(section_id, tuple(nodes))
-    visible = any(_node_markdown(node).strip() for node in immutable_nodes)
+    visible = any(_node_markdown(node, language).strip() for node in immutable_nodes)
     return SectionBlock(
         section_id=section_id or _slug(title, ordinal),
         title=title,
-        body=_nodes_markdown(immutable_nodes),
+        body=_nodes_markdown(immutable_nodes, language),
         nodes=immutable_nodes,
         claim_ids=claim_ids,
         assumption_ids=assumption_ids,
@@ -890,15 +931,17 @@ def _financial_nodes(
     column_labels = {
         "revenue": ("Revenue", "營業收入", "营业收入"),
         "revenue_growth": ("Revenue growth", "收入增長", "收入增长"),
+        "operating_income": ("Operating profit", "營業利潤", "营业利润"),
         "operating_margin": ("Operating margin", "營業利潤率", "营业利润率"),
         "net_income": ("Net income", "淨利潤", "净利润"),
         "parent_net_income": ("Profit attributable to owners", "歸母淨利潤", "归母净利润"),
         "operating_cash_flow": ("Operating cash flow", "經營現金流", "经营现金流"),
+        "capital_expenditure": ("Capital expenditure (reported scope)", "資本開支（披露口徑）", "资本开支（披露口径）"),
         "free_cash_flow": ("Free cash flow", "自由現金流", "自由现金流"),
     }
     annual_concepts = ["revenue"]
     annual_concepts.append("revenue_growth")
-    for concept in ("operating_margin", "net_income", "parent_net_income", "operating_cash_flow", "free_cash_flow"):
+    for concept in ("operating_income", "operating_margin", "net_income", "parent_net_income", "operating_cash_flow", "capital_expenditure", "free_cash_flow"):
         if any(
             isinstance(item, dict)
             and (item.get(concept) is not None or item.get(f"{concept}_status"))
@@ -1202,6 +1245,8 @@ _REPORT_SECTION_KEYS = (
 
 def _stage_section_fallbacks(
     artifacts: Sequence[dict[str, Any]],
+    *,
+    run_id: str = "",
 ) -> dict[str, Any]:
     """Project known completed-stage payloads when final synthesis is absent/incomplete.
 
@@ -1210,6 +1255,7 @@ def _stage_section_fallbacks(
     ``project_report_value``.
     """
     collected: dict[str, list[Any]] = {}
+    growth_artifacts: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
     def add(section: str, value: Any) -> None:
         if section not in _REPORT_SECTION_KEYS or value in (None, "", [], {}):
@@ -1233,6 +1279,10 @@ def _stage_section_fallbacks(
                         value = analysis.get(key)
                         if value in (None, "", [], {}):
                             continue
+                        if key == "growth_opportunities":
+                            growth_content = value if isinstance(value, dict) else {"opportunities": value}
+                            growth_artifacts.append((artifact, growth_content))
+                            continue
                         if key == "claims" and isinstance(value, list):
                             normalized_claims = []
                             for index, claim in enumerate(value):
@@ -1245,7 +1295,7 @@ def _stage_section_fallbacks(
                         else:
                             add(key, value)
         elif artifact_type == "growth-opportunities":
-            add("growth_opportunities", content)
+            growth_artifacts.append((artifact, content))
         elif artifact_type == "counter-analysis":
             if content.get("counterarguments") not in (None, "", [], {}):
                 add("counterarguments", content["counterarguments"])
@@ -1274,7 +1324,164 @@ def _stage_section_fallbacks(
             result[key] = values[0]
         else:
             result[key] = values
+
+    if growth_artifacts:
+        selected: dict[str, tuple[dict[str, Any], dict[str, Any], str]] = {}
+        legacy_keys: dict[str, tuple[tuple[str, ...], set[str]]] = {}
+        shadowed: list[dict[str, str]] = []
+        latest_usable_artifact: dict[str, Any] | None = None
+        for artifact, content in reversed(growth_artifacts):
+            artifact_run_id = str(artifact.get("run_id") or "")
+            if run_id and artifact_run_id and artifact_run_id != run_id:
+                continue
+            validation = content.get("_validation")
+            if (content.get("_response_error")
+                    or isinstance(validation, dict) and validation.get("passed") is False):
+                continue
+            latest_usable_artifact = latest_usable_artifact or artifact
+            raw_opportunities = content.get("opportunities")
+            if isinstance(raw_opportunities, list):
+                opportunities = raw_opportunities
+            elif isinstance(content.get("title"), str) and isinstance(content.get("mechanism"), str):
+                opportunities = [content]
+            else:
+                opportunities = []
+            for opportunity in opportunities:
+                if not isinstance(opportunity, dict):
+                    continue
+                title = opportunity.get("title")
+                mechanism = opportunity.get("mechanism")
+                if (not isinstance(title, str) or not title.strip()
+                        or not isinstance(mechanism, str) or not mechanism.strip()):
+                    continue
+                opportunity_id = str(opportunity.get("opportunity_id") or "").strip()
+                # The normalizer historically assigned positional IDs. They
+                # are not stable when a later generation reorders candidates.
+                stable_id = bool(opportunity_id and not re.fullmatch(
+                    r"growth-\d+", opportunity_id, re.IGNORECASE
+                ))
+                if stable_id:
+                    identity = "id:" + opportunity_id
+                else:
+                    identity_fields = (
+                        "title", "category", "mechanism", "evidence_grade",
+                        "maturity_stage", "time_horizon_years", "probability_range",
+                        "supporting_evidence_ids", "contradicting_evidence_ids",
+                        "capital_requirements", "leading_indicators",
+                        "invalidation_conditions", "scenario_eligibility",
+                    )
+                    identity_payload = {key: opportunity[key] for key in identity_fields if key in opportunity}
+                    encoded = json.dumps(
+                        identity_payload, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"), default=str,
+                    )
+                    identity = "content:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                    # Old growth-N labels were positional, not durable IDs.
+                    # Link a revision only when a distinct technical/product
+                    # anchor AND an original evidence identity agree, and the
+                    # match is unique. Never merge solely by title, position,
+                    # broad evidence overlap or fuzzy prose similarity.
+                    anchors = tuple(sorted(set(re.findall(
+                        r"\d+(?:\.\d+)?\s*(?:nm|英寸|inch)|[a-z][a-z0-9]*(?:[-/][a-z0-9]+)*",
+                        title.casefold(), re.IGNORECASE))))
+                    if not any(re.search(r"\d", anchor) for anchor in anchors):
+                        anchors = ()  # Ordinary shared words are not product identities.
+                    source_ids = {str(source) for field in (
+                        "supporting_evidence_ids", "contradicting_evidence_ids")
+                        for source in opportunity.get(field, []) if isinstance(source, str)}
+                    matches = [key for key, (current_anchors, current_sources) in legacy_keys.items()
+                               if anchors and anchors == current_anchors and source_ids & current_sources]
+                    if len(matches) == 1:
+                        shadowed.append({"artifact_id": str(artifact.get("artifact_id") or ""),
+                            "title": title, "replaced_by": matches[0],
+                            "basis": "unique_product_anchor_and_source_identity"})
+                        continue
+                    legacy_keys[identity] = (anchors, source_ids)
+                if identity in selected:
+                    continue
+                generation_id = str(
+                    artifact.get("generation_id") or content.get("generation_id")
+                    or content.get("generation") or ""
+                )
+                selected[identity] = (artifact, copy.deepcopy(opportunity), generation_id)
+
+        if selected:
+            lineage_items = [
+                {
+                    "identity": identity,
+                    "artifact_id": str(artifact.get("artifact_id") or ""),
+                    "generation_id": generation_id,
+                }
+                for identity, (artifact, _opportunity, generation_id) in selected.items()
+            ]
+            result["growth_opportunities"] = {
+                "opportunities": [value[1] for value in selected.values()],
+                "_stage_lineage": {
+                    "current_artifact_id": str(latest_usable_artifact.get("artifact_id") or "")
+                    if latest_usable_artifact else "",
+                    "opportunities": lineage_items,
+                    "superseded_items": shadowed,
+                },
+            }
+        else:
+            matching_growth = [
+                content for artifact, content in growth_artifacts
+                if not run_id or not artifact.get("run_id") or str(artifact.get("run_id")) == run_id
+            ]
+            if matching_growth:
+                result["growth_opportunities"] = matching_growth[-1]
     return result
+
+
+def _select_growth_content_nodes(nodes, selection):
+    """Apply the item lineage to committed snapshot leaves too, not only raw fallback.
+
+    Proof records remain bound to their original bodies. Only byte-identical
+    current item fields are deduplicated. New/unclassifiable analysis survives;
+    a historical snapshot is never promoted merely by being the newest one.
+    """
+    opportunities = selection.get('opportunities', [])
+    if not opportunities:
+        return nodes
+    by_title = {}
+    for index, item in enumerate(opportunities):
+        by_title.setdefault(item.get('title'), []).append((index, item))
+    obsolete_titles = {item.get('title') for item in selection.get('_stage_lineage', {}).get('superseded_items', [])}
+    chosen, unclassified = {}, []
+    for node in nodes:
+        match = re.search(r'(?:opportunities|growth_opportunities)\[\d+\](?:\.(.*))?$', node.get('source_path', ''))
+        titles = [item.get('text') for item in node.get('context', ()) if item.get('field') == 'title']
+        title = titles[-1] if titles else None
+        items = by_title.get(title, [])
+        if not match or not title:
+            unclassified.append(node)
+            continue
+        if title in obsolete_titles and not items:
+            continue
+        if not items:
+            unclassified.append(node)  # New synthesis-only opportunity is not a known old revision.
+            continue
+        relative_path = match.group(1) or ''
+        matches = []
+        for index, item in items:
+            value = item
+            try:
+                for name, ordinal in re.findall(r'([^.\[\]]+)|\[(\d+)\]', relative_path):
+                    value = value[int(ordinal)] if ordinal else value[name]
+                if value == node.get('body'):
+                    matches.append(index)
+            except (KeyError, IndexError, TypeError):
+                continue
+        if len(matches) != 1:
+            if len(items) > 1:
+                unclassified.append(node)  # Same-title distinct IDs are not a merge permission.
+            continue
+        index = matches[0]
+        identity = (index, relative_path, node.get('body_sha256'))
+        current = chosen.get(identity)
+        if current is None or (node.get('validation_state') == 'verified' and current.get('validation_state') != 'verified'):
+            chosen[identity] = {**node, '_display_opportunity_identity': index}
+    return sorted(chosen.values(), key=lambda node: node['_display_opportunity_identity']) + unclassified
 
 
 def _growth_status_nodes(content: Any, language: str) -> tuple[ReportNode, ...]:
@@ -1359,10 +1566,13 @@ def assemble_report_document(
     company_name = identity["name"]
     stage_fallback_error = False
     try:
-        stage_fallbacks = _stage_section_fallbacks(safe_artifacts)
+        stage_fallbacks = _stage_section_fallbacks(safe_artifacts, run_id=run_id)
     except Exception:
         stage_fallbacks = {}
         stage_fallback_error = True
+    if isinstance(stage_fallbacks.get('growth_opportunities'), dict) and 'growth_opportunities' in trusted_by_section:
+        trusted_by_section['growth_opportunities'] = _select_growth_content_nodes(
+            trusted_by_section['growth_opportunities'], stage_fallbacks['growth_opportunities'])
     final = resolve_report_artifact(list(safe_artifacts))
     raw_report: Any = {}
     if isinstance(final, dict):
@@ -1376,6 +1586,24 @@ def assemble_report_document(
     }
 
     def artifact_ids_for_section(section_id: str) -> tuple[str, ...]:
+        canonical_section = "counterarguments" if section_id == "opposing-views" else section_id
+        if canonical_section in trusted_by_section:
+            # A normalizer wrapper is not the source of its host proof.
+            # Preserve the actual snapshot/checkpoint lineage used to render.
+            return tuple(dict.fromkeys(str(node["source_artifact_id"]) for node in trusted_by_section[canonical_section]
+                                       if node.get("source_artifact_id")))
+        if (section_id == "growth_opportunities"
+                and isinstance(raw_report, dict)
+                and raw_report.get(section_id) in (None, "", [], {})
+                and isinstance(stage_fallbacks.get(section_id), dict)):
+            lineage = stage_fallbacks[section_id].get("_stage_lineage")
+            items = lineage.get("opportunities", []) if isinstance(lineage, dict) else []
+            source_ids = tuple(dict.fromkeys(
+                str(item.get("artifact_id") or "") for item in items
+                if isinstance(item, dict) and item.get("artifact_id")
+            )) if isinstance(items, list) else ()
+            if source_ids:
+                return source_ids
         artifact_types = {
             "financial-overview": ("deterministic-financial-summary",),
             "deterministic-balance-sheet": ("deterministic-financial-summary",),
@@ -1547,7 +1775,7 @@ def assemble_report_document(
 
     try:
         readiness_value = readiness_for_report_artifact(
-            final, safe_artifacts, run_status=str(run_status)
+            final, safe_artifacts, run_status=str(run_status), trusted_nodes=trusted_nodes
         ) if final else None
     except Exception:
         readiness_value = None
@@ -1625,6 +1853,9 @@ def assemble_report_document(
     # rendered and parsed back to recover section meaning or evidence links.
     blocks: list[SectionBlock] = []
     ordinal = 0
+    pending_verification_item_count = 0
+    pending_verification_chapter_count = 0
+    next_verification_note_number = 1
 
     def add_section(
         section_id: str,
@@ -1674,6 +1905,7 @@ def assemble_report_document(
             diagnostic_code=diagnostic_code,
             is_substantive=is_substantive,
             completeness=completeness,
+            language=locale,
         ))
 
     complete_title = final is not None and readiness.complete
@@ -1726,8 +1958,10 @@ def assemble_report_document(
     elif final is None or not readiness.complete:
         final_content = final.get("content") if isinstance(final, dict) else None
         final_verification = final_content.get("verification") if isinstance(final_content, dict) else None
-        integrated_partial = (readiness.coverage is not None and isinstance(final_verification, dict)
-                              and final_verification.get("claim_integrity_passed") is True)
+        integrated_partial = (isinstance(final_content, dict) and (
+            final_content.get("report", {}).get("cross_section_synthesis_status") == "generated_pending_verification"
+            or readiness.coverage is not None and isinstance(final_verification, dict)
+            and final_verification.get("claim_integrity_passed") is True))
         message = (
             "Integrated analysis has been preserved, but some required research obligations remain incomplete."
             if locale == EN else "已保留綜合分析，但部分必要研究義務尚未完成。"
@@ -1763,7 +1997,17 @@ def assemble_report_document(
             "evidence_methodology": ("证据与研究方法", "證據與研究方法", "Evidence and Methodology"),
         }
         position = 2 if locale == EN else 1 if locale == ZH_HANT else 0
-        gap_nodes = tuple(ReportNode("list_item", coverage_labels[item][position])
+        coverage_states = {item["obligation_id"]: item.get("state")
+                           for item in readiness.coverage.get("obligations", ()) if isinstance(item, dict)}
+        state_labels = {
+            "generated_unverified": ("已生成待核验", "已產生待核驗", "Generated, pending verification"),
+            "missing_analysis": ("未生成", "未產生", "Not generated"),
+            "missing_source_data": ("缺关键研究依据", "缺關鍵研究依據", "Key research inputs missing"),
+            "missing_evidence": ("缺必要证据", "缺必要證據", "Necessary evidence missing"),
+            "verification_failed": ("需局部核对", "需局部核對", "Local verification required"),
+        }
+        gap_nodes = tuple(ReportNode("list_item", coverage_labels[item][position] + " · " +
+                                    state_labels.get(coverage_states.get(item), state_labels["missing_source_data"])[position])
                           for item in readiness.coverage["gaps"] if item in coverage_labels)
         if gap_nodes:
             add_section("research-coverage-gaps", "Remaining Research Obligations" if locale == EN
@@ -1977,11 +2221,59 @@ def assemble_report_document(
             # nodes. Neither an artifact-wide passed bit nor another section
             # can promote this body's validation state.
             proven_nodes = []
+            pending_units = [
+                unit for unit in trusted_by_section[key]
+                if unit.get("role") == "analysis" and unit.get("validation_state") == "partial"
+            ]
+            note_groups: dict[str, dict[str, Any]] = {}
+            unit_note_groups: dict[str, dict[str, Any]] = {}
+            if pending_units:
+                pending_verification_item_count += len(pending_units)
+                pending_verification_chapter_count += 1
+                chapter_summary = (
+                    f"This chapter contains {len(pending_units)} items pending verification."
+                    if locale == EN else
+                    f"本章含 {len(pending_units)} 項待核驗內容。"
+                    if locale == ZH_HANT else
+                    f"本章含 {len(pending_units)} 项待核验内容。"
+                )
+                proven_nodes.append(ReportNode(
+                    "paragraph",
+                    chapter_summary,
+                    role="notice",
+                    materiality="non_material",
+                ))
+                for unit in pending_units:
+                    issue_code = unit.get("issue_code")
+                    reason = (
+                        issue_code.strip()
+                        if isinstance(issue_code, str) and issue_code.strip()
+                        else "CONTENT_PENDING_VERIFICATION"
+                    )
+                    reason_key = reason.casefold()
+                    record = node_validation_record(unit)
+                    group = note_groups.get(reason_key)
+                    if group is None:
+                        group = {
+                            "id": str(next_verification_note_number),
+                            "reason": reason,
+                            "source_ids": [],
+                            "validation_record": record,
+                        }
+                        next_verification_note_number += 1
+                        note_groups[reason_key] = group
+                    group["source_ids"].extend(
+                        source_id for source_id in record.evidence_ids
+                        if source_id not in group["source_ids"]
+                    )
+                    unit_note_groups[str(unit["node_id"])] = group
             emitted_context = set()
             for unit in trusted_by_section[key]:
                 record = node_validation_record(unit)
                 for context_label in unit.get("context", ()):
                     identity = (context_label.get("path"), context_label.get("field"), context_label.get("text"))
+                    if key == 'growth_opportunities' and '_display_opportunity_identity' in unit and context_label.get('field') == 'title':
+                        identity = ('opportunity', unit['_display_opportunity_identity'], context_label.get('text'))
                     if identity not in emitted_context:
                         emitted_context.add(identity)
                         proven_nodes.append(ReportNode("heading", str(context_label["text"]),
@@ -2008,13 +2300,32 @@ def assemble_report_document(
                     formatted = simple_nodes()
                     diagnostics.append(DeliveryDiagnostic("trusted_node_presentation_fallback", "presentation",
                         unit["source_path"], (unit["node_id"],)))
-                proven_nodes.extend(_apply_section_content_metadata(formatted,
+                annotated = list(_apply_section_content_metadata(formatted,
                     role=unit["role"], source_ids=record.evidence_ids, record=record, materiality="material"))
-                if unit["role"] == "analysis" and unit.get("validation_state") == "partial":
-                    label = ("Model analysis · sources located; factual premises not independently verified."
-                             if locale == EN else "模型分析 · 來源已定位，事實前提尚未獨立核驗。"
-                             if locale == ZH_HANT else "模型分析 · 来源已定位，事实前提尚未独立核验。")
-                    proven_nodes.append(ReportNode("paragraph", label, role="notice", materiality="non_material"))
+                note_group = unit_note_groups.get(str(unit.get("node_id") or ""))
+                if note_group is not None:
+                    marker_index = next((index for index in range(len(annotated) - 1, -1, -1)
+                        if annotated[index].kind not in {"heading", "confidence_heading"}), None)
+                    if marker_index is not None:
+                        annotated[marker_index] = replace(
+                            annotated[marker_index], verification_note_id=note_group["id"]
+                        )
+                proven_nodes.extend(annotated)
+            for note_group in note_groups.values():
+                reason_label = (
+                    f"Reason: {note_group['reason']}"
+                    if locale == EN else
+                    f"原因：{note_group['reason']}"
+                )
+                proven_nodes.append(ReportNode(
+                    "verification_note",
+                    reason_label,
+                    role="notice",
+                    source_ids=tuple(note_group["source_ids"]),
+                    validation_record=note_group["validation_record"],
+                    materiality="non_material",
+                    verification_note_id=note_group["id"],
+                ))
             refs = tuple(dict.fromkeys(ref for unit in trusted_by_section[key] for ref in unit.get("evidence_ids", ())))
             verified_section = all(unit.get("validation_state") == "verified" for unit in trusted_by_section[key])
             add_section("opposing-views" if key == "counterarguments" else key,
@@ -2207,6 +2518,58 @@ def assemble_report_document(
                             ))
             add_section("technical-details", "Technical Details" if locale == EN else "技術詳情" if locale == ZH_HANT else "技术详情", details)
 
+    saved_judgments = {}
+    flow_diagnostics = {}
+    for artifact in safe_artifacts:
+        if artifact.get('artifact_type') != 'stage-checkpoint':
+            continue
+        content = artifact.get('content')
+        result = content.get('result') if isinstance(content, dict) else None
+        validation = result.get('validation') if isinstance(result, dict) else None
+        record = validation.get('record') if isinstance(validation, dict) else None
+        if not isinstance(record, dict):
+            continue
+        for judgment in record.get('assertion_results', ()):
+            if (isinstance(judgment, dict) and isinstance(judgment.get('assertion_id'), str)
+                    and judgment.get('state') in {'supported', 'contradicted'}):
+                saved_judgments[judgment['assertion_id']] = judgment['state']
+        flow = record.get('source_flow', {})
+        code = flow.get('diagnostic_code') if isinstance(flow, dict) else None
+        if isinstance(code, str) and re.fullmatch(r'(?:MODEL|ASSERTION)_[A-Z0-9_]{1,80}', code):
+            flow_diagnostics[str(result.get('stage_id') or '')] = code
+    if pending_verification_item_count or saved_judgments or flow_diagnostics:
+        summary_title = (
+            "Verification Summary" if locale == EN else
+            "核驗摘要" if locale == ZH_HANT else
+            "核验摘要"
+        )
+        summary_text = (
+            f"{pending_verification_item_count} items pending verification across "
+            f"{pending_verification_chapter_count} chapters."
+            if locale == EN else
+            f"{pending_verification_item_count} 項內容待核驗，涉及 {pending_verification_chapter_count} 個章節。"
+            if locale == ZH_HANT else
+            f"{pending_verification_item_count} 项内容待核验，涉及 {pending_verification_chapter_count} 个章节。"
+        )
+        summary_nodes = [ReportNode("paragraph", summary_text, role="notice", materiality="non_material")]
+        if saved_judgments:
+            supported = sum(state == 'supported' for state in saved_judgments.values())
+            contradicted = sum(state == 'contradicted' for state in saved_judgments.values())
+            judgment_text = (f"Saved source judgments: {supported} supported; {contradicted} contradicted. These are not a count of financial facts or completed research obligations."
+                if locale == EN else f"已存來源判定：{supported} 項有支持，{contradicted} 項有衝突；不是財務事實或研究義務完成數。"
+                if locale == ZH_HANT else f"已存来源判定：{supported} 项有支持，{contradicted} 项有冲突；不是财务事实或研究义务完成数。")
+            summary_nodes.append(ReportNode('paragraph', judgment_text, role='notice', materiality='non_material'))
+        if flow_diagnostics:
+            prefix = 'Verification preparation/transport reasons: ' if locale == EN else '核驗準備／傳輸原因：' if locale == ZH_HANT else '核验准备／传输原因：'
+            summary_nodes.append(ReportNode('paragraph', prefix + ', '.join(sorted(set(flow_diagnostics.values()))),
+                                           role='notice', materiality='non_material'))
+        add_section(
+            "verification-summary",
+            summary_title,
+            tuple(summary_nodes),
+            is_substantive=False,
+        )
+
     readiness = ReadinessView(
         state=str(readiness_value.get("state", "unknown")),
         complete=readiness_value.get("complete") is True,
@@ -2259,7 +2622,21 @@ def _inline(text: str) -> str:
     return escaped
 
 
-def _render_blocks(nodes: tuple[ReportNode, ...]) -> str:
+def _verification_marker_html(node: ReportNode, language: str) -> str:
+    number = _verification_note_number(node)
+    if not number:
+        return ""
+    label = (
+        f"Verification note {number}" if language == EN else
+        f"核驗註記 {number}" if language == ZH_HANT else
+        f"核验注记 {number}"
+    )
+    target = escape(f"verification-note-{number}", quote=True)
+    return (f'<a class="verification-marker" href="#{target}" '
+            f'aria-label="{escape(label, quote=True)}"><sup>{escape(number)}</sup></a>')
+
+
+def _render_blocks(nodes: tuple[ReportNode, ...], language: str = EN) -> str:
     html: list[str] = []
     items: list[str] = []
     index = 0
@@ -2272,7 +2649,7 @@ def _render_blocks(nodes: tuple[ReportNode, ...]) -> str:
             end = index + 1
             while end < len(nodes) and nodes[end].kind != "confidence_heading":
                 end += 1
-            contents = _render_blocks(nodes[index + 1:end])
+            contents = _render_blocks(nodes[index + 1:end], language)
             html.append(
                 f'<div class="confidence-group confidence-{node.confidence_tier}">'
                 f'<div class="confidence-heading">{_inline(node.text)}</div>{contents}</div>'
@@ -2284,17 +2661,45 @@ def _render_blocks(nodes: tuple[ReportNode, ...]) -> str:
             items = []
         if node.kind == "heading":
             level = min(6, max(2, node.level))
-            html.append(f"<h{level}>{_inline(node.text)}</h{level}>")
+            html.append(f"<h{level}>{_inline(node.text)}{_verification_marker_html(node, language)}</h{level}>")
         elif node.kind == "paragraph":
-            html.append(f"<p>{_inline(node.text)}</p>")
+            marker = _verification_marker_html(node, language)
+            html.append(f"<p>{_inline(node.text)}{marker}</p>")
         elif node.kind == "quote":
-            html.append(f"<blockquote>{_inline(node.text)}</blockquote>")
+            marker = _verification_marker_html(node, language)
+            html.append(f"<blockquote>{_inline(node.text)}{marker}</blockquote>")
         elif node.kind == "list_item":
-            items.append(_inline(node.text))
+            items.append(_inline(node.text) + _verification_marker_html(node, language))
         elif node.kind == "table":
             if node.rows:
                 header, *body = node.rows
-                html.append('<table class="data-table"><thead><tr>' + "".join(f"<th>{_inline(cell)}</th>" for cell in header) + "</tr></thead><tbody>" + "".join("<tr>" + "".join(f"<td>{_inline(cell)}</td>" for cell in row) + "</tr>" for row in body) + "</tbody></table>")
+                head = "".join(f"<th>{_inline(cell)}</th>" for cell in header)
+                rows = "".join(
+                    "<tr>" + "".join(f"<td>{_inline(cell)}</td>" for cell in row) + "</tr>"
+                    for row in body
+                )
+                table = (
+                    '<table class="data-table"><thead><tr>' + head +
+                    "</tr></thead><tbody>" + rows + "</tbody></table>"
+                )
+                html.append(table + _verification_marker_html(node, language))
+        elif node.kind == "verification_note":
+            number = _verification_note_number(node)
+            if number:
+                note_id = escape(f"verification-note-{number}", quote=True)
+                summary = (
+                    f"Verification note {number}" if language == EN else
+                    f"核驗註記 {number}" if language == ZH_HANT else
+                    f"核验注记 {number}"
+                )
+                source_label = "Sources" if language == EN else "來源" if language == ZH_HANT else "来源"
+                source_values = ", ".join(f"<code>{escape(source_id)}</code>" for source_id in node.source_ids)
+                sources = (f"<p><strong>{escape(source_label)}:</strong> {source_values}</p>"
+                           if source_values else "")
+                html.append(
+                    f'<details class="verification-note" id="{note_id}">'
+                    f'<summary>{escape(summary)}</summary><p>{_inline(node.text)}</p>{sources}</details>'
+                )
         index += 1
     if items:
         html.append("<ul class=\"list\">" + "".join(f"<li>{item}</li>" for item in items) + "</ul>")
@@ -2306,7 +2711,7 @@ def render_html(document: ReportDocument) -> str:
     from .report_html import _document
 
     def section_html(section):
-        body = _render_blocks(section.nodes)
+        body = _render_blocks(section.nodes, document.language)
         if section.section_id == "research-coverage-gaps":
             # One visible summary, full obligations still available on demand
             # and in the same canonical Markdown/diagnostic payload.

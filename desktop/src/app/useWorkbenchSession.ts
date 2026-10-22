@@ -3,12 +3,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   bootstrapBackend,
   cancelResearch,
+  cancelModelCall,
   decideVisionUpload,
   deleteResearchRun,
   getResearchReport,
+  getResearchCallHistory,
   getResearchStatus,
   openExternalUrl,
   retryResearchModelStages,
+  extendResearchBudget,
   retryResearchSynthesis,
   retryResearchGrowth,
   retryResearchStage,
@@ -32,8 +35,19 @@ import type {
 
 export type WorkbenchError =
   | { kind: "core-unavailable"; detail?: string }
+  | { kind: "storage-recovery-required" }
   | { kind: "research-failed"; detail: string; code?: string; disclosureUrl?: string }
   | { kind: "report-unavailable"; run_id: string; company_name: string; ticker: string; code: string };
+
+const STORAGE_HEALTH_RECOVERY_REQUIRED = "STORAGE_HEALTH_RECOVERY_REQUIRED";
+
+function isStorageHealthRecoveryRequired(reason: unknown): boolean {
+  if (reason instanceof Error) return reason.message === STORAGE_HEALTH_RECOVERY_REQUIRED;
+  if (typeof reason === "string") return reason === STORAGE_HEALTH_RECOVERY_REQUIRED;
+  if (!reason || typeof reason !== "object") return false;
+  const value = reason as { code?: unknown; message?: unknown };
+  return value.code === STORAGE_HEALTH_RECOVERY_REQUIRED || value.message === STORAGE_HEALTH_RECOVERY_REQUIRED;
+}
 
 export type ReportLoadState =
   | { status: "idle" }
@@ -42,6 +56,7 @@ export type ReportLoadState =
   | { status: "failed"; run_id: string; company_name: string; ticker: string; code: string; preserving_previous: boolean };
 
 function reportReadErrorCode(reason: unknown): string {
+  if (isStorageHealthRecoveryRequired(reason)) return STORAGE_HEALTH_RECOVERY_REQUIRED;
   const detail = reason instanceof Error ? reason.message : String(reason ?? "");
   if (detail.includes("research run not found")) return "REPORT_NOT_FOUND";
   const code = detail.match(/REPORT_[A-Z_]+|RECOVERY_[A-Z_]+/i)?.[0]?.toUpperCase();
@@ -56,14 +71,19 @@ export function isActiveResearchJob(job: ResearchJob | null): job is ResearchJob
 
 export function useWorkbenchSession() {
   const [bootstrap, setBootstrap] = useState<BootstrapResult | null>(null);
+  const bootstrapValue = useRef<BootstrapResult | null>(null);
+  const savedPreferences = useRef<Preferences | null>(null);
   const [report, setReport] = useState<ResearchReport | null>(null);
   const [reportLoadState, setReportLoadState] = useState<ReportLoadState>({ status: "idle" });
   const [job, setJob] = useState<ResearchJob | null>(null);
   const [error, setError] = useState<WorkbenchError | null>(null);
+  const storageMaintenanceRequired = useRef(false);
   const lastRequest = useRef<ResearchRequest | null>(null);
   const reportValue = useRef<ResearchReport | null>(null);
   const selectedReportRun = useRef<string | null>(null);
   const reportReadGeneration = useRef(0);
+  const pendingBudgetApprovalRuns = useRef(new Set<string>());
+  const initialBootstrap = useRef<Promise<BootstrapResult> | null>(null);
   const pendingFinancialRetry = useRef<{
     jobId: string;
     resolve: () => void;
@@ -75,12 +95,31 @@ export function useWorkbenchSession() {
     setReport(value);
   }, []);
 
+  const commitBootstrap = useCallback((value: BootstrapResult): BootstrapResult => {
+    const next = savedPreferences.current
+      ? { ...value, preferences: savedPreferences.current }
+      : value;
+    bootstrapValue.current = next;
+    setBootstrap(next);
+    return next;
+  }, []);
+
+  const recordCoreFailure = useCallback((reason: unknown) => {
+    if (isStorageHealthRecoveryRequired(reason)) {
+      storageMaintenanceRequired.current = true;
+      setError({ kind: "storage-recovery-required" });
+    } else if (!storageMaintenanceRequired.current) {
+      setError({ kind: "core-unavailable" });
+    }
+  }, []);
+
   const readReportForRun = useCallback(async (
     runId: string,
     language?: Preferences["report_language"],
     identity: { company_name?: string; ticker?: string } = {},
     options: { preserveSameRun?: boolean; onlyIfUnselected?: boolean } = {},
   ): Promise<ResearchReport | null> => {
+    if (storageMaintenanceRequired.current) return null;
     if (options.onlyIfUnselected && selectedReportRun.current && selectedReportRun.current !== runId) {
       return null;
     }
@@ -107,23 +146,27 @@ export function useWorkbenchSession() {
     } catch (reason) {
       if (generation !== reportReadGeneration.current || selectedReportRun.current !== runId) return null;
       const code = reportReadErrorCode(reason);
-      if (!preserving) commitReport(null);
+      const storageFailure = code === STORAGE_HEALTH_RECOVERY_REQUIRED;
+      if (storageFailure && previous !== null) commitReport(previous);
+      else if (!preserving) commitReport(null);
       const companyName = identity.company_name ?? previous?.company_name ?? "";
       const ticker = identity.ticker ?? previous?.ticker ?? "";
       setReportLoadState({
         status: "failed", run_id: runId, company_name: companyName, ticker,
-        code, preserving_previous: preserving,
+        code, preserving_previous: preserving || (storageFailure && previous !== null),
       });
-      setError({ kind: "report-unavailable", run_id: runId, company_name: companyName, ticker, code });
+      if (storageFailure) recordCoreFailure(reason);
+      else setError({ kind: "report-unavailable", run_id: runId, company_name: companyName, ticker, code });
       return null;
     }
-  }, [commitReport]);
+  }, [commitReport, recordCoreFailure]);
 
   const finishFinancialJob = (job: ResearchJob, result?: FinancialRetryResult | null) => {
     const pending = pendingFinancialRetry.current;
     if (!pending || pending.jobId !== job.job_id) return;
     pendingFinancialRetry.current = null;
-    if (job.state === "completed" && result?.status === "succeeded") {
+    if (job.state === "completed" && (result?.status === "succeeded"
+      || (result?.status === "partial" && result.research_can_continue === true))) {
       pending.resolve();
     } else {
       pending.reject(new Error(result?.error || job.message || "Financial evidence refresh was incomplete"));
@@ -132,40 +175,55 @@ export function useWorkbenchSession() {
 
   useEffect(() => {
     let active = true;
-    void bootstrapBackend()
+    const selectionGenerationAtStartup = reportReadGeneration.current;
+    initialBootstrap.current ??= bootstrapBackend(true);
+    void initialBootstrap.current
       .then(async (value) => {
         if (!active) return;
-        setBootstrap(value);
-        if (value.recent_runs[0]) {
-          const initialRun = value.recent_runs[0];
+        commitBootstrap(value);
+        // Navigation/settings can render before history and report projection.
+        const complete = await bootstrapBackend();
+        if (!active) return;
+        const currentBootstrap = commitBootstrap(complete);
+        if (complete.recent_runs[0]
+            && selectedReportRun.current === null
+            && reportReadGeneration.current === selectionGenerationAtStartup) {
+          const initialRun = complete.recent_runs[0];
           await readReportForRun(
             initialRun.run_id,
-            value.preferences.report_language,
+            bootstrapValue.current?.preferences.report_language ?? currentBootstrap.preferences.report_language,
             { company_name: initialRun.company_name, ticker: initialRun.ticker },
           );
         }
       })
-      .catch(() => {
-        if (active) setError({ kind: "core-unavailable" });
+      .catch((reason) => {
+        if (active) recordCoreFailure(reason);
       });
     return () => { active = false; };
-  }, [readReportForRun]);
+  }, [commitBootstrap, readReportForRun, recordCoreFailure]);
 
   useEffect(() => {
     if (!isActiveResearchJob(job)) return;
     let active = true;
     let pollInFlight = false;
     let consecutivePollFailures = 0;
-    const poll = window.setInterval(() => {
+    let unchangedPolls = 0;
+    let lastRevision: string | undefined;
+    let stopped = false;
+    let poll: number;
+    const pollOnce = () => {
       if (pollInFlight) return;
       pollInFlight = true;
       void getResearchStatus(job.job_id)
         .then(async (next) => {
           if (!active) return;
           consecutivePollFailures = 0;
+          const changed = !next.status_revision || next.status_revision !== lastRevision;
+          unchangedPolls = changed ? 0 : unchangedPolls + 1;
+          lastRevision = next.status_revision;
           setError((current) => current?.kind === "core-unavailable" ? null : current);
           if (next.state === "completed") {
-            window.clearInterval(poll);
+            stopped = true;
             if (!next.run_id) {
               setJob(next);
               finishFinancialJob(next, next.operation_result);
@@ -176,11 +234,11 @@ export function useWorkbenchSession() {
               if (!active) return;
               const operationResult = next.operation_result ?? null;
               setJob(next);
-              setBootstrap(nextBootstrap);
-              const summary = nextBootstrap.recent_runs.find((item) => item.run_id === next.run_id);
+              const currentBootstrap = commitBootstrap(nextBootstrap);
+              const summary = currentBootstrap.recent_runs.find((item) => item.run_id === next.run_id);
               const nextReport = await readReportForRun(
                 next.run_id,
-                nextBootstrap.preferences.report_language,
+                currentBootstrap.preferences.report_language,
                 { company_name: summary?.company_name ?? "", ticker: summary?.ticker ?? "" },
                 { onlyIfUnselected: true, preserveSameRun: true },
               );
@@ -188,21 +246,21 @@ export function useWorkbenchSession() {
                 commitReport({ ...nextReport, financial_retry: operationResult });
               }
               finishFinancialJob(next, operationResult);
-            } catch {
+            } catch (reason) {
               finishFinancialJob(next);
-              if (active) setError({ kind: "core-unavailable" });
+              if (active) recordCoreFailure(reason);
             }
           } else if (next.state === "failed") {
-            window.clearInterval(poll);
+            stopped = true;
             setJob(next);
             if (next.run_id && next.operation_result) {
               try {
                 const nextBootstrap = await bootstrapBackend();
-                const summary = nextBootstrap.recent_runs.find((item) => item.run_id === next.run_id);
-                setBootstrap(nextBootstrap);
+                const currentBootstrap = commitBootstrap(nextBootstrap);
+                const summary = currentBootstrap.recent_runs.find((item) => item.run_id === next.run_id);
                 const nextReport = await readReportForRun(
                   next.run_id,
-                  nextBootstrap.preferences.report_language,
+                  currentBootstrap.preferences.report_language,
                   { company_name: summary?.company_name ?? "", ticker: summary?.ticker ?? "" },
                   { onlyIfUnselected: true, preserveSameRun: true },
                 );
@@ -211,40 +269,53 @@ export function useWorkbenchSession() {
                     commitReport({ ...nextReport, financial_retry: next.operation_result });
                   }
                 }
-              } catch {
+              } catch (reason) {
                 // The report-read status identifies storage/contract failures.
+                if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
               }
             }
             finishFinancialJob(next, next.operation_result);
-            setError({
-              kind: "research-failed",
-              detail: next.message,
-              code: next.error_code ?? undefined,
-              disclosureUrl: next.disclosure_url ?? undefined,
-            });
+            if (!storageMaintenanceRequired.current) {
+              setError({
+                kind: "research-failed",
+                detail: next.message,
+                code: next.error_code ?? undefined,
+                disclosureUrl: next.disclosure_url ?? undefined,
+              });
+            }
           } else if (next.state === "cancelled") {
-            window.clearInterval(poll);
+            stopped = true;
             setJob(next);
             finishFinancialJob(next, next.operation_result);
           } else {
-            setJob(next);
+            if (changed) setJob(next);
           }
         })
-        .catch(() => {
+        .catch((reason) => {
           if (!active) return;
+          if (isStorageHealthRecoveryRequired(reason)) {
+            stopped = true;
+            recordCoreFailure(reason);
+            return;
+          }
           consecutivePollFailures += 1;
           // A transient sidecar/IPC interruption is not a research failure.
           // Keep polling the durable job and expose the connectivity banner
           // only after several consecutive misses.
           if (consecutivePollFailures >= 3) setError({ kind: "core-unavailable" });
         })
-        .finally(() => { pollInFlight = false; });
-    }, 350);
+        .finally(() => {
+          pollInFlight = false;
+          if (active && !stopped) poll = window.setTimeout(pollOnce,
+            consecutivePollFailures > 0 || unchangedPolls >= 3 ? 3000 : unchangedPolls > 0 ? 2000 : 1000);
+        });
+    };
+    poll = window.setTimeout(pollOnce, 1000);
     return () => {
       active = false;
-      window.clearInterval(poll);
+      window.clearTimeout(poll);
     };
-  }, [job?.job_id, bootstrap?.preferences.report_language, commitReport, readReportForRun]);
+  }, [job?.job_id, bootstrap?.preferences.report_language, commitBootstrap, commitReport, readReportForRun, recordCoreFailure]);
 
   const selectRun = async (run: ResearchRunSummary) => {
     await readReportForRun(
@@ -265,6 +336,7 @@ export function useWorkbenchSession() {
   };
 
   const beginResearch = async (request: ResearchRequest = { mode: "demo" }) => {
+    if (storageMaintenanceRequired.current) return;
     setError(null);
     reportReadGeneration.current += 1;
     selectedReportRun.current = null;
@@ -276,10 +348,8 @@ export function useWorkbenchSession() {
     try {
       setJob(await startResearch(request));
     } catch (reason) {
-      setError({
-        kind: "core-unavailable",
-        detail: reason instanceof Error ? reason.message : undefined,
-      });
+      if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
+      else setError({ kind: "core-unavailable", detail: reason instanceof Error ? reason.message : undefined });
     }
   };
 
@@ -289,52 +359,70 @@ export function useWorkbenchSession() {
       const next = await cancelResearch(job.job_id);
       setJob(next);
       if (next.state === "cancelled") finishFinancialJob(next, next.operation_result);
-    } catch {
-      setError({ kind: "core-unavailable" });
+    } catch (reason) {
+      recordCoreFailure(reason);
     }
   };
 
   const savePreferences = async (preferences: Partial<Preferences>) => {
     const saved = await updatePreferences(preferences);
-    setBootstrap((current) => current ? { ...current, preferences: saved } : current);
+    savedPreferences.current = saved;
+    const current = bootstrapValue.current;
+    if (current) commitBootstrap({ ...current, preferences: saved });
     return saved;
   };
 
-  const refreshBootstrap = async () => {
-    setError(null);
+  const stopModelCall = async (requestId: string, attemptId: string) => {
+    if (!job) return;
     try {
-      setBootstrap(await bootstrapBackend());
-    } catch {
-      setError({ kind: "core-unavailable" });
+      const next = await cancelModelCall(job.job_id, requestId, attemptId);
+      setJob((current) => current?.job_id === next.job_id ? next : current);
+    } catch (reason) {
+      recordCoreFailure(reason);
     }
   };
 
-  const retryResearch = async () => {
+  const refreshBootstrap = async () => {
+    if (storageMaintenanceRequired.current) return;
+    setError(null);
+    try {
+      commitBootstrap(await bootstrapBackend());
+    } catch (reason) {
+      recordCoreFailure(reason);
+    }
+  };
+
+  const retryResearch = async (allowPartialResearch = false) => {
     if (!lastRequest.current) return;
-    await beginResearch(lastRequest.current);
+    const retryRequest = { ...lastRequest.current };
+    delete retryRequest.allow_partial_research;
+    if (allowPartialResearch) retryRequest.allow_partial_research = true;
+    await beginResearch(retryRequest);
   };
 
   const decideVision = async (approved: boolean) => {
+    if (storageMaintenanceRequired.current) return;
     if (!job) return;
     try {
       setJob(await decideVisionUpload(job.job_id, approved));
-    } catch {
-      setError({ kind: "core-unavailable" });
+    } catch (reason) {
+      recordCoreFailure(reason);
     }
   };
 
   const removeRun = async (run: ResearchRunSummary) => {
+    if (storageMaintenanceRequired.current) return;
     setError(null);
     try {
       await deleteResearchRun(run.run_id);
       const nextBootstrap = await bootstrapBackend();
-      setBootstrap(nextBootstrap);
+      const currentBootstrap = commitBootstrap(nextBootstrap);
       if (selectedReportRun.current === run.run_id) {
-        const nextRun = nextBootstrap.recent_runs[0];
+        const nextRun = currentBootstrap.recent_runs[0];
         if (nextRun) {
           await readReportForRun(
             nextRun.run_id,
-            nextBootstrap.preferences.report_language,
+            currentBootstrap.preferences.report_language,
             { company_name: nextRun.company_name, ticker: nextRun.ticker },
           );
         } else {
@@ -344,31 +432,96 @@ export function useWorkbenchSession() {
           setReportLoadState({ status: "idle" });
         }
       }
-    } catch {
-      setError({ kind: "core-unavailable" });
+    } catch (reason) {
+      recordCoreFailure(reason);
       throw new Error("research deletion failed");
     }
   };
 
   const retrySynthesis = async (selectedModel?: ResearchRequest["model"]) => {
+    if (storageMaintenanceRequired.current) return;
     const model = selectedModel ?? lastRequest.current?.model;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const next = await retryResearchSynthesis(report.run_id, model);
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
   };
 
   const retryModelStages = async () => {
+    if (storageMaintenanceRequired.current) return;
     const model = lastRequest.current?.model;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const next = await retryResearchModelStages(report.run_id, model);
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
+  };
+
+  const loadResearchCallHistory = useCallback((runId: string, stageId: string, after?: string, limit = 10) =>
+    getResearchCallHistory(runId, stageId, after, limit), []);
+
+  const refreshBudgetRunState = async (runId: string) => {
+    try {
+      const refreshedReport = await getResearchReport(runId, bootstrap?.preferences.report_language);
+      if (selectedReportRun.current === runId || !selectedReportRun.current) {
+        selectedReportRun.current = runId;
+        const current = reportValue.current;
+        commitReport(current?.run_id === runId
+          ? { ...refreshedReport, markdown: current.markdown, html: current.html }
+          : refreshedReport);
+        setReportLoadState({ status: "loaded", run_id: runId });
+      }
+    } catch (reason) {
+      if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
+      // Keep the existing report body visible if a refresh is unavailable.
+    }
+    if (job?.run_id === runId) {
+      try {
+        const refreshedJob = await getResearchStatus(job.job_id);
+        setJob((current) => current?.job_id === refreshedJob.job_id ? refreshedJob : current);
+      } catch (reason) {
+        if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
+        // The prior job snapshot remains usable; a later poll can refresh it.
+      }
+    }
+    try {
+      commitBootstrap(await bootstrapBackend());
+    } catch (reason) {
+      if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
+      // Refreshing navigation metadata is best effort and must not hide the saved report.
+    }
+  };
+
+  const approveBudgetGaps = async (runId: string, planDigest: string, gapIds: string[]) => {
+    if (storageMaintenanceRequired.current) return;
+    if (!runId || !planDigest || gapIds.length === 0) throw new Error("MODEL_BUDGET_APPROVAL_INVALID");
+    if (pendingBudgetApprovalRuns.current.has(runId)) throw new Error("MODEL_BUDGET_APPROVAL_IN_PROGRESS");
+    pendingBudgetApprovalRuns.current.add(runId);
+    try {
+      await extendResearchBudget(runId, planDigest, gapIds);
+      const updated = await retryResearchModelStages(runId, undefined, true);
+      if (selectedReportRun.current === updated.run_id || !selectedReportRun.current) {
+        selectedReportRun.current = updated.run_id;
+        commitReport(updated);
+        setReportLoadState({ status: "loaded", run_id: updated.run_id });
+      }
+      try {
+        commitBootstrap(await bootstrapBackend());
+      } catch {
+        // The recovered report is already committed; bootstrap refresh is best effort.
+      }
+    } catch (reason) {
+      if (isStorageHealthRecoveryRequired(reason)) recordCoreFailure(reason);
+      await refreshBudgetRunState(runId);
+      throw reason;
+    } finally {
+      pendingBudgetApprovalRuns.current.delete(runId);
+    }
   };
 
   const retryGrowth = async () => {
+    if (storageMaintenanceRequired.current) return;
     const model = lastRequest.current?.model;
     if (!report || !model) {
       throw new Error("model session is unavailable");
@@ -376,7 +529,7 @@ export function useWorkbenchSession() {
     setError(null);
     const next = await retryResearchGrowth(report.run_id, model);
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
   };
 
   const retryRecoveryStage = async (
@@ -385,23 +538,26 @@ export function useWorkbenchSession() {
     planHash: string,
     confirmNewAttempt = false,
   ) => {
+    if (storageMaintenanceRequired.current) return;
     if (!report) throw new Error("report is unavailable");
     if (!model) throw new Error("a model selection is required");
     setError(null);
     const next = await retryResearchStage(report.run_id, target, model, planHash, confirmNewAttempt);
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
   };
 
   const revalidateSaved = async () => {
+    if (storageMaintenanceRequired.current) return;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const next = await revalidateSavedResearch(report.run_id);
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
   };
 
   const retryFinancials = async () => {
+    if (storageMaintenanceRequired.current) return;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const started = await startResearchFinancialRetry(report.run_id);
@@ -413,6 +569,7 @@ export function useWorkbenchSession() {
   };
 
   const rebuildFinancials = async () => {
+    if (storageMaintenanceRequired.current) return;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const started = await startResearchFinancialRebuild(report.run_id);
@@ -424,6 +581,7 @@ export function useWorkbenchSession() {
   };
 
   const refreshFinancialReport = async () => {
+    if (storageMaintenanceRequired.current) return;
     if (!report) throw new Error("report is unavailable");
     setError(null);
     const next = await refreshFinancialReportBackend(
@@ -431,7 +589,7 @@ export function useWorkbenchSession() {
       report.report_language,
     );
     if (selectedReportRun.current === next.run_id) commitReport(next);
-    setBootstrap(await bootstrapBackend());
+    commitBootstrap(await bootstrapBackend());
   };
 
   const openFailedDisclosure = async () => {
@@ -457,6 +615,8 @@ export function useWorkbenchSession() {
     beginResearch,
     retryResearch,
     retryModelStages,
+    approveBudgetGaps,
+    loadResearchCallHistory,
     retrySynthesis,
     retryGrowth,
     retryRecoveryStage,
@@ -466,6 +626,7 @@ export function useWorkbenchSession() {
     refreshFinancialReport,
     openFailedDisclosure,
     stopResearch,
+    stopModelCall,
     decideVisionUpload: decideVision,
     savePreferences,
     refreshBootstrap,

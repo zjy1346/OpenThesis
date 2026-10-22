@@ -5,6 +5,7 @@ import App from "./App";
 import {
   bootstrapBackend,
   exportResearchReport,
+  extendResearchBudget,
   installResearchPack,
   listConfiguredModels,
   openExternalUrl,
@@ -33,6 +34,8 @@ vi.mock("./backend", () => ({
   startResearch: vi.fn(),
   getResearchStatus: vi.fn(),
   cancelResearch: vi.fn(),
+  extendResearchBudget: vi.fn(),
+  getResearchCallHistory: vi.fn(),
 }));
 
 describe("report-first workbench", () => {
@@ -104,12 +107,79 @@ describe("report-first workbench", () => {
     });
   });
 
+  it("shows concrete current-run budget gaps without approving them automatically", async () => {
+    vi.mocked(startResearch).mockResolvedValue({
+      job_id: "job-budget", state: "running", message: "Working", percent: 35, run_id: "run-budget",
+      call_plan: { plan_digest: "digest-1", max_calls: 2, max_input_estimate: 8_000, max_output_tokens: 20_000,
+        pending_budget_gaps: [{ gap_id: "gap-growth", stage_id: "growth-opportunities", purpose: "generation", input_estimate: 1_234,
+          output_limit: 4_096, diagnostic_code: "MODEL_RUN_CALL_BUDGET_EXHAUSTED" }] },
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+
+    expect(await screen.findByText("Growth opportunities · Generation")).toBeInTheDocument();
+    expect(screen.getByText("1,234 input tokens (estimate) · 4,096 output tokens (limit)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Approve additional budget and continue gaps" })).toBeEnabled();
+    expect(extendResearchBudget).not.toHaveBeenCalled();
+  });
+
   it("keeps the report workspace primary when no history exists", async () => {
     render(<App />);
 
     expect(await screen.findByRole("heading", { name: "Research report" })).toBeVisible();
     expect(screen.getByText("No research reports yet")).toBeVisible();
     expect(screen.getByRole("button", { name: "Open navigation" })).toBeVisible();
+  });
+
+  it("shows a local database recovery warning instead of research actions on startup corruption", async () => {
+    vi.mocked(bootstrapBackend).mockRejectedValueOnce(new Error("STORAGE_HEALTH_RECOVERY_REQUIRED"));
+    render(<App />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Database integrity could not be confirmed/);
+    expect(screen.getByRole("button", { name: "Open navigation" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Run synthetic demo research" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Configure real company research" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Start research" }));
+    expect(screen.getByRole("heading", { name: "Local database recovery check required" })).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "Research report" })).queryByRole("button", { name: "Start research" })).not.toBeInTheDocument();
+  });
+
+  it("keeps an already displayed report while suppressing paid recovery actions on storage failure", async () => {
+    const run = {
+      run_id: "run-storage", ticker: "DEMO", company_name: "Stored Company", status: "completed",
+      started_at: "2026-10-20T00:00:00Z", completed_at: "2026-10-20T00:01:00Z", report_language: "en" as const,
+      exchange: "NYSE", market: "US" as const,
+    };
+    vi.mocked(bootstrapBackend).mockResolvedValue({
+      contract_version: "2", app_version: "2.0.0", capabilities: [],
+      preferences: { ui_language: "en", report_language: "en", ui_language_mode: "manual", sidebar_collapsed: "true", parallel_agents: "false" },
+      recent_runs: [run], common_companies: [], research_packs: [], interrupted_runs: 0,
+    });
+    vi.mocked(getResearchReport)
+      .mockResolvedValueOnce({
+        run_id: run.run_id, ticker: run.ticker, company_name: run.company_name, status: "partial", report_language: "en",
+        markdown: "# Stored report body", html: "<h1>Stored report body</h1>", retryable_synthesis: true,
+        retryable_model_stages: true,
+        call_plan: { plan_digest: "digest", max_calls: 2, max_input_estimate: 8_000, max_output_tokens: 16_000,
+          pending_budget_gaps: [{ gap_id: "gap-1", stage_id: "research-synthesizer", purpose: "generation", input_estimate: 100,
+            output_limit: 1_000, diagnostic_code: "MODEL_RUN_CALL_BUDGET_EXHAUSTED" }] },
+      })
+      .mockRejectedValueOnce(new Error("STORAGE_HEALTH_RECOVERY_REQUIRED"));
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Stored report body" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Research history" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /Stored Company/ })[0]);
+
+    expect(await screen.findByText(/Close OpenThesis and copy the local data directory/)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Stored report body" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open navigation" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Regenerate synthesized report" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue model research" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve additional budget and continue gaps" })).not.toBeInTheDocument();
   });
 
   it("expands navigation on hover and can pin it open without moving the icon rail", async () => {
@@ -230,6 +300,39 @@ describe("report-first workbench", () => {
     expect(screen.getByRole("button", { name: "Try fetching again" })).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Open official disclosure platform" }));
     expect(openExternalUrl).toHaveBeenCalledWith("https://www.cninfo.com.cn/new/index");
+  });
+
+  it("requires the explicit available-material action for every partial-research retry", async () => {
+    let nextJob = 0;
+    vi.mocked(startResearch).mockImplementation(async () => {
+      nextJob += 1;
+      return { job_id: `job-scope-${nextJob}`, state: "queued", message: "", percent: 0, run_id: null };
+    });
+    vi.mocked(getResearchStatus).mockImplementation(async (jobId) => ({
+      job_id: jobId,
+      state: "failed",
+      message: "Available filing material needs explicit confirmation before research can continue.",
+      percent: 5,
+      run_id: null,
+      error_code: "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED",
+    }));
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 });
+
+    fireEvent.click(screen.getByRole("button", { name: "Try fetching again" }));
+    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(2));
+    expect(startResearch).toHaveBeenNthCalledWith(2, { mode: "demo" });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 }));
+    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(3));
+    expect(startResearch).toHaveBeenNthCalledWith(3, { mode: "demo", allow_partial_research: true });
+
+    await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 });
+    fireEvent.click(screen.getByRole("button", { name: "Try fetching again" }));
+    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(4));
+    expect(startResearch).toHaveBeenNthCalledWith(4, { mode: "demo" });
   });
 
   it("saves interface and report languages independently", async () => {
@@ -355,11 +458,12 @@ describe("report-first workbench", () => {
   it("refreshes history without restarting the workbench", async () => {
     render(<App />);
     await screen.findByRole("heading", { name: "Research report" });
+    const initialBootstrapCalls = vi.mocked(bootstrapBackend).mock.calls.length;
 
     fireEvent.click(screen.getByRole("button", { name: "Research history" }));
     fireEvent.click(screen.getByRole("button", { name: "Refresh research history" }));
 
-    await waitFor(() => expect(bootstrapBackend).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(bootstrapBackend).toHaveBeenCalledTimes(initialBootstrapCalls + 1));
   });
 
   it("keeps the last research request session-only for retry", async () => {

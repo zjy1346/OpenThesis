@@ -18,6 +18,8 @@ import type {
   ThesisVersion,
   FinancialDiagnostics,
   MarketSnapshotPreview,
+  ModelCallHistoryPage,
+  ModelCallPlan,
 } from "./types";
 
 /**
@@ -40,6 +42,10 @@ export const BACKEND_METHODS = [
   "research.list",
   "research.delete",
   "research.get_report",
+  "research.call_history",
+  "research.extend_budget",
+  "rpc.start",
+  "rpc.result",
   "research.financial_diagnostics",
     "research.start",
   "research.market_snapshot",
@@ -55,6 +61,7 @@ export const BACKEND_METHODS = [
   "research.retry_synthesis",
   "research.status",
   "research.cancel",
+  "research.cancel_model_call",
   "research.vision_decision",
 ] as const;
 
@@ -63,7 +70,7 @@ export type BackendMethod = typeof BACKEND_METHODS[number];
 type EmptyParams = Record<string, never>;
 
 export type BackendParams = {
-  "app.bootstrap": EmptyParams;
+  "app.bootstrap": { minimal?: boolean };
   "settings.update": {
     preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy">>;
   };
@@ -82,13 +89,17 @@ export type BackendParams = {
     language?: Language;
     include_technical?: boolean;
   };
+  "rpc.start": { method: string; params: Record<string, unknown> };
+  "rpc.result": { job_id: string };
   "research.financial_diagnostics": { run_id: string };
   "research.start": ResearchRequest;
   "research.market_snapshot": { company: Company; valuation?: ResearchRequest["valuation"] };
   "research.retry_growth": { run_id: string; model: ModelSelection };
   "research.retry_stage": { run_id: string; target: string; model?: ModelSelection; plan_hash: string; confirm_new_attempt?: boolean };
   "research.revalidate_saved": { run_id: string };
-  "research.retry_model_stages": { run_id: string; model?: ModelSelection };
+  "research.retry_model_stages": { run_id: string; model?: ModelSelection; budget_only?: boolean };
+  "research.call_history": { run_id: string; stage_id: string; after?: string; limit?: number };
+  "research.extend_budget": { run_id: string; plan_digest: string; gap_ids: string[] };
   "research.retry_financials": { run_id: string };
   "research.refresh_financial_report": { run_id: string; language?: Language };
   "research.start_financial_retry": { run_id: string };
@@ -97,6 +108,7 @@ export type BackendParams = {
     "research.retry_synthesis": { run_id: string; model?: ModelSelection };
   "research.status": { job_id: string };
   "research.cancel": { job_id: string };
+  "research.cancel_model_call": { job_id: string; request_id: string; attempt_id: string };
   "research.vision_decision": { job_id: string; approved: boolean };
 };
 
@@ -114,6 +126,10 @@ export type BackendResult = {
   "research.list": BootstrapResult["recent_runs"];
   "research.delete": { run_id: string; deleted: boolean };
   "research.get_report": ResearchReport;
+  "research.call_history": ModelCallHistoryPage;
+  "research.extend_budget": ModelCallPlan;
+  "rpc.start": { job_id: string };
+  "rpc.result": { state: "pending" | "ready"; response?: { result?: unknown; error?: { code: number; message: string } } };
   "research.financial_diagnostics": FinancialDiagnostics;
   "research.start": ResearchJob;
   "research.market_snapshot": MarketSnapshotPreview;
@@ -129,6 +145,7 @@ export type BackendResult = {
   "research.retry_synthesis": ResearchReport;
   "research.status": ResearchJob;
   "research.cancel": ResearchJob;
+  "research.cancel_model_call": ResearchJob;
   "research.vision_decision": ResearchJob;
 };
 

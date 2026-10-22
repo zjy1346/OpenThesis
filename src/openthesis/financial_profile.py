@@ -36,6 +36,7 @@ class FinancialProfile:
     parsing_observations: tuple[dict[str, Any], ...] = ()
     repair_observations: tuple[dict[str, Any], ...] = ()
     source_evidence: tuple[EvidenceRef, ...] = ()
+    comparison_bindings: tuple[dict[str, Any], ...] = ()
 
 
 def _validation_group_role(group: Any) -> str:
@@ -369,6 +370,9 @@ def build_financial_profile(
         ),
         "research_as_of": research_as_of or (max(research_dates) if research_dates else None),
     }
+    from .financial_comparatives import build_comparison_bindings
+    comparison_bindings = tuple(item.to_dict() for item in build_comparison_bindings(accepted))
+    period_coverage["comparison_bindings"] = comparison_bindings
     statuses = {group.validation.status for group in groups}
     has_missing_periods = any(item["status"] == "no_facts" for item in period_continuity)
     status = (
@@ -396,4 +400,5 @@ def build_financial_profile(
             deepcopy(item) for item in parsing_observations
             if isinstance(item, dict)
         ),
+        comparison_bindings=comparison_bindings,
     )

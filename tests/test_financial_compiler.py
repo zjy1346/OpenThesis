@@ -4,25 +4,15 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
 
 from openthesis.domain import Company, EvidenceRef, FilingDocument, FinancialFact
-from openthesis.financial_compiler import (
-    CandidateBatch,
-    CoveragePlanner,
-    concepts_cover_profile,
-    FactCandidate,
-    GapStageKind,
-    GapResolver,
-    FinancialFactCompiler,
-    InMemoryFactExtractor,
-    StaticFilingSource,
-    StructuredFactExtractor,
-    CompilerPolicy,
-)
+from openthesis.financial_contracts import (CandidateBatch, CompilationPolicy, FactCandidate, FinancialCandidateCollection, GapStageKind)
+from openthesis.financial_compiler import (CoveragePlanner, FinancialFactCompiler as CanonicalCompiler, concepts_cover_profile)
+from openthesis.financial_sources import (GapResolver, InMemoryFactExtractor, StaticFilingSource, StructuredFactExtractor)
+from openthesis.financial_pipeline import (FinancialCandidatePipeline as FinancialFactCompiler, CollectionPolicy as CompilerPolicy)
 from openthesis.financial_ast_adapter import PdfAstFactExtractor
-from openthesis.vision_financials import VisionAdapterError, VisionFallbackConfig
+from openthesis.vision_financials import VisionFallbackConfig
 
 
 def _subject() -> Company:
@@ -59,10 +49,10 @@ def _facts(filing: FilingDocument, *, net_income: float) -> tuple[FactCandidate,
         fact_id = f"candidate:{filing.accession_number}:{concept}"
         fact = FinancialFact(
             fact_id, filing.company_cik, concept, concept, value, "CNY", int(filing.period_end[:4]),
-            "FY", filing.form_type, f"{int(filing.period_end[:4]) - 1}-01-01" if concept not in {"assets", "liabilities", "equity"} else None,
+            "FY", filing.form_type, f"{int(filing.period_end[:4])}-01-01" if concept not in {"assets", "liabilities", "equity"} else None,
             filing.period_end, filing.filed_at, filing.accession_number, filing.source_url,
             scope="consolidated", entity="Tencent", market="HK", statement=statements[concept],
-            period_start=f"{int(filing.period_end[:4]) - 1}-01-01" if concept not in {"assets", "liabilities", "equity"} else None,
+            period_start=f"{int(filing.period_end[:4])}-01-01" if concept not in {"assets", "liabilities", "equity"} else None,
             consolidated_scope="consolidated", currency="CNY", unit_scale=1_000_000,
             unit_provenance="structured_normalized",
             source_document=filing.primary_document, source_page=132,
@@ -151,9 +141,40 @@ class FinancialFactCompilerTests(unittest.TestCase):
             for item in current
         )
         dataset = self._compile(filing, current + foreign)
-        self.assertFalse(dataset.allow_ai)
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
         self.assertIn("same_filing_comparator_identity_mismatch", dataset.diagnostics)
         self.assertFalse(any(fact.currency == "USD" for fact in dataset.research_facts))
+        self.assertFalse(dataset.capabilities["annual_trend"])
+
+    def test_parent_scope_comparator_does_not_block_consolidated_target(self):
+        filing = replace(
+            _filing("parent-comparator", "2025-12-31", "Fixture 2025 Annual Report"),
+            filed_at="2026-04-06",
+        )
+        current = _facts(filing, net_income=188_243_000_000.0)
+        parent_comparator = FactCandidate(
+            replace(
+                current[0].fact,
+                fact_id=f"{current[0].fact.fact_id}:parent-comparison",
+                fiscal_year=2024,
+                end_date="2024-12-31",
+                start_date="2024-01-01",
+                period_start="2024-01-01",
+                scope="parent",
+                consolidated_scope="parent",
+                usage_status="comparator",
+            ),
+            current[0].evidence,
+            current[0].extractor,
+        )
+
+        dataset = self._compile(filing, (*current, parent_comparator))
+
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
+        self.assertNotIn("same_filing_comparator_identity_mismatch", dataset.diagnostics)
+        self.assertFalse(any(
+            fact.scope == "parent" for fact in dataset.research_facts
+        ))
 
     def test_same_filing_comparator_unit_mismatch_is_fail_closed(self):
         filing = replace(
@@ -179,7 +200,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
             for item in current
         )
         dataset = self._compile(filing, current + mismatched)
-        self.assertFalse(dataset.allow_ai)
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
         self.assertIn("same_filing_comparator_unit_mismatch", dataset.diagnostics)
 
     def test_same_filing_restatement_and_historical_fact_are_retained_and_conflicted(self):
@@ -296,7 +317,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
             for item in current
         )
         dataset = self._compile(filing, current + wrong_period)
-        self.assertFalse(dataset.allow_ai)
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
         self.assertIn("same_filing_comparator_identity_mismatch", dataset.diagnostics)
 
     def test_incomplete_candidate_batch_cannot_bypass_quality_gate(self):
@@ -308,7 +329,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
         self.assertFalse(dataset.quarantined_facts)
         self.assertIn("required_profile_missing:net_income", dataset.validations[0].issues)
 
-    def test_same_value_with_different_statement_context_is_conflicted(self):
+    def test_wrong_statement_candidate_is_rejected_before_deduplication(self):
         filing = _filing("2023040601848", "2022-12-31", "Tencent 2022 Annual Report")
         candidates = list(_facts(filing, net_income=188_243_000_000.0))
         net_index = next(index for index, item in enumerate(candidates) if item.fact.concept == "net_income")
@@ -316,8 +337,10 @@ class FinancialFactCompilerTests(unittest.TestCase):
         candidates.append(FactCandidate(wrong, candidates[net_index].evidence, "wrong-context"))
         dataset = self._compile(filing, tuple(candidates))
         self.assertFalse(dataset.allow_ai)
-        self.assertTrue(dataset.conflicts)
-        self.assertIn("candidate_conflict", dataset.validations[0].issues)
+        self.assertFalse(dataset.conflicts)
+        self.assertIn("statement_mismatch", dataset.validations[0].issues)
+        self.assertIn(candidates[net_index].fact.fact_id, {fact.fact_id for fact in dataset.resolved_facts})
+        self.assertIn(wrong.fact_id, {fact.fact_id for fact in dataset.quarantined_facts})
 
     def test_same_semantic_fact_from_two_bboxes_merges_evidence(self):
         filing = _filing("bbox-merge", "2022-12-31", "Tencent 2022 Annual Report")
@@ -395,7 +418,11 @@ class FinancialFactCompilerTests(unittest.TestCase):
                     period_start="2022-01-01",
                     end_date=prior_interim.period_end,
                 ),
-                candidate.evidence,
+                tuple(replace(ref, document_id=prior_interim.document_id,
+                              source_url=prior_interim.source_url,
+                              content_hash=prior_interim.content_hash,
+                              published_at=prior_interim.filed_at)
+                      for ref in candidate.evidence),
                 candidate.extractor,
             )
             for candidate in interim_facts
@@ -504,8 +531,15 @@ class FinancialFactCompilerTests(unittest.TestCase):
             ),
         )
         self.assertFalse(dataset.allow_ai)
-        self.assertEqual(dataset.interim_facts, ())
-        self.assertIn("interim_comparator_missing", dataset.diagnostics)
+        self.assertTrue(dataset.interim_facts)
+        self.assertEqual({fact.end_date for fact in dataset.interim_facts}, {"2023-06-30"})
+        self.assertNotIn("net_income", {fact.concept for fact in dataset.interim_facts})
+        self.assertNotIn("2022-06-30", {fact.end_date for fact in dataset.interim_facts})
+        # The older cohort is a hidden per-metric baseline, not a substitute
+        # for the latest partial period. Its valid revenue comparison does not
+        # manufacture the latest period's absent net income.
+        self.assertEqual({fact.end_date for fact in dataset.comparator_facts}, {"2022-06-30"})
+        self.assertNotIn("interim_comparator_missing", dataset.diagnostics)
         self.assertIn("latest_interim_incomplete", dataset.diagnostics)
 
     def test_annual_cohorts_are_deduplicated_and_limited_to_six(self):
@@ -620,10 +654,21 @@ class FinancialFactCompilerTests(unittest.TestCase):
             batch = PdfAstFactExtractor().extract(subject, filing)
             concepts = {item.fact.concept for item in batch.candidates}
             self.assertTrue({"revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity"} <= concepts)
+            for candidate in batch.candidates:
+                with self.subTest(fact_id=candidate.fact.fact_id):
+                    self.assertEqual(len(candidate.evidence), 1)
+                    self.assertEqual(candidate.evidence[0].bbox, candidate.fact.source_bbox)
+                    self.assertEqual(
+                        candidate.evidence[0].evidence_id,
+                        f"fact:{candidate.fact.fact_id.removeprefix('ingest:')}",
+                    )
             net_income = [item.fact for item in batch.candidates if item.fact.concept == "net_income"]
             self.assertEqual({item.fiscal_year for item in net_income}, {2022, 2021})
             current_net_income = next(item for item in net_income if item.fiscal_year == 2022)
-            self.assertEqual(current_net_income.value, 188243000000.0)
+            self.assertEqual(current_net_income.value, 188709000000.0)
+            current_parent = next(item.fact for item in batch.candidates
+                                  if item.fact.concept == "parent_net_income" and item.fact.fiscal_year == 2022)
+            self.assertEqual(current_parent.value, 188243000000.0)
             self.assertEqual(current_net_income.source_page, 1)
             self.assertTrue(current_net_income.source_bbox)
             self.assertEqual(current_net_income.currency, "CNY")
@@ -637,7 +682,14 @@ class FinancialFactCompilerTests(unittest.TestCase):
                     reporting_currency="CNY",
                 ),
             )
-            self.assertTrue(compiler.allow_ai)
+            self.assertTrue(
+                compiler.allow_ai,
+                (
+                    compiler.status,
+                    compiler.diagnostics,
+                    tuple((item.identity, item.issues) for item in compiler.validations),
+                ),
+            )
             self.assertEqual(compiler.status, "VERIFIED")
 
     def test_coverage_planner_declares_non_financial_and_financial_profiles(self):
@@ -663,7 +715,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
     def test_financial_profile_can_pass_without_industrial_cashflow_revenue(self):
         filing = _filing("bank-profile", "2022-12-31", "Bank Fixture")
-        bank = Company("US:1089113", "BANK", "Bank Fixture", industry="banking", reporting_currency="CNY")
+        bank = replace(_subject(), ticker="BANK", name="Bank Fixture", industry="banking")
         candidates = [item for item in _facts(filing, net_income=188_243_000_000.0)
                       if item.fact.concept in {"net_income", "assets", "liabilities", "equity"}]
         extractor = InMemoryFactExtractor({filing.document_id: CandidateBatch(filing, tuple(candidates))})
@@ -687,7 +739,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
     def test_profile_equity_alias_reaches_compiler_allow_ai(self):
         filing = _filing("bank-total-equity", "2022-12-31", "Bank Fixture")
-        bank = Company("US:1089113", "BANK", "Bank Fixture", industry="banking", reporting_currency="CNY")
+        bank = replace(_subject(), ticker="BANK", name="Bank Fixture", industry="banking")
         candidates = []
         for item in _facts(filing, net_income=188_243_000_000.0):
             if item.fact.concept == "revenue" or item.fact.concept == "operating_cash_flow":
@@ -795,9 +847,18 @@ class FinancialFactCompilerTests(unittest.TestCase):
             ),
         )
         self.assertFalse(dataset.allow_ai)
-        self.assertEqual({fact.end_date for fact in dataset.research_facts}, {"2022-12-31"})
-        self.assertNotIn("2021-12-31", {fact.end_date for fact in dataset.research_facts})
-        self.assertEqual({item.identity[1] for item in dataset.research_validations}, {"2022-12-31"})
+        self.assertEqual(
+            {fact.end_date for fact in dataset.research_facts},
+            {"2021-12-31", "2022-12-31"},
+        )
+        self.assertNotIn("net_income", {
+            fact.concept for fact in dataset.research_facts
+            if fact.end_date == "2021-12-31"
+        })
+        self.assertEqual(
+            {item.identity[1] for item in dataset.research_validations},
+            {"2021-12-31", "2022-12-31"},
+        )
 
     def test_period_range_limits_research_target_window(self):
         first = _filing("range-2021", "2021-12-31", "Range 2021")
@@ -831,12 +892,66 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
         revenue = _facts(filing, net_income=188_243_000_000.0)[0]
         batch = CandidateBatch(filing, (revenue,))
+
+        def admitted_concepts(candidates, evidence):
+            dataset = CanonicalCompiler().compile(
+                _subject(), (CandidateBatch(filing, tuple(candidates), tuple(evidence)),),
+                CompilationPolicy(filings=(filing,), required_concepts=frozenset({"revenue"}),
+                                  reporting_currency="CNY", period_range=(filing.period_end, filing.period_end)),
+            )
+            return {fact.concept for fact in dataset.research_facts}
+
         result = GapResolver().resolve(
             _subject(), filing, ("revenue",),
             (Stage("structured", GapStageKind.OFFICIAL_STRUCTURED, batch), Stage("pdf", GapStageKind.PDF_AST, CandidateBatch(filing))),
+            verified_concepts=admitted_concepts,
         )
         self.assertEqual(calls, ["structured"])
         self.assertEqual([item.fact.concept for item in result.candidates], ["revenue"])
+
+    def test_gap_resolver_preserves_same_concept_across_periods(self):
+        """Comparative candidates must survive gap-stage collection."""
+        filing = _filing("gap-periods", "2025-12-31", "Fixture")
+        current = _facts(filing, net_income=188_243_000_000.0)[0]
+        prior_fact = replace(
+            current.fact,
+            fact_id="candidate:gap-periods:revenue:prior",
+            fiscal_year=2024,
+            end_date="2024-12-31",
+            period_start="2024-01-01",
+            value=current.fact.value * 0.8,
+            raw_text="Revenue prior year",
+        )
+        batch = CandidateBatch(
+            filing,
+            (
+                FactCandidate(current.fact, (EvidenceRef(
+                    "ev:revenue:2025", filing.document_id, filing.source_url,
+                    "Revenue", "page:1", "2025 revenue", filing.filed_at,
+                    filing.content_hash,
+                ),), "official"),
+                FactCandidate(prior_fact, (EvidenceRef(
+                    "ev:revenue:2024", filing.document_id, filing.source_url,
+                    "Revenue", "page:1", "2024 revenue", filing.filed_at,
+                    filing.content_hash,
+                ),), "official"),
+            ),
+        )
+
+        class Stage:
+            name = "structured"
+            stage_kind = GapStageKind.OFFICIAL_STRUCTURED
+
+            def extract(self, subject, current_filing):
+                return batch
+
+        result = GapResolver().resolve(
+            _subject(), filing, ("revenue",), (Stage(),)
+        )
+        self.assertEqual(
+            {item.fact.end_date for item in result.candidates},
+            {"2025-12-31", "2024-12-31"},
+        )
 
     def test_gap_resolver_records_failure_then_falls_back_and_honors_cancel(self):
         filing = _filing("gap-2", "2022-12-31", "Fixture")
@@ -868,6 +983,28 @@ class FinancialFactCompilerTests(unittest.TestCase):
         )
         self.assertTrue(cancelled.cancelled)
         self.assertEqual(calls, [])
+
+    def test_gap_resolver_preserves_unverified_source_only_evidence(self):
+        filing = _filing("gap-observation", "2025-12-31", "Fixture")
+        observation = EvidenceRef(
+            "observation:abc123", filing.document_id, filing.source_url,
+            "Unverified visual observation (not used in calculations): Segment margin",
+            "page:17", "Displayed value: 24.6%; Source transcription: Segment margin 24.6%",
+            filing.filed_at, filing.content_hash,
+        )
+
+        class Vision:
+            name = "vision-fallback"
+            stage_kind = GapStageKind.MINERU
+
+            def extract(self, subject, current):
+                return CandidateBatch(current, (), (observation,), ("VISION_NO_CANDIDATES",))
+
+        result = GapResolver().resolve(
+            _subject(), filing, ("revenue",), (Vision(),), user_authorized=True,
+        )
+        self.assertEqual(result.candidates, ())
+        self.assertEqual([item.evidence_id for item in result.evidence], ["observation:abc123"])
 
     def test_compiler_routes_missing_concepts_through_ordered_gap_stage(self):
         filing = _filing("gap-compile", "2022-12-31", "Fixture")
@@ -980,7 +1117,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
             def collect_candidate_batches(self, subject, filings, **kwargs):
                 structured = CandidateBatch(filing, candidates[:2])
                 pdf = CandidateBatch(filing, candidates[2:])
-                return SimpleNamespace(
+                return FinancialCandidateCollection(
                     manifests=(),
                     batches_by_document={filing.document_id: (structured, pdf)},
                     evidence=(),
@@ -1027,7 +1164,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
         class Collector:
             def collect_candidate_batches(self, subject, filings, **kwargs):
-                return SimpleNamespace(
+                return FinancialCandidateCollection(
                     manifests=(),
                     batches_by_document={
                         filing.document_id: (
@@ -1043,10 +1180,11 @@ class FinancialFactCompilerTests(unittest.TestCase):
             _subject(), [filing], Collector(), reporting_currency="CNY"
         )
 
-        self.assertFalse(dataset.allow_ai)
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
         self.assertIn("interim_comparator_missing", dataset.diagnostics)
         self.assertEqual(dataset.coverage["target_fiscal_period"], "Q1")
         self.assertEqual({fact.fiscal_period for fact in dataset.research_facts}, {"Q1"})
+        self.assertFalse(dataset.capabilities["interim_comparison"])
 
     def test_compile_from_ingestion_validates_vision_before_optional_stage(self):
         filing = _filing("vision-auth-1", "2022-12-31", "Fixture")
@@ -1054,7 +1192,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
         class Collector:
             def collect_candidate_batches(self, subject, filings, **kwargs):
-                return SimpleNamespace(
+                return FinancialCandidateCollection(
                     manifests=(),
                     batches_by_document={
                         filing.document_id: (
@@ -1070,18 +1208,21 @@ class FinancialFactCompilerTests(unittest.TestCase):
             def extract(self, *args, **kwargs):
                 raise AssertionError("vision adapter must not run before config validation")
 
-        with self.assertRaises(VisionAdapterError) as raised:
-            FinancialFactCompiler().compile_from_ingestion(
-                _subject(),
-                [filing],
-                Collector(),
-                vision_fallback=Adapter(),
-                vision_config=VisionFallbackConfig(
-                    enabled=True, consent=True, configured_model_id="test-model"
-                ),
-                reporting_currency="CNY",
-            )
-        self.assertEqual(raised.exception.code, "VISION_UPLOAD_APPROVAL_REQUIRED")
+        dataset = FinancialFactCompiler().compile_from_ingestion(
+            _subject(),
+            [filing],
+            Collector(),
+            vision_fallback=Adapter(),
+            vision_config=VisionFallbackConfig(
+                enabled=True, consent=True, configured_model_id="test-model"
+            ),
+            reporting_currency="CNY",
+        )
+        self.assertIn("VISION_UPLOAD_APPROVAL_REQUIRED", dataset.diagnostics)
+        self.assertIn(
+            candidates[0].fact.fact_id,
+            {fact.fact_id for fact in (*dataset.resolved_facts, *dataset.quarantined_facts)},
+        )
 
     def test_compile_from_ingestion_exposes_explicit_same_year_gap_stage(self):
         filing = _filing("same-year-1", "2022-12-31", "Fixture")
@@ -1090,7 +1231,7 @@ class FinancialFactCompilerTests(unittest.TestCase):
 
         class Collector:
             def collect_candidate_batches(self, subject, filings, **kwargs):
-                return SimpleNamespace(
+                return FinancialCandidateCollection(
                     manifests=(),
                     batches_by_document={
                         filing.document_id: (
@@ -1120,6 +1261,83 @@ class FinancialFactCompilerTests(unittest.TestCase):
         )
         self.assertTrue(dataset.allow_ai)
         self.assertEqual(calls, ["same-year"])
+
+    def test_incidental_non_period_end_facts_do_not_block_compiler_allow_ai(self):
+        filing = replace(
+            _filing("aapl-2024-10k", "2024-09-28", "Apple 2024 Form 10-K"),
+            filed_at="2024-10-31",
+        )
+        core_candidates = _facts(filing, net_income=93_736_000_000.0)
+        incidental_fact = FinancialFact(
+            fact_id="fact:shares-outstanding:2024",
+            company_cik=filing.company_cik,
+            concept="shares_outstanding",
+            reported_concept="EntityCommonStockSharesOutstanding",
+            value=15_115_823_000.0,
+            unit="shares",
+            fiscal_year=2024,
+            fiscal_period="FY",
+            form_type="10-K",
+            start_date=None,
+            end_date="2024-10-18",
+            filed_at=filing.filed_at,
+            accession_number=filing.accession_number,
+            source_url=filing.source_url,
+            scope="consolidated",
+            currency="",
+            unit_scale=1.0,
+            unit_provenance="structured_normalized",
+            source_document=filing.primary_document,
+            raw_text="EntityCommonStockSharesOutstanding 15115823000 shares",
+            parser_version="sec-companyfacts-v1",
+        )
+        incidental_candidate = FactCandidate(
+            incidental_fact,
+            (EvidenceRef("ev:shares", filing.document_id, filing.source_url, "10-K", "page:1", "EntityCommonStockSharesOutstanding 15115823000 shares", filing.filed_at, filing.content_hash),),
+            "sec",
+        )
+        dataset = self._compile(filing, (*core_candidates, incidental_candidate))
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
+        self.assertEqual(dataset.status, "VERIFIED")
+        self.assertNotIn("compiler_quality_gate_failed", dataset.diagnostics)
+        self.assertEqual(
+            {item.identity[1] for item in dataset.research_validations},
+            {filing.period_end},
+        )
+        shares = [
+            item for item in dataset.resolved_facts
+            if item.concept == "shares_outstanding"
+        ]
+        self.assertTrue(shares, (dataset.validations, dataset.quarantined_facts))
+        self.assertTrue(all(item.usage_status == "audit_only" for item in shares))
+
+    def test_cross_issuer_candidate_is_quarantined_without_blocking_matching_facts(self):
+        filing = _filing("identity-mismatch", "2022-12-31", "Tencent 2022 Annual Report")
+        foreign = FinancialFact(
+            "foreign:shares", "0000320193", "shares_outstanding",
+            "EntityCommonStockSharesOutstanding", 15_115_823_000.0, "shares",
+            2022, "FY", "10-K", None, "2022-10-28", "2022-10-31",
+            filing.accession_number, filing.source_url, scope="consolidated",
+            raw_text="EntityCommonStockSharesOutstanding 15115823000 shares",
+            parser_version="sec-companyfacts-v1",
+        )
+        evidence = EvidenceRef(
+            "fact:foreign:shares", filing.document_id, filing.source_url,
+            "10-K", "page:1", foreign.raw_text, filing.filed_at, filing.content_hash,
+        )
+        dataset = self._compile(
+            filing,
+            (*_facts(filing, net_income=188_243_000_000.0),
+             FactCandidate(foreign, (evidence,), "sec")),
+        )
+        self.assertTrue(dataset.allow_ai, dataset.diagnostics)
+        self.assertNotIn("foreign:shares", {fact.fact_id for fact in dataset.resolved_facts})
+        rejected = {fact.fact_id: fact for fact in dataset.quarantined_facts}
+        self.assertIn("foreign:shares", rejected)
+        self.assertEqual(rejected["foreign:shares"].usage_status, "quarantined")
+        self.assertTrue(any(
+            "issuer_identity_mismatch" in item.issues for item in dataset.validations
+        ))
 
 
 if __name__ == "__main__":

@@ -172,6 +172,10 @@ class FinancialAdmission:
         source_document_count = sum(
             1 for item in selected_filings
             if getattr(item, "accession_number", "") and getattr(item, "source_url", "")
+            and not any(str(message).startswith(item.document_id + ":")
+                        and any(marker in str(message).casefold()
+                                for marker in _SOURCE_INTEGRITY_DIAGNOSTICS)
+                        for message in diagnostics)
         )
         readiness = _research_readiness(
             capabilities, profile, facts, diagnostics, source_document_count,
@@ -236,7 +240,10 @@ _HARD_BLOCK_DIAGNOSTICS = (
     "same_filing_comparator_identity_mismatch", "same_filing_restatement_conflict",
     "stale_financial_parser_contract",
 )
-_GLOBAL_BLOCK_DIAGNOSTICS = ("identity_conflict", "content_hash_mismatch", "tampered")
+_SOURCE_INTEGRITY_DIAGNOSTICS = ("identity_conflict", "content_hash_mismatch", "tampered")
+# A failed source is already isolated by cell admission. Only an explicitly
+# run/snapshot-wide identity failure may revoke unrelated admitted evidence.
+_GLOBAL_BLOCK_DIAGNOSTICS = ("research_identity_conflict", "snapshot_identity_conflict")
 
 
 def _research_readiness(
@@ -257,9 +264,14 @@ def _research_readiness(
         item for item in diagnostics
         if any(marker in item.casefold() for marker in _GLOBAL_BLOCK_DIAGNOSTICS)
     )
-    if global_hard:
+    all_evidence_untrusted = bool(
+        hard and not has_financial_view and not source_document_count
+        and any(any(marker in item.casefold() for marker in _SOURCE_INTEGRITY_DIAGNOSTICS)
+                for item in hard)
+    )
+    if global_hard or all_evidence_untrusted:
         return ResearchReadiness(
-            ReadinessLevel.BLOCKED, capability_states, global_hard,
+            ReadinessLevel.BLOCKED, capability_states, global_hard or hard,
             ("repair_or_replace_conflicting_official_evidence",),
             source_document_count,
         )

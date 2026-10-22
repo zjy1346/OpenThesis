@@ -8,13 +8,9 @@ from types import SimpleNamespace
 import unittest
 
 from openthesis.domain import Company, EvidenceRef, FilingDocument, FinancialFact
-from openthesis.financial_compiler import (
-    CandidateBatch,
-    CompilerPolicy,
-    FactCandidate,
-    FinancialFactCompiler,
-    InMemoryFactExtractor,
-)
+from openthesis.financial_contracts import (CandidateBatch, FactCandidate)
+from openthesis.financial_pipeline import (CollectionPolicy as CompilerPolicy, FinancialCandidatePipeline as FinancialFactCompiler)
+from openthesis.financial_sources import (InMemoryFactExtractor)
 
 
 ROOT = Path(__file__).parent / "fixtures"

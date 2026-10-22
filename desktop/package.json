@@ -1,7 +1,7 @@
 {
   "name": "openthesis-desktop",
   "private": true,
-  "version": "3.0.4",
+  "version": "3.1.4",
   "type": "module",
   "packageManager": "npm@11.12.1",
   "scripts": {

@@ -15,6 +15,7 @@ import remarkGfm from "remark-gfm";
 import { exportFinancialDiagnostics, exportResearchReport, getFinancialDiagnostics, getResearchReport, listConfiguredModels } from "../../backend";
 import type { ConfiguredModelSummary, ModelSelection, RecoveryStageTarget, ResearchReport } from "../../types";
 import { modelEligibility } from "../../modelEligibility";
+import { BudgetGapApproval } from "../research/BudgetGapApproval";
 
 type ReportCopy = {
   report: string;
@@ -75,6 +76,8 @@ type ReportCopy = {
   retryFinancialsSucceeded: string;
   retryFinancialsFailed: string;
   financialRetryPartial: string;
+  financialPartialResearchAvailable: string;
+  financialMetricLabels: Record<string, string>;
   financialReportRefreshFailed: string;
   refreshFinancialReport: string;
   refreshingFinancialReport: string;
@@ -86,6 +89,7 @@ type ReportCopy = {
   financialStageProjection: string;
   financialStageRefresh: string;
   financialStageDone: string;
+  financialStagePartial: string;
   financialStageFailed: string;
   financialStagePending: string;
   rebuildFinancials: string;
@@ -152,7 +156,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRevalidateSaved, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string, confirmNewAttempt?: boolean) => Promise<void>; onRevalidateSaved?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void }) {
+export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRevalidateSaved, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud, onApproveBudgetGaps, suppressResearchActions = false }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string, confirmNewAttempt?: boolean) => Promise<void>; onRevalidateSaved?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void; onApproveBudgetGaps?: (runId: string, planDigest: string, gapIds: string[]) => Promise<void>; suppressResearchActions?: boolean }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -219,7 +223,10 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
     ...recoveryCases.filter((item) => item.status !== "resolved").map((item) => item.period || item.accession_number),
     ...(displayedReport.financial_status?.missing_periods ?? []),
   ].filter(Boolean)));
-  const failedFields = Array.from(new Set(recoveryCases.flatMap((item) => item.fields ?? []))).filter(Boolean);
+  const failedFields = Array.from(new Set([
+    ...recoveryCases.flatMap((item) => item.fields ?? []),
+    ...(financialOperation?.scoped_issues ?? []).flatMap((item) => item.concepts),
+  ])).filter(Boolean).map((field) => copy.financialMetricLabels[field] ?? field);
   const stableError = (value: string): string => {
     const code = value.toUpperCase();
     if (code.includes("VISION_MODEL_REQUIRED") || code.includes("VISION_UNAUTHORIZED") || code.includes("NEEDS_CONFIGURATION")) return copy.financialErrorConfiguration;
@@ -254,6 +261,8 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
   }[stage] ?? 0);
   const stageText = (rank: number): string => {
     if (financialRefreshFailed && rank === 4) return copy.financialStageFailed;
+    if (financialRetryPartial && financialOperation?.research_can_continue && rank === 2) return copy.financialStagePartial;
+    if ((financialOperation?.updated_artifacts?.length ?? 0) > 0 && rank >= 3) return copy.financialStageDone;
     if (financialOperation?.status === "succeeded" || stageRank(financialStage) >= rank) return copy.financialStageDone;
     if (retryState === "retrying" && stageRank(financialStage) === rank) return copy.financialStagePending;
     return copy.financialStagePending;
@@ -530,6 +539,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
       configured_model_id: configured.configured_model_id,
       connection_id: configured.connection_id,
       configuration_version: configured.configuration_version,
+      context_window_hint: configured.context_window_hint,
       role: "primary",
     };
     setRetryTarget(target);
@@ -591,6 +601,10 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
           </>}
         </div>
       </header>
+      {!suppressResearchActions && <BudgetGapApproval runId={displayedReport.run_id} callPlan={displayedReport.call_plan}
+        language={displayedReport.report_language}
+        onApprove={onApproveBudgetGaps ? (planDigest, gapIds) => onApproveBudgetGaps(displayedReport.run_id, planDigest, gapIds) : undefined}
+        disabled={retryState === "retrying"} />}
       {noSubstantiveReport ? (
         <section className="report-no-content" role="alert">
           <h3>{reportStatus?.text ?? copy.reportReadinessActionRequired}</h3>
@@ -601,7 +615,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
         <span>{reportStatus.text}</span>
         {readinessDetails}
       </div>}
-      {(recoveryAvailable || (onRevalidateSaved && recoveryPlan?.operations?.some((item) => item.code === "revalidate_saved_content"))) && (
+      {!suppressResearchActions && (recoveryAvailable || (onRevalidateSaved && recoveryPlan?.operations?.some((item) => item.code === "revalidate_saved_content"))) && (
         <section className="synthesis-capacity-recovery" aria-label={copy.recoveryTitle}>
           <div className="synthesis-capacity-explanation">
             <strong>{contextCapacityExceeded ? copy.synthesisCapacityTitle : recoveryAvailable ? copy.recoveryTitle : copy.revalidateSaved}</strong>
@@ -643,7 +657,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
           ) : null}
         </section>
       )}
-      {!recoveryAvailable && contextCapacityExceeded && onRetrySynthesis && (
+      {!suppressResearchActions && !recoveryAvailable && contextCapacityExceeded && onRetrySynthesis && (
         <section className="synthesis-capacity-recovery" aria-label={copy.synthesisCapacityTitle}>
           <div className="synthesis-capacity-explanation">
             <strong>{copy.synthesisCapacityTitle}</strong>
@@ -659,7 +673,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
               </div>
               <button type="button" className="synthesis-capacity-action-button report-retry-button" disabled={!selectedCapacityModelId || retryState === "retrying"} onClick={() => {
                 const model = capacityModels.find((item) => item.configured_model_id === selectedCapacityModelId);
-                if (model) void retryStage("synthesis", { configured_model_id: model.configured_model_id, connection_id: model.connection_id, configuration_version: model.configuration_version, role: "primary" });
+                if (model) void retryStage("synthesis", { configured_model_id: model.configured_model_id, connection_id: model.connection_id, configuration_version: model.configuration_version, context_window_hint: model.context_window_hint, role: "primary" });
               }}><RefreshCw size={16} /><span>{copy.synthesisCapacityRetry}</span></button>
             </div>
           ) : !capacityModelsLoading ? (
@@ -682,6 +696,9 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
               <span>{copy.financialAttempts.replace("{count}", String(displayedReport.financial_status.attempt_count))}{displayedReport.financial_status.last_stage ? ` · ${displayedReport.financial_status.last_stage}` : ""}</span>
             )}
             <small>{copy.financialZeroToken}</small>
+            {financialRetryPartial && financialOperation?.research_can_continue && (
+              <small>{copy.financialPartialResearchAvailable}</small>
+            )}
             {displayedReport.financial_status.snapshot_stale && (
               <small className="financial-snapshot-warning">{copy.financialSnapshotStale}</small>
             )}

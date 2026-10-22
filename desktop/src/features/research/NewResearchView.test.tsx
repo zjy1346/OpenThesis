@@ -68,6 +68,32 @@ describe("NewResearch configured models", () => {
     vi.mocked(captureMarketSnapshot).mockResolvedValue({ status: "UNAVAILABLE", error_code: "QUOTE_UNAVAILABLE" });
   });
 
+  it("receives packs after minimal bootstrap without resetting the user's selection", async () => {
+    const props = { bootstrap, copy: COPY.en, onOpenModelCenter: vi.fn(),
+      onSavePreferences: vi.fn().mockResolvedValue(bootstrap.preferences), onStart: vi.fn() };
+    const view = render(<NewResearchView {...props} />);
+    const pack = { pack_id: "pack-one", name: "Full research", version: "1", content_hash: "a" };
+    const other = { ...pack, pack_id: "pack-two", name: "Second research" };
+    view.rerender(<NewResearchView {...props} bootstrap={{ ...bootstrap, research_packs: [pack, other] }} />);
+    const selection = screen.getByRole("combobox", { name: COPY.en.researchPack });
+    await waitFor(() => expect(selection).toHaveValue("pack-one"));
+    fireEvent.change(selection, { target: { value: "pack-two" } });
+    view.rerender(<NewResearchView {...props} bootstrap={{ ...bootstrap, research_packs: [pack, other] }} />);
+    expect(selection).toHaveValue("pack-two");
+  });
+
+  it.each(["zh-CN", "zh-Hant", "en"] as const)("keeps the cache and token tradeoff visible and accessible in %s", async (locale) => {
+    const copy = COPY[locale];
+    render(<NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+    const toggle = await screen.findByRole("checkbox", { name: copy.parallelAgents });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText(copy.parallelAgentsHint)).toBeVisible();
+    expect(toggle).toHaveAccessibleDescription(copy.parallelAgentsHint);
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(toggle).toHaveAccessibleDescription(copy.parallelAgentsHint);
+  });
+
   it("sends a request id and ignores a search result after the query changes", async () => {
     let resolveSearch!: (value: Awaited<ReturnType<typeof searchCompanies>>) => void;
     vi.mocked(searchCompanies).mockImplementation(() => new Promise((resolve) => { resolveSearch = resolve; }));
@@ -307,7 +333,7 @@ describe("NewResearch configured models", () => {
 
     await waitFor(() => expect(onStart).toHaveBeenCalled());
     const request = onStart.mock.calls[0][0];
-    expect(request.model).toEqual({ configured_model_id: "primary-model", connection_id: "primary-connection", configuration_version: 4, role: "primary" });
+    expect(request.model).toEqual({ configured_model_id: "primary-model", connection_id: "primary-connection", configuration_version: 4, role: "primary", context_window_hint: null });
     expect(request.vision_fallback.model).toEqual({ configured_model_id: "vision-model", connection_id: "vision-connection", configuration_version: 2, role: "vision" });
     expect(request.vision_fallback.provider).toBe("configured_model");
     expect(request.vision_fallback.approval_mode).toBe("review_each_plan");

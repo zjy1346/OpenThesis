@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -19,6 +20,8 @@ from ..providers import ProviderError
 from ..resilience.contracts import RecoveryLimits, candidate_json, candidate_document_json, digest, MAX_CANDIDATE_JSON_BYTES
 from .responses import ModelResponse, RESPONSE_SCHEMA, MAX_RESPONSE_BYTES, response_record, restore_response
 from .manual_attempts import SCHEMA_STATEMENTS as MANUAL_SCHEMA, prepare_grant, consume_grant
+from .assertion_cache import SCHEMA_STATEMENTS as ASSERTION_SCHEMA
+from .call_budget import SCHEMA_STATEMENTS as CALL_BUDGET_SCHEMA
 from .model_format import (
     ModelFormatRecovery, check_unknown_format_submission, proven_format_rejection,
     proven_rate_rejection, rejection_retry_after,
@@ -26,6 +29,11 @@ from .model_format import (
 
 
 SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS model_wire_diagnostics (
+        request_id TEXT NOT NULL, attempt_id TEXT NOT NULL, run_id TEXT NOT NULL,
+        stage_id TEXT NOT NULL, purpose TEXT NOT NULL, diagnostics_json TEXT NOT NULL,
+        created_at REAL NOT NULL, PRIMARY KEY(request_id,attempt_id),
+        FOREIGN KEY(run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE)""",
     """CREATE TABLE IF NOT EXISTS model_stage_request_heads (
         run_id TEXT NOT NULL, stage_id TEXT NOT NULL, generation INTEGER NOT NULL,
         identity_digest TEXT NOT NULL, PRIMARY KEY(run_id,stage_id),
@@ -48,7 +56,12 @@ SCHEMA_STATEMENTS = (
         request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, content TEXT NOT NULL,
         content_digest TEXT NOT NULL, PRIMARY KEY(request_id,ordinal),
         FOREIGN KEY(request_id) REFERENCES model_request_journal(request_id) ON DELETE CASCADE)""",
-) + MANUAL_SCHEMA
+    """CREATE TABLE IF NOT EXISTS model_result_reuse (
+        run_id TEXT NOT NULL, stage_id TEXT NOT NULL, generation INTEGER NOT NULL,
+        source_request_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+        PRIMARY KEY(run_id,stage_id,generation,source_request_id),
+        FOREIGN KEY(run_id) REFERENCES research_runs(run_id) ON DELETE CASCADE)""",
+) + MANUAL_SCHEMA + ASSERTION_SCHEMA + CALL_BUDGET_SCHEMA
 
 
 class ModelRequestJournal:
@@ -70,13 +83,15 @@ class ModelRequestJournal:
         self.repair_limits = repair_limits or RecoveryLimits(calls=1, transient_retries=0)
         self.recovery_sleeper = recovery_sleeper
         self.manual_authorization_id = manual_authorization_id
+        self.budget_only = False
         self._local = threading.local()
         self._stage_configurations: dict[str, str] = {}
         self.candidate_read_issues: list[dict[str, str]] = []
 
     def prepare(self, registry, material_digest: str, invalidated: tuple[str, ...] = (), *,
                 stage_configurations: dict[str, str] | None = None,
-                local_only: bool = False, stage_material_digests: dict[str, str] | None = None) -> dict[str, int]:
+                local_only: bool = False, stage_material_digests: dict[str, str] | None = None,
+                planned_input_tokens: int | None = None, planned_requests=None) -> dict[str, int]:
         """Freeze graph generations before submitting any external request."""
         configurations = dict(stage_configurations or {})
         material_digests = dict(stage_material_digests or {})
@@ -89,6 +104,8 @@ class ModelRequestJournal:
         generations = {}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .call_budget import prepare_plan
+            prepare_plan(db, self.run_id, [spec.stage_id for spec in registry.stages], planned_input_tokens, request_plan=planned_requests)
             # The service preflight is advisory: another worker can acquire a
             # wire lease between that read and this transaction. Local reuse
             # must never invalidate the head of a still-running paid request.
@@ -108,6 +125,8 @@ class ModelRequestJournal:
                                    "configuration": configurations.get(spec.stage_id, self.configuration_fingerprint)})
                 prior = db.execute("SELECT * FROM model_stage_request_heads WHERE run_id=? AND stage_id=?",
                                    (self.run_id, spec.stage_id)).fetchone()
+                if self.budget_only and (not prior or prior["identity_digest"] != identity or spec.stage_id in invalid):
+                    raise ProviderError("Budget approval does not authorize changed inputs", code="MODEL_BUDGET_RESUME_INPUT_CHANGED")
                 generation = int(prior["generation"]) if prior else 1
                 if prior and (identity != prior["identity_digest"] or spec.stage_id in invalid):
                     generation += 1
@@ -132,6 +151,185 @@ class ModelRequestJournal:
 
     def capture_scope(self):
         return getattr(self._local, "scope", None)
+
+    def transport_context(self):
+        return getattr(self._local, "transport", None)
+
+    def record_wire_diagnostics(self, system_prompt, user_prompt, *, provider, purpose, target_paths=()):
+        """Safe physical-attempt accounting; no prompt, key or reasoning body."""
+        context = self.transport_context()
+        if context is None:
+            return
+        sizes = {"system": len(system_prompt.encode("utf-8")), "user": len(user_prompt.encode("utf-8"))}
+        components = {}
+        try:
+            raw = json.loads(user_prompt)
+            if isinstance(raw, dict):
+                for key in ("material_registry", "research_context", "prior_artifacts", "claim_contract",
+                            "task_instructions", "assigned_research_obligations", "assertions", "material"):
+                    if key in raw:
+                        components[key] = len(json.dumps(raw[key], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        except (ValueError, TypeError):
+            pass
+        total = sum(sizes.values())
+        config = getattr(provider, "config", None)
+        from .model import provider_context_capability
+        capability = provider_context_capability(provider)
+        from .input_budget import input_measurement
+        measured = input_measurement(provider, system_prompt, user_prompt)
+        diagnostic = {"schema": "model-wire-diagnostics-v1", "generation": context["generation"],
+            "parent_request_id": context["request_id"].partition(":repair:")[0],
+            "target_paths": list(target_paths),
+            "trigger_reason": "targeted_gap_repair" if target_paths else purpose,
+            "input_digest": digest({"system": system_prompt, "user": user_prompt}),
+            "configured_model_id": getattr(config, "configured_model_id", ""),
+            "configuration_version": getattr(config, "configuration_version", None),
+            "endpoint_category": "configured_gateway" if config is not None else "injected_provider",
+            "input_bytes": total, "message_bytes": sizes, "component_bytes": components,
+            "input_tokens_estimate": measured["tokens"],
+            "token_counting_method": measured["method"],
+            "tokenizer": measured["tokenizer"],
+            "context_tokens_hint": getattr(provider, "context_window_tokens", None),
+            "reserved_output_tokens": capability.reserved_output_tokens,
+            "reserved_repair_tokens": capability.reserved_repair_tokens,
+            "wire_state": "send_intent_recorded", "usage": None}
+        try:
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if self.budget_only and not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='consumed'",
+                        (self.run_id, context["request_id"])).fetchone():
+                    raise ProviderError("Only approved missing work may continue", code="MODEL_BUDGET_RESUME_SCOPE_CHANGED")
+                from .call_budget import reserve
+                reserve(db, self.run_id, context, purpose=purpose, input_estimate=measured["tokens"],
+                        output_limit=capability.reserved_output_tokens,
+                        trigger="targeted_repair" if purpose.endswith("repair") or purpose == "section_delivery" else purpose)
+                db.execute("""INSERT INTO model_wire_diagnostics VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(request_id,attempt_id) DO NOTHING""",
+                    (context["request_id"], context["attempt_id"], self.run_id, context["stage_id"], purpose,
+                     json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, allow_nan=False), self.clock()))
+        except ProviderError as error:
+            from .call_budget import record_gap
+            with self.store.connect() as db:
+                record_gap(db, self.run_id, context, purpose, measured["tokens"], capability.reserved_output_tokens, error.code)
+            raise
+
+    def finish_wire_diagnostics(self, response=None, error=None):
+        context = self.transport_context()
+        if context is None:
+            return
+        metadata = response.receipt.get("metadata", {}) if isinstance(response, ModelResponse) else {}
+        with self.store.connect() as db:
+            row = db.execute("SELECT diagnostics_json,created_at FROM model_wire_diagnostics WHERE request_id=? AND attempt_id=?",
+                             (context["request_id"], context["attempt_id"])).fetchone()
+            if row is None:
+                return
+            diagnostic = json.loads(row["diagnostics_json"])
+            code = getattr(error, "code", "")
+            status = getattr(error, "http_status", None)
+            diagnostic.update({"elapsed_seconds": max(0.0, self.clock() - row["created_at"]),
+                "wire_state": "response_received" if error is None else
+                "not_sent" if getattr(self._local, "dispatch_started", False) is False else
+                "rejected" if status in {400, 401, 403, 404, 413, 415, 422, 429}
+                or code in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE", "MODEL_CALL_CANCELLED_BEFORE_SEND"}
+                else "local_processing_failed" if getattr(error, "response_received", False) else "remote_unknown",
+                "error_code": code if isinstance(code, str) and re.fullmatch(r"MODEL_[A-Z0-9_]{1,80}", code) else "",
+                "http_status": status if type(status) is int else None,
+                "usage": {key: metadata.get(key) if type(metadata.get(key)) is int and metadata[key] >= 0 else None
+                    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens",
+                                "reasoning_tokens", "answer_tokens")}})
+            actual_input = diagnostic["usage"]["input_tokens"]
+            budget = metadata.get("output_budget_tokens")
+            diagnostic["applied_output_budget_tokens"] = budget if type(budget) is int and budget > 0 else None
+            if actual_input:
+                diagnostic["observed_bytes_per_input_token"] = diagnostic["input_bytes"] / actual_input
+            for key in ("model_id", "configured_model_id", "provider_id", "endpoint_host", "finish_reason",
+                        "output_budget_wire_field", "output_budget_semantics"):
+                if isinstance(metadata.get(key), str):
+                    diagnostic[key] = metadata[key][:256]
+            db.execute("UPDATE model_wire_diagnostics SET diagnostics_json=? WHERE request_id=? AND attempt_id=?",
+                       (json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, allow_nan=False),
+                        context["request_id"], context["attempt_id"]))
+            from .call_budget import settle
+            settle(db, context, diagnostic["usage"], "not_sent" if code == "MODEL_CALL_CANCELLED_BEFORE_SEND"
+                   else diagnostic["wire_state"])
+
+    def hydrate_input_budget(self, provider) -> None:
+        """Restore only safe received usage of this exact model configuration."""
+        observe = getattr(provider, "observe_input_usage", None)
+        config = getattr(provider, "config", None)
+        if not callable(observe) or config is None:
+            return
+        try:
+            with self.store.connect() as db:
+                rows = db.execute("SELECT diagnostics_json FROM model_wire_diagnostics ORDER BY created_at DESC LIMIT 128").fetchall()
+            for row in reversed(rows):
+                item = json.loads(row["diagnostics_json"])
+                if (item.get("configured_model_id") != config.configured_model_id
+                        or item.get("configuration_version") != config.configuration_version
+                        or item.get("wire_state") != "response_received"):
+                    continue
+                usage = item.get("usage") or {}
+                observe(input_bytes=item.get("input_bytes"), input_tokens=usage.get("input_tokens"),
+                        provider_id=item.get("provider_id"), model_id=item.get("model_id"),
+                        endpoint_host=item.get("endpoint_host"))
+        except Exception:
+            # Old/absent observations only remove an optimization, not results.
+            return
+
+    @contextmanager
+    def transport_binding(self, request_id: str, scope, attempt_id: str, *, before_dispatch=None):
+        context = {"protocol": "model-events-v1", "request_id": request_id, "run_id": self.run_id,
+                   "stage_id": scope[0], "generation": scope[1], "attempt_id": attempt_id}
+        previous = self.transport_context()
+        previous_dispatch = getattr(self._local, "before_dispatch", None)
+        previous_started = getattr(self._local, "dispatch_started", False)
+        self._local.transport = context
+        self._local.before_dispatch = before_dispatch
+        self._local.dispatch_started = False
+        self.store.model_activity.begin(context)
+        try:
+            yield
+        except BaseException as error:
+            code = getattr(error, "code", "")
+            state = ("cancelled" if code in {"MODEL_CANCELLED", "MODEL_CALL_CANCELLED", "MODEL_CALL_CANCELLED_BEFORE_SEND"} or self.cancel_check() else
+                     "rate_limited" if proven_rate_rejection(error) else
+                     "rejected" if getattr(error, "http_status", None) in {400, 401, 403, 413, 422}
+                     or code in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE", "MODEL_QUOTA_EXHAUSTED"} else
+                     "local_failure" if getattr(error, "response_received", False) else "remote_unknown")
+            self.store.model_activity.update(context, {"state": state})
+            raise
+        else:
+            self.store.model_activity.update(context, {"state": "verifying"})
+        finally:
+            self._local.transport = previous
+            self._local.before_dispatch = previous_dispatch
+            self._local.dispatch_started = previous_started
+
+    def before_dispatch(self):
+        callback = getattr(self._local, "before_dispatch", None)
+        if callback is not None:
+            callback()
+            self._local.before_dispatch = None
+        self._local.dispatch_started = True
+
+    def request_observation(self, request, stage_id):
+        """Read persisted transport evidence, never infer submission from text."""
+        with self.store.connect() as db:
+            row = db.execute("""SELECT request_id,state,response_received,diagnostic_code FROM model_request_journal
+                WHERE run_id=? AND stage_id=? AND input_digest=? AND configuration_fingerprint=?
+                ORDER BY updated_at DESC LIMIT 1""", (self.run_id, stage_id, request.input_digest,
+                self.stage_configuration(stage_id))).fetchone()
+            if row is not None:
+                from .call_budget import BUDGET_GAP_CODES
+                if (row["state"] == "rejected" and row["diagnostic_code"] in BUDGET_GAP_CODES and not row["response_received"]
+                        and not db.execute("SELECT 1 FROM model_wire_diagnostics WHERE request_id=? LIMIT 1", (row["request_id"],)).fetchone()):
+                    return {"submission_state": "not_submitted", "journal_state": "budget_blocked"}
+        if row is None:
+            return {"submission_state": "not_submitted", "journal_state": "absent"}
+        state = ("received" if row["response_received"] else "rejected" if row["state"] == "rejected"
+                 else "remote_unknown")
+        return {"submission_state": state, "journal_state": row["state"],
+                "journal_diagnostic_code": row["diagnostic_code"]}
 
     def saved_candidate(self, request, stage_id: str) -> dict | None:
         """Recover an exact received body without starting a remote intent.
@@ -223,7 +421,13 @@ class ModelRequestJournal:
             db.execute("BEGIN IMMEDIATE")
             self._check_generation(db, stage_id, generation)
             saved = db.execute("SELECT * FROM model_request_journal WHERE request_id=?", (request_id,)).fetchone()
-            if saved:
+            from .call_budget import BUDGET_GAP_CODES
+            budget_resume = bool(self.budget_only and saved and saved["state"] == "rejected"
+                and not saved["response_received"] and saved["diagnostic_code"] in BUDGET_GAP_CODES
+                and not db.execute("SELECT 1 FROM model_wire_diagnostics WHERE request_id=? LIMIT 1", (request_id,)).fetchone()
+                and db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='approved'",
+                    (self.run_id, request_id)).fetchone())
+            if saved and not budget_resume:
                 if saved["state"] == "candidate" or saved["state"] == "late_candidate" and self._recover_received(db, saved):
                     candidate = self._read_candidate(saved)
                     return deepcopy(candidate)
@@ -242,17 +446,42 @@ class ModelRequestJournal:
                     status = rate_proof["http_status"]
                 raise ProviderError("Saved request requires recovery", code=code, retryable=False,
                     http_status=status, retry_after_seconds=rate_proof["retry_after_seconds"] if rate_proof else None)
+            if self.budget_only and not budget_resume:
+                raise ProviderError("Only approved missing work may continue", code="MODEL_BUDGET_RESUME_SCOPE_CHANGED")
             # Changing model configuration cannot erase an unknown compensated
             # wire for this same physical prompt/stage. This read precedes I/O.
             supersedes_requests, supersedes_repairs = consume_grant(db,
-                self.manual_authorization_id if getattr(request, "purpose", "generation") == "generation" else "",
+                self.manual_authorization_id if getattr(request, "purpose", "generation") in {
+                    "generation", "material_coverage", "section_delivery"} else "",
                 self.run_id, stage_id, generation, self.configuration_fingerprint,
                 request.input_digest, request_id, now)
             self.check_unknown_submission(db, stage_id, request.input_digest, now,
                                           excluded_requests=supersedes_requests)
             check_unknown_format_submission(self.store, self.run_id, stage_id, request.input_digest, now,
                                             excluded_actions=supersedes_repairs)
-            db.execute("""INSERT INTO model_request_journal
+            if not self.manual_authorization_id:
+                # Host audit/parser bookkeeping can change a graph generation
+                # without changing a single physical prompt byte. Reuse only
+                # the exact same configured wire, after all unknown guards.
+                # This candidate still enters current source/business checks.
+                prior = db.execute("""SELECT * FROM model_request_journal WHERE run_id=? AND stage_id=?
+                    AND input_digest=? AND configuration_fingerprint=? AND state='candidate'
+                    AND response_received=1 ORDER BY updated_at DESC LIMIT 1""",
+                    (self.run_id, stage_id, request.input_digest, configuration)).fetchone()
+                if prior is not None:
+                    candidate = deepcopy(self._read_candidate(prior))
+                    db.execute("INSERT OR IGNORE INTO model_result_reuse VALUES(?,?,?,?,?)",
+                        (self.run_id, stage_id, generation, prior["request_id"], request.input_digest))
+                    return candidate
+            if budget_resume:
+                # No wire was sent. Keep the original denial in the gap audit;
+                # continue the same logical identity, not a new generation.
+                db.execute("UPDATE model_budget_gaps SET state='consumed' WHERE run_id=? AND request_id=? AND state='approved'",
+                    (self.run_id, request_id))
+                db.execute("UPDATE model_request_journal SET state='running',owner_id=?,lease_until=?,diagnostic_code='',updated_at=? WHERE request_id=?",
+                    (owner, now + max(1, self.timeout_seconds) + 15, now, request_id))
+            else:
+                db.execute("""INSERT INTO model_request_journal
                 (request_id,run_id,stage_id,generation,input_digest,configuration_fingerprint,
                  state,owner_id,lease_until,candidate_json,candidate_digest,diagnostic_code,created_at,updated_at,purpose)
                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -266,30 +495,35 @@ class ModelRequestJournal:
                        "repairs": supersedes_repairs}), request_id))
         # The transaction above is committed before the potentially paid call.
         try:
-            result = invoke()
+            with self.transport_binding(request_id, scope, owner):
+                result = invoke()
         except BaseException as exc:
             if getattr(exc, "response_received", False):
                 self._record_local_failure(request_id, owner, exc, getattr(exc, "safe_receipt", None))
                 raise
             code = getattr(exc, "code", "")
             format_rejection = proven_format_rejection(exc)
-            confirmed_rejection = format_rejection or code in {
+            confirmed_rejection = format_rejection or code.startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_")) or code in {
                 "MODEL_RATE_LIMITED", "MODEL_HTTP_429", "MODEL_CONTEXT_CAPACITY",
-                "MODEL_CONFIGURATION_ERROR", "MODEL_AUTHENTICATION_ERROR",
+                "MODEL_CONFIGURATION_ERROR", "MODEL_AUTHENTICATION_ERROR", "MODEL_UNAUTHORIZED", "MODEL_QUOTA_EXHAUSTED",
                 "MODEL_HTTP_400", "MODEL_HTTP_401", "MODEL_HTTP_403",
-            }
+                "MODEL_CALL_CANCELLED_BEFORE_SEND",
+                "MODEL_REQUEST_BODY_TOO_LARGE",
+            } or (isinstance(exc, ProviderError) and type(exc.http_status) is int
+                  and exc.http_status in {400, 401, 403, 404, 405, 413, 415, 422, 429})
             proof = ({"schema": "model-format-rejection-v1", "code": code,
                       "http_status": exc.http_status} if format_rejection else
                      {"schema": "model-rate-rejection-v1", "code": code, "http_status": 429,
                       "retry_after_seconds": rejection_retry_after(exc)} if proven_rate_rejection(exc) else None)
             with self.store.connect() as db:
+                receipt = self._store_partial(db, request_id, owner, getattr(exc, "partial_content", ""))
                 db.execute("""UPDATE model_request_journal SET state=?,diagnostic_code=?,updated_at=?,
-                    candidate_json=?,candidate_digest=?
+                    candidate_json=?,candidate_digest=?,receipt_json=COALESCE(?,receipt_json)
                     WHERE request_id=? AND owner_id=? AND state='running'""",
                            ("rejected" if confirmed_rejection else "unknown",
                             code if confirmed_rejection else "MODEL_SUBMISSION_UNKNOWN", self.clock(),
                             candidate_json(proof) if proof else None, digest(proof) if proof else None,
-                            request_id, owner))
+                            receipt, request_id, owner))
             raise
         # Receiving a response is a durable fact, independent of whether the
         # local Adapter/serializer/validator later succeeds. This commit occurs
@@ -339,10 +573,34 @@ class ModelRequestJournal:
             if updated is None or updated.rowcount != 1:
                 active = False
         if not active:
+            self.store.model_activity.update({"request_id": request_id, "attempt_id": owner},
+                {"state": "cancelled" if cancelled else "local_failure"})
             raise ProviderError("Model response is no longer current",
                                 code="MODEL_CANCELLED" if cancelled else "MODEL_REQUEST_EXPIRED"
                                 if expired else "MODEL_REQUEST_GENERATION_STALE")
+        self.store.model_activity.update({"request_id": request_id, "attempt_id": owner}, {"state": "saved"})
         return restore_response(record)
+
+    @staticmethod
+    def _store_partial(db, request_id, owner, text):
+        """Retain incomplete text without satisfying the unknown-wire guard."""
+        if not isinstance(text, str) or not text:
+            return None
+        from .responses import redact_response_text
+        safe, _issues = redact_response_text(text)
+        if len(safe.encode("utf-8")) > MAX_RESPONSE_BYTES:
+            return None
+        active = db.execute("SELECT 1 FROM model_request_journal WHERE request_id=? AND owner_id=? AND state='running'",
+                            (request_id, owner)).fetchone()
+        if not active:
+            return None
+        chunks = [safe[offset:offset + 64 * 1024] for offset in range(0, len(safe), 64 * 1024)]
+        db.execute("DELETE FROM model_response_chunks WHERE request_id=?", (request_id,))
+        db.executemany("INSERT INTO model_response_chunks VALUES(?,?,?,?)",
+            ((request_id, index, value, digest(value)) for index, value in enumerate(chunks)))
+        return candidate_json({"schema": "openthesis.model-partial.v1", "response_received": False,
+            "incomplete": True, "partial_bytes": len(safe.encode("utf-8")),
+            "partial_digest": digest(safe), "chunks": len(chunks)})
 
     def _record_local_failure(self, request_id, owner, error, receipt=None, trace_id="") -> str:
         known = {"MODEL_STAGE_CANDIDATE_INVALID", "MODEL_RESPONSE_ENVELOPE_INVALID",
@@ -366,6 +624,8 @@ class ModelRequestJournal:
                 (code, candidate_json(safe), trace_id, self.clock(), request_id, owner))
         if hasattr(error, "diagnostic_trace_id"):
             error.diagnostic_trace_id = trace_id
+        self.store.model_activity.update({"request_id": request_id, "attempt_id": owner},
+                                        {"state": "local_failure"})
         return code
 
     @staticmethod

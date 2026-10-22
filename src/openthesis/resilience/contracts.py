@@ -20,7 +20,9 @@ _SECRET_FIELD_NAMES = frozenset({
 })
 _USAGE_TOKEN_COUNT_FIELDS = frozenset({
     "prompttokens", "completiontokens", "totaltokens", "inputtokens", "outputtokens",
+    "cachereadinputtokens", "cachewriteinputtokens", "reasoningtokens", "answertokens",
 })
+_RECEIPT_TOKEN_COUNT_FIELDS = frozenset({"outputbudgettokens"})
 
 
 def canonical_json(value: Any) -> str:
@@ -74,24 +76,49 @@ def candidate_document_json(value: Any, *, max_bytes: int = 64 * 1024 * 1024) ->
     journal rows still use candidate_json's one MiB bound.
     """
 
-    def contains_secret_field(item: Any, parent: str = "") -> bool:
+    def contains_secret_field(item: Any, parent: str = "", *, typed_receipt_metadata: bool = False) -> bool:
         if isinstance(item, Mapping):
+            detached_receipt = getattr(item, "receipt", None)
+            mirrored_receipt = item.get("_response_receipt")
+            is_response_receipt = (item.get("schema") == "openthesis.model-response.v1"
+                                   and item.get("response_received") is True)
+            is_typed_model_response = (isinstance(detached_receipt, Mapping)
+                                       and detached_receipt.get("schema") == "openthesis.model-response.v1"
+                                       and detached_receipt.get("response_received") is True) or (
+                isinstance(mirrored_receipt, Mapping)
+                and mirrored_receipt.get("schema") == "openthesis.model-response.v1"
+                and mirrored_receipt.get("response_received") is True)
             for key, nested in item.items():
                 normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-                if normalized in _USAGE_TOKEN_COUNT_FIELDS or (parent == "usage" and normalized == "tokens"):
-                    if (isinstance(nested, bool) or not isinstance(nested, int)
-                            or nested < 0):
+                if normalized in _USAGE_TOKEN_COUNT_FIELDS | _RECEIPT_TOKEN_COUNT_FIELDS or (parent == "usage" and normalized == "tokens"):
+                    if (normalized in _RECEIPT_TOKEN_COUNT_FIELDS
+                            and not (typed_receipt_metadata or parent == "responsemeta")):
+                        return True
+                    if (nested is None and (typed_receipt_metadata or parent == "responsemeta")
+                            and normalized in _USAGE_TOKEN_COUNT_FIELDS | _RECEIPT_TOKEN_COUNT_FIELDS):
+                        continue
+                    if (isinstance(nested, bool) or not isinstance(nested, int) or nested < 0):
                         return True
                     continue
                 # Usage is a protocol object, not research prose. An unknown
                 # token counter here is not permission to persist credentials.
-                if parent == "usage" and "token" in normalized:
+                if parent in {"usage", "metadata", "responsemeta"} and "token" in normalized:
                     return True
-                if sensitive_candidate_field(str(key)) or contains_secret_field(nested, normalized):
+                # ModelResponse exposes a legacy _response_meta dictionary for
+                # callers, but its authoritative typed receipt is detached on
+                # the object. Permit unknown known-counter values only in that
+                # verified compatibility view (never in a generic user dict).
+                child_is_typed_metadata = ((is_response_receipt and normalized == "metadata")
+                    or (is_typed_model_response and normalized == "responsemeta"))
+                if (sensitive_candidate_field(str(key))
+                        or contains_secret_field(nested, normalized,
+                                                 typed_receipt_metadata=child_is_typed_metadata)):
                     return True
             return False
         if isinstance(item, (tuple, list)):
-            return any(contains_secret_field(nested, parent) for nested in item)
+            return any(contains_secret_field(nested, parent,
+                                             typed_receipt_metadata=typed_receipt_metadata)
+                       for nested in item)
         return False
 
     if contains_secret_field(value):

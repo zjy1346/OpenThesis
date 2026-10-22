@@ -449,6 +449,7 @@ def trusted_snapshot_for_artifact(artifact: dict[str, Any], *, evidence_records:
 
 def read_trusted_snapshots(artifacts: Any, *, run_id: str) -> tuple[dict[str, Any], ...]:
     """Return current source-bound snapshots without rendering or writes."""
+    from .research_section_validation import is_structural_content_path
     values = [row for row in artifacts if isinstance(row, dict) and row.get("run_id") == run_id]
     revoked = {tuple(item[key] for key in ("node_id", "source_artifact_id", "generation"))
                for record in read_content_invalidations(values, run_id=run_id)
@@ -523,6 +524,8 @@ def read_trusted_snapshots(artifacts: Any, *, run_id: str) -> tuple[dict[str, An
             for node in snapshot.get("nodes", ()):
                 if not isinstance(node, dict):
                     continue
+                if is_structural_content_path(str(node.get("source_path") or "")):
+                    continue
                 if tuple(node.get(key) for key in ("node_id", "source_artifact_id", "generation")) in revoked:
                     continue
                 position = (node.get("display_section_id", node["section_id"]),
@@ -533,7 +536,114 @@ def read_trusted_snapshots(artifacts: Any, *, run_id: str) -> tuple[dict[str, An
                 identity = (node.get("display_section_id", node["section_id"]), node["body_sha256"],
                             tuple(node.get("evidence_ids", ())), node.get("role"), node.get("context_sha256"))
                 nodes.setdefault(identity, node)
-    return tuple(nodes.values())
+    return _replay_saved_assertion_proofs(tuple(nodes.values()), values, evidence_records)
+
+
+def _replay_saved_assertion_proofs(nodes, artifacts, evidence_records):
+    """Read-only proof replay for old snapshots whose local gate lost results.
+
+    Only host checkpoint records are a proof source. Exact text/source IDs,
+    current source bytes and quote spans are checked again. Neither an old
+    stage-wide success flag nor a model-supplied verdict can bless a node.
+    """
+    from .research_assertions import AssertionSession, VERSION, validate_response
+    from .research_numeric_assertions import numeric_prose_supported
+    from copy import deepcopy
+    proofs = {}
+    for row in artifacts:
+        if row.get('artifact_type') != 'stage-checkpoint':
+            continue
+        content = row.get('content')
+        result = content.get('result') if isinstance(content, dict) else None
+        validation = result.get('validation') if isinstance(result, dict) else None
+        record = validation.get('record') if isinstance(validation, dict) else None
+        if not isinstance(record, dict):
+            continue
+        if record.get('assertion_protocol') != VERSION:
+            continue
+        for proof in record.get('assertion_results', ()):
+            if (isinstance(proof, dict) and proof.get('protocol') == VERSION
+                    and proof.get('state') in {'supported', 'contradicted'}):
+                proofs[proof.get('assertion_id')] = proof
+    if not proofs:
+        return nodes
+    sources = {item.get('evidence_id'): item for item in evidence_records if isinstance(item, dict)}
+    result = []
+    for original in nodes:
+        node = original
+        text = node.get('body')
+        refs = node.get('evidence_ids', ())
+        if (node.get('role') == 'analysis' and node.get('validation_state') == 'partial'
+                and node.get('issue_code') in {None, '', 'CONTENT_PENDING_VERIFICATION', 'CONTENT_NUMERIC_PREMISE_UNVERIFIED'}
+                and isinstance(text, str) and refs and all(key in sources for key in refs)):
+            records = [sources[key] for key in refs]
+            session = AssertionSession()
+            session.classify({'kind': 'inference', 'text': text}, records)
+            queries = list(session.queries.values())
+            valid = validate_response({'structured_output_valid': True, 'results': [proofs[query['assertion_id']] for query in queries if query['assertion_id'] in proofs]}, queries,
+                                      'historical-host-proof-replay') if queries else {}
+            if (queries and all(valid.get(query['assertion_id'], {}).get('state') == 'supported'
+                                for query in queries) and numeric_prose_supported(text, records)):
+                node = deepcopy(node)
+                judgments = [deepcopy(proofs[query['assertion_id']]) for query in queries]
+                node.update(role='verified_analysis', validation_state='verified', issue_code='',
+                            assertion_results=judgments, assertions_sha256=content_digest(judgments))
+                identity = {key: node[key] for key in ('source_path', 'body_sha256', 'evidence_ids', 'role',
+                    'validator_version', 'context_sha256', 'depends_on', 'assertions_sha256')}
+                node['node_id'] = 'node:' + content_digest(identity)
+        result.append(node)
+    return tuple(result)
+
+
+def coverage_content_view(artifact, artifacts, *, trusted_nodes=None):
+    """Bind read-time obligations to the exact host proofs used for display.
+
+    This is an ephemeral view, not a rewritten report or a stage-wide passed
+    flag. Existing prose must match its own current report node. Only absent
+    sections can use committed stage nodes, with every pending sibling kept.
+    """
+    from copy import deepcopy
+    from .research_section_validation import content_at_path, SECTION_PROOF_VERSION
+    content = artifact.get("content", {})
+    report = deepcopy(content.get("report", content))
+    verification = deepcopy(content.get("verification", {}))
+    if not isinstance(report, dict) or not isinstance(verification, dict):
+        return report, verification
+    existing = list(proven_content_nodes(report, verification.get("section_validation")))
+    nodes = (read_trusted_snapshots(artifacts, run_id=str(artifact.get("run_id") or ""))
+             if trusted_nodes is None else trusted_nodes)
+    # Recovered proofs replace only the same current report/body position.
+    replacements = {}
+    for node in nodes:
+        if node.get("source_artifact_id") != artifact.get("artifact_id"):
+            continue
+        try:
+            matches = content_digest(content_at_path(report, node["path"])) == node["body_sha256"]
+        except (TypeError, ValueError):
+            matches = False
+        if matches:
+            replacements[node["path"]] = node
+    rebound = [deepcopy(replacements.get(node["path"], node)) for node in existing]
+    absent = {node.get("display_section_id", node["section_id"]) for node in nodes
+              if report.get(node.get("display_section_id", node["section_id"])) in (None, "", [], {})}
+    for section in absent:
+        report[section] = []
+    for node in nodes:
+        section = node.get("display_section_id", node["section_id"])
+        if section not in absent:
+            continue
+        entries = report.setdefault(section, [])
+        path = f"{section}[{len(entries)}].body"
+        entry = {"body": deepcopy(node["body"]), "role": node["role"],
+                 "evidence_ids": list(node.get("evidence_ids", ()))}
+        labels = [item["text"] for item in node.get("context", ())
+                  if item.get("field") in {"name", "title"} and isinstance(item.get("text"), str)]
+        if labels:
+            entry["name"] = labels[-1]
+        entries.append(entry)
+        rebound.append({**deepcopy(node), "path": path, "section_id": section})
+    verification["section_validation"] = {"schema": SECTION_PROOF_VERSION, "nodes": rebound}
+    return report, verification
 
 
 def node_validation_record(node: dict[str, Any]) -> ValidationRecord:
@@ -560,7 +670,7 @@ def trusted_node_is_substantive(node: dict[str, Any]) -> bool:
     return (node.get("role") in {"analysis", "verified_analysis"} and node.get("validation_state") == "verified"
             or node.get("role") == "analysis" and node.get("validation_state") == "partial"
             and node.get("validator_version") == SECTION_PROOF_VERSION
-            and bool(node.get("evidence_ids")) and bool(node.get("assertion_results")))
+            and node.get("display_eligible") is True)
 
 
 def assemble_trusted_report_payload(artifacts: Any, *, run_id: str,

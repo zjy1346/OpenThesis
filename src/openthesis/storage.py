@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from dataclasses import replace, asdict, dataclass
 import re
 import math
+import time
+import threading
 from concurrent.futures import CancelledError
 from pathlib import Path
 from typing import Any, Iterator, Sequence, TYPE_CHECKING, Callable, Mapping
@@ -37,7 +39,8 @@ if TYPE_CHECKING:
     from .research_continuity import StageAttempt
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
+STARTUP_MIGRATION = "startup-read-models-v20-r7"
 
 
 class StorageSchemaError(RuntimeError):
@@ -77,7 +80,14 @@ DERIVED_PIPELINE_CONTRACT = {
 
 
 class Storage:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, *, initialization_progress=None):
+        from .model_activity import ModelActivityLedger
+        self.model_activity = ModelActivityLedger()
+        self._health_error = ""
+        self._maintenance_started = False
+        self._maintenance_lock = threading.Lock()
+        self._initialization_progress = initialization_progress
+        self.maintenance_status = {"state": "idle", "code": ""}
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.filings_dir = self.data_dir / "filings"
@@ -85,8 +95,17 @@ class Storage:
         self.packs_dir = self.data_dir / "research-packs"
         self.packs_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "openthesis.db"
+        self._startup_progress("checking_schema")
         self.migration_backup: Path | None = self._prepare_schema_upgrade()
         self._initialize()
+        self._startup_progress("storage_ready")
+
+    def _startup_progress(self, stage, completed=None, total=None):
+        if callable(self._initialization_progress):
+            try:
+                self._initialization_progress(stage, completed, total)
+            except Exception:
+                pass  # Display telemetry cannot fail a schema transaction.
 
     def _prepare_schema_upgrade(self) -> Path | None:
         """Validate and online-backup an existing DB before any schema write.
@@ -99,9 +118,6 @@ class Storage:
         source = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
         try:
             source.execute("PRAGMA query_only = ON")
-            check = source.execute("PRAGMA quick_check").fetchall()
-            if check != [("ok",)]:
-                raise StorageSchemaError("STORAGE_INTEGRITY_CHECK_FAILED")
             exists = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'").fetchone()
             row = source.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone() if exists else None
             try:
@@ -111,13 +127,21 @@ class Storage:
             if version > SCHEMA_VERSION:
                 raise StorageSchemaError("STORAGE_SCHEMA_NEWER_THAN_BINARY")
             if version == SCHEMA_VERSION:
-                return None
+                marker = source.execute("SELECT value FROM metadata WHERE key='startup_migration'").fetchone()
+                if marker and marker[0] == STARTUP_MIGRATION:
+                    return None
+            self._startup_progress("checking_integrity")
+            check = source.execute("PRAGMA quick_check").fetchall()
+            if check != [("ok",)]:
+                raise StorageSchemaError("STORAGE_INTEGRITY_CHECK_FAILED")
             directory = self.data_dir / "backups"
             directory.mkdir(parents=True, exist_ok=True)
             backup_path = directory / f"pre-schema-{version}-to-{SCHEMA_VERSION}-{uuid.uuid4().hex}.db"
             target = sqlite3.connect(backup_path)
             try:
-                source.backup(target)
+                self._startup_progress("backing_up")
+                source.backup(target, pages=128, progress=lambda _status, remaining, total:
+                              self._startup_progress("backing_up", total - remaining, total))
                 if target.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
                     raise StorageSchemaError("STORAGE_BACKUP_INTEGRITY_FAILED")
             finally:
@@ -128,12 +152,16 @@ class Storage:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        if self._health_error:
+            raise StorageCorruptionError(self._health_error)
         connection = sqlite3.connect(self.db_path, timeout=5.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
+            if self._health_error:
+                raise StorageCorruptionError(self._health_error)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -141,8 +169,67 @@ class Storage:
         finally:
             connection.close()
 
+    def start_background_maintenance(self) -> None:
+        """Cooperative, read-only health work, outside the first-screen path."""
+        with self._maintenance_lock:
+            if self._maintenance_started:
+                return
+            self._maintenance_started = True
+        def check():
+            if not self.db_path.exists():
+                return
+            connection = None
+            try:
+                connection = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.2)
+                connection.execute("PRAGMA query_only=ON")
+                prior = connection.execute("SELECT value FROM metadata WHERE key='last_background_health_check'").fetchone()
+                if prior and time.time() - float(prior[0]) < 86400:
+                    self.maintenance_status = {"state": "recently_checked", "code": ""}
+                    return
+                self.maintenance_status = {"state": "checking", "code": ""}
+                connection.set_progress_handler(lambda: (time.sleep(.001), 0)[1], 2000)
+                if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    self._health_error = "STORAGE_HEALTH_RECOVERY_REQUIRED"
+                    self.maintenance_status = {"state": "recovery_required", "code": self._health_error,
+                        "next_action": "restore_verified_backup_or_export"}
+                    return
+                self.maintenance_status = {"state": "healthy", "code": ""}
+                with self.connect() as writer:
+                    writer.execute("INSERT OR REPLACE INTO metadata VALUES('last_background_health_check',?)", (str(time.time()),))
+            except (sqlite3.Error, OSError, ValueError) as error:
+                # Busy/IO failures are not proof of corruption. Never delete,
+                # restore or quarantine history on a failed background probe.
+                error_code = getattr(error, "sqlite_errorcode", None)
+                if (isinstance(error_code, int)
+                        and error_code & 0xff in {sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB}):
+                    self._health_error = "STORAGE_HEALTH_RECOVERY_REQUIRED"
+                    self.maintenance_status = {"state": "recovery_required", "code": self._health_error,
+                        "next_action": "restore_verified_backup_or_export"}
+                else:
+                    self.maintenance_status = {"state": "unavailable", "code": "STORAGE_HEALTH_CHECK_UNAVAILABLE"}
+            finally:
+                if connection is not None:
+                    connection.close()
+        timer = threading.Timer(2, check)
+        timer.daemon = True
+        timer.start()
+
     def _initialize(self) -> None:
         with self.connect() as db:
+            try:
+                metadata = dict(db.execute("SELECT key,value FROM metadata WHERE key IN ('schema_version','startup_migration','derived_pipeline_contract')"))
+            except sqlite3.OperationalError:
+                metadata = {}
+            if (metadata.get("schema_version") == str(SCHEMA_VERSION)
+                    and metadata.get("startup_migration") == STARTUP_MIGRATION):
+                # A derived-contract change invalidates reads; it is not a
+                # reason to replay schema DDL or parse every old candidate.
+                contract = json.dumps(DERIVED_PIPELINE_CONTRACT, sort_keys=True)
+                if metadata.get("derived_pipeline_contract") != contract:
+                    db.execute("INSERT OR REPLACE INTO metadata VALUES('derived_pipeline_contract',?)", (contract,))
+                    db.execute("INSERT OR REPLACE INTO metadata VALUES('derived_rebuild_required','1')")
+                return
+            self._startup_progress("migrating_schema")
             # WAL is a persistent database setting. Configure it once at
             # initialization rather than renegotiating it on every worker
             # connection; per-connection busy_timeout is set in ``connect``.
@@ -162,6 +249,7 @@ class Storage:
                 prior_rebuild_row = None
             db.executescript(
                 """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -542,6 +630,7 @@ class Storage:
                     "role": "TEXT NOT NULL DEFAULT 'target'",
                 },
             )
+            self._startup_progress("backfilling_facts")
             self._backfill_active_fact_generations(db)
             from .resilience.repository import SCHEMA_STATEMENTS
 
@@ -557,6 +646,9 @@ class Storage:
             from .research_execution.requests import SCHEMA_STATEMENTS as REQUEST_SCHEMA_STATEMENTS
             for statement in REQUEST_SCHEMA_STATEMENTS:
                 db.execute(statement)
+            from .storage_read_models import initialize_read_models
+            self._startup_progress("building_read_models")
+            initialize_read_models(db)
             self._ensure_columns(db, "model_request_journal", {
                 "response_received": "INTEGER NOT NULL DEFAULT 0",
                 "receipt_json": "TEXT",
@@ -567,6 +659,7 @@ class Storage:
                 "supersedes_json": "TEXT NOT NULL DEFAULT '[]'",
             })
             self._ensure_columns(db, "research_stage_attempts", {"action_id": "TEXT NOT NULL DEFAULT ''"})
+            self._ensure_columns(db, "research_jobs", {"revision": "INTEGER NOT NULL DEFAULT 0"})
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -597,6 +690,9 @@ class Storage:
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('derived_rebuild_required', ?)",
                 (rebuild_required,),
             )
+            # Last write in the same schema/backfill transaction. Interrupted
+            # migrations roll back and cannot expose a partially ready DB.
+            db.execute("INSERT OR REPLACE INTO metadata VALUES('startup_migration',?)", (STARTUP_MIGRATION,))
 
     @staticmethod
     def _ensure_columns(
@@ -2823,6 +2919,186 @@ class Storage:
             self._write_lifecycle_run_db(db, run_id, payload)
             return payload
 
+    def model_call_status(self, run_id: str) -> list[dict]:
+        return self.model_call_progress(run_id)["calls"]
+
+    def model_call_plan(self, run_id: str) -> dict | None:
+        from .research_execution.call_budget import plan_status
+        with self.connect() as db:
+            return plan_status(db, run_id)
+
+    def model_call_history(self, run_id: str, *, stage_id: str, after: str = "", limit: int = 10) -> dict:
+        """Keyset pages of call receipts, not candidates, prompts or report bodies.
+
+        The durable compact read model is the history index. New events update
+        it incrementally; opening a card never reconstructs the research run.
+        Cursor keys identify physical attempts, so changing live timings does
+        not move existing rows between pages.
+        """
+        if (not isinstance(stage_id, str) or not stage_id or not isinstance(after, str)
+                or len(stage_id) > 256 or len(after) > 1024 or type(limit) is not int or not 1 <= limit <= 50):
+            raise ValueError("MODEL_HISTORY_PAGE_INVALID")
+        with self.connect() as db:
+            if not db.execute("SELECT 1 FROM research_runs WHERE run_id=?", (run_id,)).fetchone():
+                raise KeyError("research run not found")
+        key = ()
+        if after:
+            try:
+                decoded = json.loads(after)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("MODEL_HISTORY_CURSOR_INVALID") from exc
+            if not isinstance(decoded, list) or len(decoded) != 2 or not all(isinstance(value, str) for value in decoded):
+                raise ValueError("MODEL_HISTORY_CURSOR_INVALID")
+            key = tuple(decoded)
+        progress = self.model_call_progress(run_id)
+        rows = sorted((call for call in progress["calls"] if call["stage_id"] == stage_id
+                       and (call["request_id"], call["attempt_id"]) > key),
+                      key=lambda call: (call["request_id"], call["attempt_id"]))
+        page = rows[:limit]
+        return {"revision": progress["revision"], "calls": page,
+                "next_cursor": json.dumps([page[-1]["request_id"], page[-1]["attempt_id"]]) if len(rows) > limit else None}
+
+    def model_call_progress(self, run_id: str) -> dict:
+        if not run_id:
+            return {"revision": "0:0", "calls": []}
+        from .storage_read_models import status_snapshot
+        revision, durable = status_snapshot(self, run_id)
+        calls = {(call["request_id"], call["attempt_id"]): call for call in durable}
+        for active in self.model_activity.snapshot(run_id):
+            key = (active["request_id"], active["attempt_id"])
+            prior = calls.get(key, {})
+            calls[key] = {**prior, **active, "usage": active.get("usage") or prior.get("usage", {})}
+        return {"revision": f"{revision}:{self.model_activity.revision}", "calls": list(calls.values())}
+
+    def _build_model_call_status(self, run_id: str, *, request_ids=None, recovery_action_ids=None) -> list[dict]:
+        """Live timings + durable receipts; never infer missing usage as zero."""
+        if not run_id:
+            return []
+        fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens",
+                  "reasoning_tokens", "answer_tokens")
+        with self.connect() as db:
+            request_filter = "" if request_ids is None else " AND request_id IN (" + ",".join("?" for _ in request_ids) + ")"
+            request_params = (run_id, *(sorted(request_ids) if request_ids is not None else ()))
+            rows = db.execute("""SELECT j.request_id,j.owner_id,j.state,j.receipt_json,j.diagnostic_code,
+                j.purpose,j.stage_id,j.generation,j.created_at,j.updated_at FROM model_request_journal j
+                WHERE j.run_id=?""" + request_filter + " ORDER BY j.created_at", request_params).fetchall()
+            wire_rows = db.execute("""SELECT request_id,attempt_id,stage_id,purpose,diagnostics_json,created_at
+                FROM model_wire_diagnostics WHERE run_id=?""" + request_filter + " ORDER BY created_at", request_params).fetchall()
+            local_reuses = db.execute("SELECT COUNT(*) FROM model_result_reuse WHERE run_id=?", (run_id,)).fetchone()[0]
+            saved_judgments = db.execute("SELECT COUNT(*) FROM model_assertion_proofs WHERE run_id=?", (run_id,)).fetchone()[0]
+            from .research_execution.call_budget import plan_status
+            call_plan = plan_status(db, run_id)
+            recovery_filter = "" if recovery_action_ids is None else " AND e.action_id IN (" + ",".join("?" for _ in recovery_action_ids) + ")"
+            recovery_events = db.execute("""SELECT e.payload_json,e.action_id,a.state,a.diagnostic_code,
+                a.updated_at,a.started_at,a.external_intent,a.lease_token FROM recovery_events e
+                JOIN recovery_plans p ON p.plan_id=e.plan_id
+                JOIN recovery_incidents i ON i.incident_id=p.incident_id
+                JOIN recovery_actions a ON a.action_id=e.action_id AND a.plan_id=p.plan_id
+                WHERE i.run_id=? AND e.state='model-call-observed'""" + recovery_filter + " ORDER BY e.event_id",
+                (run_id, *(sorted(recovery_action_ids) if recovery_action_ids is not None else ()))).fetchall()
+            from .resilience.payloads import load_payload
+            observed_calls = []
+            for event in recovery_events:
+                try:
+                    payload = load_payload(db, event["payload_json"])
+                    receipt = payload.get("receipt", {})
+                    context = receipt.get("model_call", {})
+                    if not context:
+                        continue
+                    suffix = ":repair:" + event["action_id"]
+                    observed_id = str(context.get("request_id") or "")
+                    parent = db.execute("SELECT request_id,stage_id,generation FROM model_request_journal WHERE run_id=? AND request_id=? AND stage_id=? AND generation=?",
+                        (run_id, observed_id[:-len(suffix)] if observed_id.endswith(suffix) else "",
+                         context.get("stage_id"), context.get("generation"))).fetchone()
+                    from .resilience.contracts import digest
+                    if (parent is None or context.get("run_id") != run_id
+                            or context.get("protocol") != "model-events-v1"
+                            or not isinstance(context.get("attempt_id"), str)
+                            or payload.get("owner_digest") != digest(context["attempt_id"].partition(":")[0])):
+                        continue
+                    observed_calls.append((dict(event), receipt, context))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue  # A damaged diagnostic is a local miss, not a lost report.
+        calls = {}
+        for row in rows:
+            try:
+                receipt = json.loads(row["receipt_json"] or "{}")
+                physical_state = receipt.get("physical_call_state")
+                physical_elapsed = receipt.get("physical_call_elapsed_seconds")
+                receipt = receipt.get("physical_call_receipt", receipt)
+                metadata = receipt.get("metadata", {})
+                usage = {name: metadata.get(name) if type(metadata.get(name)) is int and metadata[name] >= 0 else None
+                         for name in fields}
+                model_identity = {name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id")
+                    if isinstance(metadata.get(name), str) and len(metadata[name]) <= 256
+                    and all(ord(c) >= 32 for c in metadata[name])}
+            except (ValueError, TypeError, AttributeError):
+                usage = {name: None for name in fields}
+                model_identity = {}
+                physical_state = None
+                physical_elapsed = None
+            state = ("saved" if row["state"] in {"candidate", "late_candidate"} else
+                     "rate_limited" if row["state"] == "rejected" and row["diagnostic_code"] in {"MODEL_RATE_LIMITED", "MODEL_HTTP_429"}
+                     else "rejected" if row["state"] == "rejected" else "local_failure"
+                     if row["state"] == "local_processing_failed" else "remote_unknown")
+            if physical_state in {"saved", "rejected"}:
+                state = physical_state
+            calls[(row["request_id"], row["owner_id"])] = {"request_id": row["request_id"], "attempt_id": row["owner_id"],
+                "purpose": row["purpose"],
+                "physical_attempt": not str(row["diagnostic_code"]).startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_")),
+                "stage_id": row["stage_id"], "generation": row["generation"], "state": state, "usage": usage,
+                "elapsed_seconds": physical_elapsed if type(physical_elapsed) in {int, float}
+                    and math.isfinite(physical_elapsed) and physical_elapsed >= 0 else max(0, row["updated_at"] - row["created_at"]),
+                "idle_seconds": None, "remote_status_unconfirmed": state == "remote_unknown",
+                "diagnostic_code": row["diagnostic_code"], **model_identity}
+        for event, receipt, context in observed_calls:
+            metadata = receipt.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            usage = {name: metadata.get(name) if type(metadata.get(name)) is int and metadata[name] >= 0 else None
+                     for name in fields}
+            if receipt.get("response_received") is True:
+                state = ("saved" if event["state"] in {"committed", "partial_committed"} else "local_failure")
+            elif receipt.get("rejected_status") in {400, 401, 403, 404, 405, 413, 415, 422, 429}:
+                state = "rate_limited" if receipt.get("diagnostic_code") in {"MODEL_RATE_LIMITED", "MODEL_HTTP_429"} else "rejected"
+            else:
+                state = "remote_unknown"
+            calls[(context["request_id"], context["attempt_id"])] = {
+                "request_id": context["request_id"], "attempt_id": context["attempt_id"],
+                "physical_attempt": bool(event['external_intent']) or receipt.get('response_received') is True,
+                "stage_id": context["stage_id"], "generation": context["generation"],
+                "state": state, "usage": usage, "idle_seconds": None,
+                "elapsed_seconds": max(0, event["updated_at"] - (event["started_at"] or event["updated_at"])),
+                "diagnostic_code": event["diagnostic_code"], "remote_status_unconfirmed": state == "remote_unknown",
+                **{name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id")
+                    if isinstance(metadata.get(name), str) and len(metadata[name]) <= 256
+                    and all(ord(c) >= 32 for c in metadata[name])}}
+        for row in wire_rows:
+            key = (row["request_id"], row["attempt_id"])
+            try:
+                diagnostic = json.loads(row["diagnostics_json"])
+                if not isinstance(diagnostic, dict) or diagnostic.get("schema") != "model-wire-diagnostics-v1":
+                    continue
+                wire_state = {"response_received": "saved", "send_intent_recorded": "remote_unknown",
+                              "local_processing_failed": "local_failure"}.get(
+                                  diagnostic.get("wire_state"), diagnostic.get("wire_state", "remote_unknown"))
+                calls.setdefault(key, {"request_id": key[0], "attempt_id": key[1], "stage_id": row["stage_id"],
+                    "generation": diagnostic.get("generation", 0), "state": wire_state,
+                    "elapsed_seconds": diagnostic.get("elapsed_seconds", max(0, time.time() - row["created_at"])),
+                    "idle_seconds": None, "remote_status_unconfirmed": wire_state == "remote_unknown",
+                    "usage": diagnostic.get("usage") or {},
+                    **{name: diagnostic[name] for name in ("model_id", "configured_model_id", "provider_id") if name in diagnostic}})
+                calls[key]["purpose"] = row["purpose"]
+                calls[key]["diagnostics"] = diagnostic
+                if diagnostic.get("wire_state") == "not_sent":
+                    calls[key]["physical_attempt"] = False
+            except (ValueError, TypeError):
+                continue  # Diagnostic damage cannot revoke a paid response.
+        for call in calls.values():
+            call["reuse_summary"] = {"local_result_reuses": local_reuses, "saved_judgments": saved_judgments}
+            call["call_plan"] = call_plan
+        return list(calls.values())
+
     def save_research_job(self, snapshot: dict[str, Any]) -> None:
         run_id = str(snapshot.get("run_id") or "")
         if not run_id:
@@ -2832,18 +3108,20 @@ class Storage:
                 return
             db.execute(
                 """
-                INSERT INTO research_jobs(job_id, run_id, state, stage, snapshot_json, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?)
+                INSERT INTO research_jobs(job_id, run_id, state, stage, snapshot_json, updated_at, revision)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                     state=excluded.state,
                     stage=excluded.stage,
                     snapshot_json=excluded.snapshot_json,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    revision=excluded.revision
+                WHERE excluded.revision >= research_jobs.revision
                 """,
                 (
                     str(snapshot["job_id"]), run_id, str(snapshot.get("state", "queued")),
                     str(snapshot.get("stage", "preparing")),
-                    json.dumps(snapshot, ensure_ascii=False), utc_now_iso(),
+                    json.dumps(snapshot, ensure_ascii=False), utc_now_iso(), int(snapshot.get("revision", 0)),
                 ),
             )
 
@@ -3207,6 +3485,13 @@ class Storage:
         with self.connect() as db:
             row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else default
+
+    def get_settings(self, defaults: Mapping[str, str]) -> dict[str, str]:
+        if not defaults:
+            return {}
+        with self.connect() as db:
+            rows = dict(db.execute("SELECT key,value FROM settings WHERE key IN (" + ",".join("?" for _ in defaults) + ")", tuple(defaults)))
+        return {key: str(rows.get(key, default)) for key, default in defaults.items()}
 
     def save_market_snapshot(self, cache_key: str, snapshot: dict[str, Any], updated_at: str) -> None:
         """Atomically persist normalized market data, never raw provider data."""

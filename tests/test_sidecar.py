@@ -13,6 +13,57 @@ from openthesis.sidecar import JsonLineServer
 
 
 class JsonLineServerTests(unittest.TestCase):
+    def test_company_search_forwards_v2_request_identity_and_echoes_result(self) -> None:
+        response = {
+            "contract": "openthesis.company-search.v2",
+            "request_id": "search-42",
+            "query": "700",
+            "market": "HK",
+            "state": "empty",
+            "companies": [],
+            "diagnostics": [],
+        }
+
+        class Service:
+            def search_companies(self, query, *, market, limit, request_id):
+                self.seen = (query, market, limit, request_id)
+                return response
+
+        service = Service()
+        result = JsonLineServer(service).dispatch({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "company.search",
+            "params": {
+                "query": "700",
+                "market": "HK",
+                "limit": 7,
+                "request_id": "search-42",
+            },
+        })
+
+        self.assertEqual(service.seen, ("700", "HK", 7, "search-42"))
+        self.assertEqual(result, response)
+
+    def test_retry_stage_dispatch_preserves_target_model_and_plan_identity(self) -> None:
+        class Service:
+            def retry_research_stage(self, run_id, target, model, plan_hash):
+                return {"run_id": run_id, "target": target, "model": model, "plan_hash": plan_hash}
+
+        server = JsonLineServer(Service())
+        model = {"configured_model_id": "configured.alt", "configuration_version": 3}
+        result = server.dispatch({
+            "jsonrpc": "2.0", "method": "research.retry_stage",
+            "params": {
+                "run_id": "run-2", "target": "counter-analysis",
+                "model": model, "plan_hash": "plan-123",
+            },
+        })
+        self.assertEqual(result, {
+            "run_id": "run-2", "target": "counter-analysis",
+            "model": model, "plan_hash": "plan-123",
+        })
+
     def test_missing_sec_email_is_a_structured_user_fixable_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = io.StringIO()
@@ -153,6 +204,75 @@ class JsonLineServerTests(unittest.TestCase):
                         "params": {"job_id": started["job_id"]},
                     }
                 )
+
+    def test_pdf_worker_failure_diagnostic_is_transparent_and_rpc_remains_available(
+        self,
+    ) -> None:
+        diagnostic = {
+            "job_id": "job-1",
+            "run_id": "run-1",
+            "state": "failed",
+            "stage": "filing-parse",
+            "filing_states": {
+                "sha256:4d3c": {
+                    "status": "failed",
+                    "file_sha256": "4d3c",
+                    "phase": "pdf-ast-parse",
+                    "page": None,
+                    "error_code": "PDF_NATIVE_WORKER_EXIT",
+                    "worker_exit_code": -11,
+                    "retry": {"allowed": True, "action": "manual_alternate_parser"},
+                },
+                "sha256:9a10": {
+                    "status": "parsed",
+                    "file_sha256": "9a10",
+                    "phase": "pdf-ast-parse",
+                    "error_code": None,
+                },
+            },
+        }
+
+        class Service:
+            def get_research_status(self, job_id: str):
+                self.seen_job_id = job_id
+                return diagnostic
+
+            def hello(self):
+                return {"contract_version": "2.0"}
+
+        output = io.StringIO()
+        JsonLineServer(Service()).serve(
+            io.StringIO(
+                "\n".join(
+                    json.dumps(request)
+                    for request in (
+                        {
+                            "jsonrpc": "2.0", "id": 1, "method": "research.status",
+                            "params": {"job_id": "job-1"},
+                        },
+                        {
+                            "jsonrpc": "2.0", "id": 2, "method": "system.hello",
+                            "params": {},
+                        },
+                    )
+                )
+                + "\n"
+            ),
+            output,
+        )
+
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0]["result"], diagnostic)
+        self.assertEqual(
+            responses[0]["result"]["filing_states"]["sha256:4d3c"]["error_code"],
+            "PDF_NATIVE_WORKER_EXIT",
+        )
+        self.assertEqual(
+            responses[0]["result"]["filing_states"]["sha256:9a10"]["status"],
+            "parsed",
+        )
+        self.assertEqual(responses[1]["result"]["contract_version"], "2.0")
 
     def test_retry_financials_is_exposed_without_model_parameters(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

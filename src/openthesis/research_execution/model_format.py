@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+import json
 import math
 from typing import Any, Callable
 
@@ -25,7 +26,8 @@ from .model_output import (
     FIELD_REPAIR_VERSION, OUTPUT_REPAIR_VERSION, merge_field_targets,
     repairable_fields, repairable_output, repaired_output_valid, normalize_stage_output,
 )
-from .responses import ModelResponse, RESPONSE_SCHEMA, response_record, restore_response
+from .responses import (ModelResponse, RESPONSE_SCHEMA, MAX_RESPONSE_BYTES,
+                        redact_response_text, response_record, restore_response)
 
 
 def proven_format_rejection(error: Any) -> bool:
@@ -166,32 +168,56 @@ class ModelFormatRecovery:
         if claim_repair:
             identity["claim_repair_plan"] = claim_plan.to_dict()
 
+        transport_contexts = []
+
         def produce(context):
             check_cancelled(context)
+            saved = next(item for item in context.coordinator.status(plan.plan_id)["actions"]
+                         if item["action_id"] == context.action_id)
             if transient:
-                saved = next(item for item in context.coordinator.status(plan.plan_id)["actions"]
-                             if item["action_id"] == context.action_id)
                 if saved["attempt"] == 1:
                     context.wait(proof["retry_after_seconds"])
                 check_cancelled(context)
-            context.consume(Usage(calls=1))
-            context.record_external_intent()
+            def record_dispatch():
+                context.consume(Usage(calls=1))
+                context.record_external_intent()
             try:
-                result = invoke()
+                # A coordinator lease may span more than one proven 429 wire.
+                # Wire attempts must still have distinct event identities.
+                attempt_id = context.token + ":" + str(saved["attempt"])
+                with journal.transport_binding(request_id + ":repair:" + context.action_id, scope, attempt_id,
+                                               before_dispatch=record_dispatch):
+                    transport_contexts.append(dict(journal.transport_context()))
+                    context.coordinator.repository.model_call_observed(plan, context.action_id, context.token,
+                        journal.clock(), {"response_received": False, "model_call": transport_contexts[-1]})
+                    result = invoke()
             except TimeoutError as error:
                 # Intent exists and the wire outcome is not observed. Never
                 # turn a timeout into proof that the provider did no work.
                 raise RecoveryError("MODEL_TIMEOUT", needs_action="query_provider_before_resubmission") from error
             except ProviderError as error:
+                if error.partial_content:
+                    safe, _issues = redact_response_text(error.partial_content)
+                    if len(safe.encode("utf-8")) <= MAX_RESPONSE_BYTES:
+                        context.coordinator.repository.external_partial(plan, context.action_id, context.token,
+                            journal.clock(), {"schema": "openthesis.model-partial.v1", "response_received": False,
+                                "incomplete": True, "partial_content": safe, "partial_digest": digest(safe),
+                                "partial_bytes": len(safe.encode("utf-8")),
+                                "model_call": transport_contexts[-1]})
                 if error.response_received:
                     context.record_external_response(error.safe_receipt or {"response_received": True})
                 if proven_format_rejection(error):
                     context.record_external_rejection(error.http_status, reason="response_format_unsupported")
-                elif (error.http_status in {401, 403, 429}
-                      and error.code in {"MODEL_AUTHENTICATION_ERROR", "MODEL_RATE_LIMITED",
-                                         "MODEL_HTTP_401", "MODEL_HTTP_403", "MODEL_HTTP_429"}):
-                    context.record_external_rejection(error.http_status)
+                elif (error.http_status in {400, 401, 403, 404, 405, 413, 415, 422, 429}
+                      and error.code in {"MODEL_AUTHENTICATION_ERROR", "MODEL_UNAUTHORIZED", "MODEL_QUOTA_EXHAUSTED", "MODEL_RATE_LIMITED",
+                                         "MODEL_HTTP_ERROR", "MODEL_CONTEXT_CAPACITY", "MODEL_HTTP_401", "MODEL_HTTP_403", "MODEL_HTTP_429"}):
+                    reason = "request_rejected" if error.http_status in {400, 404, 405, 413, 415, 422} else ""
+                    context.record_external_rejection(error.http_status, reason=reason)
                 known_rate = transient and proven_rate_rejection(error)
+                if not context.external_intent:
+                    context.coordinator.repository.model_call_observed(plan, context.action_id, context.token,
+                        journal.clock(), {"response_received": False, "model_call": transport_contexts[-1],
+                            "rejected_status": error.http_status, "diagnostic_code": error.code})
                 raise RecoveryError(error.code, transient=known_rate,
                     retry_after=rejection_retry_after(error) if known_rate else 0,
                     needs_action="wait_for_provider_cooldown_or_select_alternative" if known_rate
@@ -200,14 +226,24 @@ class ModelFormatRecovery:
             # this independent protocol verifier or any research validator.
             # The repair lane crosses the same safe response Adapter as the
             # initial wire. A sibling credential cannot erase received content.
-            context.record_external_response(result.receipt if isinstance(result, ModelResponse)
-                                             else {"schema": RESPONSE_SCHEMA, "response_received": True})
+            call_receipt = deepcopy(result.receipt) if isinstance(result, ModelResponse) else {
+                "schema": RESPONSE_SCHEMA, "response_received": True}
+            call_receipt["model_call"] = transport_contexts[-1]
+            context.record_external_response(call_receipt)
+            if isinstance(result, ModelResponse):
+                journal.store.model_activity.update(transport_contexts[-1],
+                    {"state": "verifying", "usage": result.receipt.get("metadata", {})})
             try:
                 record, _receipt = response_record(result)
             except (TypeError, ValueError, RecursionError) as error:
                 raise RecoveryError("MODEL_RESPONSE_LOCAL_PROCESSING_FAILED",
                     needs_action="revalidate_saved_content_without_resubmission") from error
             result = restore_response(record)
+            if isinstance(result, ModelResponse):
+                # Keep the typed nullable receipt adjacent while the recovery
+                # journal detaches this dict subclass into plain JSON. The
+                # serializer strips this control mirror from answer content.
+                result["_response_receipt"] = deepcopy(result.receipt)
             value = {**identity, "result": result}
             if candidate_repair:
                 value["original_result"] = deepcopy(proof)
@@ -278,6 +314,17 @@ class ModelFormatRecovery:
             else:
                 result = value["result"]
             record, receipt = response_record(result)
+            # The stored stage body may become a repaired answer, but that
+            # never changes which physical wire incurred the original usage.
+            # Preserve the first wire's receipt separately from the candidate's
+            # latest response envelope. Repair wires have their own events.
+            prior_receipt = json.loads(saved["receipt_json"] or "{}")
+            stored_receipt = {**receipt,
+                "physical_call_receipt": prior_receipt.get("physical_call_receipt", prior_receipt),
+                "physical_call_state": prior_receipt.get("physical_call_state",
+                    "rejected" if expected_state == "rejected" else "saved"),
+                "physical_call_elapsed_seconds": prior_receipt.get("physical_call_elapsed_seconds",
+                    max(0, saved["updated_at"] - saved["created_at"]))}
             encoded_record = candidate_document_json(record, max_bytes=16 * 1024 * 1024)
             encoded = journal._store_record(db, request_id, encoded_record, digest(record))
             changed = db.execute("""UPDATE model_request_journal SET state='candidate', candidate_json=?,
@@ -285,7 +332,7 @@ class ModelFormatRecovery:
                 response_received=1,receipt_json=? WHERE request_id=? AND state=?""",
                 (encoded, digest(record), journal.clock(),
                  RESPONSE_SCHEMA if record.get("schema") == RESPONSE_SCHEMA else "legacy",
-                 candidate_json(receipt), request_id, expected_state))
+                 candidate_json(stored_receipt), request_id, expected_state))
             if changed.rowcount != 1:
                 raise RecoveryConflict("RECOVERY_MODEL_REQUEST_COMMIT_CONFLICT")
             return {"revision_id": request_id}
@@ -314,12 +361,17 @@ class ModelFormatRecovery:
             code = ("MODEL_REQUEST_IN_PROGRESS" if str(error) == "RECOVERY_TARGET_BUSY"
                     else "MODEL_CANCELLED" if str(error) == "RECOVERY_CANCELLED"
                     else str(error))
+            if transport_contexts:
+                journal.store.model_activity.update(transport_contexts[-1],
+                    {"state": "cancelled" if code == "MODEL_CANCELLED" else "local_failure"})
             raise ProviderError(code, code=code) from error
         if journal.is_cancelled():
             raise ProviderError("Research cancelled", code="MODEL_CANCELLED")
         if outcome.get("state") in {RecoveryState.COMMITTED, RecoveryState.PARTIAL_COMMITTED}:
             with journal.store.connect() as db:
                 saved = db.execute("SELECT * FROM model_request_journal WHERE request_id=?", (request_id,)).fetchone()
+            if transport_contexts:
+                journal.store.model_activity.update(transport_contexts[-1], {"state": "saved"})
             return deepcopy(journal._read_candidate(saved))
         code = str(outcome.get("diagnostic_code") or
                    ("MODEL_CLAIM_REPAIR_UNAVAILABLE" if claim_repair else "MODEL_FIELD_REPAIR_UNAVAILABLE" if field_repair else
@@ -328,4 +380,7 @@ class ModelFormatRecovery:
             code = "MODEL_SUBMISSION_UNKNOWN"
         if candidate_repair and code == "RECOVERY_CANDIDATE_REJECTED":
             code = "MODEL_CLAIM_REPAIR_INVALID" if claim_repair else "MODEL_FIELD_REPAIR_INVALID" if field_repair else "MODEL_OUTPUT_REPAIR_INVALID"
+        if transport_contexts:
+            journal.store.model_activity.update(transport_contexts[-1],
+                {"state": "remote_unknown" if code == "MODEL_SUBMISSION_UNKNOWN" else "local_failure"})
         raise ProviderError(code, code=code)

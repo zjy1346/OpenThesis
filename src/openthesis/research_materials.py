@@ -6,6 +6,9 @@ records adequacy, never silently drops evidence to fit a fixed item budget.
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
+import hashlib
+import json
 import re
 
 from .research_source_context import route_repair_observations, source_context, observation_source_record
@@ -27,6 +30,97 @@ ROLE_REQUIRED = {
     'research-synthesizer': (),
     'research-synthesizer-repair': (),
 }
+
+
+def canonical_request_materials(materials: dict[str, Any], findings: dict[str, Any], *, compiled_sources=None) -> tuple[dict, dict, dict]:
+    """One complete copy per source body and dependency object in this wire.
+
+    References resolve to values physically present in this request. Source
+    identity, period, currency, units, revisions and conflicting candidates
+    remain on each owning record; only byte-identical body strings are shared.
+    This is structural interning, never model summarization or text clipping.
+    """
+    registry: dict[str, Any] = deepcopy(compiled_sources[1]) if compiled_sources is not None else {}
+    body_keys = {"raw_text", "excerpt", "source_text", "source_excerpt", "text", "quote"}
+    body_counts: dict[str, int] = {}
+    def count_bodies(value):
+        if isinstance(value, dict):
+            source = any(value.get(key) for key in ("evidence_id", "fact_id", "document_id", "source_block_id"))
+            for key, child in value.items():
+                if source and key in body_keys and isinstance(child, str) and child:
+                    body_counts[child] = body_counts.get(child, 0) + 1
+                else:
+                    count_bodies(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                count_bodies(child)
+    if compiled_sources is None:
+        count_bodies(materials)
+    else:
+        body_counts.update({record["text"]: 2 for record in registry.values()})
+    # The early source registry belongs solely to the frozen materials.
+    # Newly produced findings cannot insert a hash before its stable prefix.
+    findings_registry: dict[str, Any] = {}
+    def visit(value, *, source_lane=True):
+        if isinstance(value, dict):
+            source = any(value.get(key) for key in ("evidence_id", "fact_id", "document_id", "source_block_id"))
+            result = {}
+            for key in sorted(value):
+                child = value[key]
+                if source and key in body_keys and isinstance(child, str) and (
+                        body_counts.get(child, 0) > 1 or len(child.encode("utf-8")) > 256):
+                    full_hash = hashlib.sha256(child.encode("utf-8")).hexdigest()
+                    identity = "m:" + full_hash[:24]
+                    if identity in registry and registry[identity]["text"] != child:
+                        identity = "m:" + full_hash  # Never merge a digest-prefix collision.
+                    if source_lane:
+                        registry.setdefault(identity, {"text": child})
+                        result[key] = {"material_ref": identity}
+                    elif identity in registry and registry[identity]["text"] == child:
+                        result[key] = {"material_ref": identity}
+                    else:
+                        dynamic_id = "finding:" + full_hash
+                        findings_registry.setdefault(dynamic_id, {"text": child})
+                        result[key] = {"finding_ref": dynamic_id}
+                else:
+                    result[key] = visit(child, source_lane=source_lane)
+            return result
+        if isinstance(value, (list, tuple)):
+            return [visit(item, source_lane=source_lane) for item in value]
+        return deepcopy(value)
+
+    context = deepcopy(compiled_sources[0]) if compiled_sources is not None else visit(materials)
+    dependency = visit(findings, source_lane=False)
+    # Legacy aliases for the same dossier cannot multiply entire stage trees.
+    # Keep the public field shape, but make its local resolution explicit.
+    seen_dependencies = {}
+    def alias(value, path):
+        if isinstance(value, dict):
+            result = {}
+            for key, child in value.items():
+                encoded = json.dumps(child, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                intern = bool(child) and isinstance(child, (dict, list, str)) and len(encoded.encode("utf-8")) > 128
+                reference = {"request_path_ref": seen_dependencies[encoded]} if intern and encoded in seen_dependencies else None
+                # An alias longer than its value is inflation, not lossless
+                # compression. Keep the complete value in that case.
+                if reference is not None and len(json.dumps(reference, separators=(",", ":")).encode()) + 8 < len(encoded.encode("utf-8")):
+                    result[key] = reference
+                else:
+                    if intern:
+                        seen_dependencies[encoded] = [*path, key]
+                    result[key] = alias(child, [*path, key])
+            return result
+        if isinstance(value, list):
+            return [alias(child, [*path, index]) for index, child in enumerate(value)]
+        return value
+    if compiled_sources is None:
+        late = {key: context.pop(key) for key in ("material_adequacy", "reading_packet") if key in context}
+        context = alias(context, ["research_context"])
+        context.update(late)
+    dependency = alias(dependency, ["prior_artifacts"])
+    if findings_registry:
+        dependency["findings_registry"] = dict(sorted(findings_registry.items()))
+    return context, dependency, dict(sorted(registry.items()))
 
 
 def question_repair_targets(context: dict[str, Any], agent_id: str) -> list[dict[str, Any]]:
@@ -190,7 +284,7 @@ def route_materials(context: dict[str, Any], agent_id: str) -> dict[str, Any]:
     }
 
 
-def prompt_materials(context: dict[str, Any], agent_id: str) -> dict[str, Any]:
+def prompt_materials(context: dict[str, Any], agent_id: str, *, required_evidence_ids=()) -> dict[str, Any]:
     """One canonical body per source, with lossless typed-lane references.
 
     The validator's ledger remains unchanged. Prompt routing must not repeat
@@ -198,7 +292,38 @@ def prompt_materials(context: dict[str, Any], agent_id: str) -> dict[str, Any]:
     to the complete records in evidence_partitions, not a summary or truncation.
     """
     routed = route_materials(context, agent_id)
+    from .research_execution.reading_view import model_reading_view
+    routed = model_reading_view(routed, agent_id, required_evidence_ids=required_evidence_ids)
     routed.pop('facts', None)  # identical admitted values live in accepted_facts
+    # Publication generation is a local database lease, not source evidence.
+    # It remains in the frozen host snapshot but cannot churn an identical
+    # source/value prompt prefix every time the same financials are republished.
+    routed['accepted_facts'] = [{key: value for key, value in fact.items() if key != 'generation_id'}
+        if isinstance(fact, dict) else fact for fact in routed['accepted_facts']]
+    facts_by_id = {}
+    ambiguous = set()
+    for fact in routed['accepted_facts']:
+        if not isinstance(fact, dict) or not isinstance(fact.get('fact_id'), str):
+            continue
+        identity = fact['fact_id']
+        if identity in facts_by_id and facts_by_id[identity] != fact:
+            ambiguous.add(identity)
+        facts_by_id[identity] = fact
+    for partition, records in routed['evidence_partitions'].items():
+        referred = []
+        for record in records:
+            if record.get('kind') == 'financial_fact':
+                record = {key: value for key, value in record.items() if key != 'generation_id'}
+            identity = str(record.get('evidence_id', '')).removeprefix('fact:')
+            fact = facts_by_id.get(identity)
+            if record.get('kind') == 'financial_fact' and fact is not None and identity not in ambiguous:
+                # Reversible field inheritance, never a semantic merge of two
+                # amounts/periods. Retain every differing field as an override.
+                record = {'accepted_fact_ref': identity, **{key: value for key, value in record.items()
+                    if key not in fact or json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    != json.dumps(fact[key], ensure_ascii=False, sort_keys=True)}}
+            referred.append(record)
+        routed['evidence_partitions'][partition] = referred
     routed['evidence'] = [item['evidence_id'] for item in routed['evidence']
         if isinstance(item, dict) and isinstance(item.get('evidence_id'), str)]
     routed['source_blocks'] = [{
@@ -208,7 +333,7 @@ def prompt_materials(context: dict[str, Any], agent_id: str) -> dict[str, Any]:
     } for block in routed['source_blocks']]
     routed['material_reference_contract'] = {
         'version': 'canonical-source-registry-v1',
-        'instruction': 'Each evidence_partitions record is complete. evidence and source_blocks refer to that same registry, including its original raw_text/excerpt. accepted_facts contains the complete admitted fact tree. Follow references; they do not denote missing or summarized source material.',
+        'instruction': 'Resolve accepted_fact_ref by exact fact_id in accepted_facts in THIS request and overlay all fields on the referring evidence record. This restores its complete financial_fact with the original evidence_id and source attribution. evidence and source_blocks refer to evidence_partitions, including original raw_text/excerpt. Follow references; they do not denote missing or summarized source material.',
     }
     return routed
 

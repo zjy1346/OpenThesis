@@ -8,7 +8,8 @@ page-wide regular-expression match.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace, asdict
+from copy import deepcopy
 from concurrent.futures import CancelledError, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
@@ -19,6 +20,7 @@ from typing import Any, Callable, Protocol, Sequence
 import hashlib
 import inspect
 import json
+import calendar
 import math
 import multiprocessing as mp
 import os
@@ -40,10 +42,15 @@ class _PdfParseFlight:
 
     event: threading.Event
     result: tuple[list[FinancialFact], list[EvidenceRef], str | None] | None = None
+    participants: dict[object, tuple[Callable[[], bool] | None, float]] = field(default_factory=dict)
+    retiring: bool = False
+    progress_sequence: int = 0
+    latest_progress: tuple = ()
 
 
 _PDF_FLIGHT_LOCK = threading.Lock()
 _PDF_FLIGHTS: dict[str, _PdfParseFlight] = {}
+_PDF_PRODUCERS = ThreadPoolExecutor(max_workers=3, thread_name_prefix="financial-shared-producer")
 
 from .domain import (
     Company, EvidenceRef, FilingDocument, FinancialFact,
@@ -54,6 +61,7 @@ from .financial_contracts import (
     FinancialDataset as CanonicalFinancialDataset,
     GapStageKind, FinancialGroupValidation,
     FinancialValidation, PDF_PARSER_VERSION as _PDF_PARSER_VERSION,
+    ROE_ROW_MAPPING_VERSION as _ROE_ROW_MAPPING_VERSION,
     QuantityKind, SourceAmount, STATEMENT_FOR as _STATEMENT_FOR, ValidationStatus,
     exact_decimal_arithmetic,
 )
@@ -287,6 +295,9 @@ def _checkpoint_context_to_dict(context: PdfTableContext | None) -> dict[str, An
                 "unit_bbox": item.unit_bbox,
                 "unit_page": item.unit_page,
                 "relative_period": item.relative_period,
+                "period_start": item.period_start,
+                "period_end": item.period_end,
+                "period_basis": item.period_basis,
             }
             for item in context.periods
         ],
@@ -315,6 +326,9 @@ def _checkpoint_context_from_dict(value: dict[str, Any] | None) -> PdfTableConte
                 tuple(float(part) for part in item["unit_bbox"]) if item.get("unit_bbox") is not None else None,
                 int(item["unit_page"]) if item.get("unit_page") is not None else None,
                 str(item.get("relative_period", "")),
+                str(item.get("period_start", "")),
+                str(item.get("period_end", "")),
+                str(item.get("period_basis", "")),
             )
             for item in value.get("periods", ())
         )
@@ -877,6 +891,19 @@ class _PeriodColumn:
     unit_bbox: tuple[float, float, float, float] | None = None
     unit_page: int | None = None
     relative_period: str = ""
+    period_start: str = ""
+    period_end: str = ""
+    period_basis: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _ComparisonPeriodBinding:
+    fiscal_year: int
+    fiscal_period: str
+    period_start: str | None
+    period_end: str
+    basis: str
+    resolved: bool
 
 
 _ENGLISH_MONTHS = {
@@ -884,6 +911,81 @@ _ENGLISH_MONTHS = {
     "may": 5, "june": 6, "july": 7, "august": 8,
     "september": 9, "october": 10, "november": 11, "december": 12,
 }
+
+
+def _period_header_bounds(text: str) -> tuple[str, str, str]:
+    """Return exact header interval/end dates without borrowing manifest years."""
+    value = re.sub(r"\s+", " ", str(text).strip())
+
+    def iso(year, month, day) -> str:
+        try:
+            return date(int(year), int(month), int(day)).isoformat()
+        except (TypeError, ValueError):
+            return ""
+
+    # Explicit Chinese start/end ranges, including a repeated year at the end.
+    range_pattern = re.compile(
+        r"(?P<sy>20\d{2})年(?P<sm>\d{1,2})月(?P<sd>\d{1,2})日?\s*(?:至|到|[-—–])\s*"
+        r"(?:(?P<ey>20\d{2})年)?(?P<em>\d{1,2})月(?P<ed>\d{1,2})日?"
+    )
+    match = range_pattern.search(value)
+    if match:
+        start = iso(match.group("sy"), match.group("sm"), match.group("sd"))
+        end = iso(match.group("ey") or match.group("sy"), match.group("em"), match.group("ed"))
+        if start and end and start <= end:
+            return start, end, "explicit_header_interval"
+
+    # Common compact interim header, for example 2025年1-6月 / 2025年1—9月.
+    month_range = re.search(
+        r"(?P<year>20\d{2})年(?P<start>\d{1,2})\s*[-—–至到]\s*(?P<end>\d{1,2})月",
+        value,
+    )
+    if month_range:
+        year, first_month, last_month = map(int, month_range.groups())
+        try:
+            start = date(year, first_month, 1).isoformat()
+            end_day = calendar.monthrange(year, last_month)[1]
+            end = date(year, last_month, end_day).isoformat()
+        except (ValueError, TypeError):
+            pass
+        else:
+            if first_month <= last_month:
+                return start, end, "explicit_header_interval"
+
+    dates: list[str] = []
+    for pattern in (
+        re.compile(r"(?P<year>20\d{2})-(?P<month>\d{1,2})-(?P<day>\d{1,2})"),
+        re.compile(r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?"),
+    ):
+        for item in pattern.finditer(value):
+            parsed = iso(item.group("year"), item.group("month"), item.group("day"))
+            if parsed:
+                dates.append(parsed)
+    english = re.compile(
+        r"(?:(?P<day>\d{1,2})\s+(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)\s*,?\s*(?P<year>20\d{2})|"
+        r"(?P<month2>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<day2>\d{1,2}),?\s*(?P<year2>20\d{2}))",
+        re.I,
+    )
+    for item in english.finditer(value):
+        month_name = item.group("month") or item.group("month2")
+        day = item.group("day") or item.group("day2")
+        year = item.group("year") or item.group("year2")
+        parsed = iso(year, _ENGLISH_MONTHS[month_name.casefold()], day)
+        if parsed:
+            dates.append(parsed)
+    if len(dates) >= 2:
+        return min(dates), max(dates), "explicit_header_interval"
+
+    # Numeric day/month/year headers are accepted only in a full date shape.
+    numeric = re.search(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})[/.-](20\d{2})(?!\d)", value)
+    if numeric:
+        day, month, year = numeric.groups()
+        parsed = iso(year, month, day)
+        if parsed:
+            dates.append(parsed)
+    if dates:
+        return "", dates[-1], "explicit_header_end_date"
+    return "", "", ""
 
 
 def _effective_period_year(text: str) -> int | None:
@@ -914,6 +1016,14 @@ def _effective_period_year(text: str) -> int | None:
     )
     for match in month_day.finditer(normalized):
         dates.append((int(match.group("year")), _ENGLISH_MONTHS[match.group("month").casefold()], int(match.group("day"))))
+    iso_date = re.fullmatch(r"(?:as\s+at\s+)?(20\d{2})-(\d{1,2})-(\d{1,2})", normalized)
+    if iso_date:
+        year, month, day = map(int, iso_date.groups())
+        try:
+            date(year, month, day)
+        except ValueError:
+            return None
+        dates.append((year, month, day))
     numeric_header = re.fullmatch(r"(?:as\s+at\s+)?(\d{1,2})[/.-](\d{1,2})[/.-](20\d{2})", normalized)
     if numeric_header:
         day, month, year = map(int, numeric_header.groups())
@@ -975,6 +1085,7 @@ def _period_columns(
     fallback: list[tuple[int, float]] | None = None
     headers_by_year: dict[int, str] = {}
     header_rank_by_year: dict[int, int] = {}
+    period_bounds_by_year: dict[int, tuple[str, str, str]] = {}
     all_text = " ".join(row.text for row in rows)
     global_scale, _ = _unit_scale(all_text, rules)
     unit_cells: list[tuple[float, str, PdfCellAST]] = []
@@ -996,18 +1107,22 @@ def _period_columns(
                 if currency:
                     unit_cells.append(((cell.x0 + cell.x1) / 2, currency, cell))
         by_year: dict[int, tuple[int, float, str]] = {}
+        row_period_bounds: dict[int, tuple[str, str, str]] = {}
         for cell in _period_header_cells(row.cells):
+            period_bounds = _period_header_bounds(cell.text)
             effective_year = _effective_period_year(cell.text)
             if effective_year is not None:
                 rank = _period_revision_rank(cell.text)
                 candidate = (rank, (cell.x0 + cell.x1) / 2, cell.text.strip())
                 if effective_year not in by_year or candidate[0] > by_year[effective_year][0]:
                     by_year[effective_year] = candidate
+                    row_period_bounds[effective_year] = period_bounds
                 continue
             # A prose sentence containing a year is not a column header, even
             # when it occurs later on the same page as a genuine year table.
             match = re.fullmatch(
-                r"\s*(20\d{2})(?:年(?:度)?)?\s*"
+                r"\s*(20\d{2})(?:年(?:度|半年度|半年度报告|中期|第?[一二三四1234]季度|"
+                r"[1-9]\d?\s*[-—–至]\s*[1-9]\d?\s*月)?)?\s*"
                 r"(?:[（(](?:调整[前后]|重述[前后]|經重列|经重列|未重列|"
                 r"restated|adjusted|revised|before\s*adjustment|unadjusted)[）)])?\s*",
                 cell.text, flags=re.I,
@@ -1018,10 +1133,17 @@ def _period_columns(
                 candidate = (rank, (cell.x0 + cell.x1) / 2, cell.text.strip())
                 if year not in by_year or candidate[0] > by_year[year][0]:
                     by_year[year] = candidate
+                    row_period_bounds[year] = period_bounds
         for year, (rank, _center, header) in by_year.items():
-            if rank >= header_rank_by_year.get(year, -1):
+            current_bounds = period_bounds_by_year.get(year, ("", "", ""))
+            candidate_bounds = row_period_bounds.get(year, ("", "", ""))
+            if (rank > header_rank_by_year.get(year, -1)
+                    or (rank == header_rank_by_year.get(year, -1)
+                        and not current_bounds[0] and not current_bounds[1]
+                        and (candidate_bounds[0] or candidate_bounds[1]))):
                 header_rank_by_year[year] = rank
                 headers_by_year[year] = header
+                period_bounds_by_year[year] = candidate_bounds
         candidates = sorted(
             ((year, value[1]) for year, value in by_year.items()),
             key=lambda item: item[1],
@@ -1141,9 +1263,72 @@ def _period_columns(
                 source_page if unit_cell else None,
                 next((role for role, (position, _header) in relative_headers.items()
                     if not year and abs(position - center) < 0.01), ""),
+                period_bounds_by_year.get(year, ("", "", ""))[0],
+                period_bounds_by_year.get(year, ("", "", ""))[1],
+                period_bounds_by_year.get(year, ("", "", ""))[2],
             )
         )
     return tuple(result)
+
+
+def _summary_roe_period_columns(
+    rows: Sequence[PdfRowAST], manifest: FilingManifest,
+) -> tuple[_PeriodColumn, ...]:
+    """Bind summary ROE only when its current, prior, and change headers are explicit."""
+    try:
+        current_year = int(manifest.period_end[:4])
+    except (TypeError, ValueError):
+        return ()
+    if current_year <= 1 or not manifest.fiscal_period or not _period_start(manifest):
+        return ()
+
+    headers: dict[str, list[PdfCellAST]] = {"current": [], "prior": [], "change": []}
+    for row in rows[:12]:
+        for cell in row.cells:
+            normalized = re.sub(r"\s+", "", cell.text.casefold())
+            if normalized in {"本报告期", "本期"}:
+                headers["current"].append(cell)
+            elif normalized == "上年同期":
+                headers["prior"].append(cell)
+            elif any(marker in normalized for marker in ("增减", "变动", "变化", "change", "increase")):
+                headers["change"].append(cell)
+
+    def header_center(cells: Sequence[PdfCellAST]) -> float | None:
+        if not cells:
+            return None
+        centers = sorted((cell.x0 + cell.x1) / 2 for cell in cells)
+        clusters: list[list[float]] = []
+        for center in centers:
+            if clusters and center - sum(clusters[-1]) / len(clusters[-1]) <= 18:
+                clusters[-1].append(center)
+            else:
+                clusters.append([center])
+        return sum(clusters[0]) / len(clusters[0]) if len(clusters) == 1 else None
+
+    current_header = headers["current"][0] if len(headers["current"]) == 1 else None
+    prior_header = headers["prior"][0] if len(headers["prior"]) == 1 else None
+    current_center = header_center(headers["current"])
+    prior_center = header_center(headers["prior"])
+    change_center = header_center(headers["change"])
+    if (
+        current_header is None or prior_header is None
+        or current_center is None or prior_center is None or change_center is None
+        or not current_center < prior_center < change_center
+    ):
+        return ()
+
+    split_prior_left = (current_center + prior_center) / 2
+    split_prior_right = (prior_center + change_center) / 2
+    return (
+        _PeriodColumn(
+            current_year, current_center, current_header.x0, split_prior_left,
+            header=current_header.text.strip(), relative_period="current",
+        ),
+        _PeriodColumn(
+            current_year - 1, prior_center, split_prior_left, split_prior_right,
+            header=prior_header.text.strip(), relative_period="prior",
+        ),
+    )
 
 
 def _period_revision_rank(header: str) -> int:
@@ -2216,6 +2401,14 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
     ``率``.
     """
     initial_label = _label_compact(_row_label_text(rows[start]))
+    initial_source_label = re.sub(r"\s+", "", _row_label_source_text(rows[start]))
+    if (
+        not any(_parse_number(cell.text) is not None for cell in rows[start].cells)
+        and re.fullmatch(r"[（(]?(?:元|人民币)[/／](?:股|每股)[）)]?", initial_source_label)
+    ):
+        # A stand-alone unit continuation has no row identity of its own and
+        # must not start a second merge into the complete following metric.
+        return rows[start]
     if (initial_label.removeprefix("其中").removeprefix("including") in {"利息收入", "interestincome", "interestrevenue"}
             and any(_parse_number(cell.text) is not None for cell in rows[start].cells)):
         # An already complete valued leaf must not absorb the next blank
@@ -2274,7 +2467,10 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
         if candidate_labels and not aligned:
             break
         combined_label = current_label + candidate_label
-        current_has_values = any(_parse_number(cell.text) is not None for cell in variants[-1].cells)
+        current_has_values = any(
+            _parse_number(cell.text) is not None
+            for variant in variants for cell in variant.cells
+        )
         candidate_has_values = any(_parse_number(cell.text) is not None for cell in candidate.cells)
         if candidate_has_values and candidate_label:
             # An ownership allocation leaf with its own values is a new row,
@@ -2439,10 +2635,23 @@ def _reconcile_candidates(
     return winners[0][0], winners[0][1], []
 
 
-def _vision_page_preparation_worker(filing, config, validation_issues, existing_facts, period_header_pages):
+def _vision_page_preparation_worker(filing, config, validation_issues, existing_facts, period_header_pages,
+                                    parser_failed_pages=()):
     """Pickle-safe page selection/slicing behind a killable deadline."""
     return _vision_failed_pages(filing, config, validation_issues, existing_facts,
-                                period_header_pages=period_header_pages)
+                                period_header_pages=period_header_pages, parser_failed_pages=parser_failed_pages)
+
+
+_VISION_PAGE_WORKER_ERROR_CODES = frozenset({
+    "VISION_CANCELLED",
+    "VISION_IMAGE_RENDER_FAILED",
+    "VISION_IMAGE_RENDER_TIMEOUT",
+    "VISION_IMAGE_REPRESENTATION_FAILED",
+    "VISION_IMAGE_SIZE_LIMIT",
+    "VISION_SIZE_LIMIT",
+    "VISION_SOURCE_HASH_MISMATCH",
+    "VISION_TIMEOUT",
+})
 
 
 def _vision_failed_pages(
@@ -2451,6 +2660,7 @@ def _vision_failed_pages(
     existing_facts: Sequence[FinancialFact] = (),
     *, cancel_check: Callable[[], bool] | None = None,
     period_header_pages: Sequence[int] = (),
+    parser_failed_pages: Sequence[int] = (),
     deadline: float | None = None,
 ) -> tuple[VisionPageRequest, ...]:
     """Create bounded one-page PDFs for failed statement contexts in memory."""
@@ -2467,6 +2677,7 @@ def _vision_failed_pages(
         pages, error = _run_pdfium_isolated(
             _vision_page_preparation_worker, filing, worker_config,
             tuple(validation_issues), tuple(existing_facts), tuple(period_header_pages),
+            tuple(parser_failed_pages),
             timeout_seconds=remaining, cancel_check=cancel_check,
         )
         if error == "PDFIUM_WORKER_CANCELLED":
@@ -2474,7 +2685,8 @@ def _vision_failed_pages(
         if error == "PDFIUM_WORKER_TIMEOUT" or time.monotonic() >= deadline:
             raise VisionAdapterError("VISION_TIMEOUT")
         if error:
-            raise VisionAdapterError("VISION_PAGE_PREPARATION_UNAVAILABLE")
+            code = error if error in _VISION_PAGE_WORKER_ERROR_CODES else "VISION_PAGE_PREPARATION_UNAVAILABLE"
+            raise VisionAdapterError(code)
         return tuple(pages or ())
     if not filing.local_path or not Path(filing.local_path).is_file():
         return ()
@@ -2648,6 +2860,14 @@ def _vision_failed_pages(
             for _score, page_index in note_candidates[:note_limit]
             if page_index not in formal_chosen
         ]
+        # A parser failure is a priority hint, not a new upload permission or
+        # proof that every failed page is financial. Intersect the exact-source
+        # failed window with the already justified statements/notes, preserving
+        # the same page/byte caps and consent path. Header context stays local.
+        failed = {page - 1 for page in parser_failed_pages
+                  if type(page) is int and 1 <= page <= len(reader.pages)}
+        ordered_chosen = ([page for page in ordered_chosen if page in failed]
+                          + [page for page in ordered_chosen if page not in failed])
         selected: list[VisionPageRequest] = []
         total = 0
         for index in ordered_chosen:
@@ -2720,7 +2940,163 @@ def _emit_ingestion_progress(
         progress(stage, current, total)
 
 
-def _parse_local_pdfs_bounded(
+def _shared_pdf_producer(engine, company, filing, manifest, flight, key, parse_timeout, batch_timeout):
+    """The existing parser owns work; subscribers own only their waiting."""
+    def orphaned():
+        # Subscriber callbacks can take their own locks. Never invoke them
+        # while holding the shared registry lock.
+        with _PDF_FLIGHT_LOCK:
+            if flight.retiring:
+                return True
+            participants = dict(flight.participants)
+        now = time.monotonic()
+        for cancelled, deadline in participants.values():
+            try:
+                if deadline > now and not (cancelled and cancelled()):
+                    return False
+            except Exception:
+                continue
+        with _PDF_FLIGHT_LOCK:
+            # A new subscriber may have arrived while callbacks ran. Give it
+            # a chance to keep the producer, instead of cancelling its work.
+            if flight.participants.keys() == participants.keys():
+                flight.retiring = True
+            return flight.retiring
+
+    def progress(stage, current, total, detail=None):
+        with _PDF_FLIGHT_LOCK:
+            flight.progress_sequence += 1
+            flight.latest_progress = (stage, current, total, detail)
+
+    result = ([], [], "pdf_window_failed:ProducerInterrupted")
+    try:
+        if orphaned():
+            result = ([], [], "pdf_parse_cancelled")
+        else:
+            rows = _parse_local_pdfs_bounded_impl(engine, company, [filing], {filing.document_id: manifest},
+                cancel_check=orphaned, progress=progress, max_workers=1,
+                parse_timeout_seconds=parse_timeout, batch_timeout_seconds=batch_timeout,
+                deadline=time.monotonic() + batch_timeout, _shared_producer=True)
+            result = rows.get(filing.document_id, ([], [], "pdf_document_budget_exhausted_resumable"))
+    except Exception as error:
+        result = ([], [], f"pdf_window_failed:{type(error).__name__}")
+    finally:
+        with _PDF_FLIGHT_LOCK:
+            flight.result = result
+            flight.event.set()
+            if _PDF_FLIGHTS.get(key) is flight:
+                _PDF_FLIGHTS.pop(key, None)
+
+
+def _parse_local_pdfs_bounded(engine, company, filings, manifests, *, parse=None,
+        cancel_check=None, progress=None, max_workers=3, parse_timeout_seconds=120.0,
+        batch_timeout_seconds=280.0, worker_entry=None, deadline=None):
+    """Share identical native producers, with independently cancellable waits.
+
+    Reuse the SAME bounded parsing/checkpoint/cache implementation below. No
+    second parser, acceptance policy or cross-issuer result cache is added.
+    Injected parsers/workers retain their existing synchronous test seam.
+    """
+    default = (parse is None and worker_entry is None and type(engine) is FinancialIngestionEngine
+        and getattr(engine._parse_pdf_ast, "__func__", None) is globals().get("_ORIGINAL_PARSE_PDF_AST"))
+    if not default:
+        return _parse_local_pdfs_bounded_impl(engine, company, filings, manifests, parse=parse,
+            cancel_check=cancel_check, progress=progress, max_workers=max_workers,
+            parse_timeout_seconds=parse_timeout_seconds, batch_timeout_seconds=batch_timeout_seconds,
+            worker_entry=worker_entry, deadline=deadline)
+    end = time.monotonic() + max(.1, float(batch_timeout_seconds))
+    if deadline is not None:
+        end = min(end, deadline)
+    remaining = list(filings)
+    active, results = {}, {}
+    slots = max(1, min(3, int(max_workers)))
+    stage_completed: dict[str, set[str]] = {}
+    total_filings = len({filing.document_id for filing in filings})
+
+    def relay_progress(filing, args):
+        stage, current, total, detail = args
+        completed = stage_completed.setdefault(stage, set())
+        if current >= total:
+            completed.add(filing.document_id)
+        detail = detail or {}
+        _emit_ingestion_progress(progress, stage, len(completed), total_filings, filing,
+            status=detail.get("status", stage), error_code=detail.get("error_code"),
+            elapsed_seconds=detail.get("elapsed_seconds", 0),
+            window_index=detail.get("window_index"), window_total=detail.get("window_total"))
+
+    try:
+        while remaining or active:
+            # Harvest completed results before observing a deadline edge.
+            for document_id, (flight, key, token, seq, filing) in list(active.items()):
+                with _PDF_FLIGHT_LOCK:
+                    event_seq, args = flight.progress_sequence, flight.latest_progress
+                if (event_seq != seq and args and progress is not None
+                        and not (cancel_check and cancel_check())):
+                    relay_progress(filing, args)
+                    active[document_id] = (flight, key, token, event_seq, filing)
+                if flight.event.is_set():
+                    results[document_id] = deepcopy(flight.result)
+                    with _PDF_FLIGHT_LOCK:
+                        flight.participants.pop(token, None)
+                    del active[document_id]
+            stopped = bool(cancel_check and cancel_check())
+            if stopped or time.monotonic() >= end:
+                code = "pdf_parse_cancelled" if stopped else "pdf_batch_budget_exhausted_resumable"
+                for filing in remaining:
+                    results[filing.document_id] = ([], [], code)
+                for document_id in active:
+                    results[document_id] = ([], [], code)
+                break
+            while remaining and len(active) < slots:
+                filing = remaining.pop(0)
+                manifest = manifests.get(filing.document_id)
+                if manifest is None or not filing.local_path or not Path(filing.local_path).is_file():
+                    continue
+                try:
+                    actual = engine._file_sha256(filing.local_path, cancel_check=cancel_check, deadline=end)
+                except (OSError,TimeoutError):
+                    results[filing.document_id] = ([], [], "pdf_file_unreadable")
+                    continue
+                if not filing.content_hash:
+                    filing.content_hash = actual
+                if actual.casefold() != filing.content_hash.casefold():
+                    results.update(_parse_local_pdfs_bounded_impl(engine, company, [filing], manifests,
+                        cancel_check=cancel_check, progress=progress, deadline=end, max_workers=1,
+                        parse_timeout_seconds=parse_timeout_seconds,
+                        batch_timeout_seconds=batch_timeout_seconds, _shared_producer=True))
+                    continue
+                identity = json.dumps(asdict(manifest), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+                key = (engine._parse_cache_key(filing.local_path, company, filing, actual)
+                       + ":" + hashlib.sha256(identity.encode()).hexdigest())
+                token = object()
+                with _PDF_FLIGHT_LOCK:
+                    flight = _PDF_FLIGHTS.get(key)
+                    owner = flight is None or flight.retiring
+                    if owner:
+                        flight = _PdfParseFlight(threading.Event())
+                        _PDF_FLIGHTS[key] = flight
+                    flight.participants[token] = (cancel_check, end)
+                    active[filing.document_id] = (flight, key, token, 0, filing)
+                    if owner:
+                        try:
+                            _PDF_PRODUCERS.submit(_shared_pdf_producer, engine, replace(company), replace(filing),
+                                manifest, flight, key, max(.1, float(parse_timeout_seconds)),
+                                max(.1, float(batch_timeout_seconds)))
+                        except RuntimeError:
+                            flight.result = ([], [], "pdf_window_failed:ProducerUnavailable")
+                            flight.event.set()
+                            _PDF_FLIGHTS.pop(key, None)
+            if active:
+                next(iter(active.values()))[0].event.wait(.02)
+        return {filing.document_id: results[filing.document_id] for filing in filings
+                if filing.document_id in results}
+    finally:
+        with _PDF_FLIGHT_LOCK:
+            for flight, key, token, _seq, _filing in active.values():
+                flight.participants.pop(token, None)
+
+
+def _parse_local_pdfs_bounded_impl(
     engine: "FinancialIngestionEngine",
     company: Company,
     filings: Sequence[FilingDocument],
@@ -2734,6 +3110,7 @@ def _parse_local_pdfs_bounded(
     batch_timeout_seconds: float = 280.0,
     worker_entry: Callable[..., None] | None = None,
     deadline: float | None = None,
+    _shared_producer: bool = False,
 ) -> dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]]:
     """Parse local PDFs as bounded per-document pipelines.
 
@@ -2867,7 +3244,7 @@ def _parse_local_pdfs_bounded(
             cached = None
             cache_key = ""
         if cached is None:
-            if default_parser and cache_key and key not in hash_mismatches:
+            if default_parser and not _shared_producer and cache_key and key not in hash_mismatches:
                 with _PDF_FLIGHT_LOCK:
                     flight = _PDF_FLIGHTS.get(cache_key)
                     if flight is None:
@@ -2949,38 +3326,81 @@ def _parse_local_pdfs_bounded(
                 max_workers=checkpoint_workers,
                 thread_name_prefix="financial-checkpoint",
             )
+
+            checkpoint_next_item = 0
+
+            def submit_checkpoint() -> None:
+                nonlocal checkpoint_next_item
+                if (
+                    checkpoint_next_item >= len(uncached)
+                    or time.monotonic() >= batch_deadline
+                    or (cancel_check is not None and cancel_check())
+                ):
+                    return
+                item = uncached[checkpoint_next_item]
+                checkpoint_next_item += 1
+                checkpoint_futures[checkpoint_executor.submit(parse_checkpointed, item)] = item
+
+            def harvest_checkpoint(done_futures: set[Any]) -> None:
+                for future in done_futures:
+                    item = checkpoint_futures.pop(future, None)
+                    if item is None:
+                        continue
+                    key, _filing, _manifest = item
+                    if future.cancelled():
+                        results[key] = ([], [], "pdf_parse_cancelled")
+                        continue
+                    try:
+                        parsed_key, facts, refs, error = future.result()
+                    except Exception as exc:
+                        parsed_key, facts, refs, error = key, [], [], f"pdf_window_failed:{type(exc).__name__}"
+                    results[parsed_key] = (facts, refs, error)
+                    if error is None and facts and refs:
+                        cache_key = cache_keys.get(parsed_key)
+                        if cache_key:
+                            engine._store_parse_cache(cache_key, facts, refs)
+
             try:
-                for item in uncached:
-                    if cancel_check is not None and cancel_check():
-                        break
-                    checkpoint_futures[checkpoint_executor.submit(parse_checkpointed, item)] = item
+                for _ in range(checkpoint_workers):
+                    submit_checkpoint()
                 while checkpoint_futures:
                     done, _ = wait(tuple(checkpoint_futures), timeout=0.05, return_when=FIRST_COMPLETED)
-                    if time.monotonic() >= batch_deadline:
+                    # A future can complete just after wait() forms its done
+                    # set. Include every future that is already complete before
+                    # applying the cutoff to the remaining cohort.
+                    harvest_checkpoint(set(done) | {
+                        future for future in checkpoint_futures if future.done()
+                    })
+                    # Completed durable work belongs to this attempt even if
+                    # the clock/cancel signal changed during wait(). Only the
+                    # unfinished cohort gets a resumable budget diagnostic.
+                    expired = time.monotonic() >= batch_deadline
+                    cancelled = cancel_check is not None and cancel_check()
+                    if expired or cancelled:
+                        # One final nonblocking pass closes the completion race
+                        # at the exact batch cutoff without extending the wait.
+                        harvest_checkpoint({
+                            future for future in checkpoint_futures if future.done()
+                        })
                         for pending, item in checkpoint_futures.items():
                             pending.cancel()
-                            results[item[0]] = ([], [], "pdf_batch_budget_exhausted_resumable")
+                            results[item[0]] = ([], [], "pdf_parse_cancelled" if cancelled
+                                               else "pdf_batch_budget_exhausted_resumable")
+                        for key, _filing, _manifest in uncached[checkpoint_next_item:]:
+                            results.setdefault(
+                                key,
+                                ([], [], "pdf_parse_cancelled" if cancelled
+                                 else "pdf_batch_budget_exhausted_resumable"),
+                            )
                         break
-                    if cancel_check is not None and cancel_check():
-                        for pending, item in checkpoint_futures.items():
-                            pending.cancel()
-                            results[item[0]] = ([], [], "pdf_parse_cancelled")
-                        break
-                    for future in done:
-                        item = checkpoint_futures.pop(future)
-                        key, filing, _manifest = item
-                        if future.cancelled():
-                            results[key] = ([], [], "pdf_parse_cancelled")
-                            continue
-                        try:
-                            parsed_key, facts, refs, error = future.result()
-                        except Exception as exc:
-                            parsed_key, facts, refs, error = key, [], [], f"pdf_window_failed:{type(exc).__name__}"
-                        results[parsed_key] = (facts, refs, error)
-                        if error is None and facts and refs:
-                            cache_key = cache_keys.get(parsed_key)
-                            if cache_key:
-                                engine._store_parse_cache(cache_key, facts, refs)
+                    for _ in range(min(checkpoint_workers - len(checkpoint_futures), len(uncached))):
+                        submit_checkpoint()
+                stopped = cancel_check is not None and cancel_check()
+                expired = time.monotonic() >= batch_deadline
+                if stopped or expired:
+                    reason = "pdf_parse_cancelled" if stopped else "pdf_batch_budget_exhausted_resumable"
+                    for key, _filing, _manifest in uncached:
+                        results.setdefault(key, ([], [], reason))
                 # Progress is intentionally emitted in filing order, not
                 # completion order, so callers receive monotonic counters even
                 # when a later document finishes first.
@@ -2991,7 +3411,10 @@ def _parse_local_pdfs_bounded(
                     error = results[key][2]
                     _emit_ingestion_progress(
                         progress, "filing-parse", completed + index, total, filing,
-                        status="failed" if error else "parsed", error_code=error or "",
+                        status=("cancelled" if error == "pdf_parse_cancelled"
+                                else "needs-action" if error and ("timeout" in error or "budget_exhausted" in error)
+                                else "failed" if error else "parsed"),
+                        error_code=error or "",
                     )
             finally:
                 # Native work owns killable process deadlines. The collector
@@ -3057,60 +3480,124 @@ def _parse_local_pdfs_bounded(
 
     def submit_index() -> None:
         nonlocal next_item
-        if next_item >= len(uncached):
+        if (
+            next_item >= len(uncached)
+            or time.monotonic() >= batch_deadline
+            or (cancel_check is not None and cancel_check())
+        ):
             return
         item = uncached[next_item]
         next_item += 1
         futures[executor.submit(_index_one, item)] = ("index", item)
+
+    def submit_parse(item: tuple[str, FilingDocument, FilingManifest], candidate_pages=None) -> bool:
+        if time.monotonic() >= batch_deadline or (cancel_check is not None and cancel_check()):
+            return False
+        futures[executor.submit(parse_one, item, candidate_pages)] = ("parse", item)
+        return True
+
+    def harvest_thread_future(future: Any) -> None:
+        nonlocal indexed, parsed, completed
+        kind_item = futures.pop(future, None)
+        if kind_item is None or future.cancelled():
+            return
+        kind, item = kind_item
+        key = item[0]
+        filing = item[1]
+        try:
+            if kind == "index":
+                key, candidate_pages, index_error = future.result()
+                indexed += 1
+                _emit_ingestion_progress(progress, "filing-index", indexed, total, filing,
+                                         status="local-parsing")
+                if index_error is not None:
+                    results[key] = ([], [], index_error)
+                    parsed += 1
+                    _emit_ingestion_progress(progress, "filing-parse", parsed, total, filing,
+                                             status="failed", error_code=index_error)
+                elif not submit_parse(item, candidate_pages):
+                    reason = "pdf_parse_cancelled" if cancel_check is not None and cancel_check() else "pdf_batch_budget_exhausted_resumable"
+                    results[key] = ([], [], reason)
+                    parsed += 1
+                    _emit_ingestion_progress(
+                        progress, "filing-parse", parsed, total, filing,
+                        status="cancelled" if reason == "pdf_parse_cancelled" else "needs-action",
+                        error_code=reason,
+                    )
+                if not (cancel_check is not None and cancel_check()):
+                    submit_index()
+            else:
+                key, facts, refs, error = future.result()
+                results[key] = (facts, refs, error)
+                parsed += 1
+                completed += 1
+                if error is None and facts and refs and cache_enabled:
+                    cache_key = cache_keys.get(key)
+                    if cache_key:
+                        engine._store_parse_cache(cache_key, facts, refs)
+                _emit_ingestion_progress(
+                    progress, "filing-parse", parsed, total, filing,
+                    status=("needs-action" if error and ("timeout" in error or "budget_exhausted" in error)
+                            else "failed" if error else "parsed"),
+                    error_code=error or "",
+                )
+                if not default_parser:
+                    submit_custom_parse()
+        except CancelledError:
+            return
+
+    def submit_custom_parse() -> None:
+        nonlocal next_item
+        if (
+            next_item >= len(uncached)
+            or time.monotonic() >= batch_deadline
+            or (cancel_check is not None and cancel_check())
+        ):
+            return
+        item = uncached[next_item]
+        next_item += 1
+        futures[executor.submit(parse_one, item)] = ("parse", item)
 
     try:
         if default_parser:
             for _ in range(min(workers, len(uncached))):
                 submit_index()
         else:
-            for item in uncached:
-                futures[executor.submit(parse_one, item)] = ("parse", item)
+            for _ in range(min(workers, len(uncached))):
+                submit_custom_parse()
         while futures:
             done, _ = wait(tuple(futures), timeout=0.05, return_when=FIRST_COMPLETED)
+            # Completion may race wait()'s snapshot. Drain every future that is
+            # now complete before deciding that the batch budget has expired.
+            ready = set(done) | {future for future in futures if future.done()}
+            for future in ready:
+                harvest_thread_future(future)
             cancelled = cancel_check is not None and cancel_check()
             if cancelled or time.monotonic() >= batch_deadline:
                 reason = "pdf_parse_cancelled" if cancelled else "pdf_batch_budget_exhausted_resumable"
-                for pending, (_kind, item) in futures.items():
+                # One last nonblocking scan handles futures completing while
+                # the first ready set was being consumed.
+                for future in tuple(futures):
+                    if future.done():
+                        harvest_thread_future(future)
+                for pending, (_kind, item) in tuple(futures.items()):
                     pending.cancel()
-                    results.setdefault(item[0], ([], [], reason))
+                    if item[0] not in results:
+                        results[item[0]] = ([], [], reason)
+                        _emit_ingestion_progress(
+                            progress, "filing-parse", parsed + 1, total, item[1][1],
+                            status="cancelled" if cancelled else "needs-action",
+                            error_code=reason,
+                        )
+                for key, filing, _manifest in uncached:
+                    if key not in results:
+                        results[key] = ([], [], reason)
+                        _emit_ingestion_progress(
+                            progress, "filing-parse", parsed + 1, total, filing,
+                            status="cancelled" if cancelled else "needs-action",
+                            error_code=reason,
+                        )
                 break
-            for future in done:
-                kind, item = futures.pop(future)
-                if future.cancelled():
-                    continue
-                try:
-                    if kind == "index":
-                        key, candidate_pages, index_error = future.result()
-                        indexed += 1
-                        if progress is not None:
-                            progress("filing-index", indexed, total)
-                        if index_error is not None:
-                            results[key] = ([], [], index_error)
-                            parsed += 1
-                            if progress is not None:
-                                progress("filing-parse", parsed, total)
-                        elif cancel_check is None or not cancel_check():
-                            futures[executor.submit(parse_one, item, candidate_pages)] = ("parse", item)
-                        if not cancelled:
-                            submit_index()
-                    else:
-                        key, facts, refs, error = future.result()
-                        results[key] = (facts, refs, error)
-                        parsed += 1
-                        completed += 1
-                        if error is None and facts and refs and cache_enabled:
-                            cache_key = cache_keys.get(key)
-                            if cache_key:
-                                engine._store_parse_cache(cache_key, facts, refs)
-                        if progress is not None:
-                            progress("filing-parse", parsed, total)
-                except CancelledError:
-                    continue
     finally:
         if cancel_check is not None and cancel_check():
             cancelled = True
@@ -3121,6 +3608,19 @@ def _parse_local_pdfs_bounded(
         # injected/custom parser must not make collector shutdown unbounded;
         # it may finish later, but cannot publish cache or progress here.
         executor.shutdown(wait=not futures, cancel_futures=True)
+
+    stopped = cancelled or (cancel_check is not None and cancel_check())
+    expired = time.monotonic() >= batch_deadline
+    if stopped or expired:
+        reason = "pdf_parse_cancelled" if stopped else "pdf_batch_budget_exhausted_resumable"
+        status = "cancelled" if stopped else "needs-action"
+        for key, filing, _manifest in uncached:
+            if key not in results:
+                results[key] = ([], [], reason)
+                _emit_ingestion_progress(
+                    progress, "filing-parse", parsed + 1, total, filing,
+                    status=status, error_code=reason,
+                )
 
     by_document: dict[str, tuple[list[FinancialFact], list[EvidenceRef], str | None]] = {}
     _resolve_pdf_parse_flights(
@@ -3296,7 +3796,10 @@ def _parse_local_pdfs_isolated(
     exit_drain_seconds = 0.2
 
     def start_next() -> None:
-        nonlocal next_item
+        nonlocal next_item, parsed, cancelled
+        if cancel_check is not None and cancel_check():
+            cancelled = True
+            return
         while (
             next_item < len(uncached)
             and len(processes) < worker_count
@@ -3350,6 +3853,25 @@ def _parse_local_pdfs_isolated(
                 name=f"financial-pdf-{key[-12:]}",
             )
             process.daemon = True
+            if cancel_check is not None and cancel_check():
+                _close_pdf_result_queue(result_queue)
+                results[key] = ([], [], "pdf_parse_cancelled")
+                parsed += 1
+                _emit_ingestion_progress(
+                    progress, "filing-parse", parsed, total, filing,
+                    status="cancelled", error_code="pdf_parse_cancelled",
+                )
+                cancelled = True
+                return
+            if time.monotonic() >= batch_deadline:
+                _close_pdf_result_queue(result_queue)
+                results[key] = ([], [], "pdf_batch_timeout")
+                parsed += 1
+                _emit_ingestion_progress(
+                    progress, "filing-parse", parsed, total, filing,
+                    status="needs-action", error_code="pdf_batch_timeout",
+                )
+                continue
             try:
                 process.start()
             except (OSError, RuntimeError) as exc:
@@ -3396,41 +3918,96 @@ def _parse_local_pdfs_isolated(
             parsed,
             total,
             filing,
-            status="failed" if error else "parsed",
+            status=("needs-action" if error and ("timeout" in error or "budget_exhausted" in error)
+                    else "failed" if error else "parsed"),
             error_code=error or "",
             elapsed_seconds=time.monotonic() - state["started_at"],
         )
 
+    def consume_message(key: str, state: dict[str, Any], message: tuple[Any, ...]) -> bool:
+        """Apply one ordered worker message; return True after a final result."""
+        nonlocal indexed
+        kind = message[0]
+        if kind == "filing-index":
+            filing = state["item"][1]
+            if len(message) > 5 and message[5] is not None:
+                remember_page_texts(filing.local_path, message[5])
+            if not state["indexed"]:
+                state["indexed"] = True
+                if len(message) > 4 and message[4]:
+                    state["index_diagnostic"] = str(message[4])
+                indexed += 1
+                _emit_ingestion_progress(
+                    progress,
+                    "filing-index",
+                    indexed,
+                    total,
+                    filing,
+                    status="local-parsing",
+                    elapsed_seconds=time.monotonic() - state["started_at"],
+                )
+            return False
+        if kind == "filing-result":
+            finish_process(key, message[1])
+            return True
+        return False
+
+    def drain_available(key: str, state: dict[str, Any]) -> bool:
+        """Drain currently available queue messages without blocking."""
+        while key in processes:
+            try:
+                message = state["queue"].get_nowait()
+            except queue.Empty:
+                return False
+            if consume_message(key, state, message):
+                return True
+        return key not in processes
+
+    def drain_before_stop(key: str, state: dict[str, Any]) -> bool:
+        """Give the multiprocessing queue feeder a short, bounded handoff."""
+        if drain_available(key, state):
+            return True
+        # Queue feeder delivery can lag the child process's final put. A pair
+        # of short reads is enough to collect index-then-result without making
+        # shutdown depend on an unbounded worker wait.
+        for _ in range(2):
+            if key not in processes:
+                return True
+            try:
+                message = state["queue"].get(timeout=0.025)
+            except queue.Empty:
+                continue
+            if consume_message(key, state, message):
+                return True
+            if drain_available(key, state):
+                return True
+        return key not in processes
+
     try:
         start_next()
         while processes:
-            if cancel_check is not None and cancel_check():
-                cancelled = True
-                for key, state in tuple(processes.items()):
-                    _terminate_pdf_process(state["process"])
-                    _close_pdf_result_queue(state["queue"])
-                    processes.pop(key, None)
-                    results[key] = ([], [], "pdf_parse_cancelled")
-                    filing = state["item"][1]
-                    _emit_ingestion_progress(
-                        progress,
-                        "filing-parse",
-                        parsed,
-                        total,
-                        filing,
-                        status="cancelled",
-                        error_code="pdf_parse_cancelled",
-                        elapsed_seconds=time.monotonic() - state["started_at"],
-                    )
-                break
             progressed = False
             now = time.monotonic()
-            if now >= batch_deadline:
+            cancelled = cancel_check is not None and cancel_check()
+            batch_expired = now >= batch_deadline
+            # Drain already-published index/result messages before acting on
+            # cancellation or the batch cutoff. The multiprocessing queue is
+            # ordered, so a queued index is applied before its result.
+            for key, state in tuple(processes.items()):
+                if drain_available(key, state):
+                    progressed = True
+                    start_next()
+            if cancelled or batch_expired:
+                timeout_code = "pdf_parse_cancelled" if cancelled else "pdf_batch_timeout"
+                timeout_status = "cancelled" if cancelled else "needs-action"
+                for key, state in tuple(processes.items()):
+                    if drain_before_stop(key, state):
+                        start_next()
                 for key, state in tuple(processes.items()):
                     _terminate_pdf_process(state["process"])
                     _close_pdf_result_queue(state["queue"])
                     processes.pop(key, None)
-                    results[key] = ([], [], "pdf_batch_timeout")
+                    results[key] = ([], [], timeout_code)
                     parsed += 1
                     filing = state["item"][1]
                     _emit_ingestion_progress(
@@ -3439,80 +4016,43 @@ def _parse_local_pdfs_isolated(
                         parsed,
                         total,
                         filing,
-                        status="blocked",
-                        error_code="pdf_batch_timeout",
+                        status=timeout_status,
+                        error_code=timeout_code,
                         elapsed_seconds=time.monotonic() - state["started_at"],
                     )
                 break
             for key, state in tuple(processes.items()):
-                try:
-                    message = state["queue"].get_nowait()
-                except queue.Empty:
-                    message = None
-                if message is not None:
-                    progressed = True
-                    kind = message[0]
-                    if kind == "filing-index":
-                        filing = state["item"][1]
-                        if len(message) > 5 and message[5] is not None:
-                            remember_page_texts(filing.local_path, message[5])
-                        if not state["indexed"]:
-                            state["indexed"] = True
-                            if len(message) > 4 and message[4]:
-                                state["index_diagnostic"] = str(message[4])
-                            indexed += 1
-                            _emit_ingestion_progress(
-                                progress,
-                                "filing-index",
-                                indexed,
-                                total,
-                                filing,
-                                status="local-parsing",
-                                elapsed_seconds=time.monotonic() - state["started_at"],
-                            )
-                    elif kind == "filing-result":
-                        finish_process(key, message[1])
-                        start_next()
-                elif not state["process"].is_alive():
+                if key not in processes:
+                    continue
+                if not state["process"].is_alive():
                     # ``multiprocessing.Queue`` uses a feeder thread. A child
                     # can therefore report not-alive before its final put is
                     # visible to the parent. Give that bounded handoff a short
                     # drain window before converting a normal result into an
                     # exit failure.
-                    final_result = None
                     drain_deadline = time.monotonic() + exit_drain_seconds
-                    while time.monotonic() < drain_deadline:
+                    final_result = False
+                    while key in processes and time.monotonic() < drain_deadline:
                         try:
                             pending_message = state["queue"].get(
                                 timeout=max(0.001, drain_deadline - time.monotonic())
                             )
                         except queue.Empty:
                             continue
-                        if pending_message and pending_message[0] == "filing-index":
-                            filing = state["item"][1]
-                            if len(pending_message) > 5 and pending_message[5] is not None:
-                                remember_page_texts(filing.local_path, pending_message[5])
-                            if not state["indexed"]:
-                                state["indexed"] = True
-                                indexed += 1
-                                _emit_ingestion_progress(
-                                    progress,
-                                    "filing-index",
-                                    indexed,
-                                    total,
-                                    filing,
-                                    status="local-parsing",
-                                    elapsed_seconds=time.monotonic() - state["started_at"],
-                                )
-                        elif pending_message and pending_message[0] == "filing-result":
-                            final_result = pending_message[1]
+                        if consume_message(key, state, pending_message):
+                            final_result = True
                             break
-                    finish_process(
-                        key,
-                        final_result or (key, [], [], "pdf_worker_exit_failed"),
-                    )
-                    start_next()
+                    if final_result:
+                        progressed = True
+                        start_next()
+                    elif key in processes:
+                        finish_process(key, (key, [], [], "pdf_worker_exit_failed"))
+                        start_next()
+                    progressed = True
                 elif now >= state["deadline"]:
+                    if drain_before_stop(key, state):
+                        start_next()
+                        continue
                     _terminate_pdf_process(state["process"])
                     _close_pdf_result_queue(state["queue"])
                     processes.pop(key, None)
@@ -3525,16 +4065,18 @@ def _parse_local_pdfs_isolated(
                         parsed,
                         total,
                         filing,
-                        status="blocked",
+                        status="needs-action",
                         error_code="pdf_parse_timeout",
                         elapsed_seconds=time.monotonic() - state["started_at"],
                     )
                     start_next()
             if not progressed:
                 time.sleep(0.01)
-        if not cancelled and time.monotonic() >= batch_deadline:
+        if time.monotonic() >= batch_deadline or cancelled:
+            timeout_code = "pdf_parse_cancelled" if cancelled else "pdf_batch_timeout"
+            timeout_status = "cancelled" if cancelled else "needs-action"
             for key, filing, _manifest in uncached[next_item:]:
-                results[key] = ([], [], "pdf_batch_timeout")
+                results[key] = ([], [], timeout_code)
                 parsed += 1
                 _emit_ingestion_progress(
                     progress,
@@ -3542,8 +4084,8 @@ def _parse_local_pdfs_isolated(
                     parsed,
                     total,
                     filing,
-                    status="blocked",
-                    error_code="pdf_batch_timeout",
+                    status=timeout_status,
+                    error_code=timeout_code,
                 )
     finally:
         for key, state in tuple(processes.items()):
@@ -3585,13 +4127,23 @@ def _is_deterministic_pdf_window_failure(error: Exception) -> bool:
     document-shape failures are deterministic for the same content hash,
     parser version, rules and identity digest and may be marked exhausted.
     """
+    if isinstance(error, (TimeoutError, PermissionError, OSError, CancelledError)):
+        return False
     text = f"{type(error).__name__} {error}".casefold()
     transient_markers = (
         "timeout", "timed out", "network", "connection", "rate limit",
         "too many request", "spawn", "process start", "worker exited",
         "cancel", "resource temporarily", "broken pipe",
     )
-    return not any(marker in text for marker in transient_markers)
+    if any(marker in text for marker in transient_markers):
+        return False
+    # Unknown native/host failures remain resumable. Only a typed parser/shape
+    # failure (including the safe worker envelope) fences identical input.
+    return (isinstance(error, (ValueError, TypeError, IndexError, KeyError))
+            or any(marker in text for marker in (
+                "valueerror:", "typeerror:", "indexerror:", "keyerror:",
+                "pdfreaderror:", "pdfstreamerror:", "malformed pdf", "invalid pdf",
+                "unsupported document shape")))
 
 
 def _toc_statement_page_map(
@@ -4036,6 +4588,98 @@ def _shift_period_year(value: str | None, target_year: int) -> str | None:
         return None
 
 
+def _period_from_interval(start: str, end: str) -> str:
+    try:
+        first, last = date.fromisoformat(start), date.fromisoformat(end)
+    except (TypeError, ValueError):
+        return ""
+    if (first.month, first.day, last.month, last.day) == (1, 1, 6, 30):
+        return "H1"
+    if (first.month, first.day, last.month, last.day) == (1, 1, 3, 31):
+        return "Q1"
+    if (first.month, first.day, last.month, last.day) == (1, 1, 9, 30):
+        return "Q3"
+    if (first.month, first.day, last.month, last.day) == (1, 1, 12, 31):
+        return "FY"
+    # An explicit header is stronger than the filing-level period label.  A
+    # valid range that does not match one of our named year-to-date periods
+    # stays an interval; borrowing the filing's FY/H1 label would misstate the
+    # comparator even though its exact start/end dates are known.
+    return "INTERVAL"
+
+
+def _bind_comparison_period(
+    column: _PeriodColumn, statement: str, manifest: FilingManifest,
+) -> _ComparisonPeriodBinding:
+    """Bind an issuer's comparison column to a point or interval safely.
+
+    Balance-sheet values are points in time and require their own dated header;
+    a report's period end is not a substitute for an ambiguous comparison
+    label. Flow statements describe intervals, so year-only columns inherit the
+    filing's actual interval, while explicit headers can bind a dated range.
+    """
+    explicit_start = column.period_start or ""
+    explicit_end = column.period_end or ""
+    if statement == "balance_sheet":
+        if not explicit_end:
+            return _ComparisonPeriodBinding(
+                column.year, "", None, "",
+                "unresolved_ambiguous_point_in_time_header", False,
+            )
+        end_date = date.fromisoformat(explicit_end)
+        fiscal_period = {
+            (12, 31): "FY", (6, 30): "H1", (3, 31): "Q1", (9, 30): "Q3",
+        }.get((end_date.month, end_date.day), "AS_OF")
+        basis = (
+            "explicit_point_in_time_header"
+            if column.period_basis != "explicit_header_interval"
+            else "explicit_point_in_time_header_range_end"
+        )
+        return _ComparisonPeriodBinding(
+            column.year or end_date.year, fiscal_period, None, explicit_end, basis, True,
+        )
+
+    if statement not in {"income_statement", "cash_flow", "comprehensive_income"}:
+        return _ComparisonPeriodBinding(
+            column.year, "", None, "", "unresolved_unsupported_statement_period", False,
+        )
+
+    if explicit_start and explicit_end and column.period_basis == "explicit_header_interval":
+        fiscal_period = _period_from_interval(explicit_start, explicit_end)
+        return _ComparisonPeriodBinding(
+            int(explicit_end[:4]), fiscal_period, explicit_start, explicit_end,
+            "explicit_header_interval", True,
+        )
+
+    try:
+        current_year = int(manifest.period_end[:4])
+        target_year = column.year or current_year
+    except (TypeError, ValueError):
+        target_year = 0
+        current_year = 0
+    current_start = _period_start(manifest)
+    shifted_end = _shift_period_year(manifest.period_end, target_year) if target_year else None
+    shifted_start = _shift_period_year(current_start, target_year) if target_year else None
+    if explicit_end:
+        # An end date alone only forms a valid comparative interval when it
+        # agrees with the same filing interval shifted to that column's year.
+        if not shifted_end or explicit_end != shifted_end:
+            return _ComparisonPeriodBinding(
+                column.year, "", None, "", "unresolved_incomplete_interval_header", False,
+            )
+        basis = "explicit_header_end_date_and_filing_interval"
+        shifted_end = explicit_end
+    else:
+        basis = "column_year_and_filing_interval"
+    if not shifted_start or not shifted_end or not manifest.fiscal_period:
+        return _ComparisonPeriodBinding(
+            column.year, "", None, "", "unresolved_incomplete_interval_header", False,
+        )
+    return _ComparisonPeriodBinding(
+        int(shifted_end[:4]), manifest.fiscal_period, shifted_start, shifted_end, basis, True,
+    )
+
+
 def _pair_pdf_facts_evidence(
     facts: Sequence[FinancialFact], refs: Sequence[EvidenceRef],
 ) -> tuple[tuple[tuple[FinancialFact, EvidenceRef], ...], tuple[str, ...]]:
@@ -4096,6 +4740,7 @@ class FinancialIngestionEngine:
         self._compatibility_rules = compatibility_rules or FinancialRulesSnapshot.empty()
         self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
         self._last_pdf_context: PdfTableContext | None = None
+        self._document_execution: dict[str, dict[str, Any]] = {}
 
     def with_compatibility_rules(
         self, rules: FinancialRulesSnapshot | None
@@ -4160,6 +4805,31 @@ class FinancialIngestionEngine:
         )
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    def pending_row_mappings(self, company: Company, filings: Sequence[FilingDocument]) -> frozenset[str]:
+        """Expose document-local mapping debt before an active-cache shortcut.
+
+        This reads only the exact source/config-addressed cache entries. It
+        neither parses nor downloads and is not a new fact-admission gate.
+        """
+        if self._parse_cache_dir is None:
+            return frozenset()
+        pending = set()
+        for filing in filings:
+            if not filing.content_hash:
+                continue
+            key = self._parse_cache_key(filing.local_path, company, filing, filing.content_hash)
+            try:
+                payload = json.loads((self._parse_cache_dir / f"{key}.json").read_text(encoding="utf-8"))
+                if (payload.get("parser_version") == _PDF_PARSER_VERSION
+                    and payload.get("roe_row_mapping_version") != _ROE_ROW_MAPPING_VERSION
+                    and any(isinstance(item, dict) and item.get("concept") in {
+                        "reported_roe", "reported_roe_excluding_nonrecurring"}
+                        for item in payload.get("facts", ()))):
+                    pending.add(filing.accession_number)
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        return frozenset(pending)
+
     def _load_parse_cache(
         self, key: str
     ) -> tuple[list[FinancialFact], list[EvidenceRef]] | None:
@@ -4178,10 +4848,32 @@ class FinancialIngestionEngine:
             if (payload.get("parser_version") != _PDF_PARSER_VERSION
                     or payload.get("disclosure_version") != _SOURCE_DISCLOSURE_VERSION):
                 return None
-            facts = [FinancialFact(**item) for item in payload["facts"]]
+            cached_fact_rows = payload["facts"]
+            if (
+                payload.get("roe_row_mapping_version") != _ROE_ROW_MAPPING_VERSION
+                and any(
+                    isinstance(item, dict)
+                    and item.get("concept") in {
+                        "reported_roe", "reported_roe_excluding_nonrecurring",
+                    }
+                    for item in cached_fact_rows
+                )
+            ):
+                # This page-local mapping change affects only cached documents
+                # that actually contain ROE candidates. Other old parse
+                # payloads remain reusable without a global parser-version bump.
+                return None
+            facts = [FinancialFact(**item) for item in cached_fact_rows]
             refs = [EvidenceRef(**item) for item in payload["evidence"]]
             if any(item.parser_version not in {_PDF_PARSER_VERSION, DISCLOSURE_VERSION, *NOTE_DISCLOSURE_VERSIONS} for item in facts):
                 return None
+            observations = payload.get("document_execution", {})
+            if not isinstance(observations, dict):
+                observations = {}
+            for document_id, observation in observations.items():
+                if isinstance(document_id, str) and isinstance(observation, dict):
+                    self._document_execution[document_id] = {**observation, "cache_reused": True,
+                                                             "attempt_count": 0, "parse_elapsed_seconds": 0.0}
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
         self._parse_cache_memory[key] = (facts, refs)
@@ -4208,8 +4900,12 @@ class FinancialIngestionEngine:
             {
                 "parser_version": _PDF_PARSER_VERSION,
                 "disclosure_version": _SOURCE_DISCLOSURE_VERSION,
+                "roe_row_mapping_version": _ROE_ROW_MAPPING_VERSION,
                 "facts": [item.to_dict() for item in safe_facts],
                 "evidence": [item.to_dict() for item in safe_refs],
+                "document_execution": {document_id: self._document_execution[document_id]
+                    for document_id in sorted({ref.document_id for ref in safe_refs})
+                    if document_id in self._document_execution},
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -4263,6 +4959,9 @@ class FinancialIngestionEngine:
             run_checkpointed_windows,
         )
 
+        parse_started = time.monotonic()
+        observation = {"source_hash": filing.content_hash, "attempt_count": 1, "cache_reused": False}
+        self._document_execution[filing.document_id] = observation
         deadline = min(deadline, time.monotonic() + self._parse_timeout_seconds) if deadline is not None else time.monotonic() + self._parse_timeout_seconds
         user_cancelled = cancel_check
         cancel_check = lambda: (user_cancelled is not None and user_cancelled()) or time.monotonic() >= deadline
@@ -4274,12 +4973,24 @@ class FinancialIngestionEngine:
             return [], [], ("pdf_document_budget_exhausted_resumable",)
         except OSError:
             return [], [], ("pdf_file_unreadable",)
+        if ((filing.content_hash and actual_hash != filing.content_hash)
+                or (manifest.content_hash and manifest.content_hash != actual_hash)):
+            observation.update({"failure_stage": "source-identity", "root_error_code": "PDF_SOURCE_HASH_MISMATCH"})
+            return [], [], ("PDF_SOURCE_HASH_MISMATCH",)
+        # Legacy direct callers may not yet have a hash. Bind the bytes just
+        # observed rather than misreporting an absent expectation as a conflict.
+        # An explicit conflicting expectation above is never overwritten.
+        filing = replace(filing, content_hash=actual_hash)
+        manifest = replace(manifest, content_hash=actual_hash)
+        observation["source_hash"] = actual_hash
         document_context = read_document_context(filing.local_path, cancel_check=cancel_check,
             timeout_seconds=max(0.01, min(45.0, deadline - time.monotonic())))
         if getattr(document_context, "diagnostic_code", ""):
             return [], [], (document_context.diagnostic_code,)
         page_count = len(document_context.page_texts) or _pdf_page_count(
             filing.local_path, cancel_check=cancel_check, deadline=deadline)
+        observation.update({"page_count": page_count,
+                            "native_text_page_count": sum(bool(text.strip()) for text in document_context.page_texts)})
         if cancel_check is not None and cancel_check():
             return [], [], (("pdf_parse_cancelled" if user_cancelled is not None and user_cancelled() else "pdf_document_budget_exhausted_resumable"),)
         selected_pages = candidate_pages
@@ -4312,6 +5023,7 @@ class FinancialIngestionEngine:
         pages = frozenset(int(page) for page in selected_pages if int(page) > 0)
         page_count = page_count or max(pages)
         windows = plan_page_windows(page_count, pages, window_size=window_size)
+        observation.update({"indexed_page_count": len(pages), "window_total": len(windows)})
         from .financial_statutory_currency import bind_statutory_presentation
         document_context = replace(document_context, units=bind_statutory_presentation(
             document_context.units, document_context.page_texts, company, filing))
@@ -4346,10 +5058,6 @@ class FinancialIngestionEngine:
             ).hexdigest(),
         )
 
-        exhausted = store.load_exhausted(key, input_fingerprint=key.digest)
-        if exhausted is not None:
-            return [], [], ("pdf_window_exhausted_same_input",)
-
         worker = _CheckpointPdfWindowWorker(
             filing.local_path,
             company,
@@ -4360,8 +5068,10 @@ class FinancialIngestionEngine:
         )
 
         window_failures: list[str] = []
+        failed_pages: set[int] = set()
 
         def window_failed(_window, error):
+            failed_pages.update(_window.pages)
             if getattr(error, "code", "") == "PDF_WORKER_START_FAILED":
                 window_failures.append("PDF_WORKER_START_FAILED")
 
@@ -4379,6 +5089,12 @@ class FinancialIngestionEngine:
             on_failure=window_failed,
             deadline=deadline,
         )
+        exhausted = store.load_exhausted(key, input_fingerprint=key.digest)
+        if exhausted is not None:
+            failed_window = exhausted.get("failed_window", {})
+            expected = next((window for window in windows if window.index == failed_window.get("index")), None)
+            if expected is not None and tuple(failed_window.get("pages", ())) == expected.pages:
+                failed_pages.update(expected.pages)
         facts: dict[str, FinancialFact] = {}
         refs: dict[str, EvidenceRef] = {}
         for checkpoint in checkpoints:
@@ -4389,10 +5105,16 @@ class FinancialIngestionEngine:
         diagnostics = (
             () if len(checkpoints) == len(windows) else
             tuple(dict.fromkeys((*window_failures,
+                "pdf_window_exhausted_same_input" if exhausted is not None else
                 "pdf_parse_cancelled" if user_cancelled is not None and user_cancelled() else
                 "pdf_document_budget_exhausted_resumable" if time.monotonic() >= deadline else
                 "pdf_window_incomplete")))
         )
+        observation.update({"completed_window_count": len(checkpoints),
+                            "parser_failed_pages": sorted(failed_pages),
+                            "parse_elapsed_seconds": round(time.monotonic() - parse_started, 3),
+                            "failure_stage": "parse" if diagnostics else "",
+                            "root_error_code": diagnostics[0] if diagnostics else ""})
         return (
             sorted(facts.values(), key=lambda fact: (fact.source_page or 0, fact.fact_id)),
             sorted(refs.values(), key=lambda ref: ref.evidence_id),
@@ -4741,6 +5463,8 @@ class FinancialIngestionEngine:
                         continue
                     table = PdfTableAST(page_number, statement, scope, table_currency, multiplier, _period_headers(table_rows), table_rows)
                     columns = context.periods or _period_columns(table.rows, rules=rules, source_page=page_number)
+                    if section.summary and not columns:
+                        columns = _summary_roe_period_columns(table.rows, manifest)
                     if manifest.fiscal_period in {'FY', 'CY', 'ANNUAL'}:
                         # Explicit paired annual current/prior headers are
                         # real comparative columns, even without year digits.
@@ -5135,8 +5859,17 @@ class FinancialIngestionEngine:
                                 normalized_decimal = normalized_decimal.copy_abs().copy_negate()
                             value = float(normalized_decimal)
                             # Avoid repeated nested rows and parent-only tables.
-                            period_start = _period_start(manifest) if statement in {"income_statement", "cash_flow", "comprehensive_income"} else None
-                            identity = f"{filing.document_id}|{concept}|{page_number}|{merged_row.bbox}|{format(normalized_decimal, 'f')}"
+                            period_start = _period_start(manifest) if (
+                                statement in {"income_statement", "cash_flow", "comprehensive_income"}
+                                or (summary_page and concept == "reported_roe")
+                            ) else None
+                            fact_concept = concept
+                            if concept == "reported_roe" and (
+                                "扣除非经常性损益后" in compact
+                                or "excludingnonrecurring" in _label_compact(compact)
+                            ):
+                                fact_concept = "reported_roe_excluding_nonrecurring"
+                            identity = f"{filing.document_id}|{fact_concept}|{page_number}|{merged_row.bbox}|{format(normalized_decimal, 'f')}"
                             fact_id = hashlib.sha256(identity.encode()).hexdigest()[:24]
                             unit_excerpt = (
                                 section.context.unit_evidence
@@ -5206,8 +5939,8 @@ class FinancialIngestionEngine:
                                 )
                             fact = FinancialFact(
                                 fact_id=f"ingest:{fact_id}", company_cik=company.security_id,
-                                concept=concept, reported_concept=(
-                                    _row_label_source_text(merged_row) if concept in {
+                                concept=fact_concept, reported_concept=(
+                                    _row_label_source_text(merged_row) if concept == "reported_roe" or concept in {
                                         "net_income", "parent_net_income", "minority_interest_profit",
                                         "ordinary_shareholder_net_income",
                                         "profit_before_tax", "operating_income", "equity", "total_equity",
@@ -5331,22 +6064,13 @@ class FinancialIngestionEngine:
                                         comparison_transform = "absolute_value"
                                     else:
                                         comparison_transform = profit_loss_value_transform(compact, concept)
-                                    comparison_end = _shift_period_year(
-                                        manifest.period_end, comparison_column.year
-                                    ) or ""
-                                    if not comparison_end:
-                                        continue
-                                    comparison_start = (
-                                        _shift_period_year(
-                                            _period_start(manifest),
-                                            comparison_column.year - (
-                                                int(manifest.period_end[:4])
-                                                - int((_period_start(manifest) or manifest.period_end)[:4])
-                                            ),
-                                        )
-                                        if statement in {"income_statement", "cash_flow", "comprehensive_income"}
-                                        else None
+                                    comparison_period = _bind_comparison_period(
+                                        comparison_column,
+                                        "income_statement" if summary_page and concept == "reported_roe" else statement,
+                                        manifest,
                                     )
+                                    comparison_end = comparison_period.period_end
+                                    comparison_start = comparison_period.period_start
                                     comparison_center = (comparison_cell.x0 + comparison_cell.x1) / 2
                                     comparison_multiplier = (
                                         comparison_column.unit_scale
@@ -5368,8 +6092,10 @@ class FinancialIngestionEngine:
                                         comparison_decimal = comparison_decimal.copy_abs().copy_negate()
                                     comparison_normalized = float(comparison_decimal)
                                     comparison_identity = (
-                                        f"{filing.document_id}|{concept}|{page_number}|"
-                                        f"{merged_row.bbox}|{comparison_column.year}|{format(comparison_decimal, 'f')}"
+                                        f"{filing.document_id}|{fact_concept}|{page_number}|"
+                                        f"{merged_row.bbox}|{comparison_period.fiscal_year}|"
+                                        f"{comparison_period.fiscal_period}|{comparison_start}|{comparison_end}|"
+                                        f"{comparison_period.basis}|{format(comparison_decimal, 'f')}"
                                     )
                                     comparison_fact_id = hashlib.sha256(
                                         comparison_identity.encode()
@@ -5434,7 +6160,7 @@ class FinancialIngestionEngine:
                                         comparison_unit_ref = EvidenceRef(
                                             f"unit:{comparison_fact_id}", filing.document_id,
                                             filing.source_url,
-                                            f"{manifest.form_type} {comparison_end} / displayed unit",
+                                            f"{manifest.form_type} {comparison_end or 'period undetermined'} / displayed unit",
                                             f"page:{comparison_unit_page}", comparison_unit_excerpt,
                                             filing.filed_at, filing.content_hash,
                                         )
@@ -5450,7 +6176,8 @@ class FinancialIngestionEngine:
                                             ref.evidence_id.startswith("unit:statutory:") for ref in comparison_extra_units)
                                             else comparison_provenance if concept == "reported_roe"
                                             else fact.unit_provenance),
-                                        fiscal_year=comparison_column.year,
+                                        fiscal_year=comparison_period.fiscal_year,
+                                        fiscal_period=comparison_period.fiscal_period,
                                         start_date=comparison_start,
                                         end_date=comparison_end,
                                         period_start=comparison_start,
@@ -5462,8 +6189,9 @@ class FinancialIngestionEngine:
                                         ref,
                                         evidence_id=f"fact:{comparison_fact_id}",
                                         title=(
-                                            f"{manifest.form_type} {comparison_end} / {label} "
-                                            f"column:{comparison_column.year}"
+                                            f"{manifest.form_type} {comparison_end or 'period undetermined'} / {label} "
+                                            f"column:{comparison_column.header or comparison_column.year} / "
+                                            f"period basis:{comparison_period.basis}"
                                         ),
                                         locator=f"page:{page_number}",
                                         excerpt=comparison_fact.raw_text,

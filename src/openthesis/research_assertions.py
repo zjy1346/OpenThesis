@@ -342,61 +342,241 @@ def validate_response(response: Any, queries: list[dict[str, Any]], verifier_ide
     return accepted
 
 
+def _verification_prompt(queries: list[dict[str, Any]]) -> str:
+    sources = {source["source_block_id"]: source for query in queries for source in query["sources"]}
+    assertions = [{**{key: value for key, value in query.items() if key != "sources"},
+                   "source_block_ids": [source["source_block_id"] for source in query["sources"]]}
+                  for query in queries]
+    return json.dumps({"protocol": VERSION, "sources": dict(sorted(sources.items())),
+                       "assertions": assertions}, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _verification_batches(queries, provider):
+    """Pack the actual deduplicated wire; estimates shape batches, not refusal.
+
+    Never impose a guessed 128K hard limit on an unknown-capacity route. A
+    single source block is retained whole (including its qualifiers/footnotes).
+    If its proven capacity is insufficient the precise failure stays pending.
+    """
+    from .research_execution.input_budget import input_measurement
+    from .research_execution.model import provider_context_capability, provider_declares_context_capability
+    effective = provider.for_output_budget(32_000) if callable(getattr(provider, "for_output_budget", None)) else provider
+    limit = provider_context_capability(effective).available_input_tokens if provider_declares_context_capability(effective) else None
+    # Source-connected components keep related work together. Unrelated source
+    # groups never get packed merely because the model advertises a big window.
+    groups = []
+    for query in sorted(queries, key=lambda item: item["assertion_id"]):
+        sources = {source["source_block_id"] for source in query["sources"]}
+        related = [index for index, (keys, _) in enumerate(groups) if keys & sources]
+        members = [query]
+        for index in reversed(related):
+            keys, values = groups.pop(index)
+            sources |= keys
+            members.extend(values)
+        groups.append((sources, members))
+    source_sizes = {}
+    base = input_measurement(effective, _MODEL_PROTOCOL, '{"protocol":"' + VERSION + '","sources":{},"assertions":[]}')["tokens"]
+
+    def exact_batches(items):
+        measured = input_measurement(effective, _MODEL_PROTOCOL, _verification_prompt(items))
+        if limit is not None and measured["tokens"] > limit and len(items) > 1:
+            middle = len(items) // 2
+            yield from exact_batches(items[:middle])
+            yield from exact_batches(items[middle:])
+        else:
+            yield items
+
+    for source_ids, members in sorted(groups, key=lambda group: tuple(sorted(group[0]))):
+        batch, included, estimate = [], set(), base
+        for query in sorted(members, key=lambda item: item["assertion_id"]):
+            additions = 0
+            for source in query["sources"]:
+                key = source["source_block_id"]
+                if key not in source_sizes:
+                    source_sizes[key] = input_measurement(effective, "", json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":")))["tokens"]
+                if key not in included:
+                    additions += source_sizes[key]
+            wire_query = {key: value for key, value in query.items() if key != "sources"}
+            wire_query["source_block_ids"] = [source["source_block_id"] for source in query["sources"]]
+            query_size = input_measurement(effective, "", json.dumps(wire_query, ensure_ascii=False, separators=(",", ":")))["tokens"]
+            # Short verdict output planning, with room for exact source spans.
+            output_estimate = 1024 + 384 * (len(batch) + 1)
+            if batch and ((limit is not None and estimate + additions + query_size > limit * .95)
+                          or output_estimate > 32_000):
+                yield from exact_batches(batch)
+                batch, included, estimate = [], set(), base
+                additions = sum(source_sizes[source["source_block_id"]] for source in query["sources"])
+            batch.append(query)
+            estimate += additions + query_size
+            included.update(source["source_block_id"] for source in query["sources"])
+        if batch:
+            yield from exact_batches(batch)
+
+
 def validate_with_assertions(validate: Callable[[], Any], *, stage_id: str, journal: Any,
                              model_executor: Any = None, allow_network: bool = False) -> Any:
-    """At most one bounded semantic batch per stage; cached reads do no I/O.
+    """Persist per-assertion judgments before local validation/publication.
 
-    Results remain model judgments, not numeric proofs. Invalid/omitted targets
-    stay unresolved and the original candidate is retained by stage journaling.
+    Independent proofs survive stages and restarts. Invalid/missing results
+    never discard valid siblings. Local reads have no provider capability.
     """
-    from .research_execution.model import ModelStageRequest, provider_context_capability
+    from .research_execution.model import ModelStageRequest
+    from .research_execution.assertion_cache import (read_proofs, save_proofs, read_flow, save_flow, unknown_assertions,
+        acquire_assertions, assertion_owner_state, wait_assertions, bind_assertion_request, recover_received_proofs)
     from .providers import ProviderError
 
     initial = AssertionSession()
     with assertion_session(initial):
         result = validate()
-    queries = list(initial.queries.values())
-    results = {}
-    issue = ""
-    candidate = None
-    if queries:
-        prompt = json.dumps({"protocol": VERSION, "assertions": queries}, ensure_ascii=False, allow_nan=False)
-        request = ModelStageRequest(stage_id + ":assertion-verification", _MODEL_PROTOCOL, prompt,
-                                    purpose="semantic_verification")
+    queries = sorted(initial.queries.values(), key=lambda query: query["assertion_id"])
+    prior = read_flow(journal, stage_id, queries)
+    saved = read_proofs(journal, queries, VERSION)
+    saved.update(recover_received_proofs(journal, [query for query in queries if query["assertion_id"] not in saved], VERSION))
+    # Recheck host locations against current source bytes even for persisted
+    # proofs. Identity changes do not inherit semantic judgments.
+    results = validate_response({"structured_output_valid": True, "results": list(saved.values())}, queries, "local-proof-reuse")
+    for key in results:
+        results[key] = deepcopy(saved[key])
+    reused = len(results)
+    issue = prior.get("diagnostic_code", "")
+    received = prior.get("received_candidates", 0)
+    submitted = prior.get("submitted_batches", 0)
+    batch_records = list(prior.get("batches", []))
+    pending = [query for query in queries if query["assertion_id"] not in results]
+    waiting_queries = []
+    unknown = unknown_assertions(journal)
+    unknown_pending = [query['assertion_id'] for query in pending if query['assertion_id'] in unknown]
+    if unknown_pending:
+        issue = issue or 'MODEL_SUBMISSION_UNKNOWN'
+        pending = [query for query in pending if query['assertion_id'] not in unknown]
+    if allow_network and model_executor is not None and pending:
         try:
-            candidate = journal.saved_candidate(request, stage_id) if journal is not None else None
-            if candidate is None and allow_network and model_executor is not None:
-                # The caller binds the parent stage/generation. All normal
-                # cancellation, unknown-wire and configured-model guards apply.
-                bounded = replace(request, max_input_bytes=provider_context_capability(model_executor.provider).max_input_bytes)
-                candidate = model_executor.execute(bounded, single_attempt=True)
-            if candidate is not None:
-                identity = journal.stage_configuration(stage_id) if hasattr(journal, "stage_configuration") else journal.configuration_fingerprint
-                results = validate_response(candidate, queries, identity)
-        except ProviderError as exc:
-            issue = exc.code if re.fullmatch(r"MODEL_[A-Z0-9_]{1,70}", exc.code or "") else "ASSERTION_VERIFIER_UNAVAILABLE"
-        except (ValueError, TypeError):
-            issue = "ASSERTION_VERIFIER_RESPONSE_INVALID"
-        except Exception as exc:
-            if getattr(exc, "cancelled", False) or type(exc).__name__ in {"ModelStageCancelled", "ResearchCancelled", "StageExecutionCancelled"}:
-                raise
-            issue = "ASSERTION_VERIFIER_LOCAL_PROCESSING_FAILED"
+            batches = list(_verification_batches(pending, model_executor.provider))
+        except Exception:
+            batches = []
+            issue = "ASSERTION_VERIFIER_PREPARATION_FAILED"
+            batch_records.append({"submission_state": "not_submitted", "phase": "batch_preparation",
+                                  "diagnostic_code": issue, "assertions": len(pending)})
+        for batch in batches:
+            # Another parallel reader may have finished the same premises
+            # since this stage's initial lookup. Recheck before a paid wire.
+            fresh = read_proofs(journal, batch, VERSION)
+            valid = validate_response({'structured_output_valid': True, 'results': list(fresh.values())}, batch,
+                                      'local-proof-reuse')
+            for key in valid:
+                results[key] = deepcopy(fresh[key])
+            reused += len(valid)
+            batch = [query for query in batch if query['assertion_id'] not in valid]
+            if not batch:
+                continue
+            # Build before acquiring ownership: malformed local preparation
+            # must not strand a lock for a request that was never constructed.
+            prepared = ModelStageRequest(stage_id + ":assertion-verification", _MODEL_PROTOCOL,
+                _verification_prompt(batch), purpose="semantic_verification",
+                max_output_tokens=min(32_000, 1024 + 384 * len(batch)))
+            owner, batch, waiting = acquire_assertions(journal, batch, VERSION)
+            waiting_queries.extend(waiting)
+            if not batch:
+                continue
+            request = prepared if not waiting else ModelStageRequest(stage_id + ":assertion-verification", _MODEL_PROTOCOL,
+                _verification_prompt(batch), purpose="semantic_verification",
+                max_output_tokens=min(32_000, 1024 + 384 * len(batch)))
+            state, code = "not_submitted", ""
+            phase, capacity = "prepare", {}
+            candidate = None
+            try:
+                from .research_execution.input_budget import input_measurement
+                from .research_execution.model import provider_context_capability, provider_declares_context_capability
+                provider = model_executor.provider
+                effective = (provider.for_output_budget(request.max_output_tokens)
+                             if callable(getattr(provider, "for_output_budget", None)) else provider)
+                capability = provider_context_capability(effective)
+                capacity = {"declared": provider_declares_context_capability(effective),
+                    "available_input_tokens": capability.available_input_tokens,
+                    "reserved_output_tokens": capability.reserved_output_tokens,
+                    "counting": input_measurement(effective, request.system_prompt, request.user_prompt)}
+                candidate = journal.saved_candidate(request, stage_id) if journal is not None else None
+                if candidate is None:
+                    bind_assertion_request(journal, batch, VERSION, stage_id, request)
+                    phase = "dispatch"
+                    assertion_owner_state(journal, batch, VERSION, owner, "dispatched")
+                    candidate = model_executor.execute(request, single_attempt=True)
+                state = "received"
+                phase = "parse"
+                identity = (journal.stage_configuration(stage_id) if hasattr(journal, "stage_configuration")
+                            else getattr(journal, "configuration_fingerprint", "configured-model"))
+                parsed = validate_response(candidate, batch, identity)
+                results.update(parsed)
+                # Commit each batch before any subsequent call or local check.
+                save_proofs(journal, parsed, VERSION)
+                received += 1
+                if len(parsed) < len(batch):
+                    code = "ASSERTION_VERIFIER_RESULTS_INCOMPLETE"
+            except ProviderError as exc:
+                code = exc.code if re.fullmatch(r"MODEL_[A-Z0-9_]{1,70}", exc.code or "") else "ASSERTION_VERIFIER_UNAVAILABLE"
+                if callable(getattr(journal, "request_observation", None)):
+                    state = journal.request_observation(request, stage_id)["submission_state"]
+                elif phase == "dispatch":
+                    state = "received" if exc.response_received else "remote_unknown"
+            except (ValueError, TypeError):
+                code = "ASSERTION_VERIFIER_RESPONSE_INVALID"
+                if phase == "dispatch":
+                    # A transport/parser exception does not prove no bytes
+                    # reached the provider. Preserve durable evidence before
+                    # deciding whether another stage may elect a new sender.
+                    state = (journal.request_observation(request, stage_id)["submission_state"]
+                             if callable(getattr(journal, "request_observation", None)) else "remote_unknown")
+            except Exception as exc:
+                if getattr(exc, "cancelled", False) or type(exc).__name__ in {"ModelStageCancelled", "ResearchCancelled", "StageExecutionCancelled"}:
+                    observed = (journal.request_observation(request, stage_id)["submission_state"]
+                                if callable(getattr(journal, "request_observation", None)) else
+                                "remote_unknown" if phase == "dispatch" else "not_submitted")
+                    assertion_owner_state(journal, batch, VERSION, owner, observed)
+                    raise
+                supplied_code = getattr(exc, "code", "")
+                code = supplied_code if isinstance(supplied_code, str) and re.fullmatch(r"MODEL_[A-Z0-9_]{1,70}", supplied_code) else "ASSERTION_VERIFIER_LOCAL_PROCESSING_FAILED"
+                if phase == "dispatch" and callable(getattr(journal, "request_observation", None)):
+                    state = journal.request_observation(request, stage_id)["submission_state"]
+            assertion_owner_state(journal, batch, VERSION, owner, state)
+            submitted += int(state != "not_submitted")
+            batch_records.append({"input_digest": request.input_digest, "assertions": len(batch),
+                "assertion_ids": [query['assertion_id'] for query in batch],
+                "input_bytes": request.input_bytes, "submission_state": state, "diagnostic_code": code,
+                "phase": phase, "capacity": capacity})
+            if code:
+                issue = code
+            save_flow(journal, stage_id, queries, {"diagnostic_code": issue, "batches": batch_records,
+                "received_candidates": received, "submitted_batches": submitted, "submission_state": state})
+            if state == "remote_unknown":
+                break
+    if waiting_queries:
+        shared = wait_assertions(journal, waiting_queries, VERSION)
+        valid = validate_response({"structured_output_valid": True, "results": list(shared.values())}, waiting_queries, "single-flight-proof")
+        results.update({key: deepcopy(shared[key]) for key in valid})
+        reused += len(valid)
+        if len(valid) < len(waiting_queries):
+            issue = issue or "ASSERTION_SHARED_VERDICT_PENDING"
+    if not issue and pending and not allow_network and not prior:
+        issue = "ASSERTION_VERIFIER_NOT_SUBMITTED"
     resolved = AssertionSession(results)
     with assertion_session(resolved):
         result = validate()
-    # Add the assertion evidence to the existing business validation record;
-    # it is not a provider-owned flag in candidate content.
+    flow = {**prior, "schema": "assertion-verifier-flow-v2", "reused_proofs": reused,
+        "single_flight_consumers": len(waiting_queries),
+        'unknown_submission_assertion_ids': unknown_pending,
+        "source_fragments": len({source["source_block_id"] for query in queries for source in query["sources"]}),
+        "request_assertions": len(queries), "received_candidates": received,
+        "submitted_batches": submitted, "parsed_results": len(results), "batches": batch_records,
+        "unresolved_assertion_ids": sorted(key for key in initial.queries if results.get(key, {}).get("state") not in {"supported", "contradicted"}),
+        "diagnostic_code": issue, "submission_state": "remote_unknown" if unknown_pending or any(
+            item.get("submission_state") == "remote_unknown" for item in batch_records)
+            else "received" if received else "not_submitted"}
+    flow = save_flow(journal, stage_id, queries, flow) or flow
     record = {**result.record, "assertion_protocol": VERSION,
-              "assertion_results": list(resolved.observed.values()),
-              "source_flow": {"schema": "assertion-verifier-flow-v1",
-                  "source_fragments": len({source["evidence_id"] for query in queries for source in query["sources"]}),
-                  "request_assertions": len(queries), "received_candidates": int(candidate is not None) if queries else 0,
-                  "parsed_results": len(results),
-                  "unresolved_assertion_ids": sorted(set(initial.queries) - set(results)),
-                  "diagnostic_code": issue},
-              "assertion_flow": {"requested": len(queries), "supported": sum(item["state"] == "supported" for item in resolved.observed.values()),
-                  "contradicted": sum(item["state"] == "contradicted" for item in resolved.observed.values()),
-                  "unresolved": sum(item["state"] == "unresolved" for item in resolved.observed.values())}}
+        "assertion_results": list(resolved.observed.values()), "source_flow": flow,
+        "assertion_flow": {"requested": len(queries),
+            **{state: sum(item["state"] == state for item in resolved.observed.values())
+               for state in ("supported", "contradicted", "unresolved")}}}
     if issue:
         record["assertion_diagnostic_code"] = issue
     return replace(result, record=record)

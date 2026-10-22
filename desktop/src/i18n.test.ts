@@ -22,6 +22,25 @@ describe("desktop localization catalog", () => {
     expect(COPY["zh-Hant"].visionFallback).toContain("\u8996\u89ba");
   });
 
+  it("explains the confirmed local-database recovery boundary in every language", () => {
+    for (const locale of ["zh-CN", "zh-Hant", "en"] as const) {
+      expect(COPY[locale].storageRecoveryRequired).toContain("OpenThesis");
+      expect(COPY[locale].storageRecoveryRequired).toMatch(/copy|复制|複製/);
+      expect(COPY[locale].storageRecoveryRequired).toMatch(/backup|备份|備份/);
+      expect(COPY[locale].storageRecoveryRequired).toMatch(/diagnostic|诊断|診斷/);
+      expect(COPY[locale].storageRecoveryRequired).toMatch(/not|不会|不會/);
+    }
+  });
+
+  it("does not claim a capacity failure necessarily submitted all material or requires a larger model", () => {
+    expect(COPY["zh-CN"].synthesisCapacityBody).not.toContain("完整材料已提交");
+    expect(COPY["zh-Hant"].synthesisCapacityBody).not.toContain("完整資料已提交");
+    expect(COPY.en.synthesisCapacityBody).not.toContain("The full material was submitted");
+    expect(COPY["zh-CN"].synthesisCapacityModel).not.toContain("更大");
+    expect(COPY["zh-Hant"].synthesisCapacityModel).not.toContain("更大");
+    expect(COPY.en.synthesisCapacityModel).not.toContain("Larger");
+  });
+
   it("localizes both vision approval modes and their scope in all supported languages", () => {
     for (const locale of ["zh-CN", "zh-Hant", "en"] as const) {
       expect(COPY[locale].visionApprovalMode.trim()).not.toBe("");

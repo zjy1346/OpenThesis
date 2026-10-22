@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 
 from openthesis.domain import Company, FilingDocument, FinancialFact
+from openthesis.financial_contracts import CandidateBatch, FactCandidate
 from openthesis.financial_compiler import FinancialDataset
+from openthesis.financial_ingestion import FinancialCandidateCollection
 from openthesis.financial_recognition import (
     FinancialRecognitionCoordinator,
     RecognitionState,
@@ -48,33 +50,69 @@ class RecordingCompiler:
         self.dataset = dataset
         self.calls = []
 
-    def compile_from_ingestion(self, subject, filings, engine, **kwargs):
-        self.calls.append((subject, tuple(filings), engine, kwargs))
+    def compile(self, subject, batches, policy):
+        self.calls.append((subject, tuple(batches), policy))
+        self.assert_frozen_inputs(subject, batches, policy)
         return self.dataset
+
+    @staticmethod
+    def assert_frozen_inputs(subject, batches, policy):
+        assert subject == _company()
+        assert len(batches) == 1
+        assert isinstance(batches[0], CandidateBatch)
+        assert batches[0].filing.document_id == _filing().document_id
+        assert batches[0].filing.accession_number == _filing().accession_number
+        assert batches[0].candidates
+        assert batches[0].candidates[0].fact == _fact()
+        assert len(policy.filings) == 1
+        assert policy.filings[0].document_id == _filing().document_id
+
+
+class RecordingCollector:
+    def __init__(self):
+        self.calls = []
+
+    def collect_candidate_batches(self, subject, filings, **kwargs):
+        self.calls.append((subject, tuple(filings), kwargs))
+        filing = filings[0]
+        candidate_batch = CandidateBatch(
+            filing, (FactCandidate(_fact(), extractor="test-structured"),)
+        )
+        return FinancialCandidateCollection(
+            manifests=(),
+            batches_by_document={
+                filing.document_id: (candidate_batch, CandidateBatch(filing))
+            },
+        )
 
 
 class FinancialRecognitionCoordinatorTests(unittest.TestCase):
     def test_complete_blocked_and_failed_states_come_only_from_canonical_dataset(self):
         for expected, dataset in (
             (RecognitionState.COMPLETE, _dataset(allow_ai=True)),
-            (RecognitionState.BLOCKED, _dataset(allow_ai=False)),
-            (RecognitionState.FAILED, _dataset(allow_ai=False, resolved=False)),
+            (RecognitionState.PARTIAL, _dataset(allow_ai=False)),
+            (RecognitionState.PARTIAL, _dataset(allow_ai=False, resolved=False)),
         ):
             with self.subTest(expected=expected):
                 compiler = RecordingCompiler(dataset)
-                coordinator = FinancialRecognitionCoordinator(object(), compiler)
+                collector = RecordingCollector()
+                coordinator = FinancialRecognitionCoordinator(collector, compiler)
                 outcome = coordinator.recognize(_company(), [_filing()])
                 self.assertEqual(outcome.state, expected)
-                self.assertIs(outcome.dataset, dataset)
+                self.assertEqual(outcome.dataset.allow_ai, dataset.allow_ai)
+                self.assertEqual(outcome.dataset.resolved_facts, dataset.resolved_facts)
                 self.assertEqual(len(compiler.calls), 1)
+                self.assertEqual(len(collector.calls), 1)
 
     def test_cancelled_before_start_never_calls_compiler(self):
         compiler = RecordingCompiler(_dataset(allow_ai=True))
-        outcome = FinancialRecognitionCoordinator(object(), compiler).recognize(
+        collector = RecordingCollector()
+        outcome = FinancialRecognitionCoordinator(collector, compiler).recognize(
             _company(), [_filing()], cancel_check=lambda: True
         )
         self.assertEqual(outcome.state, RecognitionState.CANCELLED)
         self.assertEqual(compiler.calls, [])
+        self.assertEqual(collector.calls, [])
         self.assertFalse(outcome.dataset.allow_ai)
 
 

@@ -3,6 +3,7 @@ mod atomic_export;
 mod credentials;
 mod model_center;
 mod model_gateway;
+mod model_stream;
 mod provider_registry;
 
 pub use model_gateway::run_model_gateway_stdio;
@@ -271,6 +272,7 @@ pub fn run() {
         .manage(model_center::ModelCenterState::default())
         .invoke_handler(tauri::generate_handler![
             backend::backend_request,
+            backend::backend_initialization_status,
             model_center::model_center_list_providers,
             model_center::model_center_list_connections,
             model_center::model_center_save_connection,

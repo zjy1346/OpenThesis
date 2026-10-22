@@ -53,5 +53,42 @@ class DesktopPackagingRegressionTests(unittest.TestCase):
         self.assertIn("std::fs::rename", backend)
         self.assertIn('value.starts_with("VCRUNTIME")', backend)
 
+    def test_privacy_gate_normalizes_only_the_versioned_archive_root(self):
+        verifier = (
+            PROJECT_ROOT / "scripts" / "verify-release-privacy.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("^OpenThesis-[^/]+/", verifier)
+        self.assertIn("$reviewedEntryName", verifier)
+        self.assertIn("$reviewedLicenseHashes[$reviewedEntryName]", verifier)
+
+    def test_persistent_sidecar_stdout_uses_utf8_before_process_start(self):
+        verifier = (
+            PROJECT_ROOT / "scripts" / "verify-desktop-runtime.ps1"
+        ).read_text(encoding="utf-8")
+        start = verifier.index("function Start-PersistentSidecar {")
+        end = verifier.index("\nfunction Invoke-PersistentSidecarRpc", start)
+        sidecar_start = verifier[start:end]
+        encoding_line = "$startInfo.StandardOutputEncoding = [Text.Encoding]::UTF8"
+
+        self.assertIn(encoding_line, sidecar_start)
+        self.assertLess(
+            sidecar_start.index(encoding_line),
+            sidecar_start.index("if (-not $process.Start())"),
+        )
+
+    def test_json_probe_reads_utf8_json_output(self):
+        verifier = (
+            PROJECT_ROOT / "scripts" / "verify-desktop-runtime.ps1"
+        ).read_text(encoding="utf-8")
+        start = verifier.index("function Invoke-JsonProbe {")
+        end = verifier.index("\nfunction Start-PersistentSidecar", start)
+        json_probe = verifier[start:end]
+
+        self.assertIn(
+            "Get-Content -LiteralPath $ProbeFiles.Output -Raw -Encoding UTF8 | ConvertFrom-Json",
+            json_probe,
+        )
+
 if __name__ == "__main__":
     unittest.main()

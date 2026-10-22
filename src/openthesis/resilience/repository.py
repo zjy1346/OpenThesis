@@ -487,14 +487,21 @@ class RecoveryRepository:
                         {"code": "RECOVERY_RESPONSE_OBSERVED", "response_received": True,
                          "receipt": receipt, "receipt_sha256": digest(receipt),
                          "owner_digest": digest(token)}, now, action_id)
+            if "model_call" in receipt:
+                self._event(db, plan.plan_id, "model-call-observed", {
+                    "receipt": {name: receipt[name] for name in
+                        ("schema", "response_received", "metadata", "model_call") if name in receipt},
+                    "owner_digest": digest(token)}, now, action_id)
 
     def external_rejection(self, plan: RecoveryPlan, action_id: str, token: str, now: float,
                            status: int, *, reason: str = "") -> None:
         """Clear only a proven rejected creation, not a lost/failed response."""
         format_rejection = status in {400, 422} and reason == "response_format_unsupported"
-        if (reason not in {"", "response_format_unsupported"}
+        request_rejection = (reason == "request_rejected"
+                             and status in {400, 404, 405, 413, 415, 422})
+        if (reason not in {"", "response_format_unsupported", "request_rejected"}
                 or isinstance(status, bool) or not isinstance(status, int)
-                or not (status in {401, 403, 429} or format_rejection)):
+                or not (status in {401, 403, 429} or format_rejection or request_rejection)):
             raise ValueError("RECOVERY_EXTERNAL_REJECTION_UNPROVEN")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -507,6 +514,47 @@ class RecoveryRepository:
             self._event(db, plan.plan_id, RecoveryState.RUNNING,
                         {"remote_rejection_status": status,
                          **({"reason": reason} if reason else {})}, now, action_id)
+
+    def external_partial(self, plan: RecoveryPlan, action_id: str, token: str,
+                         now: float, payload: dict) -> None:
+        """Append incomplete diagnostics, never a candidate or completion proof.
+
+        The transport adapter owns sanitization. The existing bounded chunk
+        store retains the payload; neither result_json nor response_received
+        changes, so an unknown submission remains protected from resubmission.
+        """
+        if not isinstance(payload, dict) or payload.get("response_received") is not False:
+            raise ValueError("RECOVERY_PARTIAL_RECEIPT_INVALID")
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM recovery_actions WHERE action_id=?", (action_id,)).fetchone()
+            if not (row and row["plan_id"] == plan.plan_id and row["lease_token"] == token
+                    and row["external_intent"] == 1 and not row["response_received"]):
+                raise RecoveryConflict("RECOVERY_ACTION_LEASE_LOST")
+            self._event(db, plan.plan_id, RecoveryState.RUNNING,
+                        {**payload, "code": "RECOVERY_RESPONSE_INCOMPLETE", "owner_digest": digest(token)},
+                        now, action_id)
+            if "model_call" in payload:
+                # Polling progress must not reload a megabyte-scale partial
+                # body just to obtain its small host-owned call identity.
+                self._event(db, plan.plan_id, "model-call-observed", {
+                    "receipt": {name: payload[name] for name in
+                        ("schema", "response_received", "incomplete", "model_call") if name in payload},
+                    "owner_digest": digest(token)}, now, action_id)
+
+    def model_call_observed(self, plan: RecoveryPlan, action_id: str, token: str,
+                            now: float, receipt: dict) -> None:
+        """Small host-owned start/rejection observation for one repair wire."""
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._owned(db, plan, token, now)
+            row = db.execute("SELECT 1 FROM recovery_actions WHERE action_id=? AND lease_token=? AND plan_id=?",
+                             (action_id, token, plan.plan_id)).fetchone()
+            if not row:
+                raise RecoveryConflict("RECOVERY_ACTION_LEASE_LOST")
+            self._event(db, plan.plan_id, "model-call-observed", {
+                "receipt": receipt,
+                "owner_digest": digest(token)}, now, action_id)
 
     def reserve_remote_calls(self, plan: RecoveryPlan, action_id: str, token: str,
                              now: float, *, calls: int, max_calls: int) -> None:

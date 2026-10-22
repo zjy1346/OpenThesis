@@ -1,10 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Clock3, FileText } from "lucide-react";
 
-import type { ResearchJob } from "../types";
+import type { ModelCallHistoryPage, ResearchJob } from "../types";
+import { ModelCallProgress } from "../features/research/ModelCallProgress";
 import {
-  agentDisplayName,
-  isAgentStageComplete,
   formatElapsedTime,
   progressStageCopy,
   progressStageDetail,
@@ -12,6 +11,25 @@ import {
 } from "../features/research/researchProgress";
 
 type RemainingRange = { lower: number; upper: number };
+type ProgressTab = "preparation" | "research";
+
+const RESEARCH_STAGES = new Set([
+  "parallel-agents", "model-stages", "financial-analysis", "base-analysis", "business-analysis",
+  "source-industry-analysis", "source-risk-analysis", "risk-analysis", "growth-analysis",
+  "counter-analysis", "scenario-analysis", "synthesis", "final-synthesis", "comparison",
+]);
+const RESEARCH_AGENT_IDS = new Set([
+  "financial-analyst", "business-analyst", "accounting-risk-analyst", "source-industry-analysis",
+  "source-risk-analysis", "growth-opportunity-analyst", "skeptical-analyst", "forecast-analyst",
+  "research-synthesizer", "growth-opportunities", "counter-analysis", "forecast-scenarios", "final-synthesis",
+]);
+const FINAL_FILING_STATUSES = new Set(["usable", "complete", "none", "partial", "historical", "not-applicable", "needs-action", "needs_action"]);
+
+function hasModelResearchActivity(job: ResearchJob): boolean {
+  if (RESEARCH_STAGES.has(job.stage ?? "") || Object.keys(job.agent_states ?? {}).length > 0) return true;
+  return (job.model_calls ?? []).some((call) => RESEARCH_AGENT_IDS.has(call.stage_id)
+    || call.stage_id.startsWith("research-"));
+}
 
 function isFilingProgressStalled(job: ResearchJob): boolean {
   if (!["filing-parse", "filing-window"].includes(job.stage ?? "")) return false;
@@ -91,7 +109,7 @@ export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, 
   );
 }
 
-export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN", onCancel, onVisionDecision }: {
+export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN", onCancel, onVisionDecision, onCancelCall, loadCallHistory }: {
   job: ResearchJob;
   cancelLabel?: string;
   language?: string;
@@ -117,6 +135,8 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   };
   onCancel: () => void;
   onVisionDecision?: (approved: boolean) => void;
+  onCancelCall?: (requestId: string, attemptId: string) => void;
+  loadCallHistory?: (runId: string, stageId: string, after?: string, limit?: number) => Promise<ModelCallHistoryPage>;
 }) {
   const copy = labels ?? {
     cancel: cancelLabel ?? "Cancel research",
@@ -130,23 +150,27 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
     failed: "Failed",
     unknown: "Waiting",
   };
-  const statusLabel = (state: string) => {
-    if (state === "validating") return language === "en" ? "Processing and verifying" : language === "zh-Hant" ? "整理與核驗中" : "整理与核验中";
-    if (state === "completed_partial") return language === "en" ? "Processed; verification incomplete" : language === "zh-Hant" ? "已處理，核驗尚未完整" : "已处理，核验尚未完整";
-    if (state === "completed_verified" || state === "reused_verified") return copy.completed;
-    if (state === "needs_action") return language === "en" ? "Action required" : language === "zh-Hant" ? "等待處理" : "等待处理";
-    if (state === "failed_verification") return copy.failed;
-    if (state === "running") return copy.running;
-    if (state === "retrying") return copy.retrying;
-    if (state === "queued") return copy.queued;
-    if (state === "completed") return copy.completed;
-    if (state === "cancelled") return copy.cancelled;
-    if (state === "failed") return copy.failed;
-    return copy.unknown;
-  };
+  const modelResearchActivity = hasModelResearchActivity(job);
+  const [activeTab, setActiveTab] = useState<ProgressTab>("preparation");
+  const tabJobId = useRef(job.job_id);
+  const autoSwitchedJobId = useRef<string | null>(null);
+  useEffect(() => {
+    if (tabJobId.current !== job.job_id) {
+      tabJobId.current = job.job_id;
+      autoSwitchedJobId.current = null;
+      setActiveTab("preparation");
+    }
+    if (modelResearchActivity && autoSwitchedJobId.current !== job.job_id) {
+      autoSwitchedJobId.current = job.job_id;
+      setActiveTab("research");
+    }
+  }, [job.job_id, modelResearchActivity]);
+  const tabLabels = language === "en"
+    ? { preparation: "Preparation", research: "Model research" }
+    : language === "zh-Hant"
+      ? { preparation: "資料準備", research: "模型研究" }
+      : { preparation: "资料准备", research: "模型研究" };
   const agentStates = job.agent_states ?? {};
-  const totalAgents = job.total_agents ?? Object.keys(agentStates).length;
-  const completedAgents = job.completed_agents ?? Object.values(agentStates).filter(isAgentStageComplete).length;
   const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
   const [elapsed, setElapsed] = useState(backendElapsed);
   const elapsedAnchor = useRef({
@@ -222,65 +246,82 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
       "cloud-awaiting-approval": ["等待云端授权", "Awaiting cloud approval", "等待雲端授權"],
       "cloud-processing": ["云端处理中", "Cloud processing", "雲端處理中"],
       "canonical-compiling": ["汇总校验中", "Canonical compiling", "彙總驗證中"],
-      validated: ["已验证", "Validated", "已驗證"],
+      validated: ["处理完成", "Processing complete", "處理完成"],
       parsed: ["解析完成", "Parsed", "解析完成"],
-      blocked: ["已阻塞", "Blocked", "已阻塞"],
+      blocked: ["需要处理", "Needs attention", "需要處理"],
       failed: ["失败", "Failed", "失敗"],
       cancelled: ["已取消", "Cancelled", "已取消"],
+      processing: ["处理中", "Processing", "處理中"],
+      completed: ["处理完成", "Processing complete", "處理完成"],
+      complete: ["处理完成", "Processing complete", "處理完成"],
+      validating: ["整理与核验中", "Processing and checking", "整理與核驗中"],
     };
     const value = values[status];
     return value ? value[language === "en" ? 1 : language === "zh-Hant" ? 2 : 0] : status;
   };
+  const availabilityLabel = (availability: string) => {
+    const values: Record<string, readonly [string, string, string]> = {
+      usable: ["有可用内容", "Usable content available", "有可用內容"],
+      partial: ["部分可用", "Partially usable", "部分可用"],
+      complete: ["有可用内容", "Usable content available", "有可用內容"],
+      none: ["无可用内容", "No usable content", "無可用內容"],
+      historical: ["历史/比较资料已处理", "Historical/comparative material processed", "歷史／比較資料已處理"],
+      "not-applicable": ["不适用", "Not applicable", "不適用"],
+      "needs-action": ["需要处理", "Needs action", "需要處理"],
+      needs_action: ["需要处理", "Needs action", "需要處理"],
+    };
+    const value = values[availability];
+    return value ? value[language === "en" ? 1 : language === "zh-Hant" ? 2 : 0] : availability;
+  };
+  const fileMetadataLabels = language === "en"
+    ? { roles: "Roles", candidates: "Candidates", admitted: "admitted", hash: "Source hash", parseDetails: "Parsing details",
+      pages: "Total pages", nativePages: "Native-text pages", indexedPages: "Indexed pages", windowsComplete: "Windows complete",
+      parseElapsed: "Parse time", attempts: "Attempts", cacheReused: "Cached result reused", yes: "Yes", no: "No",
+      recognizedStatements: "Recognized statements", extractedPages: "Pages with extracted facts", failureStage: "Failure stage", rootError: "Root error code" }
+    : language === "zh-Hant"
+      ? { roles: "角色", candidates: "候選", admitted: "已納入", hash: "來源雜湊", parseDetails: "解析詳情",
+        pages: "總頁數", nativePages: "含原生文字頁數", indexedPages: "已建立索引頁數", windowsComplete: "已完成視窗",
+        parseElapsed: "解析耗時", attempts: "嘗試次數", cacheReused: "重用快取結果", yes: "是", no: "否",
+        recognizedStatements: "已識別報表", extractedPages: "含擷取事實的頁面", failureStage: "失敗階段", rootError: "根錯誤代碼" }
+      : { roles: "角色", candidates: "候选", admitted: "已纳入", hash: "来源哈希", parseDetails: "解析详情",
+        pages: "总页数", nativePages: "含原生文本页数", indexedPages: "已建立索引页数", windowsComplete: "已完成窗口",
+        parseElapsed: "解析耗时", attempts: "尝试次数", cacheReused: "复用缓存结果", yes: "是", no: "否",
+        recognizedStatements: "已识别报表", extractedPages: "含提取事实的页面", failureStage: "失败阶段", rootError: "根错误代码" };
+  const roleNames: Record<string, readonly [string, string, string]> = {
+    target: ["目标公司", "Target", "目標公司"],
+    comparator: ["对照公司", "Comparator", "比較公司"],
+    historical: ["历史资料", "Historical", "歷史資料"],
+  };
+  const roleLabel = (role: string) => roleNames[role]?.[language === "en" ? 1 : language === "zh-Hant" ? 2 : 0] ?? role;
   return (
     <section className="research-progress" data-state={job.state}>
-      <div className="research-progress-header">
-        <div className="research-stage-copy" aria-live="polite">
-          <strong>{stageCopy.title}</strong>
-          <span>“{stageCopy.note}”</span>
-          {stageDetail && <small>{stageDetail}</small>}
+      <div className="research-progress-summary">
+        <div className="research-progress-header">
+          <div className="research-stage-copy" aria-live="polite">
+            <strong>{stageCopy.title}</strong>
+            <span>“{stageCopy.note}”</span>
+            {stageDetail && <small>{stageDetail}</small>}
+          </div>
+          <div className="research-progress-metrics">
+            <span>{job.percent}%</span>
+            <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : language === "zh-Hant" ? "研究已用時間" : "研究已用时间"}>
+              <Clock3 size={14} aria-hidden="true" />{timingLabels.total} {formatElapsedTime(elapsed)}
+            </time>
+            <time dateTime={`PT${activeElapsed}S`}>{timingLabels.active} {formatElapsedTime(activeElapsed)}</time>
+            <time dateTime={`PT${externalElapsed}S`}>{timingLabels.external} {formatElapsedTime(externalElapsed)}</time>
+          </div>
         </div>
-        <div className="research-progress-metrics">
-          <span>{job.percent}%</span>
-          <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : language === "zh-Hant" ? "研究已用時間" : "研究已用时间"}>
-            <Clock3 size={14} aria-hidden="true" />{timingLabels.total} {formatElapsedTime(elapsed)}
-          </time>
-          <time dateTime={`PT${activeElapsed}S`}>{timingLabels.active} {formatElapsedTime(activeElapsed)}</time>
-          <time dateTime={`PT${externalElapsed}S`}>{timingLabels.external} {formatElapsedTime(externalElapsed)}</time>
-        </div>
+        <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
+        <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>
+        {remaining && <div className="research-remaining" aria-label={remainingLabel}>
+          <span>{remainingLabel}</span>
+          <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
+        </div>}
+        {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
       </div>
-      <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
-      <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>
-      {remaining && <div className="research-remaining" aria-label={remainingLabel}>
-        <span>{remainingLabel}</span>
-        <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
-      </div>}
-      {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
-      {filingStates.length > 0 && <div className="filing-progress-list" aria-label={language === "en" ? "Filing progress" : language === "zh-Hant" ? "財報進度" : "财报进度"}>
-        {filingStates.map((filing) => <div className="filing-progress-row" key={filing.filing_id} data-status={filing.status}>
-          <span>{filing.label}</span>
-          <strong>{filingStatus(filing.status)}</strong>
-          {Number(filing.window_total ?? 0) > 0 && <small>
-            {language === "en" ? "Window" : language === "zh-Hant" ? "視窗" : "窗口"} {filing.window_index ?? 0}/{filing.window_total}
-          </small>}
-          <time dateTime={`PT${Math.max(0, filing.elapsed_seconds ?? 0)}S`}>{formatElapsedTime(filing.elapsed_seconds ?? 0)}</time>
-          {filing.error_code && <code
-            tabIndex={0}
-            aria-label={language === "en" ? `Filing diagnostic: ${filing.error_code}` : language === "zh-Hant" ? `財報診斷：${filing.error_code}` : `财报诊断：${filing.error_code}`}
-            title={language === "en" ? `Diagnostic code: ${filing.error_code}. Open financial diagnostics for evidence and recovery details.` : language === "zh-Hant" ? `診斷代碼：${filing.error_code}。可開啟財報診斷查看證據與恢復詳情。` : `诊断代码：${filing.error_code}。可打开财报诊断查看证据与恢复详情。`}
-          >{filing.error_code}</code>}
-        </div>)}
-      </div>}
-      {totalAgents > 0 && <div className="agent-progress" aria-label={copy.agents}>
-        <div className="agent-progress-heading"><span>{copy.agents}</span><span>{completedAgents}/{totalAgents}</span></div>
-        <div className="agent-progress-list">
-          {Object.entries(agentStates).map(([agentId, state]) => (
-            <div className="agent-progress-row" key={agentId}>
-              <span className={`agent-state-dot agent-state-${state}`} aria-hidden="true" />
-              <span>{agentDisplayName(language, agentId)}</span><span>{statusLabel(state)}</span>
-            </div>
-          ))}
-        </div>
-      </div>}
+      <button className="research-progress-cancel" type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
+        {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
+      </button>
       {job.vision_approval_pending && job.vision_upload_preview && <div className="vision-approval-card" role="dialog" aria-label={copy.visionApprovalTitle ?? "Vision upload approval"}>
         <strong>{copy.visionApprovalTitle ?? "Vision upload approval"}</strong>
         <span>{copy.visionApprovalProvider ?? "Provider"}: {job.vision_upload_preview.provider}</span><span>{copy.visionApprovalDocument ?? "Document"}: {job.vision_upload_preview.source_document || "—"}</span>
@@ -289,12 +330,70 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
         <div className="vision-approval-actions">
           <button type="button" onClick={() => onVisionDecision?.(true)}>{copy.visionApprovalApprove ?? "Approve upload"}</button>
           <button type="button" onClick={() => onVisionDecision?.(false)}>{copy.visionApprovalDecline ?? "Do not upload"}</button>
-          <button type="button" onClick={onCancel}>{copy.cancel}</button>
         </div>
       </div>}
-      <button type="button" onClick={onCancel} disabled={job.state === "cancelling" || Boolean(job.vision_approval_pending)} hidden={Boolean(job.vision_approval_pending)}>
-        {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
-      </button>
+      <div className="research-progress-tabs" role="tablist" aria-label={language === "en" ? "Research progress views" : language === "zh-Hant" ? "研究進度檢視" : "研究进度视图"}>
+        {(["preparation", "research"] as const).map((tab) => <button
+          id={`research-progress-tab-${tab}`} key={tab} type="button" role="tab"
+          aria-selected={activeTab === tab} aria-controls="research-progress-panel"
+          className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}
+        >{tabLabels[tab]}</button>)}
+      </div>
+      <div id="research-progress-panel" className="research-progress-viewport" role="tabpanel"
+        aria-labelledby={`research-progress-tab-${activeTab}`} tabIndex={0}>
+        {activeTab === "preparation" ? <div className="filing-progress-list" aria-label={language === "en" ? "Filing progress" : language === "zh-Hant" ? "財報進度" : "财报进度"}>
+          {filingStates.length > 0 ? filingStates.map((filing) => {
+            const inferredAvailability = FINAL_FILING_STATUSES.has(filing.status) ? filing.status : undefined;
+            const availability = filing.availability ?? inferredAvailability;
+            const processStatus = filing.processing_state ?? (availability ? "" : filing.status);
+            const issueCodes = [...new Set([...(filing.issue_codes ?? []), ...(filing.error_code ? [filing.error_code] : [])])];
+            const hasCounts = filing.candidate_count !== undefined || filing.admitted_count !== undefined;
+            const detailRows: [string, string][] = [];
+            const numberText = (value: number) => value.toLocaleString(language === "en" ? "en-US" : "zh-CN");
+            if (filing.page_count !== undefined) detailRows.push([fileMetadataLabels.pages, numberText(filing.page_count)]);
+            if (filing.native_text_page_count !== undefined) detailRows.push([fileMetadataLabels.nativePages, numberText(filing.native_text_page_count)]);
+            if (filing.indexed_page_count !== undefined) detailRows.push([fileMetadataLabels.indexedPages, numberText(filing.indexed_page_count)]);
+            if (filing.completed_window_count !== undefined || filing.window_total !== undefined) {
+              detailRows.push([fileMetadataLabels.windowsComplete, `${numberText(filing.completed_window_count ?? 0)} / ${numberText(filing.window_total ?? 0)}`]);
+            }
+            if (filing.parse_elapsed_seconds !== undefined) detailRows.push([fileMetadataLabels.parseElapsed, formatElapsedTime(filing.parse_elapsed_seconds)]);
+            if (filing.attempt_count !== undefined) detailRows.push([fileMetadataLabels.attempts, numberText(filing.attempt_count)]);
+            if (filing.cache_reused !== undefined) detailRows.push([fileMetadataLabels.cacheReused, filing.cache_reused ? fileMetadataLabels.yes : fileMetadataLabels.no]);
+            if (filing.recognized_statements?.length) detailRows.push([fileMetadataLabels.recognizedStatements, filing.recognized_statements.join(" · ")]);
+            if (filing.extracted_pages?.length) detailRows.push([fileMetadataLabels.extractedPages, filing.extracted_pages.join(", ")]);
+            if (filing.failure_stage) detailRows.push([fileMetadataLabels.failureStage, filing.failure_stage]);
+            if (filing.root_error_code) detailRows.push([fileMetadataLabels.rootError, filing.root_error_code]);
+            return <article className="filing-progress-row" key={filing.filing_id} data-status={filing.status} data-availability={availability}>
+              <div className="filing-progress-main">
+                <strong className="filing-progress-name" title={filing.label}>{filing.label}</strong>
+                <div className="filing-progress-badges">
+                  {processStatus && <span className="filing-progress-process">{filingStatus(processStatus)}</span>}
+                  {availability && <span className="filing-progress-availability" data-availability={availability}>{availabilityLabel(availability)}</span>}
+                </div>
+              </div>
+              {filing.roles && filing.roles.length > 0 && <small>{fileMetadataLabels.roles}: {filing.roles.map(roleLabel).join(" · ")}</small>}
+              {hasCounts && <small>{fileMetadataLabels.candidates}: {filing.candidate_count ?? "—"} · {filing.admitted_count ?? "—"} {fileMetadataLabels.admitted}</small>}
+              {filing.completed_window_count === undefined && Number(filing.window_total ?? 0) > 0 && <small>
+                {language === "en" ? "Window" : language === "zh-Hant" ? "視窗" : "窗口"} {filing.window_index ?? 0}/{filing.window_total}
+              </small>}
+              {detailRows.length > 0 && <details className="filing-progress-details">
+                <summary>{fileMetadataLabels.parseDetails}</summary>
+                <dl>{detailRows.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+              </details>}
+              <time dateTime={`PT${Math.max(0, filing.elapsed_seconds ?? 0)}S`}>{formatElapsedTime(filing.elapsed_seconds ?? 0)}</time>
+              {filing.source_hash && <code className="filing-source-hash" title={`${fileMetadataLabels.hash}: ${filing.source_hash}`}>{fileMetadataLabels.hash}: {filing.source_hash.slice(0, 12)}</code>}
+              {issueCodes.length > 0 && <div className="filing-issue-codes" aria-label={language === "en" ? "Filing issues" : language === "zh-Hant" ? "財報問題代碼" : "财报问题代码"}>
+                {issueCodes.map((issueCode) => <code key={issueCode} tabIndex={0}
+                  aria-label={language === "en" ? `Filing diagnostic: ${issueCode}` : language === "zh-Hant" ? `財報診斷：${issueCode}` : `财报诊断：${issueCode}`}
+                  title={language === "en" ? `Diagnostic code: ${issueCode}. Open financial diagnostics for evidence and recovery details.` : language === "zh-Hant" ? `診斷代碼：${issueCode}。可開啟財報診斷查看證據與恢復詳情。` : `诊断代码：${issueCode}。可打开财报诊断查看证据与恢复详情。`}
+                >{issueCode}</code>)}
+              </div>}
+            </article>;
+          }) : <p className="progress-empty-state">{language === "en" ? "Filing details will appear here as documents are processed." : language === "zh-Hant" ? "文件處理進度會顯示在這裡。" : "文件处理进度会显示在这里。"}</p>}
+        </div> : <ModelCallProgress calls={job.model_calls ?? []} agentStates={agentStates} language={language}
+          runId={job.run_id} loadCallHistory={loadCallHistory}
+          cancelling={job.state === "cancelling"} onCancelCall={onCancelCall} />}
+      </div>
     </section>
   );
 }

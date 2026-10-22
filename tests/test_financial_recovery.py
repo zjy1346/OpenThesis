@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openthesis.domain import FilingDocument, FinancialFact
 from openthesis.financial_ingestion import FinancialGroupValidation
@@ -18,6 +19,30 @@ from openthesis.storage import Storage
 
 
 class FinancialRecoveryControllerTests(unittest.TestCase):
+    def test_source_discovery_never_uses_persisted_quality_as_current_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage = Storage(root)
+            company = build_company("300005.SZ", "Source Only")
+            storage.save_company(company)
+            path = root / "source.pdf"
+            path.write_bytes(b"captured bytes; numerical validation is downstream")
+            filing = FilingDocument("source-only", company.security_id, "source-only", "ANNUAL_REPORT",
+                "FY", "2025-12-31", "2026-03-01", "source.pdf", "https://example.test/source.pdf",
+                local_path=str(path), content_hash=hashlib.sha256(path.read_bytes()).hexdigest())
+            storage.save_filings([filing])
+            class Adapter:
+                def list_financial_filings(self, _company, *, limit):
+                    raise TimeoutError("offline discovery timeout")
+            with patch.object(storage, "get_validation_groups", side_effect=AssertionError("stale summaries are not proof")), \
+                    patch.object(storage, "get_facts", side_effect=AssertionError("discovery must not adjudicate facts")):
+                outcome = FinancialRecoveryController(storage).discover(Adapter(), company, annual_limit=1)
+            self.assertEqual(outcome.filings, (filing,))
+            self.assertEqual(outcome.state, RecoveryState.RESOLVED_STALE)
+            self.assertEqual(outcome.next_action, "continue_local_validation")
+            self.assertEqual(outcome.failed_fields, ())
+            self.assertEqual(outcome.freshness, "freshness_unverified")
+
     def test_input_fingerprint_is_stable_and_changes_with_parser_inputs(self) -> None:
         company = build_company("300000.SZ", "Fingerprint Company")
         first = FilingDocument(
@@ -42,20 +67,14 @@ class FinancialRecoveryControllerTests(unittest.TestCase):
         self.assertEqual(one, reordered)
         self.assertNotEqual(one, changed)
 
-    def test_retry_decision_exhausts_deterministic_input_but_cools_transient_failure(self) -> None:
+    def test_retry_state_is_owned_by_the_durable_core_not_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = FinancialRecoveryController(Storage(Path(directory)))
-            deterministic = controller.retry_decision("input-static", "FILING_DATA_QUALITY_FAILED")
-            self.assertEqual(deterministic.state, RecoveryState.EXHAUSTED_SAME_INPUT)
-            self.assertFalse(deterministic.allowed)
-            transient = controller.retry_decision(
-                "input-network", "FILING_FETCH_FAILED", now=100.0, cooldown_seconds=30,
-            )
-            self.assertEqual(transient.state, RecoveryState.RETRYABLE_EXTERNAL_FAILURE)
-            self.assertFalse(transient.allowed)
-            self.assertEqual(transient.retry_after_seconds, 30.0)
-            self.assertFalse(controller.retry_available("input-network", now=129.0))
-            self.assertTrue(controller.retry_available("input-network", now=130.0))
+            self.assertFalse(hasattr(controller, "_retry_attempts"))
+            self.assertFalse(hasattr(controller, "retry_decision"))
+            # Execution/cooldown/exhaustion are exercised against the actual
+            # repository and clients in test_official_source_recovery_contract
+            # and test_managed_official_http, including process-owner restart.
     def test_discovery_error_uses_complete_local_snapshot_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -122,12 +141,13 @@ class FinancialRecoveryControllerTests(unittest.TestCase):
             outcome = FinancialRecoveryController(storage).discover(
                 Adapter(), company, annual_limit=1
             )
-            self.assertEqual(outcome.state, RecoveryState.RETRYABLE_EXTERNAL_FAILURE)
+            # This is a source receipt, not a claim that net income exists.
+            self.assertEqual(outcome.state, RecoveryState.RESOLVED_STALE)
             self.assertEqual(outcome.targets, ("acc-unhealthy",))
-            self.assertEqual(outcome.next_action, "retry_local_parse")
-            self.assertEqual(outcome.failed_accessions, ("acc-unhealthy",))
-            self.assertIn("net_income", outcome.failed_fields)
-            self.assertIn("net_income_missing", outcome.failed_fields)
+            self.assertEqual(outcome.next_action, "continue_local_validation")
+            self.assertEqual(outcome.failed_accessions, ())
+            self.assertEqual(storage.get_facts(company.security_id), [])
+            self.assertEqual(storage.get_validation_groups(company.security_id)[0]["issues"], ["net_income_missing"])
 
     def test_verified_group_merges_total_equity_fact_as_equity_alias(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +234,10 @@ class FinancialRecoveryControllerTests(unittest.TestCase):
             outcome = FinancialRecoveryController(storage).discover(
                 Adapter(), company, annual_limit=1
             )
-            self.assertEqual(outcome.state, RecoveryState.RETRYABLE_EXTERNAL_FAILURE)
-            self.assertEqual(outcome.next_action, "retry_local_parse")
-            self.assertIn("equity", outcome.failed_fields)
+            self.assertEqual(outcome.state, RecoveryState.RESOLVED_STALE)
+            self.assertEqual(outcome.next_action, "continue_local_validation")
+            # Source recovery cannot upgrade either scoped numerical candidate.
+            self.assertEqual(storage.get_facts(company.security_id), [])
+            retained = storage.get_facts_audit(company.security_id)
+            self.assertEqual({(fact["currency"], fact["consolidated_scope"]) for fact in retained},
+                             {("CNY", "parent"), ("USD", "consolidated")})
