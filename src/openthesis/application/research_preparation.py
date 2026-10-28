@@ -61,6 +61,21 @@ def financial_scope_gaps(facts, filings) -> tuple[dict[str, Any], ...]:
     return tuple(gaps)
 
 
+def scope_gap_recovery_targets(scope_gaps, filings) -> tuple[str, ...]:
+    """Map period gaps to only source originals that actually declare that period."""
+    gap_periods = {
+        (str(gap.get("period_end") or ""), str(gap.get("fiscal_period") or ""))
+        for gap in scope_gaps
+        if isinstance(gap, dict) and gap.get("period_end") and gap.get("fiscal_period")
+    }
+    return tuple(sorted({
+        str(filing.accession_number)
+        for filing in filings
+        if filing.accession_number
+        and (str(filing.period_end or ""), str(filing.fiscal_period or "")) in gap_periods
+    }))
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchPreparationRequest:
     company: Company
@@ -188,8 +203,8 @@ class NewResearchPreparer:
                 # Recovery targets are internal use-case state, not mutations
                 # of a raw RPC request. No metadata can promote a candidate.
                 publication = prepared.publication or {}
-                targets = tuple(accession for accession, state in publication.get("accessions", {}).items()
-                                if state != "promoted")
+                targets = tuple(sorted(accession for accession, state in publication.get("accessions", {}).items()
+                                        if state != "promoted"))
                 if prepared.currency_lane_ambiguous and not targets:
                     targets = tuple(item.accession_number for item in filings)
                 facts = list(admitted.fact_dicts)
@@ -206,6 +221,9 @@ class NewResearchPreparer:
                 evidence.extend(bind_compiled_disclosures(
                     admitted, cached_filing_evidence(self.storage, disclosure_filings,
                         cancel_check=cancelled)))
+                with_disclosures = getattr(admitted, "with_disclosures", None)
+                if callable(with_disclosures):
+                    admitted = with_disclosures(evidence)
                 if not admitted.research_ready and not has_sourced_disclosure(evidence):
                     raise ResearchPreparationUnavailable(
                         scanner_diagnostic_code(admitted.diagnostics)
@@ -213,19 +231,36 @@ class NewResearchPreparer:
                         or "FILING_DATA_QUALITY_FAILED", outcome=prepared.recovery_outcome)
                 profile, capabilities = admitted.profile, admitted.capability_map
                 scope_gaps = financial_scope_gaps(facts, filings)
-                accessions = {item.accession_number for item in filings}
+                download_errors = {}
+                for item in prepared.errors:
+                    parts = str(item).split(":", 2)
+                    if len(parts) == 3 and parts[1] == "download":
+                        download_errors[parts[0]] = parts[2]
+                source_acquisition_gaps = [
+                    {
+                        "accession_number": filing.accession_number,
+                        "period_end": filing.period_end,
+                        "fiscal_period": filing.fiscal_period,
+                        "diagnostic_code": download_errors.get(filing.accession_number)
+                            or ("FILING_LOCAL_FILE_MISSING" if not filing.local_path else "FILING_CONTENT_HASH_MISSING"),
+                    }
+                    for filing in filings
+                    if filing.accession_number in download_errors or not filing.local_path or not filing.content_hash
+                ]
+                gap_targets = scope_gap_recovery_targets(scope_gaps, filings)
+                targets = tuple(sorted(set(targets) | set(gap_targets)
+                                       | {gap["accession_number"] for gap in source_acquisition_gaps}))
                 generations = dict(prepared.financial_generations)
-                if not facts or not (profile.metrics or profile.interim_metrics) or scope_gaps:
-                    targets = tuple(sorted(accessions))
+                if (not facts or not (profile.metrics or profile.interim_metrics)
+                        or scope_gaps or source_acquisition_gaps):
                     capabilities = {**capabilities, "financial_recovery_pending": True}
-                    if any(model.enabled for model in captured.models) and not captured.allow_partial_research:
-                        raise ResearchPreparationUnavailable("FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED",
-                                                             outcome=prepared.recovery_outcome, coverage=coverage)
                 source_state = {
                     "freshness": prepared.discovery.freshness,
                     "discovery_diagnostics": list(prepared.discovery.diagnostics),
                     "candidate_diagnostics": list(publication.get("diagnostics", ())),
                     "recovery_targets": list(targets),
+                    "scope_gaps": [dict(gap) for gap in scope_gaps],
+                    "source_acquisition_gaps": source_acquisition_gaps,
                     "currency_lane_ambiguous": bool(prepared.currency_lane_ambiguous),
                 }
                 report("filing-validation", len(filings), len(filings))
@@ -266,9 +301,15 @@ class NewResearchPreparer:
         recovery_run = request.recovery_session_id or (request.existing_run.run_id if request.existing_run else "")
         if not recovery_run:
             return  # Preserve the scope error when this entry has no durable run yet.
+        existing = {case['accession_number']: case for case in self.storage.get_financial_recovery_cases(recovery_run)
+                    if case.get('status') != 'resolved'}
         for filing in self.storage.get_filings(key):
             if targets and filing.accession_number not in targets:
                 continue
+            if filing.accession_number in existing:
+                continue  # Do not overwrite a precise parser/source diagnosis with a global scope gate.
+            if error.code == 'FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED':
+                continue  # A research-cohort gap is not a failed PDF for every healthy original.
             self.storage.save_financial_recovery_case(
                 run_id=recovery_run, company_cik=key,
                 accession_number=filing.accession_number, document_hash=filing.content_hash,

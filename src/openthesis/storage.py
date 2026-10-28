@@ -62,6 +62,80 @@ def _storage_issue(exc: Exception, path: str, row_id: str, *, artifact: bool = F
     code = supplied if re.fullmatch(r"(?:RECOVERY_PAYLOAD|FINANCIAL_FACT|FINANCIAL_CANDIDATE)_[A-Z0-9_]{1,70}", supplied) else "STORAGE_ROW_INVALID"
     return {"code": code, "path": path, "artifact_id" if artifact else "row_id": row_id}
 
+
+_PARSING_TIMING_KEYS = frozenset({
+    "source_hash_elapsed_seconds", "document_text_context_elapsed_seconds",
+    "catalog_elapsed_seconds", "candidate_plan_elapsed_seconds", "pdf_open_elapsed_seconds",
+    "page_text_cache_elapsed_seconds", "worker_session_open_elapsed_seconds", "worker_page_elapsed_seconds",
+    "parse_elapsed_seconds", "source_collection_elapsed_seconds",
+    "candidate_mapping_elapsed_seconds", "compiler_elapsed_seconds",
+    "admission_elapsed_seconds", "candidate_mapping_seconds",
+    "checkpoint_write_elapsed_seconds",
+    "geometry_extract_elapsed_seconds",
+})
+_PARSING_COUNT_KEYS = frozenset({
+    "page_count", "candidate_page_count", "completed_page_count", "worker_session_start_count",
+    "geometry_cache_hits", "geometry_extracted_pages",
+})
+
+
+def _normalize_parsing_observation(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep source-bound parser diagnostics bounded, numeric, and non-sensitive."""
+    required = ("accession_number", "period_end", "fiscal_period", "source_hash")
+    if any(not isinstance(raw.get(key), str) or not raw.get(key) for key in required):
+        raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+    normalized: dict[str, Any] = {key: str(raw[key]) for key in required}
+    for key in _PARSING_COUNT_KEYS:
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000:
+            raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+        normalized[key] = value
+    timings = raw.get("stage_timings")
+    if timings is not None:
+        if not isinstance(timings, Mapping) or any(key not in _PARSING_TIMING_KEYS for key in timings):
+            raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+        safe_timings = {}
+        for key, value in timings.items():
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or not 0 <= float(value) <= 86_400):
+                raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+            safe_timings[key] = round(float(value), 4)
+        normalized["stage_timings"] = safe_timings
+    for key, allowed in {
+        "parse_strategy": {"positioned-page-checkpoint"},
+        "backend": {"pdfplumber"},
+    }.items():
+        value = raw.get(key)
+        if value is not None:
+            if value not in allowed:
+                raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+            normalized[key] = value
+    for key in ("cache_reused", "catalog_cache_hit"):
+        if key in raw:
+            if type(raw[key]) is not bool:
+                raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+            normalized[key] = raw[key]
+    if 'local_structure' in raw:
+        local = raw['local_structure']
+        if not isinstance(local, Mapping):
+            raise ValueError('FINANCIAL_PARSING_OBSERVATION_INVALID')
+        safe_local = {}
+        for key in ('ocr_calls','cache_hits','completed_pages','selected_pages','worker_start_count',
+                    'model_load_seconds','inference_seconds','peak_memory_bytes','admitted_field_count','new_verified_field_count'):
+            value = local.get(key)
+            if value is None:
+                continue
+            limit = 274_877_906_944 if key == 'peak_memory_bytes' else 86_400 if key.endswith('_seconds') else 1_000_000
+            if (isinstance(value, bool) or not isinstance(value, (int,float))
+                    or (not key.endswith('_seconds') and not isinstance(value, int))
+                    or not math.isfinite(value) or not 0 <= value <= limit):
+                raise ValueError('FINANCIAL_PARSING_OBSERVATION_INVALID')
+            safe_local[key] = value
+        normalized['local_structure'] = safe_local
+    return normalized
+
 # One immutable description of the derived-data inputs.  Source records are
 # never migrated in place; a changed input contract makes current reads miss
 # until a new deterministic research pass writes the current version.
@@ -1365,38 +1439,36 @@ class Storage:
                             raise ValueError("FINANCIAL_FACT_VALIDATION_RECORD_INVALID") from exc
                         validation_payload[supplied_id] = normalized_record
 
-                observation_payload: list[dict[str, str]] = []
+                observation_payload: list[dict[str, Any]] = []
                 if not isinstance(parsing_observations, (list, tuple)):
                     raise ValueError("FINANCIAL_PARSING_OBSERVATIONS_INVALID")
                 for raw_observation in parsing_observations:
                     if not isinstance(raw_observation, Mapping):
                         raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
-                    accession = raw_observation.get("accession_number")
-                    period_end = raw_observation.get("period_end")
-                    fiscal_period = raw_observation.get("fiscal_period")
-                    source_hash = raw_observation.get("source_hash")
-                    if any(not isinstance(value, str) or not value for value in (
-                        accession, period_end, fiscal_period, source_hash,
-                    )):
-                        raise ValueError("FINANCIAL_PARSING_OBSERVATION_INVALID")
+                    normalized_observation = _normalize_parsing_observation(raw_observation)
+                    accession = normalized_observation["accession_number"]
+                    period_end = normalized_observation["period_end"]
+                    fiscal_period = normalized_observation["fiscal_period"]
+                    source_hash = normalized_observation["source_hash"]
                     expected_hash = normalized_hashes.get(accession, "")
+                    current_filing = db.execute(
+                        "SELECT content_hash, period_end, fiscal_period FROM filings "
+                        "WHERE company_cik=? AND accession_number=? "
+                        "ORDER BY ingested_at DESC, document_id DESC LIMIT 1",
+                        (company_cik, accession),
+                    ).fetchone()
                     if (
                         accession not in unique or not expected_hash
                         or expected_hash != source_hash.casefold()
-                        or not any(
-                            fact.accession_number == accession
-                            and fact.end_date == period_end
-                            and fact.fiscal_period == fiscal_period
-                            for fact in candidate_facts
-                        )
+                        or current_filing is None
+                        or not str(current_filing["content_hash"] or "")
+                        or str(current_filing["content_hash"] or "").casefold() != source_hash.casefold()
+                        or str(current_filing["period_end"] or "") != period_end
+                        or str(current_filing["fiscal_period"] or "") != fiscal_period
                     ):
                         raise ValueError("FINANCIAL_PARSING_OBSERVATION_BINDING_INVALID")
-                    observation_payload.append({
-                        "accession_number": accession,
-                        "period_end": period_end,
-                        "fiscal_period": fiscal_period,
-                        "source_hash": source_hash.casefold(),
-                    })
+                    normalized_observation["source_hash"] = source_hash.casefold()
+                    observation_payload.append(normalized_observation)
                 observed_accessions = {
                     item["accession_number"] for item in observation_payload
                 }
@@ -1893,7 +1965,7 @@ class Storage:
     @staticmethod
     def _candidate_parsing_observations_db(
         db: sqlite3.Connection, cik: str, *, issues: list[dict[str, str]] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """Return source-current parse observations without admitting candidates."""
         current_filings: dict[str, tuple[str, str, str]] = {}
         for row in db.execute(
@@ -1910,7 +1982,7 @@ class Storage:
                 )
 
         resolved: set[str] = set()
-        observations: list[dict[str, str]] = []
+        observations: list[dict[str, Any]] = []
         candidates = db.execute(
             "SELECT generation_id, state, source_hashes_json, candidate_json "
             "FROM financial_ingestion_candidates WHERE company_cik = ? "
@@ -1927,12 +1999,12 @@ class Storage:
                 observations_payload = payload.get("parsing_observations", [])
                 if not isinstance(observations_payload, list):
                     raise ValueError("FINANCIAL_CANDIDATE_PARSING_OBSERVATIONS_SHAPE_INVALID")
-                for observation in observations_payload:
-                    if not isinstance(observation, dict) or any(
-                        not isinstance(observation.get(key), str) or not observation.get(key)
-                        for key in ("accession_number", "period_end", "fiscal_period", "source_hash")
-                    ):
+                normalized_observations = []
+                for item in observations_payload:
+                    if not isinstance(item, dict):
                         raise ValueError("FINANCIAL_CANDIDATE_PARSING_OBSERVATION_SHAPE_INVALID")
+                    normalized_observations.append(_normalize_parsing_observation(item))
+                observations_payload = normalized_observations
                 for bucket in ("accepted_facts", "quarantined_facts", "audit_facts"):
                     facts_payload = payload.get(bucket, ())
                     if not isinstance(facts_payload, list) or any(not isinstance(item, dict) for item in facts_payload):
@@ -1962,7 +2034,6 @@ class Storage:
                 raise StorageCorruptionError(
                     "FINANCIAL_CANDIDATE_PARSING_OBSERVATIONS_SHAPE_INVALID"
                 )
-            fact_identities: set[tuple[str, str, str]] = set()
             for bucket in ("accepted_facts", "quarantined_facts", "audit_facts"):
                 raw_facts = payload.get(bucket, [])
                 if not isinstance(raw_facts, list):
@@ -1974,21 +2045,18 @@ class Storage:
                         raise StorageCorruptionError(
                             "FINANCIAL_CANDIDATE_FACT_SHAPE_INVALID"
                         )
-                    if all(isinstance(fact.get(key), str) and fact.get(key) for key in (
-                        "accession_number", "end_date", "fiscal_period",
-                    )):
-                        fact_identities.add((
-                            fact["accession_number"], fact["end_date"], fact["fiscal_period"],
-                        ))
-            archive_observations: list[dict[str, str]] = []
+            archive_observations: list[dict[str, Any]] = []
             for raw in raw_observations:
-                if not isinstance(raw, dict) or any(
-                    not isinstance(raw.get(key), str) or not raw.get(key)
-                    for key in ("accession_number", "period_end", "fiscal_period", "source_hash")
-                ):
+                if not isinstance(raw, dict):
                     raise StorageCorruptionError(
                         "FINANCIAL_CANDIDATE_PARSING_OBSERVATION_SHAPE_INVALID"
                     )
+                try:
+                    raw = _normalize_parsing_observation(raw)
+                except ValueError as exc:
+                    raise StorageCorruptionError(
+                        "FINANCIAL_CANDIDATE_PARSING_OBSERVATION_SHAPE_INVALID"
+                    ) from exc
                 accession = raw["accession_number"]
                 if accession in resolved:
                     continue
@@ -2001,15 +2069,11 @@ class Storage:
                     not current[0] or archive_hash != current[0] or source_hash != current[0]
                     or raw["period_end"] != current[1]
                     or raw["fiscal_period"] != current[2]
-                    or (accession, raw["period_end"], raw["fiscal_period"]) not in fact_identities
                 ):
                     continue
-                archive_observations.append({
-                    "accession_number": accession,
-                    "period_end": raw["period_end"],
-                    "fiscal_period": raw["fiscal_period"],
-                    "source_hash": source_hash,
-                })
+                normalized_observation = dict(raw)
+                normalized_observation["source_hash"] = source_hash
+                archive_observations.append(normalized_observation)
             if archive_observations:
                 resolved.update(item["accession_number"] for item in archive_observations)
                 observations.extend(archive_observations)
@@ -2922,6 +2986,10 @@ class Storage:
     def model_call_status(self, run_id: str) -> list[dict]:
         return self.model_call_progress(run_id)["calls"]
 
+    def research_diagnostics(self, run_id: str) -> dict:
+        from .storage_read_models import research_diagnostic_snapshot
+        return research_diagnostic_snapshot(self, run_id)
+
     def model_call_plan(self, run_id: str) -> dict | None:
         from .research_execution.call_budget import plan_status
         with self.connect() as db:
@@ -3029,7 +3097,7 @@ class Storage:
                 metadata = receipt.get("metadata", {})
                 usage = {name: metadata.get(name) if type(metadata.get(name)) is int and metadata[name] >= 0 else None
                          for name in fields}
-                model_identity = {name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id")
+                model_identity = {name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id", "usage_source", "usage_contract")
                     if isinstance(metadata.get(name), str) and len(metadata[name]) <= 256
                     and all(ord(c) >= 32 for c in metadata[name])}
             except (ValueError, TypeError, AttributeError):
@@ -3045,7 +3113,7 @@ class Storage:
                 state = physical_state
             calls[(row["request_id"], row["owner_id"])] = {"request_id": row["request_id"], "attempt_id": row["owner_id"],
                 "purpose": row["purpose"],
-                "physical_attempt": not str(row["diagnostic_code"]).startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_")),
+                "physical_attempt": not str(row["diagnostic_code"]).startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_", "MODEL_WORK_ITEM_")),
                 "stage_id": row["stage_id"], "generation": row["generation"], "state": state, "usage": usage,
                 "elapsed_seconds": physical_elapsed if type(physical_elapsed) in {int, float}
                     and math.isfinite(physical_elapsed) and physical_elapsed >= 0 else max(0, row["updated_at"] - row["created_at"]),
@@ -3070,7 +3138,7 @@ class Storage:
                 "state": state, "usage": usage, "idle_seconds": None,
                 "elapsed_seconds": max(0, event["updated_at"] - (event["started_at"] or event["updated_at"])),
                 "diagnostic_code": event["diagnostic_code"], "remote_status_unconfirmed": state == "remote_unknown",
-                **{name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id")
+                **{name: metadata[name] for name in ("configured_model_id", "model_id", "alias", "provider_id", "usage_source", "usage_contract")
                     if isinstance(metadata.get(name), str) and len(metadata[name]) <= 256
                     and all(ord(c) >= 32 for c in metadata[name])}}
         for row in wire_rows:
@@ -3090,6 +3158,9 @@ class Storage:
                     **{name: diagnostic[name] for name in ("model_id", "configured_model_id", "provider_id") if name in diagnostic}})
                 calls[key]["purpose"] = row["purpose"]
                 calls[key]["diagnostics"] = diagnostic
+                for name in ("usage_source", "usage_contract"):
+                    if isinstance(diagnostic.get(name), str):
+                        calls[key][name] = diagnostic[name][:256]
                 if diagnostic.get("wire_state") == "not_sent":
                     calls[key]["physical_attempt"] = False
             except (ValueError, TypeError):

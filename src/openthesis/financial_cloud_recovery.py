@@ -9,6 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, replace
 import time
+import json
+import uuid
 from typing import Any, Callable
 
 from .financial_compiler import FinancialFactCompiler
@@ -23,8 +25,79 @@ from .resilience.repository import RecoveryConflict
 from .resilience.strategies import CandidateResult, RecoveryError, Strategy, StrategyRegistry
 from .vision_financials import (
     MINERU_UPLOAD_PROTOCOL_VERSION, VisionExtractionResult, VisionAdapterError,
-    _check_request, _serialize_vision_result, _deserialize_vision_result, vision_task_key,
+    _check_request, _serialize_vision_result, _deserialize_vision_result,
+    replay_saved_table_sources, vision_task_key,
 )
+
+
+class _SharedRunCallContext:
+    """Bridge physical page submissions to the existing run reservations.
+
+    HTTP polling/PUTs still use the recovery incident's network budget; only
+    an actual recognition submission consumes a run generation call. No new
+    retry loop, ledger or trust boundary is introduced here.
+    """
+    def __init__(self, context, store, run_id, config, page):
+        self.context, self.store, self.run_id, self.config = context, store, run_id, config
+        self.page, self.current = page, None
+        self.started = None
+
+    def __getattr__(self, name):
+        return getattr(self.context, name)
+
+    def reserve_model_call(self, input_estimate=0, output_limit=0):
+        from .research_execution.call_budget import prepare_external_plan, reserve, record_gap
+        from .providers import ProviderError
+        row = self.store.get_run(self.run_id)
+        if row is None:
+            return
+        payload = json.loads(row["payload_json"])
+        identity = {"request_id": "vision:" + digest([self.run_id, self.context.action_id]),
+            "attempt_id": uuid.uuid4().hex, "stage_id": "financial-vision", "generation": 1}
+        raw = {"schema": "model-wire-diagnostics-v1", "wire_state": "send_intent_recorded",
+            "configured_model_id": self.config.configured_model_id, "provider_id": self.config.provider,
+            "input_tokens_estimate": input_estimate, "reserved_output_tokens": output_limit,
+            "token_counting_method": "vision_byte_planning_estimate_not_image_token_contract", "usage": None}
+        try:
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                prepare_external_plan(db, self.run_id, payload.get("research_configuration", {}).get("run_envelope"))
+                reserve(db, self.run_id, identity, purpose="vision_recognition", input_estimate=input_estimate,
+                    output_limit=output_limit, trigger="failed_page_recognition")
+                db.execute("INSERT INTO model_wire_diagnostics VALUES(?,?,?,?,?,?,?)", (identity["request_id"],
+                    identity["attempt_id"], self.run_id, identity["stage_id"], "vision_recognition", json.dumps(raw), time.time()))
+        except ProviderError as error:
+            with self.store.connect() as db:
+                record_gap(db, self.run_id, identity, "vision_recognition", input_estimate, output_limit, error.code)
+            raise RecoveryError(error.code, needs_action="review_shared_run_budget_before_cloud_submission") from error
+        self.current = identity
+        self.started = time.monotonic()
+
+    def settle_model_call(self, response=None, error=None):
+        if self.current is None:
+            return
+        from .research_execution.call_budget import settle
+        metadata = getattr(response, "receipt", {}).get("metadata", {})
+        usage = {key: metadata.get(key) if type(metadata.get(key)) is int and metadata[key] >= 0 else None
+            for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens")}
+        with self.store.connect() as db:
+            row = db.execute("SELECT diagnostics_json FROM model_wire_diagnostics WHERE request_id=? AND attempt_id=?",
+                (self.current["request_id"], self.current["attempt_id"])).fetchone()
+            raw = json.loads(row[0])
+            status = getattr(error, "http_status", None)
+            raw.update(wire_state="response_received" if response is not None else "not_sent" if getattr(error, "not_sent", False) else
+                "rejected" if status in {400, 401, 403, 413, 422, 429} else "remote_unknown", usage=usage,
+                reasoning_in_output=metadata.get("reasoning_in_output"))
+            raw["elapsed_seconds"] = max(0, time.monotonic() - self.started) if self.started is not None else None
+            if type(status) is int:
+                raw["http_status"] = status
+            for key in ("model_id", "provider_id", "endpoint_host", "usage_source", "provider_request_id", "http_status"):
+                if key in metadata:
+                    raw[key] = metadata[key]
+            settle(db, self.current, usage, raw["wire_state"], reasoning_in_output=metadata.get("reasoning_in_output"))
+            db.execute("UPDATE model_wire_diagnostics SET diagnostics_json=? WHERE request_id=? AND attempt_id=?",
+                (json.dumps(raw), self.current["request_id"], self.current["attempt_id"]))
+        self.current = None
 
 
 class DurableCloudVisionAdapter:
@@ -36,11 +109,13 @@ class DurableCloudVisionAdapter:
                  sleeper: Callable[[float], None] = time.sleep,
                  authorization_check: Callable[[], bool] | None = None,
                  limits: RecoveryLimits | None = None,
-                 budget_scope: IncidentScope | None = None):
+                 budget_scope: IncidentScope | None = None,
+                 automatic_budget_scope: bool = False):
         self.adapter, self.store, self.run_id = adapter, store, run_id
         self.compiler = compiler or FinancialFactCompiler()
         self.clock, self.sleeper, self.limits = clock, sleeper, limits
         self.budget_scope = budget_scope
+        self.automatic_budget_scope = automatic_budget_scope is True
         self.authorization_check = authorization_check or (lambda: True)
 
     def extract(self, company, filing, pages, config, *, cancel_check=None):
@@ -82,6 +157,15 @@ class DurableCloudVisionAdapter:
                         or fact.accession_number != filing.accession_number for fact in result.facts)
                         or any(ref.document_id != filing.document_id for ref in result.evidence)):
                     raise ValueError("CLOUD_CANDIDATE_SOURCE_MISMATCH")
+                result = replay_saved_table_sources(result, company, filing, (page,))
+                if result.error_code:
+                    if result.error_code == "VISION_CACHED_SOURCE_INVALID":
+                        if "VISION_CANDIDATE_INTEGRITY_FAILED" in result.diagnostics:
+                            raise ValueError("CLOUD_CANDIDATE_INVALID")
+                        raise RecoveryError(result.error_code,
+                            needs_action="review_saved_candidate_source")
+                    raise RecoveryError(result.error_code,
+                        needs_action="retry_saved_candidate_validation_or_export_diagnostic")
                 from .financial_cell_repair import reread_cell_mappings
                 # First verification is outside the SQLite publication
                 # transaction. Reuse that immutable native observation at
@@ -139,21 +223,38 @@ class DurableCloudVisionAdapter:
             # This does not extend the incident/runtime budget: it only avoids
             # treating an in-budget HTTP response as an abandoned worker.
             limits = replace(limits, lease_seconds=max(limits.lease_seconds, duration + 5.0))
+            scope = self.budget_scope
+            call_plan = self.store.model_call_plan(self.run_id) or {}
+            if (call_plan.get("policy") == "adaptive" and self.limits is None
+                    and self.automatic_budget_scope):
+                # One source-bound page is one finite recovery work item.
+                # Page consent and unknown-submission guards stay unchanged;
+                # unrelated pages cannot consume a hidden run-wide 32-call
+                # quota. Only an app-generated scope is discarded here;
+                # explicit scopes and user-supplied limits remain authoritative.
+                scope = None
             plan = RecoveryPlan("incident:" + digest({"run": self.run_id, "target": target,
-                "input": frozen_input}) if self.budget_scope is None else "incident:" + digest({
-                    "run": self.run_id, "target": self.budget_scope.target, "input": self.budget_scope.input_digest}),
+                "input": frozen_input}) if scope is None else "incident:" + digest({
+                    "run": self.run_id, "target": scope.target, "input": scope.input_digest}),
                 self.run_id, target, repository.generation, frozen_input,
-                (issue,), (action,), limits=limits, authorization_scope=authorization, budget_scope=self.budget_scope)
+                (issue,), (action,), limits=limits, authorization_scope=authorization, budget_scope=scope)
 
             def produce(context, task_id=""):
                 if time.monotonic() >= deadline:
                     raise RecoveryError("VISION_TIMEOUT", needs_action="resume_saved_page_with_fresh_task_budget")
-                if flash:
-                    result = self.adapter.extract(company, filing, (page,), config,
-                        cancel_check=cancelled, recovery_context=context, remote_task_id=task_id)
-                else:
-                    result = self.adapter.extract(company, filing, (page,), config,
-                        cancel_check=cancelled, recovery_context=context)
+                wire_context = _SharedRunCallContext(context, self.store, self.run_id, config, page)
+                try:
+                    if flash:
+                        result = self.adapter.extract(company, filing, (page,), config,
+                            cancel_check=cancelled, recovery_context=wire_context, remote_task_id=task_id)
+                    else:
+                        result = self.adapter.extract(company, filing, (page,), config,
+                            cancel_check=cancelled, recovery_context=wire_context)
+                finally:
+                    if wire_context.current is not None:
+                        from .providers import ProviderError
+                        wire_context.settle_model_call(error=ProviderError("Page attempt did not return a receipt",
+                            code="MODEL_SUBMISSION_UNKNOWN", not_sent=not context.external_intent))
                 if result.error_code:
                     key = vision_task_key(f"mineru_flash:{MINERU_UPLOAD_PROTOCOL_VERSION}",
                         filing.content_hash, (page,), namespace="page")

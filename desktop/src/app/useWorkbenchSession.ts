@@ -493,13 +493,14 @@ export function useWorkbenchSession() {
     }
   };
 
-  const approveBudgetGaps = async (runId: string, planDigest: string, gapIds: string[]) => {
+  const approveBudgetGaps = async (runId: string, planDigest: string, gapIds: string[], adaptiveChoice?: "keep" | "remove") => {
     if (storageMaintenanceRequired.current) return;
-    if (!runId || !planDigest || gapIds.length === 0) throw new Error("MODEL_BUDGET_APPROVAL_INVALID");
+    if (!runId || !planDigest || (gapIds.length === 0 && !adaptiveChoice)) throw new Error("MODEL_BUDGET_APPROVAL_INVALID");
     if (pendingBudgetApprovalRuns.current.has(runId)) throw new Error("MODEL_BUDGET_APPROVAL_IN_PROGRESS");
     pendingBudgetApprovalRuns.current.add(runId);
     try {
-      await extendResearchBudget(runId, planDigest, gapIds);
+      if (adaptiveChoice) await extendResearchBudget(runId, planDigest, gapIds, adaptiveChoice);
+      else await extendResearchBudget(runId, planDigest, gapIds);
       const updated = await retryResearchModelStages(runId, undefined, true);
       if (selectedReportRun.current === updated.run_id || !selectedReportRun.current) {
         selectedReportRun.current = updated.run_id;

@@ -25,6 +25,29 @@ def repair_context(prompt, fields):
         raise ValueError("MODEL_REPAIR_DEPENDENCY_BOUNDARY_UNKNOWN")
     if not isinstance(original, dict):
         raise ValueError("MODEL_REPAIR_DEPENDENCY_BOUNDARY_UNKNOWN")
+    from .source_compiler import expand_record_tables
+    original = expand_record_tables(original)
+    # Repairs are independent requests. Expand path aliases against this full
+    # frozen input *before* selecting partitions, so a removed sibling cannot
+    # strand references into a previous request or the relocated common core.
+    def expand_paths(value, resolving=()):
+        if isinstance(value, dict):
+            if set(value) == {"request_path_ref"}:
+                path = value["request_path_ref"]
+                if not isinstance(path, list) or len(resolving) >= 32 or tuple(path) in resolving:
+                    raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED")
+                target = original
+                try:
+                    for component in path:
+                        target = target[component]
+                except (KeyError, IndexError, TypeError):
+                    raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED") from None
+                return expand_paths(target, (*resolving, tuple(path)))
+            return {key: expand_paths(child, resolving) for key, child in value.items()}
+        if isinstance(value, list):
+            return [expand_paths(child, resolving) for child in value]
+        return deepcopy(value)
+    original = expand_paths(original)
     context = deepcopy(original.get("research_context", {}))
     selected = {"risk_disclosures", "other_disclosures"}
     known = all(field in _PARTITIONS for field in fields)
@@ -36,13 +59,13 @@ def repair_context(prompt, fields):
                for item in items if isinstance(item, dict)}
         context["evidence"] = [item for item in context.get("evidence", [])
                                if isinstance(item, str) and item in ids]
-        context["source_blocks"] = [item for item in context.get("source_blocks", [])
-                                    if item.get("evidence_ref") in ids]
+        if isinstance(context.get("source_blocks"), list):
+            context["source_blocks"] = [item for item in context["source_blocks"] if item.get("evidence_ref") in ids]
         # Accepted facts are the compact numeric/period/unit boundary, not
         # parser audit or an ancestor report. Even a business/risk patch may
         # depend on them; retaining them avoids an unprovable dependency cut.
     result = {key: deepcopy(original[key]) for key in (
-        "output_language", "output_language_instruction", "claim_contract", "request_reference_contract") if key in original}
+        "output_language", "output_language_instruction", "claim_contract", "request_reference_contract", "late_evidence") if key in original}
     result.update({"research_context": context, "target_fields": list(fields),
         "dependency_scope": "named_fields_and_risk_counterevidence" if known else "expanded_role_material_unknown_field_dependencies",
         "acceptance": "Return only target patches; preserve source identity, period, units and opposing evidence. Unknown facts stay unknown."})
@@ -90,4 +113,15 @@ def repair_context(prompt, fields):
             for child in value:
                 check(child)
     check(result)
+    # Expanding paths was necessary for safe selection, not permission to send
+    # another uncompressed copy of every admitted row in a tiny field patch.
+    # The same lossless table contract applies to these independent requests.
+    from .source_compiler import compact_record_table
+    for key in ("accepted_facts", "repair_observations", "repair_catalog"):
+        if key in context:
+            context[key] = compact_record_table(context[key])
+    for key, records in context.get("evidence_partitions", {}).items():
+        context["evidence_partitions"][key] = compact_record_table(records)
+    if "record_table_contract" in original:
+        result["record_table_contract"] = original["record_table_contract"]
     return result

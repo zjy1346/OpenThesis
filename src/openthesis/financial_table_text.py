@@ -20,7 +20,7 @@ from .financial_taxonomy import (
     equity_row_concept, has_distinct_capital_payment_label,
     normalize_financial_label, profit_row_concept, capex_component_kind,
 )
-from .financial_unit_declarations import literal_money_unit
+from .financial_unit_declarations import literal_money_unit, combined_money_unit
 
 CLOUD_TABLE_VERSION = "vision-markdown-v4"
 _NUMBER = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\)")
@@ -187,13 +187,18 @@ def concept_for_label(label: str, *, statement="", following_labels=()) -> str |
         return comprehensive_income_row_concept(source)
     if "comprehensive" in normalized or "综合收益" in normalized:
         return None
-    profit = profit_row_concept(source)
-    if profit:
-        return profit
     equity = equity_row_concept(source, following_labels=following_labels)
     if equity:
         return equity
     component = balance_component_row_concept(source)
+    if component and statement == 'balance_sheet':
+        return component
+    # Owner attribution alone is not a profit: an owners' equity row must
+    # not be swallowed by a broad profit attribution alias before its table
+    # family is considered. The formal statement still fences other roles.
+    profit = profit_row_concept(source)
+    if profit:
+        return profit
     if component:
         return component
     payment = capital_allocation_payment_concept(source)
@@ -259,7 +264,7 @@ def _table_formal_context(table):
     return context
 
 
-def explicit_table_unit(table: TextTable):
+def explicit_table_unit(table: TextTable, column_index: int | None = None):
     # Local unit lines belong to the current statement, not a unit anywhere
     # earlier in the Markdown. Headers can carry a unit in each year column.
     context = table.context
@@ -268,8 +273,39 @@ def explicit_table_unit(table: TextTable):
     for index, line in enumerate(lines):
         if table_statement(line):
             boundary = index
+    header_rows = []
+    for row in table.rows:
+        if any(concept_for_label(cell) for cell in row):
+            break
+        header_rows.append(row)
+    if column_index is not None:
+        # Column headers are physical cells, not a currency found somewhere
+        # else in the table. Explicit local units override statement defaults;
+        # a currency-only cell may inherit a separately printed multiplier.
+        context_lines = [line for line in lines[boundary:]
+            if re.search(r"(?i)unit|currency|单位|單位|币种|幣種|RMB|CNY|USD|HKD|人民币|人民幣|million|thousand", line)]
+        common = combined_money_unit(context_lines)
+        if len(common.currencies) > 1 or len(common.scales) > 1:
+            raise ValueError("CLOUD_LOCAL_UNIT_CONFLICT")
+        column_lines = [row[column_index] for row in header_rows if column_index < len(row)]
+        column = combined_money_unit(column_lines)
+        if len(column.currencies) > 1 or len(column.scales) > 1:
+            raise ValueError("CLOUD_LOCAL_UNIT_CONFLICT")
+        currencies = column.currencies or common.currencies
+        if column.scale_explicit:
+            scales = column.scales
+        elif common.scale_explicit:
+            scales = common.scales
+        else:
+            scales = column.scales or common.scales
+        observed = [line for line in (*context_lines, *column_lines)
+                    if literal_money_unit(line).currencies or literal_money_unit(line).scales]
+        if not observed:
+            return None
+        return ("\n".join(observed), next(iter(currencies), ""),
+                format(Decimal(next(iter(scales))), "f") if scales else "")
     declarations = []
-    for text in (*lines[boundary:], *[" ".join(row) for row in table.rows[:4]]):
+    for text in (*lines[boundary:], *[" ".join(row) for row in header_rows]):
         if re.search(r"(?i)unit|currency|单位|單位|币种|幣種|RMB|CNY|USD|HKD|人民币|人民幣", text):
             unit = literal_money_unit(text)
             if len(unit.currencies) > 1 or len(unit.scales) > 1:
@@ -300,6 +336,7 @@ class CellObservation:
     period_end: str
     revision: str
     statement: str
+    scope: str = 'consolidated'
 
 
 def observe_cells(tables: tuple[TextTable, ...], period_end: str, fiscal_period: str) -> tuple[CellObservation, ...]:
@@ -307,8 +344,14 @@ def observe_cells(tables: tuple[TextTable, ...], period_end: str, fiscal_period:
     observations = []
     for table_index, table in enumerate(tables):
         formal = table_statement(_table_formal_context(table))
-        if formal is None or formal[1] != "consolidated" or formal[0] == "equity_changes":
+        if formal is None or formal[0] == "equity_changes":
             continue
+        if formal[1] != 'consolidated':
+            # A bare title does not prove parent scope. Require an explicit
+            # parent-only formal heading, retaining it as a separate identity.
+            titles = [line for line in _table_formal_context(table).splitlines() if table_statement(line)]
+            if not titles or not re.search(r'(?i)parent\s+company|parent\s+only|company\s+only|母公司', titles[-1]):
+                continue
         statement = formal[0]
         headers = {}
         note_columns = set()
@@ -379,5 +422,5 @@ def observe_cells(tables: tuple[TextTable, ...], period_end: str, fiscal_period:
                     continue
                 revision = "restated" if any(item in normalize_financial_label(header) for item in ("restated", "经重述", "重列")) else "original"
                 observations.append(CellObservation(table_index, row_index, column, concept, label,
-                    raw_value, header, observed_end, revision, expected))
+                    raw_value, header, observed_end, revision, expected, formal[1]))
     return tuple(observations)

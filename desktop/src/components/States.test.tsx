@@ -2,8 +2,83 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 
 import { ResearchProgress } from "./States";
+import type { ResearchJob } from "../types";
 
 describe("ResearchProgress", () => {
+  it("estimates only fresh page work and keeps file/page counts separate across both tabs", () => {
+    const job: ResearchJob = { job_id: "fresh-pages", state: "running", message: "", percent: 20, run_id: null,
+      stage: "filing-page", elapsed_seconds: 3_600,
+      filing_states: {
+        done: { filing_id: "done", label: "2024", status: "usable", processing_state: "completed", elapsed_seconds: 20 },
+        active: { filing_id: "active", label: "2025", status: "page-parsing", elapsed_seconds: 3_500,
+          completed_page_count: 103, candidate_page_count: 200, parsed_page_count: 3,
+          parsing_active_seconds: 6, parser_backend: "pdfplumber", waiting_type: "native_parse",
+          current_page: 137, last_product_at: "2026-10-26T10:00:00+08:00" },
+      } };
+    const view = render(<ResearchProgress language="en" job={job} onCancel={vi.fn()} />);
+    expect(screen.getByLabelText("Estimated remaining")).toHaveTextContent("2m–5m");
+    expect(view.container).toHaveTextContent("Filings processed: 1 / 2");
+    expect(view.container).toHaveTextContent("Current file candidate pages: 103 / 200");
+    fireEvent.click(screen.getByRole("tab", { name: "Model research" }));
+    expect(view.container).toHaveTextContent("Current file candidate pages: 103 / 200");
+    const activity = view.container.querySelector("details.filing-activity-details")
+      ?? [...view.container.querySelectorAll("details")].find((item) => item.textContent?.includes("Current PDF page"));
+    expect(activity).not.toHaveAttribute("open");
+    expect(activity).toHaveTextContent("Current PDF page: 137");
+  });
+
+  it("shows estimating instead of extrapolating percentages or cached pages", () => {
+    render(<ResearchProgress language="en" job={{ job_id: "reuse-only", state: "running", message: "", percent: 24,
+      run_id: null, stage: "filing-page", elapsed_seconds: 3_600,
+      filing_states: { active: { filing_id: "active", label: "2025", status: "page-cache-hit", elapsed_seconds: 3_600,
+        completed_page_count: 100, candidate_page_count: 200, parsed_page_count: 0,
+        parsing_active_seconds: 0, parser_backend: "pdfplumber", waiting_type: "cache_reuse" } } }} onCancel={vi.fn()} />);
+    expect(screen.queryByLabelText("Estimated remaining")).not.toBeInTheDocument();
+    expect(screen.getByText("Estimating from completed work…")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["en", "15-minute quality-first reminder", "20 minutes is not a hard stop"],
+    ["zh-CN", "15分钟质量优先提示", "20分钟不是硬性终止时限"],
+    ["zh-Hant", "15分鐘品質優先提示", "20分鐘不是硬性終止時限"],
+  ])("shows the top-level time reminder during financial preparation in %s", (language, reminder, boundary) => {
+    render(<ResearchProgress language={language} job={{ job_id: "time-warning-preparation", state: "running", message: "Preparing", percent: 24,
+      run_id: null, stage: "filing-validation", call_plan: { plan_digest: "plan", max_calls: 16, max_input_estimate: 1_500_000, max_output_tokens: 100_000,
+        pending_budget_gaps: [], time_warning: true } }}
+      onCancel={vi.fn()} />);
+    expect(screen.getByRole("status")).toHaveTextContent(reminder);
+    expect(screen.getByRole("status")).toHaveTextContent(boundary);
+  });
+
+  it("does not show a time reminder unless the backend explicitly flags the boundary", () => {
+    const { rerender } = render(<ResearchProgress language="en" job={{ job_id: "no-time-warning", state: "running", message: "Preparing", percent: 24,
+      run_id: null, stage: "filing-validation", call_plan: { plan_digest: "plan", max_calls: 16, max_input_estimate: 1_500_000, max_output_tokens: 100_000,
+        pending_budget_gaps: [], time_warning: false } }}
+      onCancel={vi.fn()} />);
+    expect(screen.queryByText(/15-minute quality-first reminder/)).not.toBeInTheDocument();
+    rerender(<ResearchProgress language="en" job={{ job_id: "no-time-warning", state: "running", message: "Preparing", percent: 24,
+      run_id: null, stage: "filing-validation" }} onCancel={vi.fn()} />);
+    expect(screen.queryByText(/15-minute quality-first reminder/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the top-level reminder visible on the research tab before call cards exist", () => {
+    render(<ResearchProgress language="en" job={{ job_id: "time-warning-no-calls", state: "running", message: "Preparing", percent: 42,
+      run_id: null, stage: "filing-validation", call_plan: { plan_digest: "plan", max_calls: 16, max_input_estimate: 1_500_000,
+        max_output_tokens: 100_000, pending_budget_gaps: [], time_warning: true }, model_calls: [] }} onCancel={vi.fn()} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Model research" }));
+    expect(screen.getByRole("status")).toHaveTextContent("15-minute quality-first reminder");
+  });
+
+  it("keeps the model-stage reminder on ModelCallProgress without duplicating it", () => {
+    render(<ResearchProgress language="en" job={{ job_id: "time-warning-model", state: "running", message: "Researching", percent: 55,
+      run_id: null, stage: "parallel-agents", agent_states: { "financial-analyst": "running" },
+      call_plan: { plan_digest: "plan", max_calls: 16, max_input_estimate: 1_500_000, max_output_tokens: 100_000,
+        pending_budget_gaps: [], time_warning: true },
+      model_calls: [{ request_id: "warning-call", attempt_id: "attempt-1", generation: 1, stage_id: "financial-analyst", state: "running", elapsed_seconds: 2,
+        call_plan: { max_calls: 16, max_input_estimate: 1_500_000, max_output_tokens: 100_000, time_warning: true } }] }} onCancel={vi.fn()} />);
+    expect(screen.getAllByText(/15-minute quality-first reminder/)).toHaveLength(1);
+  });
+
   it("distinguishes source-stage processing and partial verification from final review", () => {
     render(<ResearchProgress language="en" job={{ job_id: "source", state: "running", message: "Reading", percent: 30, run_id: null,
       agent_states: { "source-risk-analysis": "validating", "source-industry-analysis": "completed_partial", "skeptical-analyst": "queued" } }}
@@ -122,16 +197,20 @@ describe("ResearchProgress", () => {
           stage_total: 5,
           elapsed_seconds: 30,
           filing_states: {
-            first: { filing_id: "first", label: "2025", status: "validated", elapsed_seconds: 10 },
-            second: { filing_id: "second", label: "2024", status: "cloud-processing", elapsed_seconds: 8 },
-            third: { filing_id: "third", label: "2023", status: "queued", elapsed_seconds: 0 },
+            first: { filing_id: "first", label: "2025", status: "validated", fiscal_period: "FY", elapsed_seconds: 10 },
+            second: { filing_id: "second", label: "2024", status: "validated", fiscal_period: "FY", elapsed_seconds: 8 },
+            cloud: { filing_id: "cloud", label: "2022", status: "cloud-processing", elapsed_seconds: 8,
+              last_activity_at: "2026-10-26T10:00:00+08:00" },
+            third: { filing_id: "third", label: "2023", status: "local-validating", waiting_type: "local_validation",
+              fiscal_period: "FY", elapsed_seconds: 0, last_activity_at: "2026-10-26T10:10:00+08:00" },
+            fourth: { filing_id: "fourth", label: "2022 annual", status: "queued", fiscal_period: "FY", elapsed_seconds: 0 },
           },
         }}
         labels={{ cancel: "Cancel", cancelling: "Stopping", agents: "Agents", running: "Running", retrying: "Retrying", queued: "Queued", completed: "Done", cancelled: "Cancelled", failed: "Failed", unknown: "Waiting" }}
         onCancel={vi.fn()}
       />,
     );
-    expect(screen.getByText("Processing complete")).toBeInTheDocument();
+    expect(screen.getAllByText("Processing complete")).toHaveLength(2);
     expect(screen.getByText("Cloud processing")).toBeInTheDocument();
     expect(screen.getByText("Queued")).toBeInTheDocument();
     expect(screen.getByLabelText("Estimated remaining")).toBeInTheDocument();
@@ -269,7 +348,7 @@ describe("ResearchProgress", () => {
       stage: "filing-validation", filing_states: {
         partial: { filing_id: "partial", label: "Annual filing", status: "validated", processing_state: "completed", availability: "partial",
           roles: ["target", "comparator"], candidate_count: 12, admitted_count: 8, issue_codes: ["MISSING_CASH_FLOW"], source_hash: "abcdef1234567890", elapsed_seconds: 31,
-          page_count: 80, native_text_page_count: 72, indexed_page_count: 55, completed_window_count: 4, window_total: 5,
+          page_count: 80, native_text_page_count: 72, indexed_page_count: 55, completed_page_count: 31, candidate_page_count: 55, completed_window_count: 4, window_total: 5,
           parse_elapsed_seconds: 18.4, attempt_count: 2, cache_reused: false, recognized_statements: ["balance_sheet"], extracted_pages: [2, 11],
           failure_stage: "parse", root_error_code: "FILING_PARSE_INCOMPLETE" },
         complete: { filing_id: "complete", label: "Complete filing", status: "validated", processing_state: "completed", availability: "complete", elapsed_seconds: 20 },
@@ -283,6 +362,7 @@ describe("ResearchProgress", () => {
     expect(screen.getByText("No usable content")).toBeInTheDocument();
     expect(screen.getByText(/Roles: Target · Comparator/)).toBeInTheDocument();
     expect(screen.getByText(/Candidates: 12 · 8 admitted/)).toBeInTheDocument();
+    expect(screen.getByText("Candidate pages complete: 31 / 55")).toBeInTheDocument();
     expect(screen.getByText("MISSING_CASH_FLOW")).toBeInTheDocument();
     expect(screen.getByText("Source hash: abcdef123456")).toBeInTheDocument();
     expect(screen.getByText("Historical/comparative material processed")).toBeInTheDocument();
@@ -296,7 +376,8 @@ describe("ResearchProgress", () => {
     expect(parsingDetails).toHaveTextContent("Total pages80");
     expect(parsingDetails).toHaveTextContent("Native-text pages72");
     expect(parsingDetails).toHaveTextContent("Indexed pages55");
-    expect(parsingDetails).toHaveTextContent("Windows complete4 / 5");
+    expect(parsingDetails).toHaveTextContent("Candidate pages complete31 / 55");
+    expect(parsingDetails).toHaveTextContent("Legacy windows complete4 / 5");
     expect(parsingDetails).toHaveTextContent("Parse time00:18");
     expect(parsingDetails).toHaveTextContent("Attempts2");
     expect(parsingDetails).toHaveTextContent("Cached result reusedNo");

@@ -87,6 +87,10 @@ class ModelRequestJournal:
         self._local = threading.local()
         self._stage_configurations: dict[str, str] = {}
         self.candidate_read_issues: list[dict[str, str]] = []
+        self.run_envelope = None
+        self._automatic_deadline = None
+        self._automatic_limit_seconds = None
+        self.adaptive_resume = False
 
     def prepare(self, registry, material_digest: str, invalidated: tuple[str, ...] = (), *,
                 stage_configurations: dict[str, str] | None = None,
@@ -105,7 +109,18 @@ class ModelRequestJournal:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             from .call_budget import prepare_plan
-            prepare_plan(db, self.run_id, [spec.stage_id for spec in registry.stages], planned_input_tokens, request_plan=planned_requests)
+            prepare_plan(db, self.run_id, [spec.stage_id for spec in registry.stages], planned_input_tokens,
+                         request_plan=planned_requests, envelope=self.run_envelope)
+            from .call_budget import plan_status
+            frozen_plan = plan_status(db, self.run_id)
+            self.adaptive_resume = bool(self.budget_only and (frozen_plan or {}).get("policy") == "adaptive")
+            limits = (frozen_plan or {}).get("user_envelope")
+            self._automatic_deadline = None
+            self._automatic_limit_seconds = None
+            if limits and limits.get("max_automatic_seconds") is not None:
+                remaining = limits["max_automatic_seconds"] - max(0, self.clock() - frozen_plan["started_at"])
+                self._automatic_deadline = time.monotonic() + max(0, remaining)
+                self._automatic_limit_seconds = limits["max_automatic_seconds"]
             # The service preflight is advisory: another worker can acquire a
             # wire lease between that read and this transaction. Local reuse
             # must never invalidate the head of a still-running paid request.
@@ -155,6 +170,41 @@ class ModelRequestJournal:
     def transport_context(self):
         return getattr(self._local, "transport", None)
 
+    def ensure_automatic_time_available(self):
+        if self._automatic_deadline is not None and time.monotonic() >= self._automatic_deadline:
+            context = self.transport_context()
+            if context is not None:
+                from .call_budget import record_gap
+                with self.store.connect() as db:
+                    request = getattr(self._local, "pending_work", {})
+                    record_gap(db, self.run_id, context, request.get("purpose", "generation"),
+                        request.get("input_estimate", 0), request.get("output_limit", 1), "MODEL_RUN_TIME_BUDGET_EXHAUSTED")
+            raise ProviderError("Automatic research time budget exhausted; retain completed work",
+                code="MODEL_RUN_TIME_BUDGET_EXHAUSTED", not_sent=True)
+
+    def note_preparation(self, queue_seconds, material_seconds):
+        self._local.queue_seconds = queue_seconds
+        self._local.material_seconds = material_seconds
+
+    def note_queued_work(self, purpose, input_estimate, output_limit):
+        # Queue/time exhaustion can precede wire preparation, including the
+        # first call of this run. Do not attribute it to a stale sibling wire.
+        self._local.pending_work = {"purpose": purpose, "input_estimate": input_estimate,
+            "output_limit": output_limit}
+
+    def record_stage_timing(self, stage_id, timing):
+        with self.store.connect() as db:
+            row = db.execute("SELECT request_id,attempt_id,diagnostics_json FROM model_wire_diagnostics WHERE run_id=? AND stage_id=? AND created_at>=? ORDER BY created_at DESC LIMIT 1",
+                (self.run_id, stage_id, timing.get("queued_at_epoch", self.clock()))).fetchone()
+            if row is None:
+                return  # A local-only replay cannot rewrite old transport time.
+            raw = json.loads(row["diagnostics_json"])
+            raw["stage_timeline"] = timing
+            raw["publication_seconds"] = timing.get("publication_seconds")
+            raw["verification_seconds"] = timing.get("local_verification_seconds")
+            db.execute("UPDATE model_wire_diagnostics SET diagnostics_json=? WHERE request_id=? AND attempt_id=?",
+                (json.dumps(raw, allow_nan=False), row["request_id"], row["attempt_id"]))
+
     def record_wire_diagnostics(self, system_prompt, user_prompt, *, provider, purpose, target_paths=()):
         """Safe physical-attempt accounting; no prompt, key or reasoning body."""
         context = self.transport_context()
@@ -162,13 +212,28 @@ class ModelRequestJournal:
             return
         sizes = {"system": len(system_prompt.encode("utf-8")), "user": len(user_prompt.encode("utf-8"))}
         components = {}
+        prefix_metadata = {}
         try:
             raw = json.loads(user_prompt)
             if isinstance(raw, dict):
                 for key in ("material_registry", "research_context", "prior_artifacts", "claim_contract",
-                            "task_instructions", "assigned_research_obligations", "assertions", "material"):
+                            "task_instructions", "assigned_research_obligations", "assertions", "material", "common_core", "source_package", "late_evidence"):
                     if key in raw:
                         components[key] = len(json.dumps(raw[key], ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                # Stable byte/message boundaries, never prompts or raw source.
+                prefix_keys = [key for key in raw if key not in {"agent", "task_instructions", "prior_artifacts",
+                    "assigned_research_obligations", "agent_role", "output_schema", "late_evidence", "reading_assignment"}]
+                frozen = json.dumps({key: raw[key] for key in prefix_keys}, ensure_ascii=False, separators=(",", ":"))
+                tail = json.dumps({key: raw[key] for key in raw if key not in prefix_keys}, ensure_ascii=False, separators=(",", ":"))
+                prefix_metadata = {"common_prefix_digest": digest(system_prompt), "source_package_digest": digest(frozen),
+                    "task_tail_digest": digest(tail), "source_package_bytes": len(frozen.encode()),
+                    "task_tail_bytes": len(tail.encode()), "message_boundary_version": "system-user-v1"}
+                # The actual byte prefix ends at the top-level task boundary,
+                # not at a reconstructed/sorted approximation of that JSON.
+                boundary = user_prompt.find(',"agent":')
+                if boundary >= 0:
+                    prefix_metadata["wire_prefix_digest"] = digest(user_prompt[:boundary])
+                    prefix_metadata["wire_prefix_bytes"] = len(user_prompt[:boundary].encode())
         except (ValueError, TypeError):
             pass
         total = sum(sizes.values())
@@ -192,16 +257,55 @@ class ModelRequestJournal:
             "context_tokens_hint": getattr(provider, "context_window_tokens", None),
             "reserved_output_tokens": capability.reserved_output_tokens,
             "reserved_repair_tokens": capability.reserved_repair_tokens,
-            "wire_state": "send_intent_recorded", "usage": None}
+            "queue_seconds": getattr(self._local, "queue_seconds", None),
+            "material_preparation_seconds": getattr(self._local, "material_seconds", None),
+            "sent_at_epoch": self.clock(),
+            "wire_state": "send_intent_recorded", "usage": None, **prefix_metadata}
+        self._local.wire_started = time.monotonic()
+        self._local.pending_work = {"purpose": purpose, "input_estimate": measured["tokens"],
+            "output_limit": capability.reserved_output_tokens}
+        # Host-computed semantic work, independent of transport attempt IDs
+        # and prompt wording. No source text enters the work-item ledger.
+        try:
+            semantic, _ = json.JSONDecoder().raw_decode(user_prompt[user_prompt.index("{"):])
+        except (ValueError, TypeError):
+            semantic = {}
+        if not isinstance(semantic, dict):
+            semantic = {}
+        targets = list(target_paths) or semantic.get("target_fields") or (semantic.get("sectional_delivery") or {}).get("sections") or [
+            item.get("assertion_id") for item in semantic.get("assertions", ()) if isinstance(item, dict)]
+        material = {key: semantic[key] for key in ("research_context", "material_registry", "common_core",
+            "source_package", "late_evidence", "sources", "repair_material", "material") if key in semantic}
+        claims = [{"path": item.get("path"), "original_claim": item.get("original_claim")}
+            for item in semantic.get("targets", ()) if isinstance(item, dict) and "original_claim" in item]
+        def content_only(value):
+            if isinstance(value, dict):
+                return {key: content_only(child) for key, child in value.items()
+                    if not key.startswith("_") and key not in {"created_at", "updated_at", "attempt_id"}}
+            if isinstance(value, list):
+                return [content_only(child) for child in value]
+            return value
+        work = {"obligation": digest(semantic.get("assigned_research_obligations", purpose)),
+            "targets": targets or [context["stage_id"]],
+            "source_version": digest(material) if material else digest(user_prompt),
+            "completed_digest": digest(content_only(claims or semantic.get("prior_artifacts", {}))),
+            "strategy": "source-bound:" + purpose}
+        if self.manual_authorization_id:
+            # Only the existing explicit retry grant can authorize repeating
+            # unchanged semantic work. A timestamp/attempt ID cannot do so.
+            work["strategy"] += ":manual:" + self.manual_authorization_id
         try:
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                if self.budget_only and not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='consumed'",
+                if self.budget_only and not self.adaptive_resume and not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='consumed'",
                         (self.run_id, context["request_id"])).fetchone():
                     raise ProviderError("Only approved missing work may continue", code="MODEL_BUDGET_RESUME_SCOPE_CHANGED")
                 from .call_budget import reserve
-                reserve(db, self.run_id, context, purpose=purpose, input_estimate=measured["tokens"],
+                reserve(db, self.run_id, {**context, **({"work_item": work} if purpose != "transport_retry" else {})}, purpose=purpose, input_estimate=measured["tokens"],
                         output_limit=capability.reserved_output_tokens,
+                        route_identity=getattr(config, "public_id", None),
+                        elapsed_seconds=(None if self._automatic_deadline is None else max(0,
+                            self._automatic_limit_seconds - (self._automatic_deadline - time.monotonic()))),
                         trigger="targeted_repair" if purpose.endswith("repair") or purpose == "section_delivery" else purpose)
                 db.execute("""INSERT INTO model_wire_diagnostics VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(request_id,attempt_id) DO NOTHING""",
@@ -225,10 +329,19 @@ class ModelRequestJournal:
                 return
             diagnostic = json.loads(row["diagnostics_json"])
             code = getattr(error, "code", "")
-            status = getattr(error, "http_status", None)
-            diagnostic.update({"elapsed_seconds": max(0.0, self.clock() - row["created_at"]),
+            status = getattr(error, "http_status", None) if error is not None else metadata.get("http_status")
+            elapsed = max(0, time.monotonic() - getattr(self._local, "wire_started", time.monotonic()))
+            observation = next((item for item in self.store.model_activity.snapshot(self.run_id)
+                if item["request_id"] == context["request_id"] and item["attempt_id"] == context["attempt_id"]), {})
+            queue = diagnostic.get("queue_seconds") or 0
+            material = diagnostic.get("material_preparation_seconds") or 0
+            for name in ("first_response_seconds", "first_content_seconds"):
+                offset = observation.get(name)
+                diagnostic[name] = max(0, offset - queue - material) if type(offset) in (int, float) else None
+            diagnostic.update({"elapsed_seconds": elapsed, "last_response_seconds": elapsed if response is not None else None,
+                "finished_at_epoch": self.clock(),
                 "wire_state": "response_received" if error is None else
-                "not_sent" if getattr(self._local, "dispatch_started", False) is False else
+                "not_sent" if getattr(self._local, "dispatch_started", False) is False or getattr(error,"not_sent",False) or code in {"MODEL_CONFIGURATION_CHANGED", "MODEL_OUTPUT_BUDGET_POLICY_REQUIRED", "MODEL_CONNECTION_AUTH_PAUSED"} else
                 "rejected" if status in {400, 401, 403, 404, 413, 415, 422, 429}
                 or code in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE", "MODEL_CALL_CANCELLED_BEFORE_SEND"}
                 else "local_processing_failed" if getattr(error, "response_received", False) else "remote_unknown",
@@ -243,15 +356,16 @@ class ModelRequestJournal:
             if actual_input:
                 diagnostic["observed_bytes_per_input_token"] = diagnostic["input_bytes"] / actual_input
             for key in ("model_id", "configured_model_id", "provider_id", "endpoint_host", "finish_reason",
-                        "output_budget_wire_field", "output_budget_semantics"):
+                        "output_budget_wire_field", "output_budget_semantics", "usage_source", "usage_contract", "transport_observation", "provider_request_id"):
                 if isinstance(metadata.get(key), str):
                     diagnostic[key] = metadata[key][:256]
+            diagnostic["reasoning_in_output"] = metadata.get("reasoning_in_output") if type(metadata.get("reasoning_in_output")) is bool else None
             db.execute("UPDATE model_wire_diagnostics SET diagnostics_json=? WHERE request_id=? AND attempt_id=?",
                        (json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, allow_nan=False),
                         context["request_id"], context["attempt_id"]))
             from .call_budget import settle
             settle(db, context, diagnostic["usage"], "not_sent" if code == "MODEL_CALL_CANCELLED_BEFORE_SEND"
-                   else diagnostic["wire_state"])
+                   else diagnostic["wire_state"], reasoning_in_output=diagnostic["reasoning_in_output"])
 
     def hydrate_input_budget(self, provider) -> None:
         """Restore only safe received usage of this exact model configuration."""
@@ -272,6 +386,10 @@ class ModelRequestJournal:
                 observe(input_bytes=item.get("input_bytes"), input_tokens=usage.get("input_tokens"),
                         provider_id=item.get("provider_id"), model_id=item.get("model_id"),
                         endpoint_host=item.get("endpoint_host"))
+                observe_output = getattr(provider, "observe_output_usage", None)
+                if callable(observe_output):
+                    observe_output(output_tokens=usage.get("output_tokens"), reasoning_tokens=usage.get("reasoning_tokens"),
+                        reasoning_in_output=item.get("reasoning_in_output"))
         except Exception:
             # Old/absent observations only remove an optimization, not results.
             return
@@ -293,7 +411,7 @@ class ModelRequestJournal:
             code = getattr(error, "code", "")
             state = ("cancelled" if code in {"MODEL_CANCELLED", "MODEL_CALL_CANCELLED", "MODEL_CALL_CANCELLED_BEFORE_SEND"} or self.cancel_check() else
                      "rate_limited" if proven_rate_rejection(error) else
-                     "rejected" if getattr(error, "http_status", None) in {400, 401, 403, 413, 422}
+                     "rejected" if getattr(error,"not_sent",False) or getattr(error, "http_status", None) in {400, 401, 403, 413, 422}
                      or code in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE", "MODEL_QUOTA_EXHAUSTED"} else
                      "local_failure" if getattr(error, "response_received", False) else "remote_unknown")
             self.store.model_activity.update(context, {"state": state})
@@ -425,8 +543,8 @@ class ModelRequestJournal:
             budget_resume = bool(self.budget_only and saved and saved["state"] == "rejected"
                 and not saved["response_received"] and saved["diagnostic_code"] in BUDGET_GAP_CODES
                 and not db.execute("SELECT 1 FROM model_wire_diagnostics WHERE request_id=? LIMIT 1", (request_id,)).fetchone()
-                and db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='approved'",
-                    (self.run_id, request_id)).fetchone())
+                and (self.adaptive_resume or db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND request_id=? AND state='approved'",
+                    (self.run_id, request_id)).fetchone()))
             if saved and not budget_resume:
                 if saved["state"] == "candidate" or saved["state"] == "late_candidate" and self._recover_received(db, saved):
                     candidate = self._read_candidate(saved)
@@ -446,7 +564,7 @@ class ModelRequestJournal:
                     status = rate_proof["http_status"]
                 raise ProviderError("Saved request requires recovery", code=code, retryable=False,
                     http_status=status, retry_after_seconds=rate_proof["retry_after_seconds"] if rate_proof else None)
-            if self.budget_only and not budget_resume:
+            if self.budget_only and not self.adaptive_resume and not budget_resume:
                 raise ProviderError("Only approved missing work may continue", code="MODEL_BUDGET_RESUME_SCOPE_CHANGED")
             # Changing model configuration cannot erase an unknown compensated
             # wire for this same physical prompt/stage. This read precedes I/O.
@@ -503,9 +621,10 @@ class ModelRequestJournal:
                 raise
             code = getattr(exc, "code", "")
             format_rejection = proven_format_rejection(exc)
-            confirmed_rejection = format_rejection or code.startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_")) or code in {
+            confirmed_rejection = format_rejection or getattr(exc,"not_sent",False) or code.startswith(("MODEL_RUN_", "MODEL_BUDGET_", "MODEL_STAGE_GENERATION_BUDGET_")) or code in {
                 "MODEL_RATE_LIMITED", "MODEL_HTTP_429", "MODEL_CONTEXT_CAPACITY",
                 "MODEL_CONFIGURATION_ERROR", "MODEL_AUTHENTICATION_ERROR", "MODEL_UNAUTHORIZED", "MODEL_QUOTA_EXHAUSTED",
+                "MODEL_CONFIGURATION_CHANGED", "MODEL_OUTPUT_BUDGET_POLICY_REQUIRED", "MODEL_CONNECTION_AUTH_PAUSED",
                 "MODEL_HTTP_400", "MODEL_HTTP_401", "MODEL_HTTP_403",
                 "MODEL_CALL_CANCELLED_BEFORE_SEND",
                 "MODEL_REQUEST_BODY_TOO_LARGE",
@@ -539,6 +658,8 @@ class ModelRequestJournal:
                     WHERE request_id=? AND owner_id=? AND state='running'""",
                     (receipt_encoded, trace_id, self.clock(), request_id, owner))
             record, receipt = response_record(result)
+            from .reference_aliases import bind_response_record
+            record, receipt = bind_response_record(record, receipt, getattr(request, "reference_bindings", ()), request.input_digest)
             encoded = candidate_document_json(record, max_bytes=MAX_RESPONSE_BYTES)
             candidate_digest = digest(record)
         except Exception as exc:
@@ -765,7 +886,9 @@ class ModelRequestJournal:
                 self._validate_large_record(candidate)
             if not isinstance(candidate, dict) or digest(candidate) != saved["candidate_digest"]:
                 raise ValueError("candidate_digest_mismatch")
-            return restore_response(candidate) if saved["candidate_schema"] == RESPONSE_SCHEMA else candidate
+            response = restore_response(candidate) if saved["candidate_schema"] == RESPONSE_SCHEMA else candidate
+            from .reference_aliases import restore_saved_references
+            return restore_saved_references(response, saved["input_digest"])
         except (TypeError, ValueError, RecursionError) as exc:
             raise ProviderError("Stored model candidate failed integrity",
                                 code="MODEL_REQUEST_CANDIDATE_CORRUPT") from exc

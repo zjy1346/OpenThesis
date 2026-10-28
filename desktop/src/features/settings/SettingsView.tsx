@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { listConfiguredModels } from "../../backend";
+import { cancelResearch, getResearchStatus, getStructureStatus, listConfiguredModels, startStructureInstall } from "../../backend";
 import { modelEligibility } from "../../modelEligibility";
-import type { ConfiguredModelSummary, Language, OfficialNetworkPolicy, Preferences, VisionFallbackPolicy } from "../../types";
+import type { ConfiguredModelSummary, Language, OfficialNetworkPolicy, Preferences, ResearchJob, StructureRuntimeStatus, VisionFallbackPolicy } from "../../types";
 import {
   isCurrentVisionFallbackPolicy,
   parseVisionFallbackPolicy,
@@ -54,7 +54,90 @@ type SettingsCopy = {
   officialNetworkProfilesHint?: string;
   officialNetworkTlsNote?: string;
   officialNetworkProfilesInvalid?: string;
+  structureTitle?: string;
+  structureBody?: string;
+  structureAdvancedTitle?: string;
+  structureAdvancedBody?: string;
+  structureEnabled?: string;
+  structureEnableHint?: string;
+  structurePythonPath?: string;
+  structurePythonHint?: string;
+  structureDownloadConsent?: string;
+  structureInstallButton?: string;
+  structureInstalling?: string;
+  structureStatusLoading?: string;
+  structureAvailable?: string;
+  structureNotInstalled?: string;
+  structureIncomplete?: string;
+  structureStatusUnavailable?: string;
+  structureVersions?: string;
+  structureStage?: string;
+  structureElapsed?: string;
+  structureCancelInstall?: string;
+  structureCancelPending?: string;
+  structureJobQueued?: string;
+  structureJobCompleted?: string;
+  structureJobCancelled?: string;
+  structureJobWorking?: string;
+  structurePhaseCheckingPython?: string;
+  structurePhaseInstallingRuntime?: string;
+  structurePhaseDownloadingDependencies?: string;
+  structurePhaseDownloadingModels?: string;
+  structurePhaseVerifyingIntegrity?: string;
+  structureErrorConfirmation?: string;
+  structureErrorPythonRequired?: string;
+  structureErrorRuntimeVersion?: string;
+  structureErrorModelMissing?: string;
+  structureErrorWorkerFailed?: string;
+  structureErrorWorkerTimeout?: string;
+  structureErrorModelIntegrity?: string;
+  structureErrorInstallFailed?: string;
+  structureErrorUnknown?: string;
 };
+
+const STRUCTURE_ERROR_COPY: Record<string, keyof SettingsCopy> = {
+  STRUCTURE_COMPONENT_NOT_INSTALLED: "structureNotInstalled",
+  STRUCTURE_COMPONENT_INCOMPLETE: "structureIncomplete",
+  STRUCTURE_INSTALL_CONFIRMATION_REQUIRED: "structureErrorConfirmation",
+  STRUCTURE_PYTHON_REQUIRED: "structureErrorPythonRequired",
+  STRUCTURE_RUNTIME_VERSION_MISMATCH: "structureErrorRuntimeVersion",
+  STRUCTURE_MODEL_NOT_INSTALLED: "structureErrorModelMissing",
+  STRUCTURE_WORKER_FAILED: "structureErrorWorkerFailed",
+  STRUCTURE_WORKER_TIMEOUT: "structureErrorWorkerTimeout",
+  STRUCTURE_MODEL_INTEGRITY_FAILED: "structureErrorModelIntegrity",
+  STRUCTURE_INSTALL_FAILED: "structureErrorInstallFailed",
+};
+
+const STRUCTURE_PHASE_COPY: Record<string, keyof SettingsCopy> = {
+  "checking-python": "structurePhaseCheckingPython",
+  "installing-runtime": "structurePhaseInstallingRuntime",
+  "downloading-dependencies": "structurePhaseDownloadingDependencies",
+  "downloading-models-and-verifying-cpu": "structurePhaseDownloadingModels",
+  "verifying-model-integrity": "structurePhaseVerifyingIntegrity",
+};
+
+function isAbsoluteExecutablePath(path: string): boolean {
+  const value = path.trim();
+  return /^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+|\/)/.test(value);
+}
+
+function safeStructureErrorCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return Object.hasOwn(STRUCTURE_ERROR_COPY, message) ? message : "STRUCTURE_OPERATION_UNAVAILABLE";
+}
+
+function structureErrorText(code: string | undefined, copy: SettingsCopy): string {
+  const key = code ? STRUCTURE_ERROR_COPY[code] : undefined;
+  return (key ? copy[key] : undefined) as string | undefined ?? copy.structureErrorUnknown ?? "The local structure-recognition operation failed.";
+}
+
+function structurePhaseText(job: ResearchJob, copy: SettingsCopy): string {
+  const messagePhase = (job.message || "").replace(/^structure-/, "");
+  const stagePhase = (job.stage || "").replace(/^structure-/, "");
+  const phase = STRUCTURE_PHASE_COPY[messagePhase] ? messagePhase : stagePhase || messagePhase;
+  const key = STRUCTURE_PHASE_COPY[phase];
+  return (key ? copy[key] : undefined) as string | undefined ?? copy.structureJobWorking ?? "Installation in progress";
+}
 
 const DEFAULT_OFFICIAL_NETWORK_POLICY: OfficialNetworkPolicy = {
   version: "official-network-v1",
@@ -94,6 +177,7 @@ function settingsSignatureFromPreferences(preferences: Preferences): string {
     visionApprovalMode: policy.approval_mode,
     visionStandingAuthorization: policy.standing_authorization && isCurrentVisionFallbackPolicy(policy),
     visionModelId: policy.model?.configured_model_id ?? "",
+    localStructureEnabled: preferences.local_structure_enabled === "true",
     officialNetworkPolicy: JSON.stringify(parseOfficialNetworkPolicy(preferences.official_network_policy)),
   });
 }
@@ -120,12 +204,62 @@ export function SettingsView({ language, preferences, copy, onSave }: {
   const [visionModelId, setVisionModelId] = useState(initialVisionPolicy.model?.configured_model_id ?? "");
   const [visionModels, setVisionModels] = useState<ConfiguredModelSummary[]>([]);
   const [visionLoadFailed, setVisionLoadFailed] = useState(false);
+  const [localStructureEnabled, setLocalStructureEnabled] = useState(preferences.local_structure_enabled === "true");
+  const [structureStatus, setStructureStatus] = useState<StructureRuntimeStatus | null>(null);
+  const [structureStatusLoading, setStructureStatusLoading] = useState(true);
+  const [structureStatusError, setStructureStatusError] = useState<string | null>(null);
+  const [structurePythonPath, setStructurePythonPath] = useState("");
+  const [structureDownloadConsent, setStructureDownloadConsent] = useState(false);
+  const [structureStarting, setStructureStarting] = useState(false);
+  const [structureCancelPending, setStructureCancelPending] = useState(false);
+  const [structureInstallError, setStructureInstallError] = useState<string | null>(null);
+  const [structureJob, setStructureJob] = useState<ResearchJob | null>(null);
   const initialOfficialNetworkPolicy = parseOfficialNetworkPolicy(preferences.official_network_policy);
   const [connectProxy, setConnectProxy] = useState(initialOfficialNetworkPolicy.connect_proxy);
   const [hostProfilesJson, setHostProfilesJson] = useState(() => JSON.stringify(initialOfficialNetworkPolicy.host_profiles, null, 2));
   const [networkProfilesInvalid, setNetworkProfilesInvalid] = useState(false);
   const [hostProfilesOpen, setHostProfilesOpen] = useState(false);
   const systemLanguage = resolveSystemLanguage(typeof navigator === "undefined" ? [] : navigator.languages);
+
+  const refreshStructureStatus = useCallback(async () => {
+    setStructureStatusLoading(true);
+    try {
+      const status = await getStructureStatus();
+      setStructureStatus(status);
+      setStructureStatusError(status.error_code || null);
+    } catch (error) {
+      setStructureStatus(null);
+      setStructureStatusError(safeStructureErrorCode(error));
+    } finally {
+      setStructureStatusLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshStructureStatus();
+  }, [refreshStructureStatus]);
+
+  useEffect(() => {
+    if (!structureJob || !["queued", "running", "cancelling"].includes(structureJob.state)) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void getResearchStatus(structureJob.job_id).then((job) => {
+        if (!cancelled) setStructureJob(job);
+      }).catch(() => {
+        if (!cancelled) setStructureJob((current) => current ? {
+          ...current,
+          state: "failed",
+          error_code: "STRUCTURE_STATUS_UNAVAILABLE",
+          message: "",
+        } : current);
+      });
+    }, 1_000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [structureJob]);
+
+  useEffect(() => {
+    if (structureJob?.state === "completed") void refreshStructureStatus();
+  }, [refreshStructureStatus, structureJob]);
 
   useEffect(() => {
     if (visionProvider !== "configured_model") return;
@@ -151,6 +285,7 @@ export function SettingsView({ language, preferences, copy, onSave }: {
     visionApprovalMode,
     visionStandingAuthorization,
     visionModelId,
+    localStructureEnabled,
     officialNetworkPolicy: JSON.stringify({
       ...DEFAULT_OFFICIAL_NETWORK_POLICY,
       connect_proxy: connectProxy.trim(),
@@ -178,6 +313,7 @@ export function SettingsView({ language, preferences, copy, onSave }: {
     setVisionApprovalMode(nextPolicy.approval_mode);
     setVisionStandingAuthorization(nextPolicy.standing_authorization && isCurrentVisionFallbackPolicy(nextPolicy));
     setVisionModelId(nextPolicy.model?.configured_model_id ?? "");
+    setLocalStructureEnabled(preferences.local_structure_enabled === "true");
     setConnectProxy(nextOfficialNetworkPolicy.connect_proxy);
     setHostProfilesJson(JSON.stringify(nextOfficialNetworkPolicy.host_profiles, null, 2));
     setNetworkProfilesInvalid(false);
@@ -256,9 +392,12 @@ export function SettingsView({ language, preferences, copy, onSave }: {
         report_language: reportLanguage,
         vision_fallback_policy: JSON.stringify(policyFromForm()),
         official_network_policy: JSON.stringify(officialNetworkPolicy),
+        local_structure_enabled: structureStatus?.available === true && localStructureEnabled ? "true" : "false",
       };
       await onSave(updates);
-      setSavedSignature(formSignature);
+      const structureEnabledAfterSave = updates.local_structure_enabled === "true";
+      setLocalStructureEnabled(structureEnabledAfterSave);
+      setSavedSignature(JSON.stringify({ ...JSON.parse(formSignature) as Record<string, unknown>, localStructureEnabled: structureEnabledAfterSave }));
       setState("saved");
     } catch {
       setState("failed");
@@ -278,6 +417,7 @@ export function SettingsView({ language, preferences, copy, onSave }: {
       nextPolicy.standing_authorization && isCurrentVisionFallbackPolicy(nextPolicy),
     );
     setVisionModelId(nextPolicy.model?.configured_model_id ?? "");
+    setLocalStructureEnabled(preferences.local_structure_enabled === "true");
     setConnectProxy(nextOfficialNetworkPolicy.connect_proxy);
     setHostProfilesJson(JSON.stringify(nextOfficialNetworkPolicy.host_profiles, null, 2));
     setNetworkProfilesInvalid(false);
@@ -285,6 +425,48 @@ export function SettingsView({ language, preferences, copy, onSave }: {
     lastPreferenceSignature.current = preferenceSignature;
     setState("idle");
   };
+
+  const installStructure = async () => {
+    const pythonExecutable = structurePythonPath.trim();
+    if (!structureDownloadConsent || !isAbsoluteExecutablePath(pythonExecutable) || structureStarting) return;
+    setStructureStarting(true);
+    setStructureInstallError(null);
+    try {
+      const job = await startStructureInstall(pythonExecutable);
+      setStructureJob(job);
+      setStructureDownloadConsent(false);
+    } catch (error) {
+      setStructureInstallError(safeStructureErrorCode(error));
+    } finally {
+      setStructureStarting(false);
+    }
+  };
+
+  const cancelStructureInstall = async () => {
+    if (!structureJob || !["queued", "running", "cancelling"].includes(structureJob.state) || structureCancelPending) return;
+    setStructureCancelPending(true);
+    setStructureInstallError(null);
+    try {
+      setStructureJob(await cancelResearch(structureJob.job_id));
+    } catch (error) {
+      setStructureInstallError(safeStructureErrorCode(error));
+    } finally {
+      setStructureCancelPending(false);
+    }
+  };
+
+  const structureAvailable = structureStatus?.available === true;
+  const structureActiveJob = Boolean(structureJob && ["queued", "running", "cancelling"].includes(structureJob.state));
+  const structureStatusMessage = structureStatusLoading
+    ? copy.structureStatusLoading ?? "Checking local components…"
+    : structureAvailable
+      ? copy.structureAvailable ?? "The component is installed and verified."
+      : structureStatusError === "STRUCTURE_COMPONENT_INCOMPLETE"
+        ? copy.structureIncomplete ?? "The local component is incomplete and unavailable."
+        : structureStatusError === "STRUCTURE_COMPONENT_NOT_INSTALLED" || !structureStatusError
+          ? copy.structureNotInstalled ?? "The local component is not installed."
+          : copy.structureStatusUnavailable ?? "Could not check local component status.";
+  const structureErrorCodes = [structureInstallError, structureJob?.state === "failed" ? structureJob.error_code : null].filter((code): code is string => Boolean(code));
 
   return (
     <div className="settings-view">
@@ -348,6 +530,64 @@ export function SettingsView({ language, preferences, copy, onSave }: {
             {!isCurrentVisionFallbackPolicy(initialVisionPolicy) && initialVisionPolicy.enabled && <p className="settings-message" role="status">{copy.visionAuthorizationStale ?? "Policy changed; please confirm authorization again."}</p>}
             {copy.visionRevoke && <button className="secondary-button" type="button" onClick={() => { setVisionEnabled(false); setVisionStandingAuthorization(false); }}>{copy.visionRevoke}</button>}
           </div>
+        </div>}
+      </section>
+
+      <section className="settings-card settings-section" data-testid="local-structure-settings" aria-labelledby="local-structure-settings-title">
+        <header className="settings-section-header">
+          <h3 id="local-structure-settings-title">{copy.structureTitle ?? "Optional PP-StructureV3 local recognition"}</h3>
+          <p>{copy.structureBody ?? "An optional pretrained structure-recognition component that runs locally, without training or document uploads. Python 3.12 is required; downloads may use several gigabytes."}</p>
+        </header>
+        <p className={`settings-message${structureStatusError && !["STRUCTURE_COMPONENT_NOT_INSTALLED", "STRUCTURE_COMPONENT_INCOMPLETE"].includes(structureStatusError) ? " error" : ""}`} role={structureStatusError && !["STRUCTURE_COMPONENT_NOT_INSTALLED", "STRUCTURE_COMPONENT_INCOMPLETE"].includes(structureStatusError) ? "alert" : "status"}>
+          {structureStatusMessage}
+        </p>
+        {structureAvailable && Object.keys(structureStatus?.versions ?? {}).length > 0 && <div className="field-caption">
+          <strong>{copy.structureVersions ?? "Verified versions"}</strong>
+          <ul>{Object.entries(structureStatus?.versions ?? {}).map(([name, version]) => <li key={name}>{name}: {version}</li>)}</ul>
+        </div>}
+        <label className="settings-toggle-row">
+          <span><strong>{copy.structureEnabled ?? "Use local structure recognition for financial filings"}</strong><small className="field-caption">{copy.structureEnableHint ?? "Install and verify the component before enabling it. Turning it off keeps the component installed."}</small></span>
+          <input
+            type="checkbox"
+            aria-label={copy.structureEnabled ?? "Use local structure recognition for financial filings"}
+            checked={structureAvailable && localStructureEnabled}
+            disabled={!structureAvailable}
+            onChange={(event) => setLocalStructureEnabled(event.target.checked)}
+          />
+        </label>
+        {!structureAvailable && <details className="settings-advanced structure-experimental-setup">
+          <summary>{copy.structureAdvancedTitle ?? "Advanced experimental setup"}</summary>
+          <p className="field-caption">{copy.structureAdvancedBody ?? "Optional local inference only. Normal PDF recognition does not require this component."}</p>
+          <div className="settings-fields">
+            <label htmlFor="structure-python-executable"><span>{copy.structurePythonPath ?? "Python 3.12 executable path"}</span><input
+              id="structure-python-executable"
+              type="text"
+              value={structurePythonPath}
+              onChange={(event) => setStructurePythonPath(event.target.value)}
+              placeholder="C:\\Python312\\python.exe"
+              autoComplete="off"
+              spellCheck={false}
+            /></label>
+            <p className="field-caption">{copy.structurePythonHint ?? "Enter the absolute path to local Python 3.12."}</p>
+            <label className="check-row"><input type="checkbox" checked={structureDownloadConsent} onChange={(event) => setStructureDownloadConsent(event.target.checked)} />{copy.structureDownloadConsent ?? "I agree to download the local components and pretrained models."}</label>
+            <button className="secondary-button" type="button" onClick={() => void installStructure()} disabled={structureStarting || structureActiveJob || !structureDownloadConsent || !isAbsoluteExecutablePath(structurePythonPath)}>
+              {structureStarting ? copy.structureInstalling ?? "Installing…" : copy.structureInstallButton ?? "Install local structure runtime"}
+            </button>
+          </div>
+        </details>}
+        {structureErrorCodes.map((code, index) => <p className="settings-message error" role="alert" key={`${code}-${index}`}>{structureErrorText(code, copy)}</p>)}
+        {structureJob && <div className="structure-install-job" aria-live="polite" data-testid="structure-install-job">
+          {structureJob.state === "queued" && <p className="settings-message">{copy.structureJobQueued ?? "Waiting to install"}</p>}
+          {structureJob.state === "running" && <p className="settings-message"><strong>{copy.structureStage ?? "Current stage"}:</strong> {structurePhaseText(structureJob, copy)}</p>}
+          {structureJob.state === "cancelling" && <p className="settings-message">{copy.structureCancelPending ?? "Cancelling…"}</p>}
+          {structureJob.state === "completed" && <p className="settings-message" role="status">{copy.structureJobCompleted ?? "The installation job finished; checking the component again."}</p>}
+          {structureJob.state === "cancelled" && <p className="settings-message" role="status">{copy.structureJobCancelled ?? "Installation cancelled. Normal local PDF recognition and existing cloud settings are unaffected."}</p>}
+          {structureActiveJob && <div className="settings-action-buttons">
+            <span className="field-caption">{copy.structureElapsed ?? "Elapsed"}: {Math.max(0, Math.floor(structureJob.elapsed_seconds ?? 0))}s</span>
+            <button className="secondary-button" type="button" onClick={() => void cancelStructureInstall()} disabled={structureCancelPending || structureJob.state === "cancelling"}>
+              {structureCancelPending ? copy.structureCancelPending ?? "Cancelling…" : copy.structureCancelInstall ?? "Cancel installation"}
+            </button>
+          </div>}
         </div>}
       </section>
 

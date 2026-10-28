@@ -23,11 +23,11 @@ _INTEGER_META = frozenset({"credential_version", "connection_configuration_versi
     "model_configuration_version", "configuration_version", "content_length",
     "free_verified_at", "timeout_seconds", "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens",
-    "output_budget_tokens"})
+    "output_budget_tokens", "http_status"})
 _OPTIONAL_USAGE_META = frozenset({"input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens"})
 _STRING_META = frozenset({"configured_model_id", "connection_id", "provider_id", "model_id",
     "alias", "endpoint_host", "finish_reason", "billing_class", "free_source_url", "refusal",
-    "output_budget_wire_field", "output_budget_semantics"})
+    "output_budget_wire_field", "output_budget_semantics", "usage_source", "usage_contract", "transport_observation", "provider_request_id"})
 _USAGE_ALIASES = {
     "input_tokens": "input_tokens", "prompt_tokens": "input_tokens",
     "output_tokens": "output_tokens", "completion_tokens": "output_tokens",
@@ -223,7 +223,12 @@ def received_response(content: dict, metadata: Any, *, expected_model_id: str = 
         if name == "usage":
             continue
         path = "$.receipt.metadata." + str(name)
-        if name in _INTEGER_META:
+        if name == "reasoning_in_output":
+            if value is None or type(value) is bool:
+                receipt["metadata"][name] = value
+            else:
+                issues.append({"code": "MODEL_RESPONSE_META_TYPE_INVALID", "path": path})
+        elif name in _INTEGER_META:
             if value is None and (name in {"free_verified_at", "output_budget_tokens"} or name in _OPTIONAL_USAGE_META):
                 receipt["metadata"][name] = None
             elif type(value) is int and value >= 0:

@@ -57,6 +57,9 @@ class FinancialArtifactRefresher:
         quality = {"status": profile.status.value, "rejected_periods": list(profile.rejected_periods),
             "period_continuity": list(profile.period_continuity), "period_coverage": dict(profile.period_coverage)}
         summary = {
+            "company": company.to_dict(),
+            "research_ready": bool(view.research_ready),
+            "capabilities": dict(view.capabilities),
             "markdown": deterministic_summary(company.name, metrics, str(payload.get("report_language", "zh-CN")),
                 company.reporting_currency),
             "metrics": metrics, "interim_metrics": interim,
@@ -68,11 +71,22 @@ class FinancialArtifactRefresher:
             "financial_quality": quality,
         }
         now = utc_now_iso()
+        from .research_snapshot import financial_semantics_digest
+        from ..research_coverage import has_analysis
+        from ..report_readiness import REQUIRED_REPORT_SECTIONS
+        analysis_exists = any(item.get('artifact_type') in {'agent-analysis', 'growth-opportunities', 'counter-analysis', 'forecast-scenarios'}
+            or item.get('artifact_type') == 'research-report' and isinstance(item.get('content'), dict)
+            and any(has_analysis(item['content'].get(section)) for section in REQUIRED_REPORT_SECTIONS)
+            for item in artifacts)
+        old_snapshot = payload.get('data_snapshot', {})
+        old_semantics = old_snapshot.get('financial_semantics_sha256', '') if isinstance(old_snapshot, dict) else ''
+        prior_stale = bool((base or {}).get('content', {}).get('financial_refresh', {}).get('qualitative_snapshot_stale'))
+        qualitative_stale = bool(analysis_exists and (prior_stale or old_semantics != financial_semantics_digest(profile.fact_dicts)))
         overlay = {"mode": "financial-refresh-overlay",
             "base_report_artifact_id": str(base["artifact_id"]) if base else "",
             "financial_refresh": {"updated_at": now, "fact_count": len(profile.fact_dicts),
                 "status": profile.status.value, "model_called": False,
-                "qualitative_snapshot_stale": True, "financial_quality": quality}}
+                "qualitative_snapshot_stale": qualitative_stale, "financial_quality": quality}}
         outputs = [
             ResearchArtifact(f"{run_id}:deterministic-financial-summary:retry-{digest(summary)[:16]}", run_id,
                 "deterministic-financial-summary", "Deterministic Financial Overview", summary,
@@ -80,11 +94,12 @@ class FinancialArtifactRefresher:
             ResearchArtifact(f"{run_id}:research-report:overlay-{digest(overlay)[:16]}", run_id,
                 "research-report", "Financial Refresh Report", overlay, agent_id="financial-refresh"),
         ]
-        from .research_snapshot import financial_semantics_digest
+        from ..storage import DERIVED_PIPELINE_CONTRACT
         payload["data_snapshot"] = {**dict(payload.get("data_snapshot", {})), "captured_at": now,
             "financial_facts_sha256": digest(list(profile.fact_dicts)),
             "financial_semantics_sha256": financial_semantics_digest(profile.fact_dicts),
             "financial_fact_count": len(profile.fact_dicts),
+            "derived_pipeline_contract": DERIVED_PIPELINE_CONTRACT,
             "financial_generations": dict(summary["financial_generations"]),
             "financial_fact_ids_sha256": digest(sorted(item.get("fact_id", "") for item in profile.fact_dicts))}
         run = ResearchRun(run_id, replace(company), str(payload.get("workflow_id", "")),

@@ -35,8 +35,8 @@ class FinancialPdfSource:
         deadline: float | None = None,
     ) -> Any:
         """Return explicit structured/PDF batches and their source manifests."""
-        budget_deadline = time.monotonic() + float(self.engine._batch_timeout_seconds)
-        deadline = min(deadline, budget_deadline) if deadline is not None else budget_deadline
+        # Batch time is a scheduler slice, not an implicit whole-research cap.
+        # Only a caller's explicit deadline terminates an adaptive collection.
 
         # The engine remains the bounded parser/cache implementation; this
         # source adapter owns the collection choreography, not the compiler.

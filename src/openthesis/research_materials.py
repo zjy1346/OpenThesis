@@ -32,6 +32,32 @@ ROLE_REQUIRED = {
 }
 
 
+def intern_request_values(value, path=(), *, seen=None):
+    """Share only byte-identical JSON subtrees at earlier in-request paths.
+
+    Identity-bearing records are not merged: each original array position and
+    all differing source/period/unit fields survive. The reader resolves table
+    presentation before these paths, so columns/data can remain lossless.
+    """
+    seen = {} if seen is None else seen
+    def visit(item, current, *, eligible=True):
+        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        share = eligible and bool(item) and isinstance(item, (dict, list, str)) and len(encoded.encode()) > 128
+        if share and encoded in seen:
+            reference = {"request_path_ref": seen[encoded]}
+            if len(json.dumps(reference, separators=(",", ":")).encode()) + 8 < len(encoded.encode()):
+                return reference
+        if share:
+            seen[encoded] = list(current)
+        if isinstance(item, dict):
+            return {key: visit(child, (*current, key), eligible=not (key == "company" and len(current) == 1))
+                for key, child in item.items()}
+        if isinstance(item, list):
+            return [visit(child, (*current, index)) for index, child in enumerate(item)]
+        return deepcopy(item)
+    return visit(value, tuple(path), eligible=False)
+
+
 def canonical_request_materials(materials: dict[str, Any], findings: dict[str, Any], *, compiled_sources=None) -> tuple[dict, dict, dict]:
     """One complete copy per source body and dependency object in this wire.
 
@@ -164,7 +190,7 @@ def usable_disclosure(item: dict[str, Any]) -> bool:
         r"business(?: overview| review)?|risk factors|audit opinion|independent auditor.?s? report|"
         r"management.?s? discussion and analysis)\s*[:：。.]?\s*", body, flags=re.IGNORECASE)
     return bool(body and item.get('source_url') and item.get('document_id')
-                and not identity.startswith(('table:', 'fact:', 'meta:', 'gap:', 'observation:'))
+                and not identity.startswith(('table:', 'table-structure:', 'fact:', 'meta:', 'gap:', 'observation:'))
                 and item.get('kind') not in {'material_gap', 'financial_fact', 'unverified_visual_observation', 'metadata'}
                 and str(item.get('locator', '')).casefold() not in {'metadata', 'filing-metadata'}
                 and not unit_only and not heading_only)
@@ -179,6 +205,15 @@ def material_capabilities(context: dict[str, Any]) -> set[str]:
         question_repair_targets(context, 'financial-analyst'))
     if any(observation_source_record(item) is not None for item in selected):
         result.add('sourced_financial_observations')
+    # A fact-shaped ledger row is not enough to bypass the immutable admitted
+    # view. Source-only stage contexts intentionally omit this quantitative
+    # policy and continue from their independently verified original bodies.
+    policy = context.get('financial_capabilities')
+    if isinstance(policy, dict):
+        for name in ('quantitative_facts', 'business_disclosures', 'mda_disclosures',
+                     'risk_disclosures', 'audit_disclosures', 'sourced_disclosures'):
+            if policy.get(name) is False:
+                result.discard(name)
     return result
 
 
@@ -326,11 +361,12 @@ def prompt_materials(context: dict[str, Any], agent_id: str, *, required_evidenc
         routed['evidence_partitions'][partition] = referred
     routed['evidence'] = [item['evidence_id'] for item in routed['evidence']
         if isinstance(item, dict) and isinstance(item.get('evidence_id'), str)]
-    routed['source_blocks'] = [{
-        **{key: value for key, value in block.items() if key not in {'raw_text', 'evidence_id'}},
-        'evidence_ref': block.get('evidence_id'),
-        'body_from': 'evidence_partitions',
-    } for block in routed['source_blocks']]
+    # The host's computed assertion index is not a second original. Its block
+    # hashes/default metadata are derived by source_identity during validation;
+    # generation cites evidence_id in the complete source records instead.
+    # Repeating that entire 1K-row index costs more than the original tables.
+    routed['source_blocks'] = {'records_from': 'evidence_partitions', 'citation_key': 'evidence_id',
+        'metadata_from': 'the owning complete evidence record and accepted_fact_ref; host derives assertion block hashes locally'}
     routed['material_reference_contract'] = {
         'version': 'canonical-source-registry-v1',
         'instruction': 'Resolve accepted_fact_ref by exact fact_id in accepted_facts in THIS request and overlay all fields on the referring evidence record. This restores its complete financial_fact with the original evidence_id and source attribution. evidence and source_blocks refer to evidence_partitions, including original raw_text/excerpt. Follow references; they do not denote missing or summarized source material.',

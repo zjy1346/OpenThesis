@@ -11,6 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import re
+import time
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -95,6 +96,9 @@ class StageExecutor:
         checkpoint: Callable[[StageResult], None] | None = None,
         candidate_checkpoint: Callable[[StageSpec, str, dict[str, Any]], None] | None = None,
         candidate_preparer: Callable[..., None] | None = None,
+        candidate_wave_preparer: Callable[..., None] | None = None,
+        dispatch_group: Callable[[StageSpec], str] | None = None,
+        timing_observer: Callable[[str, dict], None] | None = None,
         candidate_verifier: Callable[..., StageResult] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress: Callable[[str, str], None] | None = None,
@@ -104,6 +108,11 @@ class StageExecutor:
         self.checkpoint = checkpoint or (lambda _result: None)
         self.candidate_checkpoint = candidate_checkpoint or (lambda _spec, _digest, _candidate: None)
         self.candidate_preparer = candidate_preparer
+        if candidate_preparer is not None and candidate_wave_preparer is not None:
+            raise ValueError("STAGE_PREPARER_MUST_NOT_DOUBLE_SUBMIT")
+        self.candidate_wave_preparer = candidate_wave_preparer
+        self.dispatch_group = dispatch_group
+        self.timing_observer = timing_observer
         self.candidate_verifier = candidate_verifier
         self.cancel_check = cancel_check or (lambda: False)
         self.progress = progress or (lambda _stage, _state: None)
@@ -148,6 +157,7 @@ class StageExecutor:
         for stage_id in invalid:
             registry.get(stage_id)
         remaining = set(selected)
+        wave_candidates = {}
         results: dict[str, StageResult] = {}
         saved = dict(previous or {})
         local_candidates = dict(revalidation_candidates or {})
@@ -162,6 +172,25 @@ class StageExecutor:
                     fingerprints[spec.stage_id] = prior.execution_fingerprint
         executor = ThreadPoolExecutor(max_workers=max_workers)
         pending = {}
+        timeline = {}
+        cold_leads = {}
+        attempted_packets = set()
+
+        def checkpoint(result):
+            details = timeline.get(result.stage_id, {})
+            # Timing must not change a content-addressed trusted checkpoint.
+            # The same immutable object is already committed by the verifier.
+            started = time.monotonic()
+            self.checkpoint(result)
+            if self.timing_observer is not None:
+                safe = {key: value for key, value in details.items() if not key.startswith("_")}
+                safe.update(publication_seconds=max(0, time.monotonic() - started), published_at_epoch=time.time())
+                try:
+                    self.timing_observer(result.stage_id, safe)
+                except Exception:
+                    # Optional attribution cannot invalidate saved research or
+                    # turn a received response into another remote submission.
+                    pass
 
         def expected(spec: StageSpec) -> str:
             return stage_input_digest(spec, input_identities[spec.stage_id],
@@ -210,7 +239,7 @@ class StageExecutor:
                                validation, candidate_hash, error_code,
                                execution_fingerprint=fingerprint, has_candidate=True)
 
-        def verify(spec: StageSpec, stage_input: str, candidate: dict[str, Any],
+        def verify_candidate(spec: StageSpec, stage_input: str, candidate: dict[str, Any],
                    fingerprint: str) -> StageResult:
             if self.candidate_verifier is None:
                 return verify_local(spec, stage_input, candidate, fingerprint)
@@ -235,11 +264,27 @@ class StageExecutor:
                     has_candidate=True)
             return result
 
+        def verify(spec, stage_input, candidate, fingerprint):
+            started = time.monotonic()
+            details = timeline.setdefault(spec.stage_id, {"depends_on": list(spec.depends_on)})
+            details["verification_started_at_epoch"] = time.time()
+            try:
+                return verify_candidate(spec, stage_input, candidate, fingerprint)
+            finally:
+                details["local_verification_seconds"] = max(0, time.monotonic() - started)
+                details["verification_finished_at_epoch"] = time.time()
+
         def produce(spec: StageSpec, stage_input: str, dependencies: dict[str, Any]) -> StageResult:
             self._check_cancelled()
             self.progress(spec.stage_id, "running")
-            candidate = self.handlers[spec.handler_id](spec,
-                deepcopy(scoped_inputs.get(spec.stage_id, frozen_inputs)), deepcopy(dependencies))
+            details = timeline[spec.stage_id]
+            started = time.monotonic()
+            details.update(producer_started_at_epoch=time.time(), queue_seconds=max(0, started - details["_queued"]))
+            try:
+                candidate = self.handlers[spec.handler_id](spec,
+                    deepcopy(scoped_inputs.get(spec.stage_id, frozen_inputs)), deepcopy(dependencies))
+            finally:
+                details.update(producer_seconds=max(0, time.monotonic() - started), producer_finished_at_epoch=time.time())
             if not isinstance(candidate, dict):
                 raise ValueError("STAGE_CANDIDATE_CONTRACT_INVALID")
             self._check_cancelled()
@@ -262,6 +307,13 @@ class StageExecutor:
                     execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint),
                     has_candidate=True, diagnostics={"candidate_available": True,
                                                      "processing_phase": "candidate_checkpoint"})
+            if self.candidate_wave_preparer is not None:
+                # Free this worker before collecting the ready wave. Waiting
+                # at a worker-side barrier deadlocks when wave > pool size.
+                return StageResult(spec.stage_id, spec.identity, stage_input, frozen_candidate,
+                    StageValidation(False, state="needs_action"), digest(frozen_candidate),
+                    execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint),
+                    has_candidate=True, diagnostics={"wave_preparation_pending": True})
             if self.candidate_preparer is not None:
                 try:
                     prepared = deepcopy(frozen_candidate)
@@ -283,7 +335,7 @@ class StageExecutor:
                           fingerprints.get(spec.stage_id, execution_fingerprint))
 
         try:
-            while remaining or pending:
+            while remaining or pending or wave_candidates:
                 self._check_cancelled()
                 for spec in registry.stages:
                     if spec.stage_id not in remaining or any(key not in results for key in spec.depends_on):
@@ -300,7 +352,7 @@ class StageExecutor:
                                              digest({}), "STAGE_INPUT_CAPABILITY_UNAVAILABLE" if missing_capabilities
                                                  else "STAGE_DEPENDENCY_UNAVAILABLE",
                                              execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint))
-                        self.checkpoint(result)
+                        checkpoint(result)
                         results[spec.stage_id] = result
                         remaining.remove(spec.stage_id)
                         self.progress(spec.stage_id, "needs_action")
@@ -319,7 +371,7 @@ class StageExecutor:
                         # only explicit invalidation may start a new attempt.
                         reused = verify(spec, stage_input, previous_result.candidate,
                                         previous_result.execution_fingerprint)
-                        self.checkpoint(reused)
+                        checkpoint(reused)
                         results[spec.stage_id] = reused
                         remaining.remove(spec.stage_id)
                         self.progress(spec.stage_id, "reused_verified" if reused.validation.passed else reused.validation.state)
@@ -346,7 +398,7 @@ class StageExecutor:
                             "processing_phase": "local_candidate_reprojection",
                             "source_execution_fingerprint": local_candidate.execution_fingerprint,
                             "source_candidate_digest": local_candidate.candidate_digest})
-                        self.checkpoint(migrated)
+                        checkpoint(migrated)
                         results[spec.stage_id] = migrated
                         remaining.remove(spec.stage_id)
                         self.progress(spec.stage_id, migrated.validation.state)
@@ -356,14 +408,21 @@ class StageExecutor:
                             StageValidation(False, state="needs_action", issues=("STAGE_SAVED_CANDIDATE_UNAVAILABLE",)),
                             digest({}), "STAGE_SAVED_CANDIDATE_UNAVAILABLE", execution_fingerprint=
                             fingerprints.get(spec.stage_id, execution_fingerprint))
-                        self.checkpoint(missing)
+                        checkpoint(missing)
                         results[spec.stage_id] = missing
                         remaining.remove(spec.stage_id)
                         self.progress(spec.stage_id, "needs_action")
                         continue
                     if len(pending) >= max_workers:
                         continue
+                    packet = self.dispatch_group(spec) if self.dispatch_group is not None else ""
+                    # A necessary first task may establish the same packet's
+                    # remote prefix. Other packets still use the free slot;
+                    # there is no warmup call, retry probe or global barrier.
+                    if packet and packet not in attempted_packets and packet in cold_leads:
+                        continue
                     self.progress(spec.stage_id, "queued")
+                    timeline[spec.stage_id] = {"depends_on": list(spec.depends_on), "queued_at_epoch": time.time(), "_queued": time.monotonic()}
                     dependencies = {key: dependency_findings(results[key].validation.trusted_output) for key in spec.depends_on}
                     if spec.optional_dependencies:
                         dependencies["_dependency_gaps"] = [{"stage_id": key,
@@ -373,14 +432,50 @@ class StageExecutor:
                             if not results[key].validation.passed]
                     future = executor.submit(produce, spec, stage_input, dependencies)
                     pending[future] = (spec, stage_input)
+                    if packet and packet not in attempted_packets:
+                        cold_leads[packet] = future
                     remaining.remove(spec.stage_id)
                 if not pending:
+                    if wave_candidates:
+                        batch = [wave_candidates[key] for key in sorted(wave_candidates)]
+                        wave_candidates.clear()
+                        supplied = [(spec, deepcopy(result.candidate), deepcopy(scoped_inputs.get(spec.stage_id, frozen_inputs)))
+                                    for spec, _stage_input, result in batch]
+                        prepared = True
+                        wave_started = time.monotonic()
+                        wave_id = digest([spec.stage_id for spec, _stage, _candidate in batch])
+                        try:
+                            self.candidate_wave_preparer(supplied)
+                            if any(digest(candidate) != result.candidate_digest
+                                   for (_spec, candidate, _inputs), (_original, _identity, result) in zip(supplied, batch)):
+                                raise ValueError("STAGE_CANDIDATE_PREPARER_MUTATED_CONTENT")
+                        except StageExecutionCancelled:
+                            raise
+                        except Exception:
+                            prepared = False
+                        for spec, stage_input, candidate in batch:
+                            timeline.setdefault(spec.stage_id, {}).update(shared_wave_id=wave_id,
+                                shared_wave_verification_seconds=max(0, time.monotonic() - wave_started))
+                            self._check_cancelled()
+                            result = (verify(spec, stage_input, candidate.candidate,
+                                fingerprints.get(spec.stage_id, execution_fingerprint)) if prepared else replace(candidate,
+                                    error_code="STAGE_WAVE_PREPARATION_FAILED",
+                                    validation=StageValidation(False, state="needs_action", issues=("STAGE_WAVE_PREPARATION_FAILED",)),
+                                    diagnostics={"candidate_available": True, "processing_phase": "wave_preparation"}))
+                            checkpoint(result)
+                            results[spec.stage_id] = result
+                            self.progress(spec.stage_id, result.validation.state)
+                        continue
                     if remaining:
                         raise RuntimeError("STAGE_GRAPH_CANNOT_PROGRESS")
                     break
                 finished, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in finished:
                     spec, stage_input = pending.pop(future)
+                    for packet, lead in tuple(cold_leads.items()):
+                        if lead is future:
+                            attempted_packets.add(packet)
+                            del cold_leads[packet]
                     try:
                         result = future.result()
                     except StageExecutionCancelled:
@@ -415,8 +510,11 @@ class StageExecutor:
                                              bool(getattr(exc, "retryable", False)),
                                              execution_fingerprint=fingerprints.get(spec.stage_id, execution_fingerprint),
                                              diagnostics=diagnostic)
+                    if result.diagnostics.get("wave_preparation_pending") and result.has_candidate:
+                        wave_candidates[spec.stage_id] = (spec, stage_input, result)
+                        continue
                     self._check_cancelled()
-                    self.checkpoint(result)
+                    checkpoint(result)
                     self._check_cancelled()
                     results[spec.stage_id] = result
                     self.progress(spec.stage_id, result.validation.state)

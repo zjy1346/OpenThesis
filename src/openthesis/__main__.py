@@ -4,6 +4,9 @@ import os
 
 
 def entrypoint() -> int:
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     if os.environ.get("OPENTHESIS_SMOKE_TEST") == "1":
         from .smoke import run_smoke_test
 

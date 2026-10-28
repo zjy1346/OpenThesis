@@ -1,0 +1,222 @@
+{
+  "schema": "openthesis-structure-models-v1",
+  "versions": {
+    "paddleocr": "3.7.0",
+    "paddlex": "3.7.2",
+    "paddlepaddle": "3.2.0"
+  },
+  "models": [
+    {
+      "name": "PP-DocLayout_plus-L",
+      "revision": "aa52b8528c84f9b1a34ac3a88fe0e576edb9d11d",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-DocLayout_plus-L"
+    },
+    {
+      "name": "PP-LCNet_x1_0_doc_ori",
+      "revision": "d3b95a6dff5fe8a94f2748e12b61cb26818a0df8",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori"
+    },
+    {
+      "name": "PP-LCNet_x1_0_table_cls",
+      "revision": "2fa6323e7dab88fa883081db1460995f46af2922",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_table_cls"
+    },
+    {
+      "name": "PP-LCNet_x1_0_textline_ori",
+      "revision": "cd237a44b0e359d4fe38310a416203cf7403faa5",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_textline_ori"
+    },
+    {
+      "name": "PP-OCRv5_server_det",
+      "revision": "ca867c897ecbca8873081573a802ad70d499cb94",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-OCRv5_server_det"
+    },
+    {
+      "name": "PP-OCRv5_server_rec",
+      "revision": "b26c3587fda8da3c8ec0ce357214b4d661ff1558",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/PP-OCRv5_server_rec"
+    },
+    {
+      "name": "RT-DETR-L_wired_table_cell_det",
+      "revision": "e2bd53c06b3a815d86acbf5c6779dada58819cfe",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/RT-DETR-L_wired_table_cell_det"
+    },
+    {
+      "name": "RT-DETR-L_wireless_table_cell_det",
+      "revision": "25ca86356a601c877476bb0dcc5fd09153d9d64d",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/RT-DETR-L_wireless_table_cell_det"
+    },
+    {
+      "name": "SLANet_plus",
+      "revision": "bae6e5f8c3c4e7da0c0b7639fdf3228fe76184e2",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/SLANet_plus"
+    },
+    {
+      "name": "SLANeXt_wired",
+      "revision": "763069fcda6a065f2171753205a32bf899a88d15",
+      "license": "Apache-2.0",
+      "source": "https://huggingface.co/PaddlePaddle/SLANeXt_wired"
+    }
+  ],
+  "files": [
+    {
+      "path": "PP-DocLayout_plus-L/inference.json",
+      "size": 1081621,
+      "sha256": "99bd09c0a1b9e88d35c65c305b91711d98055fc94b4a6eecd50da02e04729384"
+    },
+    {
+      "path": "PP-DocLayout_plus-L/inference.pdiparams",
+      "size": 129307978,
+      "sha256": "24ca3e2e442164505e250deef59f7ee9a54ea12dd32875c9cd6155d959dc97da"
+    },
+    {
+      "path": "PP-DocLayout_plus-L/inference.yml",
+      "size": 1838,
+      "sha256": "d60f782a16f96afb27e8280399899a94c3e9ffc694ffb2f913ea00af1c522f1e"
+    },
+    {
+      "path": "PP-LCNet_x1_0_doc_ori/inference.json",
+      "size": 104441,
+      "sha256": "3580978602f309c3554508dd85d4fe09b73a7e0d80d7f9e63258f5b72c390c69"
+    },
+    {
+      "path": "PP-LCNet_x1_0_doc_ori/inference.pdiparams",
+      "size": 6754166,
+      "sha256": "e8d6e7c5d264507e40e58a655779059d616b20d7441ea22047d829eb3931989c"
+    },
+    {
+      "path": "PP-LCNet_x1_0_doc_ori/inference.yml",
+      "size": 766,
+      "sha256": "9e195eb729a8173588cd0e8a852c8b373aa606e79e77b4ac7d8346f5426caf26"
+    },
+    {
+      "path": "PP-LCNet_x1_0_table_cls/inference.json",
+      "size": 104441,
+      "sha256": "43401e76ed7b0e34787533016ea4ec9193d5b5964c3f948991fc5b531651ef33"
+    },
+    {
+      "path": "PP-LCNet_x1_0_table_cls/inference.pdiparams",
+      "size": 6743918,
+      "sha256": "d0224afd9cfddf22da17407c6c78491baaa1f25922fbb312c9b0d2037c802db0"
+    },
+    {
+      "path": "PP-LCNet_x1_0_table_cls/inference.yml",
+      "size": 762,
+      "sha256": "891b1f4b0ccddaf6aca0fce8c8a38e5ab5da9f62fb9adaa7c75e161ee03bb787"
+    },
+    {
+      "path": "PP-LCNet_x1_0_textline_ori/inference.json",
+      "size": 104399,
+      "sha256": "b81929eeaff8e52db0fafb49c9fbfc5bc0572f81641fe0179cc52096323fb4d4"
+    },
+    {
+      "path": "PP-LCNet_x1_0_textline_ori/inference.pdiparams",
+      "size": 6743918,
+      "sha256": "0de2bcf996cf553e2b848dd7b1769dafffc6917b1ccdf55c1d8efe7909fbf743"
+    },
+    {
+      "path": "PP-LCNet_x1_0_textline_ori/inference.yml",
+      "size": 735,
+      "sha256": "8d5120d0e1a30a9df7ed46aa9119da3796ed066777089d1c1d705f132d5e90f9"
+    },
+    {
+      "path": "PP-OCRv5_server_det/inference.json",
+      "size": 402480,
+      "sha256": "af5876933d8806a1b50d895867e0781e135cd92ff37381992828fc8d1b842d28"
+    },
+    {
+      "path": "PP-OCRv5_server_det/inference.pdiparams",
+      "size": 87932887,
+      "sha256": "183146fe9d9910352f68482f623bcbbb9fa7b9e8fa1463b9ad288cef00524d2d"
+    },
+    {
+      "path": "PP-OCRv5_server_det/inference.yml",
+      "size": 903,
+      "sha256": "28fb721efc3634fc8aa677e474b9602cb815a91cf569ef357a7a553d7b3ce685"
+    },
+    {
+      "path": "PP-OCRv5_server_rec/inference.json",
+      "size": 325204,
+      "sha256": "8e6e12e5d42531840310977fffb58165bf889fc5061408c5a8afdb6985f47fcb"
+    },
+    {
+      "path": "PP-OCRv5_server_rec/inference.pdiparams",
+      "size": 84390117,
+      "sha256": "63853f062a5f4089befc16f565a68277618e0da5cb45468b49d11079de0ada77"
+    },
+    {
+      "path": "PP-OCRv5_server_rec/inference.yml",
+      "size": 148345,
+      "sha256": "2c719dba044c4e2228aef8ff92f5f575394d75d24c16de096a33b7cfd902f66d"
+    },
+    {
+      "path": "RT-DETR-L_wired_table_cell_det/inference.json",
+      "size": 1081363,
+      "sha256": "abea237f1e53d3dc3bf7ea1321dfebe78552a6070e567dfc94028b622fd575e8"
+    },
+    {
+      "path": "RT-DETR-L_wired_table_cell_det/inference.pdiparams",
+      "size": 128841073,
+      "sha256": "357321c2845f0a035e8d118622649685a3cdb89d28b09a64e45a5a3df7a9fedc"
+    },
+    {
+      "path": "RT-DETR-L_wired_table_cell_det/inference.yml",
+      "size": 1630,
+      "sha256": "edf6d6180f2b9e3e666c744ee5ded38a72c6ef9056cd193250e3e55ba268acef"
+    },
+    {
+      "path": "RT-DETR-L_wireless_table_cell_det/inference.json",
+      "size": 1081363,
+      "sha256": "abea237f1e53d3dc3bf7ea1321dfebe78552a6070e567dfc94028b622fd575e8"
+    },
+    {
+      "path": "RT-DETR-L_wireless_table_cell_det/inference.pdiparams",
+      "size": 128841073,
+      "sha256": "c0f8c9ea07be8916ece73a8acf807bd21aed3ef11969b319c2dccb2406774c34"
+    },
+    {
+      "path": "RT-DETR-L_wireless_table_cell_det/inference.yml",
+      "size": 1633,
+      "sha256": "f2d0f00ea42aacc162f72a35cf54330e392a7d669e9a1b43896d3bd77a512621"
+    },
+    {
+      "path": "SLANet_plus/inference.json",
+      "size": 315660,
+      "sha256": "aba91cd956f4a1648b0f89df94c3cf8acaa066b47e2b689d109843b40d8545a2"
+    },
+    {
+      "path": "SLANet_plus/inference.pdiparams",
+      "size": 7666515,
+      "sha256": "012986b0e2bfe90410618bfb4b7cf4fcb6c978caefd84c63c2934f8387b09ab8"
+    },
+    {
+      "path": "SLANet_plus/inference.yml",
+      "size": 2035,
+      "sha256": "8a6372d3269a6f112fe13a2da7952a84da6e112c10a3146cbb43de5bd01d19fa"
+    },
+    {
+      "path": "SLANeXt_wired/inference.json",
+      "size": 959302,
+      "sha256": "5b872f08e74f628ca1db8405db147e82e6e0c7cb358e101fd01cdafc946632d8"
+    },
+    {
+      "path": "SLANeXt_wired/inference.pdiparams",
+      "size": 364771513,
+      "sha256": "ff0362a30f707fa7d27d8453c4396b992fca287377a42d01515bca6eeb3908f5"
+    },
+    {
+      "path": "SLANeXt_wired/inference.yml",
+      "size": 2066,
+      "sha256": "abbbd1b4dc6b1a2e9cd34c035514da53a1a6b1ec267292b0b8802025650a33bf"
+    }
+  ]
+}

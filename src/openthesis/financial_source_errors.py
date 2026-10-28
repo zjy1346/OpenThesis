@@ -12,6 +12,16 @@ TRANSIENT_SOURCE_CODES = frozenset({
 })
 LOCAL_PARSER_AVAILABILITY_CODES = frozenset({
     "PDF_WORKER_START_FAILED", "DOCUMENT_CONTEXT_TIMEOUT", "DOCUMENT_CONTEXT_LOCAL_UNAVAILABLE",
+    "PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION",
+    "PDF_BACKEND_IMPORT_FAILED", "PDFIUM_WORKER_START_FAILED", "PDFIUM_WORKER_EXIT",
+    "PDFIUM_WORKER_TIMEOUT", "PDFIUM_WORKER_PROTOCOL_ERROR", "PDFIUM_WORKER_ERROR",
+    "PDF_SOURCE_NOT_FOUND", "PDF_SOURCE_ACCESS_DENIED", "PDF_SOURCE_INVALID",
+    "PDF_TEXT_EXTRACTION_FAILED", "DOCUMENT_CONTEXT_OCR_REQUIRED",
+})
+PDF_RUNTIME_FAILURE_CODES = frozenset({
+    "PDF_BACKEND_IMPORT_FAILED", "PDFIUM_WORKER_START_FAILED", "PDFIUM_WORKER_EXIT",
+    "PDFIUM_WORKER_PROTOCOL_ERROR", "PDFIUM_WORKER_ERROR", "PDF_WORKER_START_FAILED",
+    "DOCUMENT_CONTEXT_LOCAL_UNAVAILABLE",
 })
 SOURCE_ERROR_ACTIONS = {
     "SOURCE_NETWORK_UNAVAILABLE": "check_official_network_or_retry",
@@ -22,6 +32,7 @@ SOURCE_ERROR_ACTIONS = {
     "PDF_WORKER_START_FAILED": "restore_local_worker_or_enable_authorized_cloud",
     "DOCUMENT_CONTEXT_TIMEOUT": "restore_local_worker_or_enable_authorized_cloud",
     "DOCUMENT_CONTEXT_LOCAL_UNAVAILABLE": "restore_local_worker_or_enable_authorized_cloud",
+    "PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION": "retry_saved_candidate_validation_or_enable_authorized_cloud",
     "FILING_STATUS_UNVERIFIED": "inspect_official_disclosure_status",
     "NO_FILINGS_AVAILABLE": "provide_official_source_or_retry_discovery",
     "FILING_CONTENT_UNSAFE": "repair_or_replace_conflicting_official_evidence",
@@ -33,4 +44,10 @@ SOURCE_ERROR_ACTIONS = {
     "FILING_ACCESS_DENIED": "configure_official_source",
     "OFFICIAL_SOURCE_CONFIGURATION_REQUIRED": "configure_official_source",
     "SEC_CONTACT_CONFIGURATION_REQUIRED": "configure_sec_contact",
+    **{code: "repair_local_pdf_runtime" for code in PDF_RUNTIME_FAILURE_CODES},
+    "PDF_SOURCE_NOT_FOUND": "restore_registered_original",
+    "PDF_SOURCE_ACCESS_DENIED": "repair_local_file_access",
+    "PDF_SOURCE_INVALID": "replace_damaged_official_original",
+    "PDF_TEXT_EXTRACTION_FAILED": "retry_alternate_parser_or_authorize_ocr",
+    "DOCUMENT_CONTEXT_OCR_REQUIRED": "authorize_scanned_page_ocr",
 }

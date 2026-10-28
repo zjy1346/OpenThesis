@@ -17,7 +17,7 @@ PROTOCOL = "model-events-v1"
 MAX_BODY_BYTES = 16 * 1024 * 1024
 MAX_FRAME_BYTES = 7 * MAX_BODY_BYTES
 MAX_WIRE_BYTES = 8 * MAX_BODY_BYTES
-_STATES = frozenset({"connecting", "waiting_response", "content", "reasoning", "heartbeat"})
+_STATES = frozenset({"connecting", "waiting_response", "connected", "content", "reasoning", "heartbeat"})
 
 
 class GatewayFrameError(ValueError):

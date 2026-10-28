@@ -40,7 +40,8 @@ STATEMENT_FOR = {
     "parent_net_income": "income_statement", "minority_interest_profit": "income_statement",
     "ordinary_shareholder_net_income": "income_statement",
     "operating_income": "income_statement", "gross_profit": "income_statement",
-    "cost_of_revenue": "income_statement", "capital_expenditure": "cash_flow",
+    "cost_of_revenue": "income_statement", "total_operating_cost": "income_statement",
+    "capital_expenditure": "cash_flow",
     "capital_expenditure_ppe": "cash_flow", "capital_expenditure_intangible": "cash_flow",
     "share_repurchase": "cash_flow", "shareholder_dividends_paid": "cash_flow",
     "lease_liability_payment": "cash_flow", "deferred_asset_acquisition_payment": "cash_flow",
@@ -483,6 +484,7 @@ class GapStageKind(StrEnum):
 
     OFFICIAL_STRUCTURED = "official_structured"
     PDF_AST = "pdf_ast"
+    LOCAL_STRUCTURE = "local_structure"
     SAME_YEAR_OFFICIAL = "same_year_official"
     MINERU = "mineru"
 

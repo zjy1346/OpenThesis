@@ -28,7 +28,8 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_contracts import QuantityKind, SourceAmount
 from .financial_gateway_proof import GATEWAY_FACT_VERSION, gateway_source_id
-from .financial_cloud_proof import canonical_cloud_source
+from .financial_cloud_proof import canonical_cloud_source, cloud_source_id
+from .financial_table_text import CLOUD_TABLE_VERSION
 from .model_scheduler import shared_model_scheduler
 from .providers import ProviderError
 from .resilience.contracts import Usage
@@ -47,6 +48,7 @@ _VISION_CONCEPT_STATEMENTS = {
     "operating_income": "income_statement",
     "gross_profit": "income_statement",
     "cost_of_revenue": "income_statement",
+    "total_operating_cost": "income_statement",
     "operating_cash_flow": "cash_flow",
     "capital_expenditure": "cash_flow",
     "assets": "balance_sheet",
@@ -204,112 +206,20 @@ class VisionAdapterError(RuntimeError):
         super().__init__(code)
 
 
-def _pdfium_process_entry(worker: Callable[..., Any], args: tuple[Any, ...], sender: Any) -> None:
-    """Call a PDFium operation in a child without returning exception payloads."""
-
-    try:
-        sender.send(("result", worker(*args)))
-    except BaseException as exc:
-        code = getattr(exc, "code", "")
-        if not isinstance(code, str) or not re.fullmatch(r"[A-Z0-9_]{1,64}", code):
-            code = "PDFIUM_WORKER_ERROR"
-        try:
-            sender.send(("error", code))
-        except (BrokenPipeError, EOFError, OSError):
-            pass
-    finally:
-        try:
-            sender.close()
-        except (OSError, ValueError):
-            pass
-
-
 def _run_pdfium_isolated(
     worker: Callable[..., Any],
     *args: Any,
     timeout_seconds: float = 45.0,
     cancel_check: Callable[[], bool] | None = None,
+    diagnostic_callback=None,
+    operation="",
+    backend="pdfium",
+    page_range=None,
 ) -> tuple[Any | None, str | None]:
-    """Run native PDFium work with a killable process deadline.
-
-    This uses the same spawn + one-way-pipe + deadline/cancel pattern as the
-    durable PDF-window worker. A daemon PDF worker already has an outer hard
-    process boundary, so it executes directly there instead of trying to nest
-    a multiprocessing child. Spawn failures never fall back to an unsafe
-    in-process PDFium call.
-    """
-
-    if mp.current_process().daemon:
-        try:
-            return worker(*args), None
-        except BaseException as exc:
-            code = getattr(exc, "code", "")
-            return None, code if isinstance(code, str) and re.fullmatch(r"[A-Z0-9_]{1,64}", code) else "PDFIUM_WORKER_ERROR"
-
-    try:
-        context = mp.get_context("spawn")
-        receiver, sender = context.Pipe(duplex=False)
-    except (OSError, RuntimeError, ValueError):
-        return None, "PDFIUM_WORKER_START_FAILED"
-
-    process = context.Process(
-        target=_pdfium_process_entry,
-        args=(worker, tuple(args), sender),
-        name="pdfium-native-worker",
-    )
-    process.daemon = True
-    try:
-        try:
-            process.start()
-        except (OSError, RuntimeError, ValueError, TypeError, AttributeError):
-            return None, "PDFIUM_WORKER_START_FAILED"
-        sender.close()
-        deadline = time.monotonic() + max(0.05, float(timeout_seconds))
-        while True:
-            if cancel_check is not None and cancel_check():
-                return None, "PDFIUM_WORKER_CANCELLED"
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None, "PDFIUM_WORKER_TIMEOUT"
-            if receiver.poll(min(0.05, remaining)):
-                try:
-                    kind, value = receiver.recv()
-                except (EOFError, OSError):
-                    return None, "PDFIUM_WORKER_EXIT"
-                process.join(timeout=0.5)
-                if process.is_alive():
-                    return None, "PDFIUM_WORKER_EXIT"
-                if kind == "error":
-                    return None, str(value)
-                if kind != "result":
-                    return None, "PDFIUM_WORKER_EXIT"
-                return value, None
-            if not process.is_alive():
-                if receiver.poll(0.2):
-                    try:
-                        kind, value = receiver.recv()
-                    except (EOFError, OSError):
-                        return None, "PDFIUM_WORKER_EXIT"
-                    if kind == "error":
-                        return None, str(value)
-                    if kind == "result":
-                        return value, None
-                return None, "PDFIUM_WORKER_EXIT"
-    finally:
-        try:
-            if process.is_alive():
-                process.terminate()
-            process.join(timeout=1.0)
-            if process.is_alive() and hasattr(process, "kill"):
-                process.kill()
-                process.join(timeout=1.0)
-        except (AssertionError, OSError, ValueError):
-            pass
-        for connection in (sender, receiver):
-            try:
-                connection.close()
-            except (OSError, ValueError):
-                pass
+    """Compatibility seam; both PDF backends share structured, killable IPC."""
+    from .pdf_worker import run_pdf_worker
+    return run_pdf_worker(worker, *args, timeout_seconds=timeout_seconds, cancel_check=cancel_check,
+        diagnostic_callback=diagnostic_callback, operation=operation, backend=backend, page_range=page_range)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1250,6 +1160,11 @@ class MineruFlashAdapter:
                 }
 
                 if not task_id:
+                    reserve_run = getattr(recovery_context, "reserve_model_call", None)
+                    if callable(reserve_run):
+                        # A free parser has no LLM token contract, but its
+                        # recognition submission still consumes a physical call.
+                        reserve_run()
                     claim = getattr(self.journal, "claim_vision_task", None) if self.journal is not None else None
                     if callable(claim):
                         try:
@@ -1284,6 +1199,9 @@ class MineruFlashAdapter:
                         headers={"Content-Type": "application/json"},
                         body=json.dumps(payload).encode("utf-8"), cancel_check=cancel_check,
                     )
+                    settle_run = getattr(recovery_context, "settle_model_call", None)
+                    if callable(settle_run):
+                        settle_run(response=response)
                     data = response.json()
                     raw_task_id = _json_value(data, "data.task_id")
                     if isinstance(raw_task_id, (str, int)) and not isinstance(raw_task_id, bool):
@@ -1411,6 +1329,8 @@ class GatewayVisionAdapter:
             page_errors: list[str] = []
             scope = getattr(self.provider, "for_request_budget", None)
             provider = scope(deadline, cancel_check) if callable(scope) else self.provider
+            output_scope = getattr(provider, "for_output_budget", None)
+            provider = output_scope(8192) if callable(output_scope) else provider
             for page in pages:
                 if cancel_check and cancel_check():
                     raise VisionAdapterError("VISION_CANCELLED")
@@ -1423,8 +1343,18 @@ class GatewayVisionAdapter:
                 if time.monotonic() >= deadline:
                     raise VisionAdapterError("VISION_TIMEOUT")
                 prompt = (
-                    "Return JSON only with this shape: "
-                    "{facts:[{concept,value,currency,unit_scale,unit_text,statement,"
+                    "Return JSON only. Prefer source-faithful structured tables with shape "
+                    "{schema:'financial-structure-v1',original_page:N,blocks:["
+                    "{type:'title',text:'exact printed statement heading'},"
+                    "{type:'text',text:'exact printed units/period declarations'},"
+                    "{type:'table',bbox:[left,top,right,bottom],rows:[["
+                    "{text:'exact cell text',rowspan:1,colspan:1}]]}]}. "
+                    "Preserve ALL columns, merged header spans, unknown labels, amounts and "
+                    "consolidated/parent headings. Do not invent geometry, currency, dates or "
+                    "missing cells; omit optional bbox when unavailable. Keep each printed "
+                    "currency attached to its own header column. "
+                    "Alternatively the supported flat candidate shape is: "
+                    "{facts:[{concept,label,value,currency,unit_scale,unit_text,statement,"
                     "scope,scope_text,period_end,period_text,original_page,raw_text}],"
                     "observations:[{label,value_text,original_page,raw_text}],"
                     "cell_mappings:[{concept,label,row_quote,original_page}]}. "
@@ -1432,6 +1362,8 @@ class GatewayVisionAdapter:
                     "scope, preserve the stated period and currency, and omit uncertain facts. "
                     "For every fact quote unit_text, scope_text, and period_text verbatim "
                     "from the page and include all three in raw_text with the numeric row. "
+                    "For each fact include label as the exact displayed row label, without "
+                    "period/unit/table headings. "
                     "Only emit supported standard concepts; put other visible numeric metrics "
                     "in observations as text, never as facts. Observations are unverified "
                     "and must not be used for calculations. If an unfamiliar row label needs "
@@ -1460,6 +1392,9 @@ class GatewayVisionAdapter:
                             if recovery_context is not None:
                                 recovery_context.checkpoint()
                                 recovery_context.consume(Usage(calls=1, pages=int(json_mode)))
+                                reserve_run = getattr(recovery_context, "reserve_model_call", None)
+                                if callable(reserve_run):
+                                    reserve_run(input_estimate=len(image) + len(system.encode()) + len(prompt.encode()), output_limit=8192)
                                 # Each wire intent is durable. A known rejected
                                 # format may be retried, an unknown outcome may not.
                                 recovery_context.record_external_intent()
@@ -1468,8 +1403,14 @@ class GatewayVisionAdapter:
                                     once(system, prompt, image, json_mode=json_mode)
                                     if callable(once) else provider.generate_vision(system, prompt, image)
                                 )
+                                settle_run = getattr(recovery_context, "settle_model_call", None)
+                                if callable(settle_run):
+                                    settle_run(response=structured)
                                 break
                             except ProviderError as exc:
+                                settle_run = getattr(recovery_context, "settle_model_call", None)
+                                if callable(settle_run):
+                                    settle_run(error=exc)
                                 format_rejected = (
                                     exc.code == "MODEL_RESPONSE_FORMAT_UNSUPPORTED"
                                     and type(exc.http_status) is int and exc.http_status in {400, 422}
@@ -1603,19 +1544,23 @@ class VisionTaskCoordinator:
             prior = self.journal.get_vision_task(task_key) if self.journal is not None else None
             cached = self._completed_results.get(task_key)
             if cached is not None and self._completed_bindings.get(task_key) == binding:
-                return cached
+                replayed = replay_saved_table_sources(cached, company, filing, ordered_pages)
+                self._completed_results[task_key] = replayed
+                return replayed
             load_result = getattr(self.journal, "get_vision_result", None)
             if callable(load_result):
                 persisted = load_result(task_key)
-                restored = (_deserialize_vision_result(persisted)
-                    if isinstance(persisted, dict) and persisted.get("candidate_binding") == binding else None)
-                if restored is not None:
+                if isinstance(persisted, dict) and persisted.get("candidate_binding") == binding:
+                    restored = _deserialize_vision_result(persisted)
+                    if restored is None:
+                        return _saved_source_invalid_result()
                     cached = VisionExtractionResult(
                         restored.facts,
                         restored.evidence,
                         restored.diagnostics + ("VISION_RESULT_CACHE_HIT",),
                         None,
                     )
+                    cached = replay_saved_table_sources(cached, company, filing, ordered_pages)
                     self._completed_results[task_key] = cached
                     self._completed_bindings[task_key] = binding
                     return cached
@@ -1755,8 +1700,11 @@ class VisionTaskCoordinator:
 def _render_pdfium_page(pdf_bytes: bytes) -> bytes:
     """Native PDFium renderer; called only behind a process boundary."""
 
+    from .pdf_worker import pdf_phase
+    pdf_phase('import', backend='pdfium')
     import pypdfium2 as pdfium
 
+    pdf_phase('open', backend='pdfium', version=str(pdfium.PYPDFIUM_INFO))
     document = pdfium.PdfDocument(pdf_bytes)
     page = bitmap = image = None
     try:
@@ -1768,6 +1716,7 @@ def _render_pdfium_page(pdf_bytes: bytes) -> bytes:
         width, height = math.ceil(page.get_width() * 1.5), math.ceil(page.get_height() * 1.5)
         if width > 4096 or height > 4096 or width * height > 12_000_000:
             raise VisionAdapterError("VISION_IMAGE_SIZE_LIMIT")
+        pdf_phase('render')
         bitmap = page.render(scale=1.5, rev_byteorder=True)
         image = bitmap.to_pil()
         width, height = image.size
@@ -1860,6 +1809,9 @@ def parse_vision_markdown(
 
 def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pages: Sequence[VisionPageRequest]) -> VisionExtractionResult:
     """Parse explicitly evidenced standard facts and separate unverified observations."""
+    if isinstance(payload, dict) and payload.get('schema') == 'financial-structure-v1':
+        from .financial_sources.structure import parse_structure
+        return parse_structure(payload, company, filing, pages)
     if not isinstance(payload, dict) or not isinstance(payload.get("facts", []), list):
         return VisionExtractionResult(error_code="VISION_STRUCTURED_JSON_REQUIRED", diagnostics=("VISION_STRUCTURED_JSON_REQUIRED",))
     rows = payload.get("facts", [])[:200]
@@ -1871,6 +1823,10 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
     refs: list[EvidenceRef] = []
     pages_by_number = {page.original_page: page for page in pages}
     from .financial_cell_repair import mapping_reference
+    from .financial_taxonomy import (
+        cost_row_concept, cost_row_is_non_amount, cost_row_mentions,
+        cost_row_source_is_non_amount,
+    )
     mappings = payload.get("cell_mappings", [])
     if isinstance(mappings, list) and len(mappings) <= 200:
         refs.extend(ref for item in mappings if (ref := mapping_reference(item, filing, set(pages_by_number))) is not None)
@@ -1900,6 +1856,7 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
             scope_text = str(row.get("scope_text", "")).strip()[:160]
             period_text = str(row.get("period_text", "")).strip()[:160]
             raw_text = str(row.get("raw_text", "")).strip()[:2000]
+            source_label = str(row.get("label", "")).strip()[:300]
             if (
                 reported_value is None
                 or scale not in _VISION_UNIT_SCALES
@@ -1916,12 +1873,29 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
                 or not _vision_source_phrase_present(raw_text, period_text)
                 or not _vision_unit_scale_is_explicit(unit_text, scale)
                 or not _vision_currency_is_explicit(unit_text, currency)
+                or (source_label and not _vision_source_phrase_present(raw_text, source_label))
             ):
                 observation = _unverified_vision_observation(row, filing, pages_by_number)
                 if observation is not None:
                     refs.append(observation)
                 continue
         except (KeyError, TypeError, ValueError):
+            observation = _unverified_vision_observation(row, filing, pages_by_number)
+            if observation is not None:
+                refs.append(observation)
+            continue
+        # The model's claim is only a candidate. Prefer the explicit row label
+        # over wider raw_text, which may also contain unrelated table headings.
+        label_mentions_cost = bool(cost_row_mentions(source_label))
+        source_cost_label = source_label or raw_text
+        source_cost_concept = cost_row_concept(source_cost_label)
+        if (
+            (label_mentions_cost and cost_row_is_non_amount(source_label))
+            or cost_row_source_is_non_amount(source_cost_label)
+            or (source_cost_concept is not None and source_cost_concept != concept)
+            or (concept in {"cost_of_revenue", "total_operating_cost"}
+                and source_cost_concept != concept)
+        ):
             observation = _unverified_vision_observation(row, filing, pages_by_number)
             if observation is not None:
                 refs.append(observation)
@@ -1951,7 +1925,7 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
         period_start = _vision_period_start(filing.fiscal_period, filing.period_end, statement)
         fact_id = f"{filing.document_id}:{concept}:{page_no}:{page.content_hash[:16]}:{value}"
         fact = FinancialFact(
-            fact_id, company.security_id, concept, concept, value,
+            fact_id, company.security_id, concept, source_label or concept, value,
             currency, int(filing.period_end[:4]), filing.fiscal_period, filing.form_type,
             period_start, filing.period_end, filing.filed_at, filing.accession_number,
             filing.source_url, scope="consolidated", entity=company.name,
@@ -1997,3 +1971,228 @@ def parse_vision_json(payload: Any, company: Company, filing: FilingDocument, pa
             (), tuple(refs), ("VISION_NO_CANDIDATES",), "VISION_NO_CANDIDATES"
         )
     return VisionExtractionResult(tuple(facts), tuple(refs), ("VISION_CANDIDATES_ONLY",))
+
+
+def _saved_source_invalid_result(*, candidate_integrity_failed: bool = False) -> VisionExtractionResult:
+    diagnostics = ("VISION_CACHED_SOURCE_INVALID",)
+    if candidate_integrity_failed:
+        diagnostics += ("VISION_CANDIDATE_INTEGRITY_FAILED",)
+    return VisionExtractionResult(
+        diagnostics=diagnostics,
+        error_code="VISION_CACHED_SOURCE_INVALID",
+    )
+
+
+def _saved_table_fact_is_intact(
+    fact: FinancialFact,
+    evidence_by_id: Mapping[str, EvidenceRef],
+    filing: FilingDocument,
+    page_by_identity: Mapping[tuple[int, str], VisionPageRequest],
+) -> bool:
+    """Reject altered normalized table facts before trusting their raw proof."""
+    lineage = fact.normalization_lineage
+    if lineage is None or lineage.inputs:
+        return False
+    try:
+        amount = SourceAmount(
+            lineage.raw_value,
+            lineage.scale,
+            QuantityKind(lineage.quantity_kind),
+            lineage.currency,
+            lineage.unit_evidence_ids,
+            lineage.value_transform,
+        ).normalize()
+        if amount.normalized_value != lineage.normalized_value:
+            return False
+        normalized_value = Decimal(amount.normalized_value)
+        if not math.isfinite(fact.value) or float(normalized_value) != fact.value:
+            return False
+        scale = Decimal(lineage.scale)
+        if (Decimal(str(fact.unit_scale)) != scale
+                or fact.currency.strip().upper() != amount.currency
+                or fact.unit.strip().upper() != amount.currency):
+            return False
+
+        unit_ids = tuple(lineage.unit_evidence_ids)
+        if not unit_ids or len(set(unit_ids)) != len(unit_ids):
+            return False
+        allowed_unit_pages = set()
+        for page in page_by_identity.values():
+            allowed_unit_pages.add(page.original_page)
+            allowed_unit_pages.update(
+                context.original_page for context in page.unit_contexts
+                if context.document_hash == filing.content_hash
+            )
+        for evidence_id in unit_ids:
+            ref = evidence_by_id.get(evidence_id)
+            if (ref is None or ref.evidence_id != evidence_id
+                    or not evidence_id.startswith("vision-unit:")
+                    or ref.document_id != filing.document_id
+                    or ref.source_url != filing.source_url
+                    or ref.content_hash != filing.content_hash
+                    or ref.published_at != filing.filed_at
+                    or ref.title != "Explicit financial-statement unit"):
+                return False
+            match = re.fullmatch(r"page:([1-9]\d*)", ref.locator)
+            if match is None:
+                return False
+            unit_page = int(match.group(1))
+            if unit_page not in allowed_unit_pages:
+                return False
+            expected_id = "vision-unit:" + sha256(
+                f"{filing.document_id}|{unit_page}|{ref.excerpt}".encode()
+            ).hexdigest()
+            # The unit excerpt may intentionally compose a public multiplier
+            # with a column-local currency (for example, public USD millions
+            # and a local RMB header). Its meaning is re-established from the
+            # hash-bound raw table below and checked by the normal compiler;
+            # do not re-interpret this flattened excerpt as one declaration.
+            if expected_id != evidence_id:
+                return False
+        return True
+    except (InvalidOperation, TypeError, ValueError, OverflowError, AttributeError):
+        return False
+
+
+def replay_saved_table_sources(
+    result: VisionExtractionResult,
+    company: Company,
+    filing: FilingDocument,
+    pages: Sequence[VisionPageRequest],
+) -> VisionExtractionResult:
+    """Rebuild cached table candidates only from their bound raw source proof.
+
+    Flat legacy candidates without table-source proofs keep their historical
+    behavior. Table-derived normalized facts are never parser input.
+    """
+    if not isinstance(result, VisionExtractionResult):
+        return _saved_source_invalid_result()
+
+    page_by_identity: dict[tuple[int, str], VisionPageRequest] = {}
+    for page in pages:
+        identity = (page.original_page, page.content_hash)
+        if identity in page_by_identity and page_by_identity[identity] != page:
+            return _saved_source_invalid_result()
+        page_by_identity[identity] = page
+
+    proof_refs: dict[str, EvidenceRef] = {}
+    evidence_by_id: dict[str, EvidenceRef] = {}
+    for ref in result.evidence:
+        previous_ref = evidence_by_id.get(ref.evidence_id)
+        if previous_ref is not None and previous_ref.to_dict() != ref.to_dict():
+            return _saved_source_invalid_result()
+        evidence_by_id[ref.evidence_id] = ref
+        if not ref.evidence_id.startswith("vision-table:"):
+            continue
+        previous = proof_refs.get(ref.evidence_id)
+        if previous is not None and previous.to_dict() != ref.to_dict():
+            return _saved_source_invalid_result()
+        proof_refs[ref.evidence_id] = ref
+
+    table_facts = []
+    preserved_facts = []
+    proof_ids = set(proof_refs)
+    for fact in result.facts:
+        fact_proofs = {
+            item for item in fact.classification_evidence_ids
+            if item.startswith("vision-table:")
+        }
+        is_table_fact = fact.parser_version == CLOUD_TABLE_VERSION or bool(fact_proofs)
+        if is_table_fact:
+            if not fact_proofs or not fact_proofs.issubset(proof_ids):
+                return _saved_source_invalid_result()
+            if not _saved_table_fact_is_intact(fact, evidence_by_id, filing, page_by_identity):
+                return _saved_source_invalid_result(candidate_integrity_failed=True)
+            table_facts.append(fact)
+        else:
+            preserved_facts.append(fact)
+
+    if not proof_refs:
+        if table_facts:
+            return _saved_source_invalid_result()
+        return result
+
+    from dataclasses import asdict
+    from .financial_sources.structure import parse_structure, structure_to_markdown
+
+    replayed: list[VisionExtractionResult] = []
+    for evidence_id, ref in sorted(proof_refs.items()):
+        try:
+            if (not isinstance(ref.excerpt, str)
+                    or len(ref.excerpt.encode("utf-8")) > 5 * 1024 * 1024):
+                return _saved_source_invalid_result()
+            payload = json.loads(ref.excerpt)
+            if not isinstance(payload, dict):
+                return _saved_source_invalid_result()
+            if (canonical_cloud_source(payload) != ref.excerpt
+                    or payload.get("schema") != CLOUD_TABLE_VERSION
+                    or ref.evidence_id != cloud_source_id(ref.document_id, payload)):
+                return _saved_source_invalid_result()
+            if (ref.document_id != filing.document_id
+                    or ref.source_url != filing.source_url
+                    or ref.content_hash != filing.content_hash
+                    or payload.get("document_hash") != filing.content_hash
+                    or payload.get("period_end") != filing.period_end
+                    or payload.get("fiscal_period") != filing.fiscal_period):
+                return _saved_source_invalid_result()
+            page_number = payload.get("original_page")
+            page_hash = payload.get("page_hash")
+            if type(page_number) is not int or not isinstance(page_hash, str):
+                return _saved_source_invalid_result()
+            page = page_by_identity.get((page_number, page_hash))
+            if page is None or ref.locator != f"page:{page_number}":
+                return _saved_source_invalid_result()
+            if payload.get("unit_contexts") != [asdict(item) for item in page.unit_contexts]:
+                return _saved_source_invalid_result()
+
+            markdown = payload.get("markdown")
+            if not isinstance(markdown, str) or len(markdown.encode("utf-8")) > 4 * 1024 * 1024:
+                return _saved_source_invalid_result()
+            source_structure = payload.get("source_structure")
+            if source_structure is not None:
+                if structure_to_markdown(source_structure) != markdown:
+                    return _saved_source_invalid_result()
+                current = parse_structure(source_structure, company, filing, (page,))
+            else:
+                current = parse_vision_markdown(markdown, company, filing, (page,))
+            if current.error_code in {
+                "VISION_PAGE_MAPPING_REQUIRED", "VISION_STRUCTURE_INVALID",
+                "VISION_TABLE_SOURCE_INVALID", "VISION_EMPTY_MARKDOWN",
+                "VISION_DOCUMENT_HASH_REQUIRED",
+            }:
+                return _saved_source_invalid_result()
+            if not any(ref.evidence_id == evidence_id for ref in current.evidence):
+                return _saved_source_invalid_result()
+            replayed.append(current)
+        except (TypeError, ValueError, OverflowError, UnicodeError, RecursionError):
+            return _saved_source_invalid_result()
+
+    facts_by_id: dict[str, FinancialFact] = {}
+    for fact in (*preserved_facts, *(fact for item in replayed for fact in item.facts)):
+        previous = facts_by_id.get(fact.fact_id)
+        if previous is not None and previous.to_dict() != fact.to_dict():
+            return _saved_source_invalid_result()
+        facts_by_id[fact.fact_id] = fact
+
+    evidence_by_id: dict[str, EvidenceRef] = {}
+    for ref in (*result.evidence, *(ref for item in replayed for ref in item.evidence)):
+        previous = evidence_by_id.get(ref.evidence_id)
+        if previous is not None and previous.to_dict() != ref.to_dict():
+            return _saved_source_invalid_result()
+        evidence_by_id[ref.evidence_id] = ref
+
+    diagnostics = list(result.diagnostics)
+    replay_errors = []
+    for item in replayed:
+        diagnostics.extend(item.diagnostics)
+        if item.error_code:
+            replay_errors.append(item.error_code)
+    if "VISION_SAVED_SOURCE_REVALIDATED" not in diagnostics:
+        diagnostics.append("VISION_SAVED_SOURCE_REVALIDATED")
+    return VisionExtractionResult(
+        tuple(facts_by_id.values()),
+        tuple(evidence_by_id.values()),
+        tuple(diagnostics),
+        replay_errors[0] if replay_errors else None,
+        result.retry_after_seconds,
+    )

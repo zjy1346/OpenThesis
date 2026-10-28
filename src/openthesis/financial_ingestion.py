@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace, asdict
 from copy import deepcopy
 from concurrent.futures import CancelledError, ThreadPoolExecutor, wait, FIRST_COMPLETED
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from io import BytesIO
@@ -32,6 +32,8 @@ import time
 import types
 
 
+# Kept stable for cache-key continuity. Targeted taxonomy dependency is stored
+# separately in each cache payload so unaffected ASTs remain reusable.
 _PDF_TAXONOMY_VERSION = "canonical-taxonomy-v1"
 _PDF_CACHE_POLICY_VERSION = "parse-cache-v5-source-label-boundaries"
 
@@ -82,7 +84,8 @@ from .disclosure_identity import DisclosureIdentityResolver, _title_report_year
 from .financial_compatibility import FinancialRulesSnapshot
 from .financial_statement_identity import STATEMENT_TITLE_MARKERS, classify_statement_title, is_narrative_title_tail, statement_title_evidence_id
 from .financial_taxonomy import (
-    FINANCIAL_LABEL_ALIASES,
+    FINANCIAL_LABEL_ALIASES, FINANCIAL_MAPPING_VERSION, cost_row_alias_conflicts,
+    cost_row_concept, cost_row_mentions,
     balance_component_row_concept,
     cash_flow_total_label_matches, comprehensive_income_row_concept,
     liability_total_label_matches,
@@ -388,6 +391,11 @@ class _CheckpointPdfWindowWorker:
     manifest: FilingManifest
     compatibility_rules: FinancialRulesSnapshot
     document_units: DocumentUnitResolution = DocumentUnitResolution()
+    document_texts: tuple[str, ...] = ()
+    checkpoint_directory: str = ""
+
+    def open_session(self):
+        return _CheckpointPdfDocumentSession(self)
 
     def __call__(self, window: Any, initial_context: dict[str, Any] | None = None):
         engine = FinancialIngestionEngine(
@@ -406,6 +414,84 @@ class _CheckpointPdfWindowWorker:
             document_units=self.document_units,
         )
         return facts, refs, _checkpoint_context_to_dict(engine._last_pdf_context)
+
+
+class _CheckpointPdfDocumentSession:
+    """One parser and one open PDF per filing, reused for page checkpoints."""
+
+    def __init__(self, worker: _CheckpointPdfWindowWorker):
+        import pdfplumber
+        self.worker = worker
+        self.engine = FinancialIngestionEngine(
+            max_workers=1,
+            compatibility_rules=worker.compatibility_rules,
+        )
+        self.pdf = None
+        text_cache_started = time.monotonic()
+        self.document_texts = worker.document_texts or cached_page_texts(worker.local_path) or ()
+        from .financial_checkpoint import PositionedPageStore
+        self.page_store = (PositionedPageStore(worker.checkpoint_directory, worker.manifest.content_hash,
+            pdfplumber.__version__) if worker.checkpoint_directory and worker.manifest.content_hash else None)
+        self.diagnostics = {
+            "strategy": "positioned-page-checkpoint",
+            "backend": "pdfplumber",
+            "pdf_open_elapsed_seconds": 0.0,
+            "page_text_cache_elapsed_seconds": round(time.monotonic() - text_cache_started, 4),
+            "document_page_count": len(self.document_texts),
+            "geometry_cache_hits": 0,
+            "geometry_extracted_pages": 0,
+            "geometry_extract_elapsed_seconds": 0.0,
+        }
+
+    def _page_data(self, number):
+        cached = self.page_store.load(number) if self.page_store is not None else None
+        if cached is not None:
+            self.diagnostics['geometry_cache_hits'] += 1
+            return cached['words'], cached['text']
+        if self.pdf is None:
+            import pdfplumber
+            started = time.monotonic()
+            self.pdf = pdfplumber.open(self.worker.local_path)
+            self.diagnostics['pdf_open_elapsed_seconds'] += time.monotonic() - started
+        started = time.monotonic()
+        page = self.pdf.pages[number - 1]
+        words = page.extract_words(keep_blank_chars=False, use_text_flow=False) or []
+        text = (page.extract_text() or '') if words else ''
+        self.diagnostics['geometry_extracted_pages'] += 1
+        self.diagnostics['geometry_extract_elapsed_seconds'] += time.monotonic() - started
+        if self.page_store is not None:
+            try:
+                self.page_store.save(number, words, text)
+            except OSError:
+                # Extraction remains valid even if this optional raw cache
+                # cannot be written; normal fact checkpoints still apply.
+                pass
+        return words, text
+
+    def __call__(self, window: Any, initial_context: dict[str, Any] | None = None):
+        worker = self.worker
+        try:
+            facts, refs = self.engine._parse_pdf_ast(
+                worker.local_path, worker.company, worker.filing, worker.manifest,
+                candidate_pages=frozenset(window.pages), index_precomputed=True,
+                compatibility_rules=worker.compatibility_rules, initial_context=initial_context,
+                document_units=worker.document_units, document_units_bound=True,
+                document_texts=self.document_texts, page_data=self._page_data,
+            )
+        finally:
+            # pdfplumber caches characters/layout on Page objects. Keep the
+            # PDF open without retaining every processed page's geometry.
+            for number in window.pages:
+                if self.pdf is not None and 1 <= number <= len(self.pdf.pages):
+                    close = getattr(self.pdf.pages[number - 1], "close", None)
+                    if callable(close):
+                        close()
+        return facts, refs, _checkpoint_context_to_dict(self.engine._last_pdf_context)
+
+    def close(self):
+        close = getattr(self.pdf, "close", None)
+        if callable(close):
+            close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,6 +598,7 @@ _LABELS: dict[str, tuple[str, ...]] = {
     ),
     "gross_profit": FINANCIAL_LABEL_ALIASES["gross_profit"],
     "cost_of_revenue": FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
+    "total_operating_cost": FINANCIAL_LABEL_ALIASES["total_operating_cost"],
 }
 _CORE = {"revenue", "net_income", "assets", "liabilities", "equity", "operating_cash_flow"}
 _STATEMENT_MARKERS = STATEMENT_TITLE_MARKERS
@@ -532,7 +619,45 @@ def _labels_for_rules(rules: FinancialRulesSnapshot | None) -> dict[str, tuple[s
             key = next((name for name, values in labels.items() if any(_label_compact(canonical) == _label_compact(value) for value in values)), "")
         if key and key in labels:
             labels[key] = tuple(dict.fromkeys((*labels[key], *aliases)))
+    # A trusted compatibility pack may extend a vocabulary, but it cannot
+    # redefine a known member of a mutually-exclusive accounting family.
+    for concept in labels:
+        labels[concept] = tuple(
+            label for label in labels[concept]
+            if not cost_row_alias_conflicts(label, concept)
+        )
     return labels
+
+
+def _cost_mapping_recompile_needed(
+    facts: Sequence[dict[str, Any] | FinancialFact],
+    mapping_version: str | None,
+    evidence: Sequence[dict[str, Any] | EvidenceRef] = (),
+) -> bool:
+    """Invalidate stale mapping generations only for cost-related documents.
+
+    Prior generations could map ``营业总成本`` into the single COGS concept,
+    but an apparently-correct COGS row from that generation also cannot prove
+    that the newly-separated total-cost row was considered. Reparse the exact
+    document when either its canonical concepts or retained source labels
+    touch either cost family. Cost-free documents stay reusable. Current
+    generation entries are reused and continue through ordinary validators.
+    """
+
+    if mapping_version == FINANCIAL_MAPPING_VERSION:
+        return False
+    for fact in (*facts, *evidence):
+        if isinstance(fact, dict):
+            concept = fact.get("concept")
+            labels = (fact.get("reported_concept", ""), fact.get("raw_text", ""), fact.get("excerpt", ""))
+        else:
+            concept = getattr(fact, "concept", "")
+            labels = (getattr(fact, "reported_concept", ""), getattr(fact, "raw_text", ""), getattr(fact, "excerpt", ""))
+        if concept in {"cost_of_revenue", "total_operating_cost"} or any(
+            cost_row_mentions(label) for label in labels
+        ):
+            return True
+    return False
 
 
 def _statement_markers_for_rules(rules: FinancialRulesSnapshot | None) -> dict[str, tuple[str, ...]]:
@@ -1084,6 +1209,7 @@ def _period_columns(
     dual: list[tuple[int, float]] | None = None
     fallback: list[tuple[int, float]] | None = None
     headers_by_year: dict[int, str] = {}
+    source_headers_by_year: dict[int, str] = {}
     header_rank_by_year: dict[int, int] = {}
     period_bounds_by_year: dict[int, tuple[str, str, str]] = {}
     all_text = " ".join(row.text for row in rows)
@@ -1148,8 +1274,15 @@ def _period_columns(
             ((year, value[1]) for year, value in by_year.items()),
             key=lambda item: item[1],
         )
-        if len(candidates) >= 2 and dual is None:
-            dual = candidates
+        if len(candidates) >= 2:
+            if dual is None:
+                dual = candidates
+            # Source-column lineage should use the actual table axis. A
+            # separate prose/date line such as "Year ended December 31,
+            # 2025" can resolve period_end, but cannot replace a visible
+            # paired column heading (2025 | 2024).
+            for year, _center in candidates:
+                source_headers_by_year.setdefault(year, by_year[year][2])
             continue
         if not candidates:
             normalized_row = re.sub(r"\s+", "", row.text.casefold())
@@ -1256,7 +1389,7 @@ def _period_columns(
                 right,
                 currency,
                 global_scale if currency else 1.0,
-                headers_by_year.get(year, "") if year else next((header for position, header in
+                (source_headers_by_year.get(year) or headers_by_year.get(year, "")) if year else next((header for position, header in
                     relative_headers.values() if abs(position - center) < 0.01), ""),
                 unit_cell.text if unit_cell else "",
                 (unit_cell.x0, unit_cell.top, unit_cell.x1, unit_cell.bottom) if unit_cell else None,
@@ -1952,6 +2085,7 @@ def _row_label_text(row: PdfRowAST) -> str:
     return re.sub(r"\s+", "", _row_label_source_text(row))
 
 
+@lru_cache(maxsize=8192)
 def _known_label(text: str, rules: FinancialRulesSnapshot | None = None) -> bool:
     if is_profit_sign_convention(text):
         return False
@@ -2362,6 +2496,7 @@ def _summary_revision_boundary(rows: Sequence[PdfRowAST]) -> int | None:
                  and not any(_parse_number(cell.text) is not None for cell in row.cells)), None)
 
 
+@lru_cache(maxsize=8192)
 def _completes_known_label(prefix: str, suffix: str, rules: FinancialRulesSnapshot | None = None) -> bool:
     """Return whether a short, unrecognized tail completes a known label.
 
@@ -2910,6 +3045,9 @@ def _emit_ingestion_progress(
     elapsed_seconds: float = 0.0,
     window_index: int | None = None,
     window_total: int | None = None,
+    completed_page_count: int | None = None,
+    candidate_page_count: int | None = None,
+    page_activity: dict[str, Any] | None = None,
 ) -> None:
     """Emit optional per-filing detail without breaking legacy callbacks."""
 
@@ -2927,6 +3065,11 @@ def _emit_ingestion_progress(
         if window_index is not None and window_total is not None:
             detail["window_index"] = max(0, int(window_index))
             detail["window_total"] = max(0, int(window_total))
+        if completed_page_count is not None and candidate_page_count is not None:
+            detail["completed_page_count"] = max(0, int(completed_page_count))
+            detail["candidate_page_count"] = max(0, int(candidate_page_count))
+        if page_activity:
+            detail.update(page_activity)
     try:
         signature = inspect.signature(progress)
         accepts_detail = len(signature.parameters) >= 4
@@ -2952,7 +3095,7 @@ def _shared_pdf_producer(engine, company, filing, manifest, flight, key, parse_t
         now = time.monotonic()
         for cancelled, deadline in participants.values():
             try:
-                if deadline > now and not (cancelled and cancelled()):
+                if (deadline is None or deadline > now) and not (cancelled and cancelled()):
                     return False
             except Exception:
                 continue
@@ -2973,11 +3116,35 @@ def _shared_pdf_producer(engine, company, filing, manifest, flight, key, parse_t
         if orphaned():
             result = ([], [], "pdf_parse_cancelled")
         else:
-            rows = _parse_local_pdfs_bounded_impl(engine, company, [filing], {filing.document_id: manifest},
-                cancel_check=orphaned, progress=progress, max_workers=1,
-                parse_timeout_seconds=parse_timeout, batch_timeout_seconds=batch_timeout,
-                deadline=time.monotonic() + batch_timeout, _shared_producer=True)
-            result = rows.get(filing.document_id, ([], [], "pdf_document_budget_exhausted_resumable"))
+            previous = (0, 0)
+            artifacts = set()
+            while not orphaned():
+                rows = _parse_local_pdfs_bounded_impl(engine, company, [filing], {filing.document_id: manifest},
+                    cancel_check=orphaned, progress=progress, max_workers=1,
+                    parse_timeout_seconds=parse_timeout, batch_timeout_seconds=batch_timeout,
+                    deadline=time.monotonic() + batch_timeout, _shared_producer=True)
+                result = rows.get(filing.document_id, ([], [], "pdf_document_budget_exhausted_resumable"))
+                observation = engine._document_execution.get(filing.document_id, {})
+                advanced = (observation.get("context_completed_pages", 0), observation.get("completed_window_count", 0))
+                current_artifacts = set(observation.get("work_progress", {}).get("artifacts", ()))
+                current_artifacts.update('input:' + item for item in
+                    observation.get('work_progress', {}).get('pending_inputs', ()))
+                changed_inputs = current_artifacts.difference(artifacts)
+                resumable_slice = result[2] in {"pdf_document_budget_exhausted_resumable",
+                    "pdf_batch_budget_exhausted_resumable", "document_context_slice_exhausted_resumable"}
+                # Native timeout diagnostics are retained, but a durable split
+                # is a NEW effective input and must run in this same operation.
+                # No new input/algorithm means no replay of a timed-out unit.
+                changed_timeout = (result[2] in {"PDFIUM_WORKER_TIMEOUT", "PDF_TABLE_WINDOW_TIMEOUT"}
+                    and bool(changed_inputs))
+                if not resumable_slice and not changed_timeout:
+                    break
+                if advanced <= previous and not current_artifacts.difference(artifacts):
+                    result = (result[0], result[1], "PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION")
+                    break
+                previous = advanced
+                artifacts.update(current_artifacts)
+                progress("filing-status", 0, 1, {"status": "slice-resuming"})
     except Exception as error:
         result = ([], [], f"pdf_window_failed:{type(error).__name__}")
     finally:
@@ -3004,9 +3171,7 @@ def _parse_local_pdfs_bounded(engine, company, filings, manifests, *, parse=None
             cancel_check=cancel_check, progress=progress, max_workers=max_workers,
             parse_timeout_seconds=parse_timeout_seconds, batch_timeout_seconds=batch_timeout_seconds,
             worker_entry=worker_entry, deadline=deadline)
-    end = time.monotonic() + max(.1, float(batch_timeout_seconds))
-    if deadline is not None:
-        end = min(end, deadline)
+    end = deadline
     remaining = list(filings)
     active, results = {}, {}
     slots = max(1, min(3, int(max_workers)))
@@ -3019,10 +3184,15 @@ def _parse_local_pdfs_bounded(engine, company, filings, manifests, *, parse=None
         if current >= total:
             completed.add(filing.document_id)
         detail = detail or {}
-        _emit_ingestion_progress(progress, stage, len(completed), total_filings, filing,
+        page_stage = stage == "filing-page"
+        _emit_ingestion_progress(progress, stage, current if page_stage else len(completed),
+            total if page_stage else total_filings, filing,
             status=detail.get("status", stage), error_code=detail.get("error_code"),
             elapsed_seconds=detail.get("elapsed_seconds", 0),
-            window_index=detail.get("window_index"), window_total=detail.get("window_total"))
+            window_index=detail.get("window_index"), window_total=detail.get("window_total"),
+            completed_page_count=detail.get("completed_page_count"), candidate_page_count=detail.get("candidate_page_count"),
+            page_activity={key:detail[key] for key in ("parsed_page_count", "parsing_active_seconds",
+                "last_product_at", "waiting_type", "parser_backend", "current_page") if key in detail})
 
     try:
         while remaining or active:
@@ -3040,7 +3210,7 @@ def _parse_local_pdfs_bounded(engine, company, filings, manifests, *, parse=None
                         flight.participants.pop(token, None)
                     del active[document_id]
             stopped = bool(cancel_check and cancel_check())
-            if stopped or time.monotonic() >= end:
+            if stopped or (end is not None and time.monotonic() >= end):
                 code = "pdf_parse_cancelled" if stopped else "pdf_batch_budget_exhausted_resumable"
                 for filing in remaining:
                     results[filing.document_id] = ([], [], code)
@@ -3258,6 +3428,10 @@ def _parse_local_pdfs_bounded_impl(
             continue
         facts, refs = cached
         results[key] = (facts, refs, None)
+        engine._document_execution[filing.document_id] = {
+            "source_hash":filing.content_hash, "cache_reused":True,
+            "worker_session_start_count":0, "parse_strategy":"positioned-page-checkpoint",
+        }
         completed += 1
         _emit_ingestion_progress(
             progress,
@@ -3280,7 +3454,17 @@ def _parse_local_pdfs_bounded_impl(
         }
 
     if process_isolated:
-        if engine._checkpoint_dir is not None and not hash_mismatches:
+        if worker_entry is None and not hash_mismatches:
+            # Every public entry uses the same resumable pipeline. A caller
+            # without a durable workspace still gets isolated temporary window
+            # storage, retained for this engine's lifetime. Parser workers do
+            # not recurse here; they call only the positioned AST operation.
+            if engine._checkpoint_dir is None:
+                if engine._parse_cache_dir is not None:
+                    engine._checkpoint_dir = engine._parse_cache_dir / "checkpoints"
+                else:
+                    engine._temporary_checkpoints = tempfile.TemporaryDirectory(prefix="openthesis-windows-")
+                    engine._checkpoint_dir = Path(engine._temporary_checkpoints.name)
             # Opt-in durable window recovery.  The default process scheduler
             # remains unchanged; callers that provide a checkpoint directory
             # get an ordered checkpoint boundary before compiler validation.
@@ -3292,27 +3476,54 @@ def _parse_local_pdfs_bounded_impl(
             ) -> tuple[str, list[FinancialFact], list[EvidenceRef], str | None]:
                 key, filing, manifest = item
                 parse_started = time.monotonic()
+                last_page_event = parse_started
+                unique_completed = 0
+                parsed_page_count = 0
+                parsing_active_seconds = 0.0
 
-                def window_progress(index: int, count: int, status: str) -> None:
+                def page_progress(completed_pages: int, candidate_pages: int, status: str, page_detail=None) -> None:
+                    nonlocal last_page_event, unique_completed, parsed_page_count, parsing_active_seconds
                     if time.monotonic() >= batch_deadline or (cancel_check is not None and cancel_check()):
                         return
+                    now = time.monotonic()
+                    if status.startswith("text-"):
+                        last_page_event = now
+                        _emit_ingestion_progress(progress, "filing-index", completed_pages, candidate_pages,
+                            filing, status="indexing", elapsed_seconds=now - parse_started,
+                            page_activity={"waiting_type":"native_parse", "parser_backend":"pdfium"})
+                        return
+                    if status == "checkpointed" and completed_pages > unique_completed:
+                        parsed_page_count += completed_pages - unique_completed
+                        parsing_active_seconds += now - last_page_event
+                    unique_completed = max(unique_completed, completed_pages)
+                    if status != "parsing":
+                        last_page_event = now
+                    activity = {"parsed_page_count": parsed_page_count,
+                        "parsing_active_seconds": round(parsing_active_seconds, 4),
+                        "parser_backend": "pdfplumber",
+                        "waiting_type": "cache_reuse" if status == "cache-hit" else "native_parse"}
+                    if status in {"cache-hit", "checkpointed"}:
+                        activity["last_product_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                    if isinstance(page_detail, dict) and type(page_detail.get("current_page")) is int:
+                        activity["current_page"] = page_detail["current_page"]
                     _emit_ingestion_progress(
                         progress,
-                        "filing-window",
-                        index,
-                        count,
+                        "filing-page",
+                        completed_pages,
+                        candidate_pages,
                         filing,
-                        status=f"window-{status}",
+                        status=f"page-{status}",
                         elapsed_seconds=time.monotonic() - parse_started,
-                        window_index=index,
-                        window_total=count,
+                        completed_page_count=completed_pages,
+                        candidate_page_count=candidate_pages,
+                        page_activity=activity,
                     )
 
                 try:
                     facts, refs, window_diagnostics = engine.parse_local_pdf_resumable(
                         company, filing, manifest,
                         cancel_check=cancel_check,
-                        progress=window_progress,
+                        progress=page_progress,
                         deadline=batch_deadline,
                     )
                     error = window_diagnostics[0] if window_diagnostics else None
@@ -3376,7 +3587,7 @@ def _parse_local_pdfs_bounded_impl(
                     # unfinished cohort gets a resumable budget diagnostic.
                     expired = time.monotonic() >= batch_deadline
                     cancelled = cancel_check is not None and cancel_check()
-                    if expired or cancelled:
+                    if cancelled or (expired and not _shared_producer):
                         # One final nonblocking pass closes the completion race
                         # at the exact batch cutoff without extending the wait.
                         harvest_checkpoint({
@@ -3585,7 +3796,7 @@ def _parse_local_pdfs_bounded_impl(
                     if item[0] not in results:
                         results[item[0]] = ([], [], reason)
                         _emit_ingestion_progress(
-                            progress, "filing-parse", parsed + 1, total, item[1][1],
+                        progress, "filing-parse", parsed + 1, total, item[1],
                             status="cancelled" if cancelled else "needs-action",
                             error_code=reason,
                         )
@@ -4237,7 +4448,9 @@ def _toc_statement_page_map(
 
 
 def _candidate_pages_from_text(
-    page_texts: Sequence[str], *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None
+    page_texts: Sequence[str], *, continuation_pages: int, rules: FinancialRulesSnapshot | None = None,
+    catalog_pages: Sequence[dict[str, Any]] | None = None,
+    document_units: DocumentUnitResolution | None = None,
 ) -> frozenset[int] | None:
     """Convert one page-index text stream into the bounded candidate set."""
 
@@ -4246,8 +4459,16 @@ def _candidate_pages_from_text(
     summary_pages: set[int] = set()
     statement_kinds: set[str] = set()
     lexical_starts: list[int] = []
-    scoped_units = discover_document_units(page_texts)
+    scoped_units = document_units or discover_document_units(page_texts)
+    labels = _labels_for_rules(rules)
+    lexical_labels = {
+        statement: tuple(tuple(_label_compact(label) for label in labels[concept])
+            for concept, owner in _STATEMENT_FOR.items()
+            if owner == statement and concept != "reported_roe")
+        for statement in ("income_statement", "balance_sheet", "cash_flow")
+    }
     for page_number, text in enumerate(page_texts, 1):
+        page_record = catalog_pages[page_number - 1] if catalog_pages and page_number <= len(catalog_pages) else {}
         compact = re.sub(r"\s+", "", text).casefold()
         if disclosure_page_needed(text):
             # Exact explicit audit/note sentences are independent candidates,
@@ -4255,14 +4476,19 @@ def _candidate_pages_from_text(
             summary_pages.add(page_number)
         if scoped_units.note_text_for_page(page_number) is not None:
             summary_pages.add(page_number)
-        labels = _labels_for_rules(rules)
         if any(label.casefold() in compact for label in labels["reported_roe"]):
             # ROE is commonly disclosed in a standalone performance table
             # outside the three formal statements. Keep the exact page in
             # the bounded coordinate pass without widening its continuation
             # window to unrelated narrative pages.
             summary_pages.add(page_number)
-        statement_context = _statement_context(text, rules)
+        if catalog_pages is not None:
+            statement_context = (
+                (page_record.get("statement"), page_record.get("scope"))
+                if page_record.get("statement") else None
+            )
+        else:
+            statement_context = _statement_context(text, rules)
         if statement_context is not None:
             starts.append(page_number)
             statement_kinds.add(statement_context[0])
@@ -4271,16 +4497,13 @@ def _candidate_pages_from_text(
         # very large exchange PDFs. Recover a bounded page only when several
         # canonical row labels from one statement co-occur; a single narrative
         # mention is intentionally insufficient.
+        lexical_text = _label_compact(compact)
         for statement, threshold in (
             ("income_statement", 3), ("balance_sheet", 4), ("cash_flow", 2),
         ):
-            concepts = [
-                concept for concept, owner in _STATEMENT_FOR.items()
-                if owner == statement and concept != "reported_roe"
-            ]
             hits = sum(
-                1 for concept in concepts
-                if any(_label_compact(label) in _label_compact(compact) for label in labels[concept])
+                1 for aliases in lexical_labels[statement]
+                if any(label in lexical_text for label in aliases)
             )
             if hits >= threshold:
                 lexical_starts.append(page_number)
@@ -4728,12 +4951,14 @@ class FinancialIngestionEngine:
         batch_timeout_seconds: float = 280.0,
         compatibility_rules: FinancialRulesSnapshot | None = None,
         checkpoint_dir: str | Path | None = None,
+        local_structure_root: str | Path | None = None,
     ) -> None:
         # The cache is deliberately optional so fixture/injected engines keep
         # their historical behavior. Production supplies a workspace-owned
         # directory; successful entries are content addressed and atomic.
         self._parse_cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._parse_cache_memory: dict[str, tuple[list[FinancialFact], list[EvidenceRef]]] = {}
+        self._parse_cache_mapping_versions: dict[str, str] = {}
         self._max_workers = max(1, min(3, int(max_workers)))
         self._parse_timeout_seconds = max(0.1, float(parse_timeout_seconds))
         self._batch_timeout_seconds = max(0.1, min(280.0, float(batch_timeout_seconds)))
@@ -4741,6 +4966,16 @@ class FinancialIngestionEngine:
         self._checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
         self._last_pdf_context: PdfTableContext | None = None
         self._document_execution: dict[str, dict[str, Any]] = {}
+        self._local_structure_root = Path(local_structure_root) if local_structure_root else None
+
+    def with_local_structure(self, root):
+        selected = Path(root) if root else None
+        if selected == self._local_structure_root:
+            return self
+        return FinancialIngestionEngine(cache_dir=self._parse_cache_dir, max_workers=self._max_workers,
+            parse_timeout_seconds=self._parse_timeout_seconds, batch_timeout_seconds=self._batch_timeout_seconds,
+            compatibility_rules=self._compatibility_rules, checkpoint_dir=self._checkpoint_dir,
+            local_structure_root=selected)
 
     def with_compatibility_rules(
         self, rules: FinancialRulesSnapshot | None
@@ -4761,6 +4996,7 @@ class FinancialIngestionEngine:
             batch_timeout_seconds=self._batch_timeout_seconds,
             compatibility_rules=selected,
             checkpoint_dir=self._checkpoint_dir,
+            local_structure_root=self._local_structure_root,
         )
 
     @staticmethod
@@ -4811,13 +5047,19 @@ class FinancialIngestionEngine:
         This reads only the exact source/config-addressed cache entries. It
         neither parses nor downloads and is not a new fact-admission gate.
         """
-        if self._parse_cache_dir is None:
+        if self._parse_cache_dir is None and not self._parse_cache_memory:
             return frozenset()
         pending = set()
         for filing in filings:
             if not filing.content_hash:
                 continue
             key = self._parse_cache_key(filing.local_path, company, filing, filing.content_hash)
+            cached_memory = self._parse_cache_memory.get(key)
+            if (cached_memory is not None and _cost_mapping_recompile_needed(
+                    cached_memory[0], self._parse_cache_mapping_versions.get(key), cached_memory[1])):
+                pending.add(filing.accession_number)
+            if self._parse_cache_dir is None:
+                continue
             try:
                 payload = json.loads((self._parse_cache_dir / f"{key}.json").read_text(encoding="utf-8"))
                 if (payload.get("parser_version") == _PDF_PARSER_VERSION
@@ -4825,6 +5067,10 @@ class FinancialIngestionEngine:
                     and any(isinstance(item, dict) and item.get("concept") in {
                         "reported_roe", "reported_roe_excluding_nonrecurring"}
                         for item in payload.get("facts", ()))):
+                    pending.add(filing.accession_number)
+                if (payload.get("parser_version") == _PDF_PARSER_VERSION
+                        and _cost_mapping_recompile_needed(
+                            payload.get("facts", ()), payload.get("financial_mapping_version"), payload.get("evidence", ()))):
                     pending.add(filing.accession_number)
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
@@ -4835,6 +5081,10 @@ class FinancialIngestionEngine:
     ) -> tuple[list[FinancialFact], list[EvidenceRef]] | None:
         cached = self._parse_cache_memory.get(key)
         if cached is not None:
+            if _cost_mapping_recompile_needed(
+                cached[0], self._parse_cache_mapping_versions.get(key), cached[1],
+            ):
+                return None
             return ([replace(item) for item in cached[0]], [replace(item) for item in cached[1]])
         if self._parse_cache_dir is None:
             return None
@@ -4849,6 +5099,10 @@ class FinancialIngestionEngine:
                     or payload.get("disclosure_version") != _SOURCE_DISCLOSURE_VERSION):
                 return None
             cached_fact_rows = payload["facts"]
+            if _cost_mapping_recompile_needed(
+                cached_fact_rows, payload.get("financial_mapping_version"), payload.get("evidence", ()),
+            ):
+                return None
             if (
                 payload.get("roe_row_mapping_version") != _ROE_ROW_MAPPING_VERSION
                 and any(
@@ -4877,6 +5131,7 @@ class FinancialIngestionEngine:
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
         self._parse_cache_memory[key] = (facts, refs)
+        self._parse_cache_mapping_versions[key] = str(payload.get("financial_mapping_version", ""))
         return ([replace(item) for item in facts], [replace(item) for item in refs])
 
     def _store_parse_cache(
@@ -4894,6 +5149,7 @@ class FinancialIngestionEngine:
         ]
         safe_refs = [replace(item) for item in refs]
         self._parse_cache_memory[key] = (safe_facts, safe_refs)
+        self._parse_cache_mapping_versions[key] = FINANCIAL_MAPPING_VERSION
         if self._parse_cache_dir is None:
             return
         payload = json.dumps(
@@ -4901,6 +5157,7 @@ class FinancialIngestionEngine:
                 "parser_version": _PDF_PARSER_VERSION,
                 "disclosure_version": _SOURCE_DISCLOSURE_VERSION,
                 "roe_row_mapping_version": _ROE_ROW_MAPPING_VERSION,
+                "financial_mapping_version": FINANCIAL_MAPPING_VERSION,
                 "facts": [item.to_dict() for item in safe_facts],
                 "evidence": [item.to_dict() for item in safe_refs],
                 "document_execution": {document_id: self._document_execution[document_id]
@@ -4954,8 +5211,9 @@ class FinancialIngestionEngine:
 
         from .financial_checkpoint import (
             CheckpointKey,
+            PdfWorkerSession,
             WindowCheckpointStore,
-            plan_page_windows,
+            plan_checkpointed_page_windows,
             run_checkpointed_windows,
         )
 
@@ -4968,7 +5226,9 @@ class FinancialIngestionEngine:
         if not filing.local_path or not Path(filing.local_path).is_file():
             return [], [], ("pdf_file_missing",)
         try:
+            hash_started = time.monotonic()
             actual_hash = self._file_sha256(filing.local_path, cancel_check=user_cancelled, deadline=deadline)
+            observation["source_hash_elapsed_seconds"] = round(time.monotonic() - hash_started, 4)
         except TimeoutError:
             return [], [], ("pdf_document_budget_exhausted_resumable",)
         except OSError:
@@ -4983,8 +5243,42 @@ class FinancialIngestionEngine:
         filing = replace(filing, content_hash=actual_hash)
         manifest = replace(manifest, content_hash=actual_hash)
         observation["source_hash"] = actual_hash
-        document_context = read_document_context(filing.local_path, cancel_check=cancel_check,
-            timeout_seconds=max(0.01, min(45.0, deadline - time.monotonic())))
+        document_context_started = time.monotonic()
+        document_context = read_document_context(filing.local_path, cancel_check=user_cancelled,
+            timeout_seconds=max(0.01, deadline - time.monotonic()), deadline=deadline,
+            checkpoint_dir=(self._checkpoint_dir / 'document-text') if self._checkpoint_dir else None,
+            source_hash=actual_hash, progress=progress)
+        observation["document_text_context_elapsed_seconds"] = round(time.monotonic() - document_context_started, 4)
+        observation["context_completed_pages"] = document_context.completed_pages
+        observation["pdf_worker_diagnostics"] = list(document_context.worker_diagnostics)
+        from .financial_sources.document_catalog import (
+            candidate_pages_from_catalog,
+            document_catalog,
+            load_document_catalog,
+            save_document_catalog,
+        )
+        catalog_dir = self._checkpoint_dir or Path(filing.local_path).parent / '.checkpoints'
+        rules_fingerprint = self._compatibility_rules.semantic_fingerprint()
+        catalog_started = time.monotonic()
+        catalog = load_document_catalog(catalog_dir, actual_hash, rules_fingerprint)
+        observation["catalog_cache_hit"] = catalog is not None
+        if catalog is None:
+            catalog = document_catalog(
+                document_context,
+                actual_hash,
+                rules_fingerprint,
+                lambda text: _statement_context(text, self._compatibility_rules),
+                select_candidates=lambda texts, records: _candidate_pages_from_text(
+                    texts,
+                    continuation_pages=3,
+                    rules=self._compatibility_rules,
+                    catalog_pages=records,
+                    document_units=document_context.units,
+                ),
+            )
+            save_document_catalog(catalog_dir, catalog)
+        observation["catalog_elapsed_seconds"] = round(time.monotonic() - catalog_started, 4)
+        observation["catalog_pages"] = len(catalog['pages'])
         if getattr(document_context, "diagnostic_code", ""):
             return [], [], (document_context.diagnostic_code,)
         page_count = len(document_context.page_texts) or _pdf_page_count(
@@ -4993,10 +5287,19 @@ class FinancialIngestionEngine:
                             "native_text_page_count": sum(bool(text.strip()) for text in document_context.page_texts)})
         if cancel_check is not None and cancel_check():
             return [], [], (("pdf_parse_cancelled" if user_cancelled is not None and user_cancelled() else "pdf_document_budget_exhausted_resumable"),)
+        candidate_plan_started = time.monotonic()
         selected_pages = candidate_pages
-        if selected_pages is None and document_context.page_texts:
-            selected_pages = _candidate_pages_from_text(document_context.page_texts,
-                continuation_pages=3, rules=self._compatibility_rules)
+        if selected_pages is None:
+            selected_pages = candidate_pages_from_catalog(catalog)
+        if selected_pages is None:
+            # The complete source-bound text stream has already been indexed.
+            # An incomplete financial map means broaden the plan, not start a
+            # second text worker and classify the same original again.
+            if document_context.completed_pages == len(document_context.page_texts) and document_context.page_texts:
+                selected_pages = frozenset(range(1, len(document_context.page_texts) + 1))
+                catalog = {**catalog, 'candidate_plan_complete': True,
+                    'pages': [{**item, 'candidate': True} for item in catalog['pages']]}
+                save_document_catalog(catalog_dir, catalog)
         if selected_pages is None:
             indexed_pages, index_diagnostic = _candidate_financial_pages_with_diagnostic(
                 filing.local_path,
@@ -5018,12 +5321,17 @@ class FinancialIngestionEngine:
                 selected_pages = frozenset(range(1, page_count + 1))
             else:
                 selected_pages = indexed_pages
+            if selected_pages is not None:
+                selected = set(selected_pages)
+                catalog = {**catalog, 'candidate_plan_complete': True,
+                    'pages': [{**item, 'candidate': item['page'] in selected}
+                        for item in catalog['pages']]}
+                save_document_catalog(catalog_dir, catalog)
+        observation["candidate_plan_elapsed_seconds"] = round(time.monotonic() - candidate_plan_started, 4)
         if not selected_pages:
             return [], [], ("pdf_candidate_pages_unavailable",)
         pages = frozenset(int(page) for page in selected_pages if int(page) > 0)
         page_count = page_count or max(pages)
-        windows = plan_page_windows(page_count, pages, window_size=window_size)
-        observation.update({"indexed_page_count": len(pages), "window_total": len(windows)})
         from .financial_statutory_currency import bind_statutory_presentation
         document_context = replace(document_context, units=bind_statutory_presentation(
             document_context.units, document_context.page_texts, company, filing))
@@ -5034,9 +5342,7 @@ class FinancialIngestionEngine:
             return [], [], ("pdf_statement_period_conflict",)
         if not manifest.period_end:
             return [], period_gap_evidence(filing, document_context.period_gaps), ("PERIOD_DECLARATION_NOT_FOUND",)
-        store = WindowCheckpointStore(
-            self._checkpoint_dir or (Path(filing.local_path).parent / ".checkpoints")
-        )
+        store = WindowCheckpointStore(catalog_dir)
         key = CheckpointKey(
             actual_hash,
             _PDF_PARSER_VERSION,
@@ -5057,6 +5363,28 @@ class FinancialIngestionEngine:
                 ).encode("utf-8")
             ).hexdigest(),
         )
+        windows = plan_checkpointed_page_windows(store, key, page_count, pages)
+        # Keep a continuous table's dependency order intact, but process
+        # formal consolidated statements before independent note blocks.
+        blocks = []
+        for window in windows:
+            if blocks and window.pages[0] == blocks[-1][-1].pages[-1] + 1:
+                blocks[-1].append(window)
+            else:
+                blocks.append([window])
+        main_pages = {item['page'] for item in catalog['pages']
+            if item.get('statement') in {'income_statement', 'balance_sheet', 'cash_flow'}
+            and item.get('scope') == 'consolidated'}
+        declaration_pages = {item['page'] for item in catalog['pages'] if item.get('units') or item.get('periods')}
+        def block_priority(block):
+            block_pages = {page for window in block for page in window.pages}
+            return (0 if block_pages & main_pages else 1 if block_pages & declaration_pages else 2,
+                block[0].pages[0])
+        windows = tuple(window for block in sorted(blocks, key=block_priority) for window in block)
+        observation.update({"indexed_page_count": len(pages), "window_total": len(windows),
+            "page_total": len(pages), "candidate_page_count": len(pages),
+            "parse_strategy": "positioned-page-checkpoint",
+            "checkpointed_work_unit": "page"})
 
         worker = _CheckpointPdfWindowWorker(
             filing.local_path,
@@ -5065,6 +5393,8 @@ class FinancialIngestionEngine:
             manifest,
             self._compatibility_rules,
             document_context.units,
+            tuple(document_context.page_texts),
+            str(store.directory),
         )
 
         window_failures: list[str] = []
@@ -5074,21 +5404,40 @@ class FinancialIngestionEngine:
             failed_pages.update(_window.pages)
             if getattr(error, "code", "") == "PDF_WORKER_START_FAILED":
                 window_failures.append("PDF_WORKER_START_FAILED")
+            else:
+                from .financial_source_errors import LOCAL_PARSER_AVAILABILITY_CODES
+                code = getattr(error, 'code', '')
+                if code in LOCAL_PARSER_AVAILABILITY_CODES:
+                    window_failures.append(code)
+            if isinstance(getattr(error, 'diagnostic', None), dict):
+                observation['pdf_worker_diagnostics'].append(error.diagnostic)
 
-        checkpoints = run_checkpointed_windows(
-            store,
-            key,
-            windows,
-            worker,
-            max_retries=1,
-            cancel_check=cancel_check,
-            progress=progress,
-            timeout_seconds=self._parse_timeout_seconds,
-            input_fingerprint=key.digest,
-            deterministic_failure=_is_deterministic_pdf_window_failure,
-            on_failure=window_failed,
-            deadline=deadline,
-        )
+        with PdfWorkerSession(worker) as worker_session:
+            checkpoints = run_checkpointed_windows(
+                store,
+                key,
+                windows,
+                worker_session,
+                max_retries=1,
+                cancel_check=user_cancelled,
+                progress=progress,
+                timeout_seconds=120.0,
+                input_fingerprint=key.digest,
+                deterministic_failure=_is_deterministic_pdf_window_failure,
+                on_failure=window_failed,
+                deadline=deadline,
+                scheduling_slice=True,
+                adaptive=True,
+                independent_pages=True,
+                work_identity={'accession_number': filing.accession_number,
+                    'period_end': manifest.period_end, 'fiscal_period': manifest.fiscal_period,
+                    'revision': manifest.revision, 'scope': 'original-statement-scopes',
+                    'statements': sorted({kind for text in document_context.page_texts
+                        if (kind := (_statement_context(text, self._compatibility_rules) or ('', ''))[0])}),
+                    'missing_concepts': [], 'input_artifact_hash': actual_hash},
+            )
+        observation["work_progress"] = store.work_progress(key)
+        observation["checkpoint_write_elapsed_seconds"] = round(store.write_elapsed_seconds, 4)
         exhausted = store.load_exhausted(key, input_fingerprint=key.digest)
         if exhausted is not None:
             failed_window = exhausted.get("failed_window", {})
@@ -5098,12 +5447,18 @@ class FinancialIngestionEngine:
         facts: dict[str, FinancialFact] = {}
         refs: dict[str, EvidenceRef] = {}
         for checkpoint in checkpoints:
+            if isinstance((checkpoint.context or {}).get('pdf_worker_diagnostic'), dict):
+                observation['pdf_worker_diagnostics'].append(checkpoint.context['pdf_worker_diagnostic'])
             for fact in checkpoint.facts:
                 facts.setdefault(fact.fact_id, fact)
             for ref in checkpoint.evidence:
                 refs.setdefault(ref.evidence_id, ref)
+        observation["completed_page_count"] = len({
+            page for checkpoint in checkpoints for page in checkpoint.window.pages
+        })
+        completed_pages = {page for checkpoint in checkpoints for page in checkpoint.window.pages}
         diagnostics = (
-            () if len(checkpoints) == len(windows) else
+            () if pages.issubset(completed_pages) else
             tuple(dict.fromkeys((*window_failures,
                 "pdf_window_exhausted_same_input" if exhausted is not None else
                 "pdf_parse_cancelled" if user_cancelled is not None and user_cancelled() else
@@ -5111,10 +5466,44 @@ class FinancialIngestionEngine:
                 "pdf_window_incomplete")))
         )
         observation.update({"completed_window_count": len(checkpoints),
+                            "completed_page_count": len(completed_pages),
                             "parser_failed_pages": sorted(failed_pages),
                             "parse_elapsed_seconds": round(time.monotonic() - parse_started, 3),
                             "failure_stage": "parse" if diagnostics else "",
                             "root_error_code": diagnostics[0] if diagnostics else ""})
+        sessions = {}
+        for item in observation["pdf_worker_diagnostics"]:
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("worker_session_pid")
+            if pid in worker_session.started_worker_pids:
+                sessions[str(pid)] = item
+        observation["pdf_open_elapsed_seconds"] = round(sum(
+            float(item.get("pdf_open_elapsed_seconds", 0.0) or 0.0)
+            for item in sessions.values()
+        ), 4)
+        observation["worker_session_start_count"] = worker_session.process_start_count
+        for metric in ('geometry_cache_hits', 'geometry_extracted_pages'):
+            observation[metric] = sum(int(item.get(metric, 0)) for item in sessions.values())
+        observation['geometry_extract_elapsed_seconds'] = round(sum(
+            float(item.get('geometry_extract_elapsed_seconds', 0.0)) for item in sessions.values()), 4)
+        observation["worker_session_open_elapsed_seconds"] = round(sum(
+            float(item.get("worker_session_open_elapsed_seconds", 0.0) or 0.0)
+            for item in sessions.values()
+        ), 4)
+        observation["page_text_cache_elapsed_seconds"] = round(sum(
+            float(item.get("page_text_cache_elapsed_seconds", 0.0) or 0.0)
+            for item in sessions.values()
+        ), 4)
+        observation["worker_page_elapsed_seconds"] = round(sum(
+            float(item.get("elapsed_seconds", 0.0) or 0.0)
+            for item in observation["pdf_worker_diagnostics"] if isinstance(item, dict)
+            and item.get("worker_session_pid") in worker_session.started_worker_pids
+        ), 4)
+        from .financial_sources.pdf_document_units import persist_runtime_receipt
+        persist_runtime_receipt(store.directory / 'document-text', actual_hash,
+            raw_error_code=observation['root_error_code'], completed_pages=document_context.completed_pages,
+            workers=observation['pdf_worker_diagnostics'])
         return (
             sorted(facts.values(), key=lambda fact: (fact.source_page or 0, fact.fact_id)),
             sorted(refs.values(), key=lambda ref: ref.evidence_id),
@@ -5346,8 +5735,13 @@ class FinancialIngestionEngine:
         compatibility_rules: FinancialRulesSnapshot | None = None,
         initial_context: dict[str, Any] | None = None,
         document_units: DocumentUnitResolution | None = None,
+        document_units_bound: bool = False,
+        document_texts: Sequence[str] | None = None,
+        pdf_document: Any = None,
+        page_data: Any = None,
     ):
         import pdfplumber
+        from contextlib import nullcontext
 
         facts: list[FinancialFact] = []
         refs: list[EvidenceRef] = []
@@ -5365,8 +5759,13 @@ class FinancialIngestionEngine:
         rules = compatibility_rules or self._compatibility_rules
         if not index_precomputed:
             candidate_pages = _candidate_financial_pages(path, rules=rules)
-        with pdfplumber.open(path) as pdf:
-            document_texts = cached_page_texts(path)
+        if page_data is not None and not document_texts:
+            raise ValueError('positioned page cache requires a complete source-bound text index')
+        pdf_context = (nullcontext(pdf_document) if pdf_document is not None or page_data is not None
+            else pdfplumber.open(path))
+        with pdf_context as pdf:
+            if document_texts is None:
+                document_texts = cached_page_texts(path)
             if document_units is None:
                 # The native index normally already owns all text. A direct
                 # positioned fixture uses its supplied pages without filesystem
@@ -5378,12 +5777,12 @@ class FinancialIngestionEngine:
                     else:
                         document_texts = tuple(page.extract_text() or "" for page in pdf.pages)
                 document_units = discover_document_units(document_texts)
-            if document_texts is not None:
+            if document_texts is not None and not document_units_bound:
                 from .financial_statutory_currency import bind_statutory_presentation
                 document_units = bind_statutory_presentation(document_units, document_texts, company, filing)
             normalization_refs.extend(document_units.statutory_presentation)
             if not manifest.period_end:
-                observed_pages = cached_page_texts(path)
+                observed_pages = document_texts if page_data is not None else cached_page_texts(path)
                 if observed_pages is None:
                     observed_pages = []
                     for page_number, page in enumerate(pdf.pages, 1):
@@ -5397,14 +5796,20 @@ class FinancialIngestionEngine:
                 manifest = _manifest_from_observed_pages(manifest, filing, observed_pages)
                 if not manifest.period_end:
                     return [], period_gap_evidence(filing, statement_period_gaps(observed_pages))
-            for page_number, page in enumerate(pdf.pages, 1):
-                if candidate_pages is not None and page_number not in candidate_pages:
+            total_pages = len(document_texts) if page_data is not None else len(pdf.pages)
+            page_numbers = sorted(candidate_pages) if candidate_pages is not None else range(1, total_pages + 1)
+            for page_number in page_numbers:
+                if page_number < 1 or page_number > total_pages:
                     continue
-                words = page.extract_words(keep_blank_chars=False, use_text_flow=False) or []
+                if page_data is not None:
+                    words, page_text = page_data(page_number)
+                else:
+                    page = pdf.pages[page_number - 1]
+                    words = page.extract_words(keep_blank_chars=False, use_text_flow=False) or []
+                    page_text = (page.extract_text() or '') if words else ''
                 if not words:
                     continue
                 rows = _positioned_pdf_rows(words)
-                page_text = page.extract_text() or ""
                 if rows:
                     page_bbox = (min(row.bbox[0] for row in rows), min(row.bbox[1] for row in rows),
                                  max(row.bbox[2] for row in rows), max(row.bbox[3] for row in rows))
@@ -5462,6 +5867,16 @@ class FinancialIngestionEngine:
                         ))
                         continue
                     table = PdfTableAST(page_number, statement, scope, table_currency, multiplier, _period_headers(table_rows), table_rows)
+                    # Preserve every positioned row, including unknown labels.
+                    # This is a source observation, not a guessed financial fact.
+                    structure = json.dumps({"contract":"native-table-v1", "statement":statement,
+                        "scope":scope, "currency":table_currency, "scale":str(multiplier),
+                        "rows":[{"bbox":row.bbox, "cells":[asdict(cell) for cell in row.cells]}
+                                for row in table_rows]}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    table_id = hashlib.sha256((filing.content_hash + str(page_number) + structure).encode()).hexdigest()
+                    normalization_refs.append(EvidenceRef(f"table-structure:{table_id}", filing.document_id,
+                        filing.source_url, "Positioned table / unvalidated observation", f"page:{page_number}",
+                        structure, filing.filed_at, filing.content_hash))
                     columns = context.periods or _period_columns(table.rows, rules=rules, source_page=page_number)
                     if section.summary and not columns:
                         columns = _summary_roe_period_columns(table.rows, manifest)
@@ -5789,7 +6204,12 @@ class FinancialIngestionEngine:
                                     prefix
                                     and any("\u4e00" <= char <= "\u9fff" for char in prefix[-1:])
                                     and not numbered_prefix
-                                    and not (concept == "revenue" and prefix == "其中")
+                                    and not (prefix == "其中" and (
+                                        concept == "revenue" or (
+                                            concept in {"cost_of_revenue", "total_operating_cost"}
+                                            and cost_row_concept(compact) == concept
+                                        )
+                                    ))
                                 ):
                                     continue
                             label_end = max(

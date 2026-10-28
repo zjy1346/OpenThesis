@@ -52,8 +52,8 @@ const GEMINI_MODELS: &[ModelPreset] = &[
 ];
 const OPENROUTER_MODELS: &[ModelPreset] = &[ModelPreset { model_id: "openrouter/free", alias: "OpenRouter Free", capabilities: TEXT_JSON, billing_class: "free_tier" }];
 const OLLAMA_MODELS: &[ModelPreset] = &[
-    ModelPreset { model_id: "qwen3:8b", alias: "Qwen 3 8B", capabilities: TEXT_JSON, billing_class: "local_no_provider_fee" },
-    ModelPreset { model_id: "deepseek-r1:8b", alias: "DeepSeek R1 8B", capabilities: TEXT_JSON, billing_class: "local_no_provider_fee" },
+    ModelPreset { model_id: "qwen3:8b", alias: "Qwen 3 8B", capabilities: TEXT_JSON, billing_class: "unknown" },
+    ModelPreset { model_id: "deepseek-r1:8b", alias: "DeepSeek R1 8B", capabilities: TEXT_JSON, billing_class: "unknown" },
 ];
 static PROVIDERS: &[ProviderDefinition] = &[
     ProviderDefinition {
@@ -81,7 +81,7 @@ static PROVIDERS: &[ProviderDefinition] = &[
         requires_api_key: true,
         supports_discovery: false,
         free_hint: false,
-        allowed_hosts: &["dashscope.aliyuncs.com"],
+        allowed_hosts: &["dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"],
         recommended_models: QWEN_MODELS,
         models_path: None,
         default_test_model_id: Some("qwen3.7-flash"),
@@ -185,7 +185,7 @@ static PROVIDERS: &[ProviderDefinition] = &[
         help_url: "https://ollama.com/download",
         requires_api_key: false,
         supports_discovery: true,
-        free_hint: true,
+        free_hint: false,
         allowed_hosts: &["127.0.0.1", "localhost", "::1"],
         recommended_models: OLLAMA_MODELS,
         models_path: Some("/api/tags"),
@@ -297,14 +297,6 @@ pub(crate) fn stream_requests_usage(provider_id: &str) -> bool {
     matches!(provider_id, "openai" | "deepseek" | "qwen" | "kimi_cn" | "kimi_global")
 }
 
-pub(crate) fn stream_reasoning_fields(provider_id: &str) -> &'static [&'static str] {
-    match provider_id {
-        "deepseek" | "qwen" | "kimi_cn" | "kimi_global" | "glm" => &["reasoning_content"],
-        "openrouter" => &["reasoning", "reasoning_details"],
-        "ollama" => &["thinking"],
-        _ => &[],
-    }
-}
 pub fn validate_provider_id(value: &str) -> Result<(), String> {
     if value.len() > 64
         || value.is_empty()
@@ -337,44 +329,59 @@ pub fn validate_endpoint(provider_id: &str, endpoint: &str) -> Result<(), String
     if endpoint.len() > 2048 || endpoint.is_empty() {
         return Err("endpoint is invalid".to_string());
     }
-    let provider = find(provider_id).ok_or_else(|| "unknown provider".to_string())?;
+    find(provider_id).ok_or_else(|| "unknown provider".to_string())?;
     let url = tauri::Url::parse(endpoint).map_err(|_| "endpoint is invalid".to_string())?;
-    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() {
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("endpoint must not contain credentials or a query".to_string());
     }
     let host = url
         .host_str()
         .ok_or_else(|| "endpoint host is missing".to_string())?;
-    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
-    if loopback {
-        if !matches!(provider.provider_id, "ollama" | "custom") || url.scheme() != "http" {
-            return Err(
-                "loopback endpoint must use http and belong to Ollama or custom".to_string(),
-            );
-        }
-        return Ok(());
-    }
-    if url.scheme() != "https" {
+    validate_model_destination(&url)?;
+    let local = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        || host.ends_with(".localhost")
+        || host.trim_matches(['[',']']).parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+            std::net::IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        });
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
         return Err("cloud endpoint must use https".to_string());
-    }
-    if provider.provider_id != "custom"
-        && provider.provider_id != "ollama"
-        && !provider.allowed_hosts.contains(&host)
-    {
-        return Err("endpoint host is not allowed for this provider".to_string());
     }
     Ok(())
 }
 
+/// Saved user targets may be private/Fake-IP, but never metadata or non-unicast.
+pub(crate) fn validate_model_destination(url: &reqwest::Url) -> Result<(),String> {
+    let host=url.host_str().ok_or("endpoint host is missing")?.trim_matches(['[',']']).trim_end_matches('.').to_ascii_lowercase();
+    if ["metadata.google.internal","metadata.goog","instance-data"].contains(&host.as_str())
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| !allowed_model_ip(ip)) {
+        return Err("MODEL_ENDPOINT_FORBIDDEN_TARGET".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn allowed_model_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let a=ip.octets();
+            !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast() && a[0]!=0 && a[0]<224
+                && !["169.254.169.254","169.254.170.2","100.100.100.200"].contains(&ip.to_string().as_str())
+        }
+        std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(||
+            !ip.is_unspecified() && !ip.is_multicast() && ip != "fd00:ec2::254".parse::<std::net::Ipv6Addr>().unwrap(),
+            |v4| allowed_model_ip(std::net::IpAddr::V4(v4))),
+    }
+}
+
 pub fn billing_class_for(provider_id: &str, model_id: &str) -> &'static str {
+    // A loopback connection can forward cloud models; model names do not prove hosting cost.
+    if provider_id == "ollama" { return "unknown"; }
     if let Some(provider) = find(provider_id) {
         if let Some(preset) = provider.recommended_models.iter().find(|preset| preset.model_id == model_id) {
             return preset.billing_class;
         }
     }
-    if provider_id == "ollama" {
-        "local_no_provider_fee"
-    } else if provider_id == "openrouter"
+    if provider_id == "openrouter"
         && (model_id == "openrouter/free" || model_id.ends_with(":free"))
     {
         "free_tier"
@@ -399,7 +406,7 @@ mod tests {
         assert!(!all().iter().any(|provider| provider.provider_id == "none"));
         let ollama = find("ollama").unwrap();
         assert!(!ollama.requires_api_key);
-        assert!(ollama.free_hint);
+        assert!(!ollama.free_hint); // Localhost alone does not certify execution location or price.
     }
     #[test]
     fn providers_expose_builtin_models_and_test_defaults() {
@@ -426,13 +433,23 @@ mod tests {
     fn endpoint_policy_accepts_official_and_local_hosts() {
         assert!(validate_endpoint("openai", "https://api.openai.com/v1").is_ok());
         assert!(validate_endpoint("ollama", "http://localhost:11434").is_ok());
-        assert!(validate_endpoint("ollama", "https://localhost:11434").is_err());
-        assert!(validate_endpoint("openai", "http://localhost:11434").is_err());
+        assert!(validate_endpoint("ollama", "https://localhost:11434").is_ok());
+        assert!(validate_endpoint("openai", "http://localhost:11434").is_ok());
         assert!(validate_endpoint("custom", "http://localhost:11434").is_ok());
+        assert!(validate_endpoint("custom", "http://[::1]:11434").is_ok());
         assert!(validate_endpoint("ollama", "https://remote.example/v1").is_ok());
         assert!(validate_endpoint("openai", "http://api.openai.com/v1").is_err());
-        assert!(validate_endpoint("openai", "https://evil.example/v1").is_err());
+        assert!(validate_endpoint("openai", "https://user-chosen.example/v1").is_ok());
         assert!(validate_endpoint("custom", "https://example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn explicitly_configured_destinations_are_brand_independent_but_not_metadata_321() {
+        assert!(validate_endpoint("openai", "https://enterprise.internal/v1").is_ok());
+        assert!(validate_endpoint("custom", "https://198.18.0.1/v1").is_ok());
+        assert!(validate_endpoint("custom", "https://169.254.169.254/latest/meta-data").is_err());
+        assert!(validate_endpoint("custom", "https://0.0.0.0/v1").is_err());
+        assert!(validate_endpoint("custom", "https://224.0.0.1/v1").is_err());
     }
 
     #[test]

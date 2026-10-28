@@ -2,17 +2,37 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { COPY } from "../../i18n";
-import { exportFinancialDiagnostics, getFinancialDiagnostics, listConfiguredModels } from "../../backend";
+import { exportFinancialDiagnostics, exportResearchDiagnostics, getFinancialDiagnostics, getResearchDiagnostics, listConfiguredModels } from "../../backend";
 import { stripReportPreamble } from "./ReportWorkspace";
 import { ReportWorkspace } from "./ReportWorkspace";
 
 vi.mock("../../backend", () => ({
   getResearchReport: vi.fn(), exportResearchReport: vi.fn(),
   getFinancialDiagnostics: vi.fn(), exportFinancialDiagnostics: vi.fn(),
+  getResearchDiagnostics: vi.fn(), exportResearchDiagnostics: vi.fn(),
   listConfiguredModels: vi.fn(),
 }));
 
 describe("report presentation", () => {
+  it.each(["completed", "partial"] as const)("exports research diagnostics for a %s report without requiring financial diagnostics", async (status) => {
+    const diagnostics = {
+      schema: "openthesis.research-diagnostics.v1",
+      run: { run_id: "research-run", status, started_at: "now", completed_at: null, wall_elapsed_seconds: 45 },
+      totals: { input_tokens: { value: null, known_sum: 0, unknown_attempts: 1 } },
+      actual_cost: { amount: null, currency: null, status: "unknown" },
+    };
+    vi.mocked(getResearchDiagnostics).mockResolvedValue(diagnostics as never);
+    vi.mocked(exportResearchDiagnostics).mockResolvedValue(true);
+    render(<ReportWorkspace report={{ run_id: "research-run", ticker: "1211", company_name: "BYD", status, report_language: "en", markdown: "Body", html: "" }} copy={COPY.en} />);
+    const button = screen.getByRole("button", { name: COPY.en.researchExportDiagnostics });
+    expect(button).toBeVisible();
+    fireEvent.click(button);
+    await waitFor(() => expect(getResearchDiagnostics).toHaveBeenCalledWith("research-run"));
+    await waitFor(() => expect(exportResearchDiagnostics).toHaveBeenCalledWith(diagnostics));
+    expect(screen.getByRole("status")).toHaveTextContent(COPY.en.researchDiagnosticsExported);
+    expect(getFinancialDiagnostics).not.toHaveBeenCalled();
+  });
+
   it("shows an unconfirmed reporting currency without relabelling the listing currency", () => {
     render(<ReportWorkspace copy={COPY.en} report={{ run_id: "currency", ticker: "09988.HK", company_name: "Fixture",
       status: "partial", report_language: "en", listing_currency: "HKD", reporting_currency: "", markdown: "Body", html: "" }} />);
@@ -36,6 +56,20 @@ describe("report presentation", () => {
     await waitFor(() => expect(approve).toHaveBeenCalledWith("budget-run", "digest-1", ["gap-growth"]));
     expect(await screen.findByText(/The plan changed or approval did not complete/)).toHaveAttribute("role", "alert");
     expect(screen.getByText("Saved report body")).toBeInTheDocument();
+  });
+
+  it("forwards an explicit adaptive migration choice through the report workspace", async () => {
+    const approve = vi.fn().mockResolvedValue(undefined);
+    render(<ReportWorkspace copy={COPY.en} onApproveBudgetGaps={approve} report={{ run_id: "legacy-run", ticker: "1211", company_name: "Fixture",
+      status: "partial", report_language: "en", markdown: "Saved report body", html: "", call_plan: {
+        plan_digest: "legacy-digest", max_calls: null, max_input_estimate: null, max_output_tokens: null,
+        limit_source: "unknown", adaptive_resume_available: true, migration_choice_required: true,
+        pending_budget_gaps: [],
+      } }} />);
+
+    expect(approve).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep current limit" }));
+    expect(approve).toHaveBeenCalledWith("legacy-run", "legacy-digest", [], "keep");
   });
   it("exposes saved-content revalidation without a model-retry plan or configured model", async () => {
     const local = vi.fn(async () => undefined);
@@ -63,6 +97,7 @@ describe("report presentation", () => {
         requires_new_attempt_authorization: true, unknown_stages: ["business-analyst"] },
     }} />);
     const button = await screen.findByRole("button", { name: COPY.en.recoveryRetry });
+    await waitFor(() => expect(screen.getByLabelText(COPY.en.recoveryModel)).toHaveValue("m"));
     expect(button).toBeDisabled();
     expect(screen.getByText(COPY.en.recoveryUnknownWarning)).toBeInTheDocument();
     const consent = screen.getByRole("checkbox", { name: COPY.en.recoveryConfirmNewAttempt });
@@ -256,18 +291,111 @@ describe("report presentation", () => {
     resolveRetry?.();
   });
 
-  it("keeps a zero-token financial retry visible with missing periods and no model selection", async () => {
+  it("keeps local financial repair visible and only claims stale AI conclusions when research output exists", async () => {
     let resolveRetry: (() => void) | undefined;
     const retryFinancials = vi.fn(() => new Promise<void>((resolve) => { resolveRetry = resolve; }));
-    render(<ReportWorkspace report={{ run_id: "run", ticker: "9988", company_name: "Alibaba", status: "completed", report_language: "en", financial_status: { state: "incomplete", retryable: true, history_years: 2, expected_periods: ["2026", "2025", "2024"], available_periods: ["2026", "2024"], missing_periods: ["2025"], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-download", last_error: "temporary_timeout", updated_at: "", next_action: "retry_missing_periods", model_calls: 0, token_delta: 0, snapshot_stale: true }, markdown: "# Report", html: "" }} copy={COPY.en} onRetryFinancials={retryFinancials} />);
+    render(<ReportWorkspace report={{ run_id: "run", ticker: "9988", company_name: "Alibaba", status: "completed", report_language: "en", is_substantive: true, financial_status: { state: "incomplete", retryable: true, history_years: 2, expected_periods: ["2026", "2025", "2024"], available_periods: ["2026", "2024"], missing_periods: ["2025 FY"], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-download", last_error: "temporary_timeout", updated_at: "", next_action: "retry_missing_periods", model_calls: 0, token_delta: 0, snapshot_stale: true, has_research_output: true }, markdown: "# Report", html: "" }} copy={COPY.en} onRetryFinancials={retryFinancials} />);
 
-    expect(screen.getByText("Missing fiscal years: 2025")).toBeInTheDocument();
-    expect(screen.getByText(COPY.en.financialZeroToken)).toBeInTheDocument();
+    expect(screen.getByText("Missing filing periods: 2025 annual filing")).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.financialModelBoundary)).toBeInTheDocument();
     expect(screen.getByText(COPY.en.financialSnapshotStale)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: COPY.en.retryFinancials }));
     expect(retryFinancials).toHaveBeenCalledTimes(1);
     expect(await screen.findByText(COPY.en.retryingFinancials)).toBeInTheDocument();
     resolveRetry?.();
+  });
+
+  it.each(["en", "zh-CN", "zh-Hant"] as const)("offers the local recognition setup action for unfinished financials in %s", (language) => {
+    const configure = vi.fn();
+    const copy = COPY[language];
+    render(<ReportWorkspace report={{
+      run_id: "local-structure", ticker: "1211", company_name: "BYD", status: "partial", report_language: language,
+      financial_status: {
+        state: "incomplete", retryable: false, history_years: 1, expected_periods: ["2025"],
+        available_periods: [], missing_periods: ["2025"], nodes: [], issues: [], attempt_count: 1,
+        last_stage: "filing-parse", last_error: "", updated_at: "", next_action: "none", model_calls: 0, token_delta: 0,
+        local_structure: { available: false, enabled: false, error_code: "STRUCTURE_COMPONENT_NOT_INSTALLED" },
+      },
+      markdown: "# Saved report", html: "",
+    }} copy={copy} onConfigureCloud={configure} />);
+
+    expect(screen.getByText(copy.localStructureConfigureBody)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: copy.localStructureConfigure }));
+    expect(configure).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides local recognition setup when enabled, financials are complete, or the report is legacy", () => {
+    const base = {
+      retryable: false, history_years: 1, expected_periods: [], available_periods: [], missing_periods: [],
+      nodes: [], issues: [], attempt_count: 0, last_stage: "", last_error: "", updated_at: "", next_action: "none",
+      model_calls: 0, token_delta: 0,
+    };
+    const configure = vi.fn();
+    const { rerender } = render(<ReportWorkspace report={{
+      run_id: "enabled", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en",
+      financial_status: { ...base, state: "incomplete", local_structure: { available: true, enabled: true, error_code: "" } },
+      markdown: "# Saved report", html: "",
+    }} copy={COPY.en} onConfigureCloud={configure} />);
+    expect(screen.queryByRole("button", { name: COPY.en.localStructureConfigure })).not.toBeInTheDocument();
+
+    rerender(<ReportWorkspace report={{
+      run_id: "complete", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      financial_status: { ...base, state: "complete", local_structure: { available: false, enabled: false, error_code: "STRUCTURE_COMPONENT_NOT_INSTALLED" } },
+      markdown: "# Saved report", html: "",
+    }} copy={COPY.en} onConfigureCloud={configure} />);
+    expect(screen.queryByRole("button", { name: COPY.en.localStructureConfigure })).not.toBeInTheDocument();
+
+    rerender(<ReportWorkspace report={{
+      run_id: "legacy", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en",
+      financial_status: { ...base, state: "incomplete" },
+      markdown: "# Saved report", html: "",
+    }} copy={COPY.en} onConfigureCloud={configure} />);
+    expect(screen.queryByRole("button", { name: COPY.en.localStructureConfigure })).not.toBeInTheDocument();
+    expect(configure).not.toHaveBeenCalled();
+  });
+
+  it("hides local recognition setup when no settings-navigation callback is available", () => {
+    render(<ReportWorkspace report={{
+      run_id: "no-settings", ticker: "1211", company_name: "BYD", status: "partial", report_language: "en",
+      financial_status: {
+        state: "warning", retryable: false, history_years: 1, expected_periods: [], available_periods: [], missing_periods: [],
+        nodes: [], issues: [], attempt_count: 0, last_stage: "", last_error: "", updated_at: "", next_action: "none",
+        model_calls: 0, token_delta: 0,
+        local_structure: { available: false, enabled: false, error_code: "STRUCTURE_COMPONENT_NOT_INSTALLED" },
+      },
+      markdown: "# Saved report", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.queryByRole("button", { name: COPY.en.localStructureConfigure })).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.localStructureConfigureBody)).not.toBeInTheDocument();
+  });
+
+  it.each([false, undefined] as const)("does not call a deterministic financial overview stale AI research when research output is %s", (hasResearchOutput) => {
+    render(<ReportWorkspace report={{
+      run_id: "financial-only", ticker: "9988", company_name: "Alibaba", status: "completed", report_language: "en",
+      is_substantive: true,
+      financial_status: { state: "warning", retryable: false, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "artifact-rebuild", last_error: "",
+        updated_at: "", next_action: "none", model_calls: 0, token_delta: 0, snapshot_stale: true,
+        ...(hasResearchOutput === undefined ? {} : { has_research_output: hasResearchOutput }) },
+      markdown: "# Deterministic financial overview", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.queryByText(COPY.en.financialSnapshotStale)).not.toBeInTheDocument();
+  });
+
+  it("does not show the AI stale banner when the report itself is not substantive", () => {
+    render(<ReportWorkspace report={{
+      run_id: "stage-only", ticker: "9988", company_name: "Alibaba", status: "partial", report_language: "en",
+      is_substantive: false,
+      financial_status: { state: "warning", retryable: false, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "artifact-rebuild", last_error: "",
+        updated_at: "", next_action: "none", model_calls: 0, token_delta: 0, snapshot_stale: true,
+        has_research_output: true },
+      markdown: "", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.queryByText(COPY.en.financialSnapshotStale)).not.toBeInTheDocument();
   });
 
   it("requires explicit confirmation before a full financial rebuild", () => {
@@ -317,11 +445,161 @@ describe("report presentation", () => {
       }, markdown: "# Report", html: "",
     }} copy={COPY.en} onRetryFinancials={vi.fn(async () => undefined)} />);
 
-    expect(screen.getByText("Failed reports: 2025")).toBeInTheDocument();
+    expect(screen.getByText("Failed filing periods: 2025 annual filing")).toBeInTheDocument();
     expect(screen.getByText("Failed fields: Revenue")).toBeInTheDocument();
     expect(screen.getByText("Failed stage: Financial validation")).toBeInTheDocument();
     expect(screen.getByText(/Official filing retrieval or parsing did not complete/)).toBeInTheDocument();
     expect(screen.queryByText(/FILING_DATA_QUALITY_FAILED/)).not.toBeInTheDocument();
+    const accession = screen.getByText("acc-2025");
+    const details = accession.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    expect(accession.closest("summary")).toBeNull();
+    fireEvent.click(details?.querySelector("summary") as HTMLElement);
+    expect(details).toHaveAttribute("open");
+    expect(screen.getByText("acc-2025")).toBeInTheDocument();
+  });
+
+  it("labels local PDF reading separately from financial validation", () => {
+    render(<ReportWorkspace report={{
+      run_id: "reading", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      financial_status: { state: "warning", retryable: true, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-parse", last_error: "",
+        updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0,
+        recovery_cases: [{ accession_number: "acc-reading", period: "2025 FY", fields: [], stage: "filing-parse",
+          error_code: "LOCAL_READ_FAILED", attempts: 1, status: "open", next_action: "retry_local_parse" }] },
+      markdown: "# Report", html: "",
+    }} copy={COPY.en} />);
+
+    expect(screen.getByText("Failed stage: Local reading")).toBeInTheDocument();
+    expect(screen.getByText("Attempts: 1 · Local reading")).toBeInTheDocument();
+    expect(screen.queryByText(/filing-parse/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(COPY.en.financialStageStatus)).toHaveTextContent("Local reading: Complete");
+    expect(screen.getByLabelText(COPY.en.financialStageStatus)).toHaveTextContent("Financial validation: In progress");
+  });
+
+  it("hides retry, rebuild, and cloud activation for a required local runtime repair but keeps diagnostics", () => {
+    const configure = vi.fn();
+    const retryFinancials = vi.fn(async () => undefined);
+    const rebuildFinancials = vi.fn(async () => undefined);
+    const retryModelStages = vi.fn(async () => undefined);
+    const retrySynthesis = vi.fn(async () => undefined);
+    render(<ReportWorkspace report={{
+      run_id: "runtime", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      retryable_model_stages: true, retryable_synthesis: true,
+      financial_status: { state: "incomplete", retryable: true, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-parse", last_error: "",
+        updated_at: "", next_action: "repair_local_pdf_runtime", model_calls: 0, token_delta: 0,
+        failure_layer: "runtime", runtime_repair_required: true,
+        recovery_cases: [{ accession_number: "acc", period: "2025 FY", fields: [], stage: "filing-parse",
+          error_code: "VISION_MODEL_REQUIRED", attempts: 1, status: "open", next_action: "configure_cloud" }] },
+      markdown: "# Report", html: "",
+    }} copy={COPY.en} onRetryFinancials={retryFinancials} onRebuildFinancials={rebuildFinancials}
+      onRetryModelStages={retryModelStages} onRetrySynthesis={retrySynthesis} onConfigureCloud={configure} />);
+
+    expect(screen.getByText(COPY.en.financialRuntimeRepairGuidance)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: COPY.en.financialExportDiagnostics })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.retryFinancials })).not.toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.rebuildFinancials)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.financialConfigureCloud })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.synthesisCapacityConfigure })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.retryModelStages })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY.en.retrySynthesis })).not.toBeInTheDocument();
+    expect(retryFinancials).not.toHaveBeenCalled();
+    expect(rebuildFinancials).not.toHaveBeenCalled();
+    expect(retryModelStages).not.toHaveBeenCalled();
+    expect(retrySynthesis).not.toHaveBeenCalled();
+    expect(configure).not.toHaveBeenCalled();
+  });
+
+  it("allows one local financial retry when a historical runtime failure is explicitly cleared", () => {
+    const retryFinancials = vi.fn(async () => undefined);
+    render(<ReportWorkspace report={{
+      run_id: "runtime-cleared", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      financial_status: { state: "incomplete", retryable: true, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-parse", last_error: "",
+        updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0,
+        failure_layer: "runtime", runtime_repair_required: false },
+      markdown: "# Report", html: "",
+    }} copy={COPY.en} onRetryFinancials={retryFinancials} />);
+
+    const retry = screen.getByRole("button", { name: COPY.en.retryFinancials });
+    expect(retry).toBeEnabled();
+    expect(screen.queryByText(COPY.en.financialRuntimeRepairGuidance)).not.toBeInTheDocument();
+    fireEvent.click(retry);
+    expect(retryFinancials).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers the existing model-eligible resume action when materials are ready but research is empty", async () => {
+    vi.mocked(listConfiguredModels).mockResolvedValue([{
+      configured_model_id: "m", connection_id: "c", model_id: "capable", alias: "Capable",
+      free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null,
+      enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null,
+      context_window_hint: null, temperature: null, timeout_seconds: 120, configuration_version: 3,
+    }]);
+    const resume = vi.fn(async () => undefined);
+    render(<ReportWorkspace copy={COPY.en} onRetryRecoveryStage={resume} report={{
+      run_id: "ready-run", ticker: "1211", company_name: "BYD", status: "failed", report_language: "en",
+      is_substantive: false, markdown: "", html: "",
+      financial_status: { state: "complete", retryable: false, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "artifact-rebuild", last_error: "",
+        updated_at: "", next_action: "none", model_calls: 0, token_delta: 0, failure_layer: "ready" },
+      recovery_plan: { target: "model-stages", stages: ["business-analyst"], reason: "base_stage_incomplete",
+        input_artifact_ids: [], plan_hash: "ready-plan", available: true },
+    }} />);
+
+    expect(await screen.findByText(COPY.en.reportMaterialsReadyContinue)).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.recoveryResumeBody)).toBeInTheDocument();
+    const resumeButton = await screen.findByRole("button", { name: COPY.en.recoveryResumeAction });
+    expect(resumeButton).toBeEnabled();
+    fireEvent.click(resumeButton);
+    await waitFor(() => expect(resume).toHaveBeenCalledWith("model-stages", {
+      configured_model_id: "m", connection_id: "c", configuration_version: 3, role: "primary", context_window_hint: null,
+    }, "ready-plan"));
+  });
+
+  it("offers model resume for a deterministic financial summary without AI research output", async () => {
+    vi.mocked(listConfiguredModels).mockResolvedValue([{
+      configured_model_id: "m", connection_id: "c", model_id: "capable", alias: "Capable",
+      free_tier: false, billing_class: "paid", free_source_url: null, free_verified_at: null,
+      enabled: true, capabilities: ["text_chat"], health_status: "ready", last_discovered_at: null,
+      context_window_hint: null, temperature: null, timeout_seconds: 120, configuration_version: 3,
+    }]);
+    const resume = vi.fn(async () => undefined);
+    render(<ReportWorkspace copy={COPY.en} onRetryRecoveryStage={resume} report={{
+      run_id: "financial-only-run", ticker: "1211", company_name: "BYD", status: "completed", report_language: "en",
+      is_substantive: true, markdown: "# Deterministic financial summary", html: "",
+      financial_status: { state: "complete", retryable: false, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "artifact-rebuild", last_error: "",
+        updated_at: "", next_action: "none", model_calls: 0, token_delta: 0, snapshot_stale: true,
+        failure_layer: "ready", has_research_output: false },
+      recovery_plan: { target: "model-stages", stages: ["business-analyst"], reason: "base_stage_incomplete",
+        input_artifact_ids: [], plan_hash: "financial-only-plan", available: true },
+    }} />);
+
+    expect(screen.getByText("Deterministic financial summary")).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.recoveryResumeTitle)).toBeInTheDocument();
+    expect(screen.getByText(COPY.en.recoveryResumeBody)).toBeInTheDocument();
+    expect(screen.queryByText(COPY.en.financialSnapshotStale)).not.toBeInTheDocument();
+    const resumeButton = await screen.findByRole("button", { name: COPY.en.recoveryResumeAction });
+    expect(resumeButton).toBeEnabled();
+    fireEvent.click(resumeButton);
+    await waitFor(() => expect(resume).toHaveBeenCalledWith("model-stages", {
+      configured_model_id: "m", connection_id: "c", configuration_version: 3, role: "primary", context_window_hint: null,
+    }, "financial-only-plan"));
+  });
+
+  it("keeps an actionable local financial repair button in the empty-report state", () => {
+    const retryFinancials = vi.fn(async () => undefined);
+    render(<ReportWorkspace copy={COPY.en} onRetryFinancials={retryFinancials} report={{
+      run_id: "empty-financial", ticker: "1211", company_name: "BYD", status: "failed", report_language: "en",
+      is_substantive: false, markdown: "", html: "",
+      financial_status: { state: "incomplete", retryable: true, history_years: 1, expected_periods: [], available_periods: [],
+        missing_periods: [], nodes: [], issues: [], attempt_count: 1, last_stage: "filing-download", last_error: "",
+        updated_at: "", next_action: "retry_failed_nodes", model_calls: 0, token_delta: 0 },
+    }} />);
+
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.retryFinancials }));
+    expect(retryFinancials).toHaveBeenCalledTimes(1);
   });
 
   it.each(["en", "zh-CN", "zh-Hant"] as const)("explains localized partial financial refresh in %s", (language) => {
@@ -385,4 +663,23 @@ describe("report presentation", () => {
     fireEvent.click(screen.getByRole("button", { name: COPY.en.financialConfigureCloud }));
     expect(configure).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION", "DOCUMENT_CONTEXT_OCR_REQUIRED", "PDF_TEXT_EXTRACTION_FAILED"])(
+    "offers an explicit optional visual recovery action for %s without starting an upload", (code) => {
+      const configure = vi.fn();
+      render(<ReportWorkspace report={{ run_id: "visual-recovery", ticker: "1211", company_name: "BYD",
+        status: "partial", report_language: "en", markdown: "# Financial overview", html: "",
+        financial_status: { state: "warning", retryable: true, history_years: 2, expected_periods: [],
+          available_periods: [], missing_periods: [], nodes: [], issues: [], attempt_count: 1,
+          last_stage: "filing-parse", last_error: code, updated_at: "",
+          next_action: "retry_saved_candidate_validation_or_enable_authorized_cloud", model_calls: 0, token_delta: 0,
+          failure_layer: "extraction", runtime_repair_required: false,
+          recovery_cases: [{ accession_number: "acc", period: "2025 Q1", fields: [], stage: "filing-parse",
+            error_code: code, attempts: 1, status: "open", next_action: "authorize_scanned_page_ocr" }] },
+      }} copy={COPY.en} onConfigureCloud={configure} />);
+      expect(configure).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: COPY.en.financialConfigureCloud }));
+      expect(configure).toHaveBeenCalledTimes(1);
+    },
+  );
 });

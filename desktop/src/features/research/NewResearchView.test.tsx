@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { captureMarketSnapshot, listConfiguredModels, searchCompanies } from "../../backend";
+import { captureMarketSnapshot, getResearchBudgetPreview, listConfiguredModels, searchCompanies } from "../../backend";
 import { COPY } from "../../i18n";
 import type { BootstrapResult } from "../../types";
 import { NewResearchView } from "./NewResearchView";
@@ -12,6 +12,7 @@ vi.mock("../../backend", () => ({
   openExternalUrl: vi.fn(),
   searchCompanies: vi.fn(),
   captureMarketSnapshot: vi.fn(),
+  getResearchBudgetPreview: vi.fn(),
 }));
 
 const bootstrap: BootstrapResult = {
@@ -66,6 +67,105 @@ describe("NewResearch configured models", () => {
     vi.clearAllMocks();
     vi.mocked(listConfiguredModels).mockResolvedValue(configuredModels);
     vi.mocked(captureMarketSnapshot).mockResolvedValue({ status: "UNAVAILABLE", error_code: "QUOTE_UNAVAILABLE" });
+    vi.mocked(getResearchBudgetPreview).mockResolvedValue({
+      schema: "openthesis.research-budget-preview.v1",
+      user_envelope: { mode: "standard", max_input_tokens: 1_500_000, max_output_tokens: 100_000, max_total_tokens: 1_600_000, max_calls: 16, max_automatic_seconds: 1200, warning_seconds: 900 },
+      estimated_cost: null,
+      price_status: "unknown",
+      workload_status: "pending_material_compilation",
+    });
+  });
+
+  it("defaults to adaptive research and sends null hard limits in both envelope shapes", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+
+    expect(screen.getByText("Adaptive research: complete according to actual workload")).toBeVisible();
+    expect(screen.queryByText(/1,500,000|100,000 tokens|up to 16 calls|20 minutes/)).not.toBeInTheDocument();
+    expect(screen.getByText(COPY.en.runBudgetDisclaimer)).toBeVisible();
+    expect(getResearchBudgetPreview).not.toHaveBeenCalled();
+    await screen.findByRole("combobox", { name: COPY.en.primaryModel });
+    fireEvent.click(screen.getByRole("button", { name: "700" }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    await waitFor(() => expect(onStart).toHaveBeenCalled());
+    expect(onStart.mock.calls[0][0].run_envelope).toEqual({
+      policy: "adaptive", mode: "adaptive",
+      user_hard_limits: { max_calls: null, max_input_tokens: null, max_output_tokens: null,
+        max_total_tokens: null, max_automatic_seconds: null, max_cost: null },
+      max_calls: null, max_input_tokens: null, max_output_tokens: null,
+      max_total_tokens: null, max_automatic_seconds: null, max_cost: null, warning_seconds: 900,
+    });
+  });
+
+  it.each([
+    ["zh-CN", "自适应研究：按实际工作量完成"],
+    ["en", "Adaptive research: complete according to actual workload"],
+    ["zh-Hant", "自適應研究：按實際工作量完成"],
+  ])("localizes the adaptive default in %s", (language, text) => {
+    const copy = COPY[language as keyof typeof COPY];
+    render(<NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={vi.fn()}
+      onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
+    expect(screen.getByText(text)).toBeVisible();
+  });
+
+  it("allows explicit caps beyond the former limits and disables exact cost caps without a quote", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+    await screen.findByRole("combobox", { name: COPY.en.primaryModel });
+    fireEvent.click(screen.getByText("Set optional hard limits"));
+    fireEvent.change(screen.getByRole("spinbutton", { name: COPY.en.runBudgetCalls }), { target: { value: "300" } });
+    fireEvent.change(screen.getByRole("spinbutton", { name: COPY.en.runBudgetSeconds }), { target: { value: "90000" } });
+    expect(screen.getByRole("spinbutton", { name: COPY.en.runBudgetCost }).closest("label")).toHaveTextContent(COPY.en.runBudgetQuoteRequired);
+    expect(screen.getByRole("spinbutton", { name: COPY.en.runBudgetCost })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "700" }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    await waitFor(() => expect(onStart).toHaveBeenCalled());
+    expect(onStart.mock.calls[0][0].run_envelope).toMatchObject({
+      policy: "adaptive", mode: "adaptive", max_calls: 300, max_automatic_seconds: 90000,
+      user_hard_limits: { max_calls: 300, max_automatic_seconds: 90000, max_cost: null },
+      max_cost: null, warning_seconds: 900,
+    });
+  });
+
+  it("includes the returned price quote when an explicit cost cap is set", async () => {
+    vi.mocked(getResearchBudgetPreview).mockResolvedValueOnce({
+      schema: "openthesis.research-budget-preview.v1",
+      user_envelope: { mode: "adaptive", policy: "adaptive", user_hard_limits: { max_calls: null, max_input_tokens: null,
+        max_output_tokens: null, max_total_tokens: null, max_automatic_seconds: null, max_cost: null },
+        max_calls: null, max_input_tokens: null, max_output_tokens: null, max_total_tokens: null,
+        max_automatic_seconds: null, max_cost: null, warning_seconds: 900 },
+      estimated_cost: 2.5, price_status: "known", workload_status: "ready",
+      price_quote: { quote_id: "quote-1", currency: "USD" },
+    } as never);
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+    await screen.findByRole("combobox", { name: COPY.en.primaryModel });
+    fireEvent.click(screen.getByText("Set optional hard limits"));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.runBudgetPreview }));
+    await screen.findByTestId("run-budget-preview-result");
+    const costCap = screen.getByRole("spinbutton", { name: COPY.en.runBudgetCost });
+    expect(costCap).toBeEnabled();
+    fireEvent.change(costCap, { target: { value: "42.75" } });
+    fireEvent.click(screen.getByRole("button", { name: "700" }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    await waitFor(() => expect(onStart).toHaveBeenCalled());
+    expect(onStart.mock.calls[0][0].run_envelope).toMatchObject({
+      max_cost: 42.75,
+      user_hard_limits: { max_cost: 42.75 },
+      price_quote: { quote_id: "quote-1", currency: "USD" },
+    });
+  });
+
+  it("rejects non-safe-integer hard limits without restoring default caps", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()} onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+    await screen.findByRole("combobox", { name: COPY.en.primaryModel });
+    fireEvent.click(screen.getByText("Set optional hard limits"));
+    fireEvent.change(screen.getByRole("spinbutton", { name: COPY.en.runBudgetCalls }), { target: { value: "9007199254740992" } });
+    fireEvent.click(screen.getByRole("button", { name: "700" }));
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+    expect(onStart).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent(COPY.en.runBudgetInvalid);
   });
 
   it("receives packs after minimal bootstrap without resetting the user's selection", async () => {
@@ -337,7 +437,8 @@ describe("NewResearch configured models", () => {
     expect(request.vision_fallback.model).toEqual({ configured_model_id: "vision-model", connection_id: "vision-connection", configuration_version: 2, role: "vision" });
     expect(request.vision_fallback.provider).toBe("configured_model");
     expect(request.vision_fallback.approval_mode).toBe("review_each_plan");
-    expect(JSON.stringify(request)).not.toMatch(/api_key|token|base_url|preset_id/i);
+    const { run_envelope: _runEnvelope, ...safeRequest } = request;
+    expect(JSON.stringify(safeRequest)).not.toMatch(/api_key|base_url|preset_id/i);
   });
 
   it("does not expose per-run vision controls when no persistent policy is enabled", async () => {
@@ -359,7 +460,8 @@ describe("NewResearch configured models", () => {
     await waitFor(() => expect(onStart).toHaveBeenCalled());
     const request = onStart.mock.calls[0][0];
     expect(request.vision_fallback).toBeUndefined();
-    expect(JSON.stringify(request)).not.toMatch(/api_key|token|base_url|preset_id/i);
+    const { run_envelope: _runEnvelope, ...safeRequest } = request;
+    expect(JSON.stringify(safeRequest)).not.toMatch(/api_key|base_url|preset_id/i);
   });
 
   it("requires renewed authorization when a persisted policy is stale", async () => {

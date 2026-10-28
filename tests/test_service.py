@@ -1599,18 +1599,15 @@ class AppServiceTests(unittest.TestCase):
             self.assertTrue(status["run_id"])
             self.assertEqual(
                 provider_calls,
-                [
-                    ("gateway:test.primary@1", "primary", 1),
-                    ("gateway:test.primary@1", "primary", 1),
-                ],
+                [("gateway:test.primary@1", "primary", 1)],
             )
-            # Two provider instances are expected for the independent source
-            # and financial research lanes.  The stage execution itself must
-            # not replay a lane on the same provider instance.
+            # Preparation freezes once; each configured model creates one
+            # workflow shared by the ready source and financial stages.
             self.assertEqual(generation_calls.count("primary"), len(generation_calls))
             self.assertTrue(generation_calls)
             self.assertTrue(any("Our business serves domestic vehicle manufacturers" in item
                                 for item in provider_inputs))
+            self.assertTrue(any("revenue-only" in item for item in provider_inputs))
             report = service.get_report(status["run_id"])
             self.assertEqual(report["financial_status"]["state"], "warning")
             admitted = service.storage.get_facts(company.security_id)
@@ -2885,6 +2882,63 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(status["expected_periods"], ["2025", "2024", "2023", "2022", "2021", "2020"])
             self.assertNotIn("2026", status["available_periods"])
             self.assertEqual(status["missing_periods"], [])
+
+    def test_interim_failure_does_not_poison_verified_annual_status(self) -> None:
+        company = build_company("002594.SZ", "BYD", reporting_currency="CNY")
+        required = frozenset({
+            "revenue", "net_income", "operating_cash_flow", "assets", "liabilities", "equity",
+        })
+        annual = FilingDocument(
+            "annual-2025", company.security_id, "annual-2025", "ANNUAL_REPORT", "FY",
+            "2025-12-31", "2026-03-01", "2025.pdf", "https://example.test/2025.pdf",
+        )
+        prior_annual = FilingDocument(
+            "annual-2024", company.security_id, "annual-2024", "ANNUAL_REPORT", "FY",
+            "2024-12-31", "2025-03-01", "2024.pdf", "https://example.test/2024.pdf",
+        )
+        older_annual = FilingDocument(
+            "annual-2023", company.security_id, "annual-2023", "ANNUAL_REPORT", "FY",
+            "2023-12-31", "2024-03-01", "2023.pdf", "https://example.test/2023.pdf",
+        )
+        interim = FilingDocument(
+            "q1-2025", company.security_id, "q1-2025", "QUARTERLY_REPORT", "Q1",
+            "2025-03-31", "2025-04-30", "2025-q1.pdf", "https://example.test/2025-q1.pdf",
+        )
+        annual_group = FinancialGroupValidation(
+            (annual.accession_number, annual.period_end, "FY", "consolidated", "CNY"),
+            FinancialValidation(ValidationStatus.VERIFIED, (), required, (), ()),
+        )
+        prior_annual_group = FinancialGroupValidation(
+            (prior_annual.accession_number, prior_annual.period_end, "FY", "consolidated", "CNY"),
+            FinancialValidation(ValidationStatus.VERIFIED, (), required, (), ()),
+        )
+        older_annual_group = FinancialGroupValidation(
+            (older_annual.accession_number, older_annual.period_end, "FY", "consolidated", "CNY"),
+            FinancialValidation(ValidationStatus.VERIFIED, (), required, (), ()),
+        )
+        interim_group = FinancialGroupValidation(
+            (interim.accession_number, interim.period_end, "Q1", "consolidated", "CNY"),
+            FinancialValidation(ValidationStatus.REJECTED, ("quarterly_statement_incomplete",), frozenset(), (), ()),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = AppService(Path(directory))
+            service.storage.save_company(company)
+            service.storage.save_filings([annual, prior_annual, older_annual, interim])
+            service.storage.replace_financial_ingestion(
+                company.security_id, [annual.accession_number, prior_annual.accession_number, older_annual.accession_number, interim.accession_number],
+                [], [], [annual_group, prior_annual_group, older_annual_group, interim_group],
+            )
+
+            status = _financial_status(
+                service.storage, company.to_dict(),
+                {"research_configuration": {"annual_history_years": 2}},
+            )
+
+        self.assertEqual(status["state"], "complete", status)
+        annual_node = next(item for item in status["nodes"] if item["period"] == "2025")
+        self.assertEqual(annual_node["state"], "verified")
+        q1_node = next(item for item in status["interim_nodes"] if item["period"] == "2025-03-31")
+        self.assertEqual(q1_node["state"], "rejected")
 
     def test_demo_research_job_reports_progress_and_produces_a_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

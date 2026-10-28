@@ -5,16 +5,19 @@ from dataclasses import dataclass, replace
 from copy import deepcopy
 from concurrent.futures import CancelledError
 import inspect
+import json
 import time
 from typing import Any, Callable, Sequence
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_contracts import (
     CandidateBatch, FactCandidate, FilingSource, FactExtractor, CompilationPolicy,
-    FinancialDataset, GapStageKind, ValidationStatus, candidate_batches_from_facts, STATEMENT_FOR,
+    FinancialDataset, FinancialSourceFailure, GapStageKind, ValidationStatus,
+    candidate_batches_from_facts, STATEMENT_FOR,
 )
 from .financial_compiler import FinancialFactCompiler, CoveragePlanner, concepts_cover_profile
-from .financial_admission import FinancialAdmission, FinancialResearchView
+from .financial_admission import FinancialAdmission, FinancialResearchView, ReadinessLevel
+from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
 from .financial_sources import (
     GapResolver, MappedCandidateExtractor, StructuredFactExtractor,
     VisionCandidateExtractor, _prefetch_vision_batches,
@@ -38,6 +41,7 @@ class CollectionPolicy:
     gap_extractors: tuple[FactExtractor, ...] = ()
     gap_user_authorized: bool = False
     gap_max_attempts: int = 1
+    phase_timings: dict[str, Any] | None = None
 
 
 def _disclosed_optional_concepts(subject, filing, candidates) -> frozenset[str]:
@@ -263,7 +267,7 @@ def document_processing_outcome(filing: FilingDocument, dataset: FinancialDatase
     else:
         availability = "none"
         status = "needs-action"
-    execution_failed = any(item.stage in {"download", "parse", "worker", "index"} for item in failures)
+    execution_failed = any(item.required and item.stage in {"download", "parse", "worker", "index"} for item in failures)
     return {"status": status, "processing_state": "failed" if execution_failed else "completed",
             "availability": availability, "roles": roles,
             "candidate_count": len(candidate_ids), "admitted_count": len(admitted_ids),
@@ -309,21 +313,27 @@ class FinancialCandidatePipeline:
         """
 
         _raise_if_cancelled(cancel_check)
-        # One absolute task budget starts before collection. Local hashes,
-        # indexes, windows and authorized cloud preparation consume it; a new
-        # phase must not reset the allowance after local work has exhausted it.
-        task_deadline = min(deadline, time.monotonic() + float(getattr(engine, "_batch_timeout_seconds", 280.0))) if deadline is not None else time.monotonic() + float(getattr(engine, "_batch_timeout_seconds", 280.0))
+        # The engine's batch timeout is a resumable scheduling slice, not an
+        # implicit whole-task limit. Only the captured caller deadline ends an
+        # adaptive collection; all local/cloud phases share that same value.
+        # Otherwise the outer subscriber cancels healthy producers at 280 s
+        # before their existing checkpoint-progress continuation can finish.
+        task_deadline = deadline
         collector = engine if callable(getattr(engine, "collect_candidate_batches", None)) else LegacyFinancialSource(engine)
         collection_options = dict(structured_sources=structured_sources,
                                   cancel_check=cancel_check, progress=progress)
         parameters = inspect.signature(collector.collect_candidate_batches).parameters
         if "deadline" in parameters or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
             collection_options["deadline"] = task_deadline
+        collection_started = time.monotonic()
         collection = collector.collect_candidate_batches(
             subject,
             filings,
             **collection_options,
         )
+        phase_timings: dict[str, Any] = {
+            "source_collection_elapsed_seconds": round(time.monotonic() - collection_started, 4),
+        }
         # The collector always places structured first and PDF second.  An
         # empty structured batch is intentional: it makes PDF a deterministic
         # fallback while ensuring every structured adapter was queried.
@@ -341,6 +351,9 @@ class FinancialCandidatePipeline:
             MappedCandidateExtractor(primary, GapStageKind.OFFICIAL_STRUCTURED, "official-structured"),
             MappedCandidateExtractor(pdf, GapStageKind.PDF_AST, "financial-ingestion-ast"),
         ]
+        if getattr(engine, '_local_structure_root', None) is not None:
+            from .local_structure import LocalStructureExtractor
+            extractors.append(LocalStructureExtractor(engine._local_structure_root, engine, cancel_check, progress))
         for extractor in same_year_extractors:
             try:
                 stage_kind = GapStageKind(getattr(extractor, "stage_kind"))
@@ -410,24 +423,99 @@ class FinancialCandidatePipeline:
                 status="canonical-compiling",
                 elapsed_seconds=time.monotonic() - filing_started_at[filing.document_id],
             )
+        candidate_compile_started = time.monotonic()
         dataset = self.compile(
             subject,
             actual_range,
-            CollectionPolicy(**policy_kwargs),
+            CollectionPolicy(**policy_kwargs, phase_timings=phase_timings),
         )
+        phase_timings["candidate_mapping_elapsed_seconds"] = round(
+            time.monotonic() - candidate_compile_started, 4,
+        )
+        diagnostic_engine = getattr(engine, "engine", engine)
+        execution = getattr(diagnostic_engine, "_document_execution", {})
+        if isinstance(execution, dict):
+            per_filing = phase_timings.get("candidate_mapping_by_filing_seconds", {})
+            for filing in filings:
+                observation = execution.get(filing.document_id)
+                if not isinstance(observation, dict) or observation.get("source_hash") != filing.content_hash:
+                    continue
+                observation["stage_timings"] = {
+                    key: float(value)
+                    for key, value in phase_timings.items()
+                    if key != "candidate_mapping_by_filing_seconds"
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+                if isinstance(per_filing, dict) and filing.document_id in per_filing:
+                    observation["stage_timings"]["candidate_mapping_seconds"] = float(per_filing[filing.document_id])
 
+        vision_batches = {}
         def finalize(current: FinancialDataset, extra: Sequence[str] = ()) -> FinancialDataset:
             _raise_if_cancelled(cancel_check)
             if extra:
                 current = _append_dataset_diagnostics(current, extra)
+            # A failed native backend is not a failed original after an
+            # independently compiled structure path fills its required roles.
+            # Keep the exact native failure for audit, but revoke its active
+            # publication fence only for this same hash and complete work.
+            failures = []
+            for failure in collection.source_failures:
+                filing = next((item for item in filings if item.document_id == failure.document_id
+                    and item.accession_number == failure.accession_number), None)
+                observation = getattr(engine, '_document_execution', {}).get(failure.document_id,{})
+                local = observation.get('local_structure',{})
+                from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
+                allowed = failure.stage == 'parse' and failure.code in (PDF_RUNTIME_FAILURE_CODES | {
+                    'DOCUMENT_CONTEXT_OCR_REQUIRED','PDF_TEXT_EXTRACTION_FAILED','DOCUMENT_CONTEXT_TIMEOUT',
+                    'PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION','PDFIUM_WORKER_TIMEOUT'})
+                facts = tuple(fact for group in current.validations for fact in group.accepted
+                    if filing is not None and fact.accession_number == filing.accession_number
+                    and fact.end_date == filing.period_end and fact.fiscal_period == filing.fiscal_period
+                    and fact.consolidated_scope == current.coverage.get('target_scope',policy_kwargs['scope'])
+                    and fact.currency == current.coverage.get('target_currency',policy_kwargs['reporting_currency']))
+                required = compiler_policy.required_concepts or CoveragePlanner().plan(subject).required_concepts
+                refs = {ref.evidence_id:ref for ref in current.evidence}
+                def structure_proven(fact):
+                    for key in fact.classification_evidence_ids:
+                        proof = refs.get(key)
+                        if (proof is None or filing is None or proof.document_id != filing.document_id
+                                or proof.content_hash != filing.content_hash or not key.startswith('vision-table:')):
+                            continue
+                        try:
+                            payload = json.loads(proof.excerpt)
+                            if payload.get('source_structure',{}).get('backend') == 'paddle-structure-v3':
+                                return True
+                        except (ValueError,TypeError,AttributeError):
+                            continue
+                    return False
+                structure_fact = any(structure_proven(fact) for fact in facts)
+                local_ready = bool(filing is not None and structure_fact
+                    and observation.get('source_hash') == filing.content_hash
+                    and local.get('selected_pages',0) > 0
+                    and (local.get('completed_pages') == local.get('selected_pages')
+                        or local.get('targets_complete') is True)
+                    and local.get('state') == 'ready')
+                cloud = vision_batches.get(failure.document_id)
+                cloud_ids = {candidate.fact.fact_id for candidate in cloud.candidates} if cloud is not None else set()
+                cloud_ready = bool(filing is not None and cloud is not None
+                    and cloud.filing.document_id == filing.document_id
+                    and cloud.filing.content_hash == filing.content_hash
+                    and any(fact.fact_id in cloud_ids for fact in facts))
+                recovered = bool(allowed and filing is not None and (local_ready or cloud_ready)
+                    and concepts_cover_profile({fact.concept for fact in facts},required))
+                failures.append(replace(failure,required=False) if recovered else failure)
+            current = replace(current,source_failures=tuple(failures))
             for index, filing in enumerate(filings, start=1):
-                outcome = document_processing_outcome(filing, current, collection)
+                outcome = document_processing_outcome(filing, current,
+                    replace(collection,source_failures=tuple(failures)))
                 observation = getattr(engine, "_document_execution", {}).get(filing.document_id, {})
                 if observation.get("source_hash") == filing.content_hash:
                     outcome.update({key: value for key, value in observation.items() if key in {
                         "page_count", "native_text_page_count", "indexed_page_count", "window_total",
+                        "completed_page_count", "candidate_page_count",
                         "completed_window_count", "parse_elapsed_seconds", "failure_stage",
-                        "root_error_code", "attempt_count", "cache_reused"}})
+                        "root_error_code", "attempt_count", "cache_reused", "pdf_worker_diagnostics",
+                        "work_progress", "catalog_pages", "local_structure"}})
                 _emit_filing_progress(
                     progress,
                     "filing-validation",
@@ -442,7 +530,7 @@ class FinancialCandidatePipeline:
                 current,
                 manifests=collection.manifests,
                 diagnostics=tuple(dict.fromkeys((*current.diagnostics, *collection.diagnostics))),
-                source_failures=collection.source_failures,
+                source_failures=tuple(failures),
             )
 
         vision_diagnostics: tuple[str, ...] = ()
@@ -484,6 +572,12 @@ class FinancialCandidatePipeline:
             visual_filings: list[FilingDocument] = []
             for filing in filings:
                 accession = filing.accession_number
+                from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
+                if any(failure.document_id == filing.document_id and failure.code in PDF_RUNTIME_FAILURE_CODES
+                       for failure in collection.source_failures):
+                    # A broken local component is not permission to submit all
+                    # originals to a cloud service. Other healthy docs proceed.
+                    continue
                 groups = tuple(
                     item for item in dataset.validations
                     if tuple(getattr(item, "identity", ()))
@@ -587,6 +681,10 @@ class FinancialCandidatePipeline:
         diagnostics: list[str] = []
         candidates: list[FactCandidate] = []
         evidence: list[EvidenceRef] = []
+        phase_timings = policy.phase_timings if isinstance(policy.phase_timings, dict) else None
+        per_filing_mapping: dict[str, float] = {}
+        compiler_elapsed = 0.0
+        initially_verified: dict[str, set[tuple]] = {}
         if not filings and policy.filing_source is not None:
             filings = tuple(policy.filing_source.fetch(subject, period_range))
         extractors = policy.extractors
@@ -599,6 +697,7 @@ class FinancialCandidatePipeline:
         candidates: list[FactCandidate] = []
         evidence: list[EvidenceRef] = []
         for filing in filings:
+            filing_mapping_started = time.monotonic()
             if not extractors:
                 diagnostics.append(f"{filing.document_id}:no_fact_extractor")
                 continue
@@ -648,6 +747,7 @@ class FinancialCandidatePipeline:
                 candidate_evidence: Sequence[EvidenceRef],
             ) -> frozenset[str]:
                 """Recompile the frozen filing batch before declaring coverage."""
+                nonlocal compiler_elapsed
                 # Production always uses FinancialFactCompiler.  A few
                 # compatibility callers inject a recording compiler whose
                 # compile result is intentionally a fixed fixture and cannot
@@ -658,6 +758,7 @@ class FinancialCandidatePipeline:
                 if not canonical_gate:
                     return frozenset()
                 try:
+                    compiler_started = time.monotonic()
                     result = self.compiler.compile(
                         subject,
                         (CandidateBatch(filing, tuple(candidate_items), tuple(candidate_evidence)),),
@@ -675,10 +776,15 @@ class FinancialCandidatePipeline:
                         f"{filing.document_id}:verified_coverage_compile_failed:{type(exc).__name__}"
                     )
                     return frozenset()
+                finally:
+                    compiler_elapsed += time.monotonic() - compiler_started
                 target_end = str(filing.period_end or "")[:10]
                 # ``resolved_facts`` is an audit projection and may include
                 # non-canonical siblings.  Gap coverage must be based only on
                 # the compiler's admitted research view.
+                if filing.document_id not in initially_verified:
+                    initially_verified[filing.document_id] = {
+                        _financial_value_identity(fact) for fact in getattr(result, "research_facts", ())}
                 return frozenset(
                     fact.concept
                     for fact in getattr(result, "research_facts", ())
@@ -714,6 +820,8 @@ class FinancialCandidatePipeline:
                 evidence.extend(gap.evidence)
                 diagnostics.extend(f"{filing.document_id}:{message}" for message in gap.diagnostics)
 
+            per_filing_mapping[filing.document_id] = round(time.monotonic() - filing_mapping_started, 4)
+
 
         batches = tuple(CandidateBatch(
             filing,
@@ -721,12 +829,42 @@ class FinancialCandidatePipeline:
             tuple(ref for ref in evidence if ref.document_id == filing.document_id),
             tuple(diagnostics) if index == 0 else (),
         ) for index, filing in enumerate(filings))
-        return self.compiler.compile(subject, batches, CompilationPolicy(
+        final_compile_started = time.monotonic()
+        result = self.compiler.compile(subject, batches, CompilationPolicy(
             filings=filings, required_concepts=policy.required_concepts,
             reporting_currency=policy.reporting_currency, fiscal_period=policy.fiscal_period,
             scope=policy.scope,
             period_range=policy.period_range if policy.period_range is not None else period_range,
         ))
+        compiler_elapsed += time.monotonic() - final_compile_started
+        refs = {ref.evidence_id:ref for ref in getattr(result, 'evidence', ())}
+        for filing in filings:
+            for extractor in (*extractors, *policy.gap_extractors):
+                if getattr(extractor, 'stage_kind', None) != GapStageKind.LOCAL_STRUCTURE:
+                    continue
+                observation = getattr(getattr(extractor, 'engine', None), '_document_execution', {}).get(filing.document_id, {})
+                local = observation.get('local_structure')
+                if not isinstance(local, dict):
+                    continue
+                admitted = set()
+                for fact in getattr(result, 'research_facts', ()):
+                    if fact.accession_number != filing.accession_number:
+                        continue
+                    for key in fact.classification_evidence_ids:
+                        ref = refs.get(key)
+                        if not ref or ref.document_id != filing.document_id or ref.content_hash != filing.content_hash or not key.startswith('vision-table:'):
+                            continue
+                        try:
+                            if json.loads(ref.excerpt).get('source_structure', {}).get('backend') == 'paddle-structure-v3':
+                                admitted.add(_financial_value_identity(fact))
+                        except (ValueError, TypeError, AttributeError):
+                            continue
+                local['admitted_field_count'] = len(admitted)
+                local['new_verified_field_count'] = len(admitted - initially_verified.get(filing.document_id, set()))
+        if phase_timings is not None:
+            phase_timings["compiler_elapsed_seconds"] = round(compiler_elapsed, 4)
+            phase_timings["candidate_mapping_by_filing_seconds"] = per_filing_mapping
+        return result
 
     def compile_frozen(
         self,
@@ -797,6 +935,7 @@ class FinancialPipeline:
                 if snapshot.period_range is not None else policy.period_range
             ),
         )
+        diagnostic_engine = None
         if snapshot.frozen_candidate_batches is None:
             run_engine = (
                 self.engine_for(snapshot.subject, snapshot.filings)
@@ -804,6 +943,7 @@ class FinancialPipeline:
             )
             if run_engine is None:
                 raise ValueError("FINANCIAL_SOURCE_ENGINE_REQUIRED")
+            diagnostic_engine = getattr(run_engine, "engine", run_engine)
             dataset = self.candidates.compile_from_ingestion(
                 snapshot.subject,
                 snapshot.filings,
@@ -838,6 +978,8 @@ class FinancialPipeline:
             dataset = _append_dataset_diagnostics(dataset, snapshot.source_diagnostics)
         if snapshot.source_failures:
             dataset = replace(dataset, source_failures=(*dataset.source_failures, *snapshot.source_failures))
+        parsing_observations = _parser_execution_observations(snapshot, diagnostic_engine)
+        admission_started = time.monotonic()
         view = self.admission.admit(
             snapshot.subject,
             dataset,
@@ -846,12 +988,127 @@ class FinancialPipeline:
             evidence=dataset.evidence,
             requested_annual_count=snapshot.requested_annual_count,
             research_as_of=snapshot.research_as_of,
-            parsing_observations=snapshot.parsing_observations,
+            parsing_observations=parsing_observations,
         )
+        admission_elapsed = round(time.monotonic() - admission_started, 4)
+        execution = getattr(diagnostic_engine, "_document_execution", {})
+        if isinstance(execution, dict):
+            for filing in snapshot.filings:
+                observation = execution.get(filing.document_id)
+                if not isinstance(observation, dict) or observation.get("source_hash") != filing.content_hash:
+                    continue
+                timings = observation.setdefault("stage_timings", {})
+                if isinstance(timings, dict):
+                    timings["admission_elapsed_seconds"] = admission_elapsed
+        incremental_accessions = _incremental_page_accessions(snapshot, dataset, view)
+        if incremental_accessions:
+            source_failures = list(dataset.source_failures)
+            filings_by_accession = {item.accession_number: item for item in snapshot.filings}
+            existing_required = {
+                (item.document_id, item.accession_number) for item in source_failures
+                if item.required
+            }
+            for accession in incremental_accessions:
+                filing = filings_by_accession.get(accession)
+                if (filing is not None
+                        and (filing.document_id, filing.accession_number) not in existing_required):
+                    source_failures.append(FinancialSourceFailure(
+                        filing.document_id, filing.accession_number,
+                        "parse", "PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION", required=True,
+                    ))
+            if len(source_failures) != len(dataset.source_failures):
+                dataset = replace(dataset, source_failures=tuple(source_failures))
+            readiness = view.readiness
+            reasons = tuple(dict.fromkeys((*readiness.reasons, "source_page_plan_incomplete")))
+            actions = tuple(dict.fromkeys((*readiness.actions, "source_page_plan_incomplete")))
+            view = replace(view, readiness=replace(
+                readiness,
+                level=(ReadinessLevel.PARTIAL if readiness.level is ReadinessLevel.FULL
+                    else readiness.level),
+                reasons=reasons,
+                actions=actions,
+            ))
+        publishable_accessions = tuple(sorted(set(
+            _publishable_accessions(snapshot, dataset, view)
+        ) | set(incremental_accessions)))
         return replace(
             view, canonical_dataset=dataset,
-            publishable_accessions=_publishable_accessions(snapshot, dataset, view),
+            profile=replace(view.profile, parsing_observations=_parser_execution_observations(snapshot, diagnostic_engine)),
+            publishable_accessions=publishable_accessions,
+            incremental_accessions=incremental_accessions,
         )
+
+
+def _parser_execution_observations(snapshot, engine):
+    """Copy only bounded diagnostic fields; parser internals can contain paths."""
+    observations = {item["accession_number"]: deepcopy(item)
+        for item in snapshot.parsing_observations if isinstance(item, dict)
+        and isinstance(item.get("accession_number"), str) and item["accession_number"]}
+    execution = getattr(engine, "_document_execution", {})
+    timing_keys = {
+        "source_hash_elapsed_seconds", "document_text_context_elapsed_seconds",
+        "catalog_elapsed_seconds", "candidate_plan_elapsed_seconds", "pdf_open_elapsed_seconds",
+        "page_text_cache_elapsed_seconds", "worker_session_open_elapsed_seconds", "worker_page_elapsed_seconds",
+        "parse_elapsed_seconds", "source_collection_elapsed_seconds", "candidate_mapping_elapsed_seconds",
+        "compiler_elapsed_seconds", "admission_elapsed_seconds", "candidate_mapping_seconds",
+        "checkpoint_write_elapsed_seconds",
+        "geometry_extract_elapsed_seconds",
+    }
+    for filing in snapshot.filings:
+        raw = execution.get(filing.document_id) if isinstance(execution, dict) else None
+        if not isinstance(raw, dict) or not filing.content_hash:
+            continue
+        if raw.get("source_hash") != filing.content_hash:
+            if raw.get("source_hash") is not None:
+                observations.pop(filing.accession_number, None)
+            continue
+        # Do not relabel an execution observation whose own period identity
+        # contradicts the selected filing. Missing period fields retain the
+        # compatibility behavior of binding to the filing metadata below.
+        raw_period_end = raw.get("period_end")
+        raw_fiscal_period = raw.get("fiscal_period")
+        if (raw_period_end is not None
+                and str(raw_period_end).strip() != str(filing.period_end or "").strip()):
+            observations.pop(filing.accession_number, None)
+            continue
+        if (raw_fiscal_period is not None
+                and str(raw_fiscal_period).strip().upper()
+                != str(filing.fiscal_period or "").strip().upper()):
+            observations.pop(filing.accession_number, None)
+            continue
+        observation = {"accession_number": filing.accession_number, "period_end": filing.period_end,
+            "fiscal_period": filing.fiscal_period, "source_hash": filing.content_hash}
+        timings = {**raw, **(raw["stage_timings"] if isinstance(raw.get("stage_timings"), dict) else {})}
+        observation["stage_timings"] = {key: value for key, value in timings.items()
+            if key in timing_keys and isinstance(value, (int, float)) and not isinstance(value, bool)
+            and 0 <= value <= 86_400}
+        for key in ("page_count", "candidate_page_count", "completed_page_count", "worker_session_start_count",
+                    "geometry_cache_hits", "geometry_extracted_pages"):
+            value = raw.get(key)
+            if type(value) is int and 0 <= value <= 1_000_000:
+                observation[key] = value
+        for key in ("cache_reused", "catalog_cache_hit"):
+            if type(raw.get(key)) is bool:
+                observation[key] = raw[key]
+        if raw.get("parse_strategy") == "positioned-page-checkpoint":
+            observation["parse_strategy"] = raw["parse_strategy"]
+            # This execution strategy is implemented by the positioned PDF
+            # worker whose native backend is pdfplumber. An explicit backend
+            # remains authoritative and is never relabeled when it disagrees.
+            backend = raw.get("backend", "pdfplumber")
+            if isinstance(backend, str):
+                observation["backend"] = backend
+        if isinstance(raw.get('local_structure'), dict):
+            observation['local_structure'] = {key:value for key,value in raw['local_structure'].items() if key in {
+                'ocr_calls','cache_hits','completed_pages','selected_pages','worker_start_count',
+                'model_load_seconds','inference_seconds','peak_memory_bytes','admitted_field_count','new_verified_field_count'}}
+        observations[filing.accession_number] = observation
+    return tuple(observations[key] for key in sorted(observations) if key)
+
+
+def _financial_value_identity(fact):
+    return tuple(getattr(fact, key, None) for key in ('concept','start_date','end_date',
+        'fiscal_period','currency','consolidated_scope','value','unit_scale'))
 
 
 def disclosed_reporting_currency(
@@ -922,6 +1179,146 @@ def _publishable_accessions(
         if not failed:
             publishable.append(filing.accession_number)
     return tuple(sorted(set(publishable)))
+
+
+_INCREMENTAL_PAGE_FAILURE_CODES = frozenset({
+    "PDF_WINDOW_NO_PROGRESS_NEEDS_ACTION", "PDF_WINDOW_TIMEOUT", "PDF_WORKER_TIMEOUT",
+    "PDF_WINDOW_DETERMINISTIC_FAILED", "PDF_PAGE_PARSE_FAILED", "FILING_LOCAL_PARSE_FAILED",
+}) | PDF_RUNTIME_FAILURE_CODES
+_INCREMENTAL_PAGE_DIAGNOSTICS = frozenset({
+    "pdf_window_incomplete", "pdf_window_failed", "pdf_window_exhausted",
+    "pdf_document_budget_exhausted_resumable",
+})
+_INCREMENTAL_PAGE_FENCES = frozenset({
+    "pdf_parse_cancelled", "pdf_file_missing", "pdf_file_unreadable",
+    "pdf_candidate_pages_unavailable", "cache_hash_mismatch", "legacy_source_failed",
+})
+
+
+def _incremental_page_accessions(
+    snapshot: FinancialResearchSnapshot, dataset: FinancialDataset,
+    view: FinancialResearchView,
+) -> tuple[str, ...]:
+    """Admit compiler-verified facts only behind a bound partial-page checkpoint.
+
+    This is an additive cache-publication path, not a recovery-success claim.
+    The original failures and diagnostics remain untouched on the canonical
+    dataset and the existing full-publication policy is evaluated separately.
+    """
+    filings = tuple(snapshot.filings)
+    if not filings:
+        return ()
+    by_document = {item.document_id: item for item in filings if item.document_id}
+    by_accession = {item.accession_number: item for item in filings if item.accession_number}
+    validations = dataset.coverage.get("fact_validation_records", {})
+    if not isinstance(validations, dict):
+        validations = {}
+    observations = tuple(getattr(view.profile, "parsing_observations", ()) or ())
+
+    def accepted_fact_exists(filing: FilingDocument) -> bool:
+        for fact in view.facts:
+            # The compiler owns each fact's admitted period and scope. A
+            # same-filing comparison or AS_OF row need not match the filing's
+            # primary period; only the source accession must match here.
+            if fact.accession_number != filing.accession_number:
+                continue
+            record = validations.get(fact.fact_id)
+            if isinstance(record, dict) and record.get("accepted") is True:
+                return True
+        return False
+
+    def observation_for(filing: FilingDocument) -> dict[str, Any] | None:
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            candidate_pages = observation.get("candidate_page_count")
+            completed_pages = observation.get("completed_page_count")
+            if (observation.get("accession_number") == filing.accession_number
+                    and observation.get("source_hash") == filing.content_hash
+                    and observation.get("period_end") == filing.period_end
+                    and str(observation.get("fiscal_period", "")).strip().upper()
+                    == str(filing.fiscal_period or "").strip().upper()
+                    and observation.get("parse_strategy") == "positioned-page-checkpoint"
+                    and observation.get("backend") == "pdfplumber"
+                    and type(candidate_pages) is int and type(completed_pages) is int
+                    and 0 < completed_pages < candidate_pages):
+                return observation
+        return None
+
+    def diagnostic_parts(diagnostic: Any) -> tuple[FilingDocument | None, str]:
+        text = str(diagnostic)
+        matches: list[tuple[int, FilingDocument, str]] = []
+        for filing in filings:
+            for identity in (filing.document_id, filing.accession_number):
+                if identity and text.startswith(identity + ":"):
+                    matches.append((len(identity), filing, text[len(identity) + 1:]))
+        if not matches:
+            return None, text
+        longest = max(item[0] for item in matches)
+        owners = {(item[1].document_id, item[1].accession_number)
+                  for item in matches if item[0] == longest}
+        if len(owners) != 1:
+            return None, text
+        owner_identity = next(iter(owners))
+        owner = next(item for item in filings
+                     if (item.document_id, item.accession_number) == owner_identity)
+        suffix = next(item[2] for item in matches if item[0] == longest
+                      and (item[1].document_id, item[1].accession_number) == owner_identity)
+        return owner, suffix
+
+    incremental: list[str] = []
+    for filing in filings:
+        if not filing.content_hash or observation_for(filing) is None or not accepted_fact_exists(filing):
+            continue
+
+        blocked = False
+        saw_local_page_failure = False
+        for failure in dataset.source_failures:
+            if not getattr(failure, "required", False):
+                continue
+            document_id = str(getattr(failure, "document_id", "") or "")
+            accession = str(getattr(failure, "accession_number", "") or "")
+            document_owner = by_document.get(document_id)
+            accession_owner = by_accession.get(accession)
+            if document_owner is None and accession_owner is None:
+                # A required failure with no filing identity is global/unknown.
+                blocked = True
+                break
+            if document_owner is not filing and accession_owner is not filing:
+                # A failure explicitly attributed to another filing is isolated.
+                continue
+            exact_source = document_owner is filing and accession_owner is filing
+            code = str(getattr(failure, "code", "")).upper()
+            stage = str(getattr(failure, "stage", "")).casefold()
+            if (not exact_source or stage not in {"parse", "worker"}
+                    or code not in _INCREMENTAL_PAGE_FAILURE_CODES):
+                blocked = True
+                break
+            saw_local_page_failure = True
+        if blocked:
+            continue
+
+        for diagnostic in dataset.diagnostics:
+            owner, suffix = diagnostic_parts(diagnostic)
+            if owner is not None and owner is not filing:
+                # Do not let another known source's diagnostics taint this filing.
+                continue
+            lowered = suffix.casefold()
+            if any(marker in lowered for marker in _INCREMENTAL_PAGE_FENCES):
+                blocked = True
+                break
+            if owner is filing:
+                code = lowered.split(":", 1)[0]
+                if code in _INCREMENTAL_PAGE_DIAGNOSTICS:
+                    saw_local_page_failure = True
+            elif any(marker in lowered for marker in _INCREMENTAL_PAGE_DIAGNOSTICS):
+                # An unbound page-plan failure is global, not evidence that this
+                # filing alone may use the incremental publication path.
+                blocked = True
+                break
+        if not blocked and saw_local_page_failure:
+            incremental.append(filing.accession_number)
+    return tuple(sorted(set(incremental)))
 
 
 def _raise_if_cancelled(cancel_check: Any) -> None:

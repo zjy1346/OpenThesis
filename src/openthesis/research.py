@@ -242,8 +242,10 @@ def _agent_prompt_bundle(
             return [stable_record(item) for item in value]
         return value
 
-    from .research_execution.source_compiler import compiled_role_sources
-    compiled_sources = compiled_role_sources(context_json, role, _collect_evidence_ids(prior_artifacts))
+    from .research_execution.source_compiler import compiled_source_package
+    packet_context, packet_registry, source_packet, common_core, late_sources, reading_assignment = compiled_source_package(
+        context_json, role, _collect_evidence_ids(prior_artifacts))
+    compiled_sources = (packet_context, packet_registry)
     # Keep the existing material sections and list ordering (which can encode
     # source/role priority). Canonicalize mapping keys only, without dropping
     # fields, changing independent agents or inventing a paid cache prewarm.
@@ -261,6 +263,10 @@ def _agent_prompt_bundle(
         "claim_contract": stable_record(claim_contract),
         "output_language": report_language,
         "output_language_instruction": language_instruction,
+        "source_reference_contract": "Typed evidence/fact reference fields use request-local @E/@F names. Copy these names exactly in typed citation fields. They refer only to complete sources/facts supplied in THIS request; a delegated reading assignment alone is not evidence. The host restores the original identities and applies ordinary source and financial validation. Do not put aliases in narrative or formula expressions, invent aliases, or treat them as verified facts.",
+        "record_table_contract": "Before resolving request_path_ref, interpret each record_table:columns-data-v1 as its COMPLETE original record array: for each [group,index] in order, merge groups[group].shared with the row obtained by zipping columns and data[index]. Missing fields remain absent; null is explicit. Every value, source identity, period, unit, qualifier and original ordering is retained. This is lossless tabular presentation, not a summary or omitted source.",
+        "common_core": stable_record(common_core),
+        "source_package": source_packet,
         "material_registry": material_registry,
         "request_reference_contract": "material_ref resolves to complete text in material_registry in THIS request. finding_ref resolves to prior_artifacts.findings_registry in THIS request. request_path_ref resolves to the JSON path array in THIS request. Preserve each referring record's issuer, period, units and revision; identical text never merges those identities. All referenced material is included, not a summary or external lookup.",
         "research_context": materials,
@@ -268,7 +274,10 @@ def _agent_prompt_bundle(
         "task_instructions": role_prompt,
         "prior_artifacts": stage_findings,
         "assigned_research_obligations": obligation_production_plan(role),
+        "reading_assignment": reading_assignment,
     }
+    if late_sources:
+        prompt_payload["late_evidence"] = late_sources
     if role_id is not None:
         prompt_payload["agent_role"] = role
     if output_schema is not None:
@@ -310,8 +319,9 @@ def _agent_prompt_bundle(
         narrowed = repair_context(json.dumps(prompt_payload, ensure_ascii=False), tuple(sections))
         prompt_payload = {**narrowed, **{key: prompt_payload[key] for key in (
             "agent", "task_instructions", "assigned_research_obligations", "sectional_delivery", "output_schema")}}
+    from .research_execution.reference_aliases import encode_references, reference_aliases
     user_prompt = json.dumps(
-        prompt_payload,
+        encode_references(prompt_payload, reference_aliases(context_json)),
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -349,6 +359,7 @@ class ResearchContext:
     repair_observations: list[dict[str, Any]] = field(default_factory=list)
     material_issues: list[dict[str, Any]] = field(default_factory=list)
     research_as_of: str = ""
+    source_reader_roles: tuple[str, ...] = ()
 
     def compact_json(self) -> str:
         return json.dumps(
@@ -361,6 +372,7 @@ class ResearchContext:
                 "valuation": self.valuation,
                 "market_snapshot": self.market_snapshot,
                 "research_as_of": self.research_as_of,
+                **({"source_reader_roles": list(self.source_reader_roles)} if self.source_reader_roles else {}),
                 "valuation_gaps": self.valuation_gaps(),
                 "repair_observations": self.repair_observations,
                 "issues": self.material_issues,
@@ -2093,11 +2105,12 @@ class ResearchWorkflow:
 
     def _recover_synthesis_output_sections(self, context_json: str, projected: dict[str, Any],
             original: dict[str, Any], *, run: ResearchRun | None = None) -> dict[str, Any]:
-        """One targeted supplement; never rewrite closed sections or loop.
+        """One semantic work item per missing section; preserve closed content.
 
         Missing objects are named before dispatch. An open partial object is
         retained for inspection, not overwritten by a guessed continuation.
-        The request is charged to the same per-stage/run repair allowance.
+        Each source-bound section is journaled separately, not squeezed into
+        one fixed whole-report output allowance. No unchanged section repeats.
         """
         sections = list(dict.fromkeys([*(key for key in REQUIRED_REPORT_SECTIONS if key != "claims"),
             *sorted({path.split(".")[0] for item in ResearchCoverageContract.obligations
@@ -2111,16 +2124,17 @@ class ResearchWorkflow:
                       and item.get("code") == "MODEL_OUTPUT_CONTAINER_INCOMPLETE"]
         states = [{"section": section, "complete": section_has_substance(section, original.get(section))
                    and not any(path.startswith("$." + section) for path in open_paths)} for section in sections]
-        missing = [section for section in sections if section not in original]
+        missing = [state["section"] for state in states if not state["complete"]
+            and not any(path.startswith("$." + state["section"]) for path in open_paths)]
         parts = []
-        if missing:
+        for missing_section in missing:
             self._check_cancelled()
             try:
-                part = self._run_agent_adaptive("research-synthesizer-missing-sections",
+                part = self._run_agent_adaptive("research-synthesizer-missing-" + missing_section,
                     "prompts/research-synthesizer.md", context_json,
                     {**projected, "received_synthesis_findings": prior_findings,
                      "sectional_delivery": {"schema": "research-section-delivery-v2-targeted",
-                         "sections": missing, "all_sections": sections}},
+                         "sections": [missing_section], "all_sections": sections}},
                     run=run, role_id="research-synthesizer", output_schema="research-report-section-v1")
                 from .research_execution.model_output import response_refused
                 meta = part.get("_response_meta", {})
@@ -2130,14 +2144,14 @@ class ResearchWorkflow:
                 parts.append(part)
                 for state in states:
                     section = state["section"]
-                    if section in missing:
+                    if section == missing_section:
                         if part.get(section) not in (None, "", [], {}):
                             result[section] = deepcopy(part[section])
                         state.update(complete=finished and section_has_substance(section, part.get(section)),
                                      candidate_sha256=recovery_digest(part))
             except (ProviderError, SynthesisContextLimitError) as exc:
                 for state in states:
-                    if state["section"] in missing:
+                    if state["section"] == missing_section:
                         state["code"] = exc.code
         result["claims"] = _collect_stage_claims(original, *parts)
         complete = bool(missing) and bool(states) and all(item["complete"] for item in states)
@@ -3085,6 +3099,7 @@ class ResearchWorkflow:
                                    cancel_check=self.cancel_check,
                                    manual_authorization_id=self.manual_authorization_id)
         journal.budget_only = self.budget_gap_resume
+        journal.run_envelope = (getattr(run, "research_configuration", None) or {}).get("run_envelope")
         journal.hydrate_input_budget(self.provider)
         return journal
 
@@ -3119,6 +3134,8 @@ class ResearchWorkflow:
             context_json, prior_artifacts,
             role_id=role_id, output_schema=output_schema,
         )
+        from .research_execution.reference_aliases import reference_aliases, supplied_bindings
+        bindings = supplied_bindings(user_prompt, reference_aliases(context_json))
         request = ModelStageRequest(
             agent_id, system_prompt, user_prompt,
             max_input_bytes=(provider_context_capability(self._stage_budget_provider(agent_id)).max_input_bytes
@@ -3127,24 +3144,42 @@ class ResearchWorkflow:
             claim_repair_contract=self._claim_repair_contract(context_json) if role == "research-synthesizer" else None,
             max_output_tokens=self._stage_output_budget(agent_id),
             purpose="section_delivery" if output_schema == "research-report-section-v1" else "generation",
+            reference_bindings=tuple(sorted(bindings.items())),
         )
         try:
             return executor.execute(request, material_adequacy=gate, language=self.report_language)
         except ModelStageCancelled:
             raise ResearchCancelled() from None
 
-    def _stage_output_budget(self, agent_id: str) -> int:
+    def _stage_output_budget(self, agent_id: str, *, stage_id: str | None = None) -> int:
         # A per-call allowance, never a report length cap. Truncation is not
         # completion; the adaptive coverage path retains received candidates.
+        journal = getattr(self._model_context, "journal", None)
+        scope = journal.capture_scope() if journal is not None else None
+        stage_id = stage_id or (scope[0] if scope else agent_id)
+        source_reading = stage_id in SOURCE_ANALYSIS_STAGES
         synthesis = "synthes" in agent_id
-        extended = any(key in agent_id for key in ("growth", "skeptic", "forecast"))
-        desired = 131_072 if synthesis else 98_304 if extended else 65_536
+        extended = not source_reading and any(key in agent_id for key in ("growth", "skeptic", "forecast", "counter"))
+        # Standard delivery targets, not a licence to omit sections. Existing
+        # length-cut/sectional recovery retains completed bodies and shares
+        # the same run envelope. Never inflate this with the context hint.
+        visible_target = 8_192 if synthesis or extended else 4_096
+        # The wire parameter may include reasoning. Allocate a separate
+        # planning allowance; never turn a visible-output target directly
+        # into the whole generated-token ceiling or disable thinking globally.
+        reasoning_estimate = 2_048 if synthesis or extended else 1_024
+        observed_allowance = getattr(self.provider, "output_allowance", None)
+        desired = (observed_allowance(visible_target, reasoning_estimate) if callable(observed_allowance)
+            else visible_target + reasoning_estimate)
         # Even without a user hint the planner has a provisional context. Do
         # not reserve more than that whole window and collapse recovery to a
         # one-byte input allowance. This is planning, not a vendor maximum;
         # the host applies only officially supported model-specific limits.
         capacity = provider_context_capability(self.provider).max_input_tokens
         return min(desired, max(1024, capacity // (2 if synthesis else 3 if extended else 4)))
+
+    def _stage_planning_output_budget(self, agent_id: str, stage_id: str) -> int:
+        return self._stage_output_budget(agent_id, stage_id=stage_id)
 
     def _stage_budget_provider(self, agent_id: str):
         scope = getattr(self.provider, "for_output_budget", None)

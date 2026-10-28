@@ -5,6 +5,8 @@ from copy import deepcopy
 import base64
 import binascii
 import hashlib
+import inspect
+import math
 import json
 import locale
 import re
@@ -159,6 +161,7 @@ PREFERENCE_DEFAULTS: dict[str, str] = {
     # Keeping the complete policy in one setting prevents a partially written
     # provider/authorization pair from ever enabling uploads accidentally.
     "vision_fallback_policy": "",
+    "local_structure_enabled": "false",
     # Versioned, non-secret visual fallback policy.  A standing authorization
     # is always explicit and can be revoked independently of provider/model
     # selection.  Legacy per-run consent is never promoted into these keys.
@@ -226,6 +229,7 @@ class _FinancialReportRefreshError(RuntimeError):
 @dataclass(slots=True)
 class _ResearchJob:
     job_id: str
+    operation_type: str = "research"
     cancel_event: threading.Event = field(default_factory=threading.Event)
     generation: int = 0
     revision: int = 0
@@ -417,7 +421,7 @@ class AppService:
         )
         self._financial_pipeline = FinancialPipeline(
             self._financial_ingestion,
-            engine_for=self._financial_source_service.ingestion_for,
+            engine_for=self._ingestion_with_optional_structure,
         )
         self._financial_artifact_refresher = FinancialArtifactRefresher(
             self.storage, self._financial_pipeline
@@ -586,12 +590,14 @@ class AppService:
         adapter = self._vision_adapter_factory(config)
         if isinstance(adapter, (MineruFlashAdapter, GatewayVisionAdapter)):
             from .financial_recovery import financial_incident_scope
+            budget_scope = financial_incident_scope(company) if company is not None else None
             if isinstance(adapter, MineruFlashAdapter):
                 adapter.journal = self.storage
             adapter = DurableCloudVisionAdapter(
                 adapter, self.storage, run_id,
                 authorization_check=lambda: _vision_policy_snapshot(self.preferences()) == policy_snapshot,
-                budget_scope=financial_incident_scope(company) if company is not None else None,
+                budget_scope=budget_scope,
+                automatic_budget_scope=budget_scope is not None,
             )
         return adapter
 
@@ -624,6 +630,8 @@ class AppService:
                 "research.extend_budget",
                 "research.call_history",
                 "research.financial_diagnostics",
+                "research.diagnostics",
+                "research.budget_preview",
                 "research.start",
                 "research.market_snapshot",
                 "research.retry_growth",
@@ -668,6 +676,58 @@ class AppService:
             "report_language": normalize_language(report_stored or ui_language),
         }
 
+    def _ingestion_with_optional_structure(self, company, filings):
+        engine = self._financial_source_service.ingestion_for(company, filings)
+        clone = getattr(engine, 'with_local_structure', None)
+        if not callable(clone):
+            return engine
+        enabled = self.preferences().get('local_structure_enabled') == 'true'
+        return clone(self.storage.data_dir / 'optional-components/paddle-structure-v1' if enabled else None)
+
+    def structure_status(self):
+        from .local_structure import component_status
+        return component_status(self.storage.data_dir / 'optional-components/paddle-structure-v1')
+
+    def start_structure_install(self, python_executable, *, confirmed=False):
+        if confirmed is not True:
+            raise ValueError('STRUCTURE_INSTALL_CONFIRMATION_REQUIRED')
+        if (not isinstance(python_executable, str) or not Path(python_executable).is_absolute()
+                or not Path(python_executable).is_file()):
+            raise ValueError('STRUCTURE_PYTHON_REQUIRED')
+        job = _ResearchJob(job_id=uuid.uuid4().hex, stage='structure-install', operation_type='structure-install',
+            ui_language=self.preferences()['ui_language'])
+        with self._jobs_lock:
+            for active in self._jobs.values():
+                if active.operation_type == 'structure-install' and active.state in {'queued','running','cancelling'}:
+                    return active.visible_snapshot()
+            self._jobs[job.job_id] = job
+
+        def execute():
+            from .local_structure import install_component
+            def progress(phase):
+                self._update_job(job,state='running',stage='structure-' + phase,
+                    message=phase, percent=0)
+            try:
+                result = install_component(python_executable,
+                    self.storage.data_dir / 'optional-components/paddle-structure-v1',
+                    confirmed=True, cancel_check=job.cancel_event.is_set, progress=progress)
+                if job.cancel_event.is_set():
+                    self._update_job(job,state='cancelled',error_code=None)
+                else:
+                    self._update_job(job,state='completed',percent=100,operation_result=result)
+            except Exception as error:
+                from concurrent.futures import CancelledError
+                if isinstance(error, CancelledError) or job.cancel_event.is_set():
+                    self._update_job(job,state='cancelled',error_code=None)
+                else:
+                    code = str(error)
+                    safe = {'STRUCTURE_RUNTIME_VERSION_MISMATCH','STRUCTURE_MODEL_NOT_INSTALLED',
+                        'STRUCTURE_WORKER_FAILED','STRUCTURE_WORKER_TIMEOUT','STRUCTURE_MODEL_INTEGRITY_FAILED',
+                        'STRUCTURE_PYTHON_REQUIRED'}
+                    self._update_job(job,state='failed',error_code=code if code in safe else 'STRUCTURE_INSTALL_FAILED')
+        threading.Thread(target=execute, name='openthesis-structure-install', daemon=True).start()
+        return job.visible_snapshot()
+
     def update_preferences(self, updates: dict[str, Any]) -> dict[str, str]:
         unknown = sorted(set(updates) - set(PREFERENCE_DEFAULTS))
         if unknown:
@@ -689,8 +749,10 @@ class AppService:
                     _parse_official_network_policy(value)
                 except (ValueError, TypeError) as error:
                     raise PreferenceValidationError("official network policy is invalid") from error
-            if key in {"vision_enabled", "vision_standing_authorization"} and value not in {"true", "false"}:
+            if key in {"vision_enabled", "vision_standing_authorization", "local_structure_enabled"} and value not in {"true", "false"}:
                 raise PreferenceValidationError(f"{key} must be true or false")
+            if key == 'local_structure_enabled' and value == 'true' and not self.structure_status()['available']:
+                raise PreferenceValidationError('STRUCTURE_COMPONENT_NOT_INSTALLED')
             if key in {"vision_policy_version", "vision_configuration_version"}:
                 try:
                     value = str(max(1, int(value)))
@@ -1148,6 +1210,20 @@ class AppService:
         except Exception:
             call_plan = None
             read_diagnostics.append({"code": "MODEL_PLAN_METADATA_UNAVAILABLE", "location": "model-call-plan"})
+        analysis_ids = {str(item.get("artifact_id", "")) for item in artifacts
+            if item.get("artifact_type") in {"agent-analysis", "growth-opportunities", "counter-analysis", "forecast-scenarios"}
+            or item.get("artifact_type") == "research-report" and item.get("agent_id") != "financial-refresh"}
+        financial_status['local_structure'] = {**self.structure_status(),
+            'enabled': self.preferences().get('local_structure_enabled') == 'true'}
+        financial_status["has_research_output"] = any(section.get("is_substantive")
+            and analysis_ids.intersection(section.get("source_artifact_ids", ()))
+            for section in report_read.visible_sections)
+        if financial_status['has_research_output']:
+            last_report = next((item for item in reversed(artifacts) if item.get('artifact_type') == 'research-report'), {})
+            overlay = last_report.get('content', {})
+            if isinstance(overlay, dict) and overlay.get('mode') == 'financial-refresh-overlay':
+                financial_status['snapshot_stale'] = bool(financial_status['snapshot_stale']
+                    or overlay.get('financial_refresh', {}).get('qualitative_snapshot_stale'))
         return {
             "run_id": run_id,
             "call_plan": call_plan,
@@ -1188,21 +1264,73 @@ class AppService:
             "html": report_read.html,
         }
 
-    def extend_model_budget(self, run_id: str, expected_digest: str, gap_ids: list[str]) -> dict:
+    def extend_model_budget(self, run_id: str, expected_digest: str, gap_ids: list[str], adaptive_choice=None) -> dict:
         if (not isinstance(run_id, str) or not run_id or not isinstance(expected_digest, str)
                 or not re.fullmatch(r"[a-f0-9]{64}", expected_digest)
-                or not isinstance(gap_ids, list) or not 1 <= len(gap_ids) <= 100
+                or adaptive_choice not in (None, "keep", "remove")
+                or not isinstance(gap_ids, list) or not (0 if adaptive_choice else 1) <= len(gap_ids) <= 100
                 or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value) for value in gap_ids)
                 or len(set(gap_ids)) != len(gap_ids)):
             raise ValueError("MODEL_BUDGET_APPROVAL_INVALID")
         from .research_execution.call_budget import extend_plan
+        if any(item.get("active") for item in self._recovery_wire_states(run_id)):
+            raise ValueError("MODEL_REQUEST_IN_PROGRESS")
         try:
             with self.storage.connect() as db:
-                return extend_plan(db, run_id, expected_digest, gap_ids)
+                return extend_plan(db, run_id, expected_digest, gap_ids, adaptive_choice)
         except ValueError as error:
             if str(error) in {"MODEL_BUDGET_PLAN_CHANGED", "MODEL_BUDGET_GAP_CHANGED"}:
                 raise ServiceConfigurationError(str(error)) from error
             raise
+
+    def research_diagnostics(self, run_id: str) -> dict[str, Any]:
+        result = self.storage.research_diagnostics(run_id)
+        financial = self.financial_diagnostics(run_id)
+        result["app"] = financial["app"]
+        result["company"] = financial["company"]
+        result["financial"] = {"snapshot_kind": "historical" if financial["financial_status"].get("snapshot_stale") else "current",
+            "status": financial["financial_status"], "issues": financial["issues"], "recovery_cases": financial["recovery_cases"]}
+        return result
+
+    def research_budget_preview(self, envelope=None) -> dict[str, Any]:
+        from .research_execution.call_budget import user_envelope
+        return {"schema": "openthesis.research-budget-preview.v1",
+            "user_envelope": user_envelope(envelope), "estimated_cost": None,
+            "price_status": "unknown", "workload_status": "pending_material_compilation"}
+
+    def pdf_runtime_diagnostics(self, run_id: str, document_id: str) -> dict[str, Any]:
+        """Local-only ability check for an existing run's registered original.
+
+        Not an arbitrary-path API or a model call. Text stays local, and this
+        cannot admit financial facts or change a report generation.
+        """
+        from .financial_sources.pdf_document_units import read_document_context
+        if not isinstance(run_id, str) or not isinstance(document_id, str):
+            raise ValueError("run and document identity required")
+        run = self.storage.get_run(run_id)
+        if run is None:
+            raise KeyError("research run not found")
+        company = _decode_payload(run.get("payload_json")).get("company", {})
+        filing = next((item for item in self.storage.get_filings(_financial_storage_key(company))
+                       if item.document_id == document_id), None)
+        if filing is None:
+            raise KeyError("registered filing not found")
+        try:
+            with open(filing.local_path, "rb") as source:
+                digest = hashlib.file_digest(source, "sha256").hexdigest()
+        except FileNotFoundError:
+            return {"raw_error_code": "PDF_SOURCE_NOT_FOUND", "worker_diagnostics": []}
+        except OSError:
+            return {"raw_error_code": "PDF_SOURCE_ACCESS_DENIED", "worker_diagnostics": []}
+        if not filing.content_hash or digest != filing.content_hash:
+            return {"raw_error_code": "PDF_SOURCE_HASH_MISMATCH", "worker_diagnostics": []}
+        context = read_document_context(filing.local_path, source_hash=digest,
+            checkpoint_dir=self.storage.data_dir / "pdf-runtime-checks", timeout_seconds=90.)
+        return {"schema": "openthesis.pdf-runtime.v1", "source_hash": digest,
+            "raw_error_code": context.diagnostic_code, "page_count": context.completed_pages,
+            "nonempty_pages": sum(bool(text.strip()) for text in context.page_texts),
+            "text_characters": sum(len(text) for text in context.page_texts),
+            "worker_diagnostics": list(context.worker_diagnostics)}
 
     def financial_diagnostics(self, run_id: str) -> dict[str, Any]:
         """Return a bounded, exportable diagnostic snapshot for one run.
@@ -1237,14 +1365,29 @@ class AppService:
                 "pages": [int(page) for page in case.get("pages", []) if isinstance(page, int)][:100],
                 "fields": [str(field)[:160] for field in case.get("fields", [])][:100],
                 "stage": str(case.get("stage", ""))[:120],
-                "error_code": FinancialRecoveryController.classify_error(case.get("error_code", "")),
+                "error_code": FinancialRecoveryController.raw_error_code(case.get("error_code", "")),
+                "raw_error_code": FinancialRecoveryController.raw_error_code(case.get("error_code", "")),
+                "error_category": FinancialRecoveryController.classify_error(case.get("error_code", "")),
                 "attempts": int(case.get("attempts", 0) or 0),
                 "status": str(case.get("status", "open"))[:40],
                 "next_action": str(case.get("next_action", ""))[:160],
                 "freshness": "stale" if status.get("snapshot_stale") else "current",
             })
+        from .financial_sources.pdf_document_units import runtime_receipt_path
+        runtime_receipts = []
+        for filing in self.storage.get_filings(company_key):
+            receipt_path = runtime_receipt_path(self.storage.data_dir / "financial-window-checkpoints" / "document-text", filing.content_hash)
+            try:
+                if receipt_path.stat().st_size > 512_000:
+                    continue
+                receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+                if receipt.get('source_hash') == filing.content_hash:
+                    runtime_receipts.append({'document_id': filing.document_id, **_safe_pdf_runtime_receipt(receipt)})
+            except (OSError, ValueError, TypeError):
+                continue
         market = str(company.get("market", "US"))
         pack = self._financial_source_service.compatibility_summary(market, "annual")
+        parsing_snapshot = self.storage.get_financial_research_snapshot(company_key)
         return {
             "schema": "openthesis.financial-diagnostics.v1",
             "app": {"version": self.app_version, "contract_version": CONTRACT_VERSION},
@@ -1254,11 +1397,13 @@ class AppService:
                 key: status.get(key)
                 for key in ("state", "expected_periods", "available_periods", "missing_periods",
                             "unverified_periods", "attempt_count", "last_stage", "updated_at",
-                            "next_action", "snapshot_stale", "quality_summary")
+                            "next_action", "snapshot_stale", "quality_summary", "failure_layer", "runtime_repair_required", "interim_nodes")
             },
             "recovery_cases": cases,
+            "pdf_runtime": runtime_receipts,
+            "parse_observations": parsing_snapshot.get("parsing_observations", []),
             "issues": [
-                {key: issue.get(key) for key in ("period", "stage", "code", "status", "quality_class", "next_action")}
+                {key: issue.get(key) for key in ("period", "fiscal_period", "stage", "code", "status", "quality_class", "next_action")}
                 for issue in status.get("issues", [])
             ],
             "active_compatibility_pack": pack,
@@ -1400,9 +1545,15 @@ class AppService:
             ),
         )
 
-        def update(stage: str, current: int, total: int) -> None:
+        def update(stage: str, current: int, total: int, detail=None) -> None:
             if job.cancel_event.is_set():
                 raise ResearchCancelled()
+            if stage in {'cache-check', 'filing-index', 'filing-window', 'filing-page', 'filing-status', 'filing-candidates'}:
+                self._ingestion_progress(job, stage, current, total, detail if isinstance(detail, dict) else None)
+                return
+            if (stage in {"filing-parse", "filing-validation"}
+                    and isinstance(detail, dict) and detail.get("filing_id")):
+                self._ingestion_progress(job, stage, current, total, detail)
             stage_percent = {
                 "filing-discovery": 8,
                 "filing-download": 15,
@@ -1452,7 +1603,9 @@ class AppService:
             self._update_job(
                 job,
                 state="completed" if completed else "failed",
-                stage="completed" if completed else "financial-validation",
+                stage="completed" if completed else (
+                    "filing-parse" if report.get('financial_status', {}).get('failure_layer') in {'runtime', 'source', 'ocr', 'extraction'}
+                    else "financial-validation"),
                 percent=100,
                 operation_result=dict(retry) if isinstance(retry, dict) else {},
                 recovery_outcome=recovery,
@@ -1572,11 +1725,22 @@ class AppService:
             if callable(language_setter):
                 language_setter(str(payload.get("report_language") or "zh-Hant"))
         notify = progress or (lambda *_args: None)
+
+        try:
+            inspect.signature(notify).bind("filing-parse", 0, 0, None)
+        except (TypeError, ValueError):
+            notify_with_detail = False
+        else:
+            notify_with_detail = True
+
         def on_progress(stage, current, total, detail=None):
             if stage == "filing-acquisition-complete":
                 filing_hashes.update(item.content_hash for item in detail or () if item.content_hash)
                 return
-            notify(stage, current, total)
+            if notify_with_detail:
+                notify(stage, current, total, detail)
+            else:
+                notify(stage, current, total)
         return (OfficialFinancialRequest(company, adapter, candidate_sources=tuple(sources),
             annual_history_years=history, force=force, repair=True, run_id=run_id,
             recovery_targets=frozenset() if force else frozenset(
@@ -1738,7 +1902,9 @@ class AppService:
             raise ValueError("RESEARCH_BUDGET_RESUME_INVALID")
         if budget_only:
             with self.storage.connect() as db:
-                if not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND state='approved'", (run_id,)).fetchone():
+                from .research_execution.call_budget import plan_status
+                plan = plan_status(db, run_id) or {}
+                if not (plan.get("policy_migrations") and plan.get("policy") == "adaptive") and not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND state='approved'", (run_id,)).fetchone():
                     raise ValueError("MODEL_BUDGET_APPROVAL_REQUIRED")
             return self._retry_research_model_stages_once(run_id, model, budget_only=True)
         return self._execute_recovery_plan(
@@ -1907,6 +2073,10 @@ class AppService:
         return self._disclosure_service.capture(company, policy).to_dict()
 
     def start_research(self, request: dict[str, Any]) -> dict[str, Any]:
+        # Validate before identity/network work and persist the explicit choice;
+        # a model's context capacity must not silently enlarge user spending.
+        from .research_execution.call_budget import user_envelope
+        envelope = user_envelope(request.get("run_envelope"))
         mode = request.get("mode")
         if mode not in {"demo", "company"}:
             raise ValueError("unsupported research mode")
@@ -1955,9 +2125,15 @@ class AppService:
                 "research_pack_version": selected_pack.version,
                 "research_pack_content_identity": selected_pack.content_hash,
                 "annual_history_years": _research_history_years(request, selected_pack),
+                "run_envelope": envelope,
             },
         )
         self._continuity.start(run)
+        # Start the one run clock before PDF/visual preparation. Compiling the
+        # later text plan preserves this clock and all early vision spending.
+        from .research_execution.call_budget import prepare_external_plan
+        with self.storage.connect() as db:
+            prepare_external_plan(db, run.run_id, envelope)
         job = _ResearchJob(
             job_id=uuid.uuid4().hex,
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
@@ -1996,7 +2172,14 @@ class AppService:
                 snapshot = current.visible_snapshot()
         snapshot["model_calls"] = progress["calls"]
         snapshot["call_plan"] = self.storage.model_call_plan(snapshot.get("run_id") or "")
-        snapshot["status_revision"] = f"{snapshot.get('revision', 0)}:{progress['revision']}"
+        # The durable call read model deliberately does not rebuild on every
+        # clock tick. Refresh only its small live plan overlay; a quiet stream
+        # must still expose the run-wide warning at the correct boundary.
+        for call in snapshot["model_calls"]:
+            if "call_plan" in call:
+                call["call_plan"] = snapshot["call_plan"]
+        warning = (snapshot["call_plan"] or {}).get("time_warning") is True
+        snapshot["status_revision"] = f"{snapshot.get('revision', 0)}:{progress['revision']}:w{int(warning)}"
         return snapshot
 
     def cancel_model_call(self, job_id: str, request_id: str, attempt_id: str) -> dict:
@@ -2129,24 +2312,54 @@ class AppService:
         if detail and detail.get("filing_id"):
             filing_states = {key: dict(value) for key, value in job.filing_states.items()}
             filing_id = str(detail["filing_id"])
+            previous_filing_state = filing_states.get(filing_id, {})
             filing_states[filing_id] = {
-                **filing_states.get(filing_id, {}),
+                **previous_filing_state,
                 "filing_id": filing_id,
                 "label": str(detail.get("label") or filing_id),
                 "status": str(detail.get("status") or stage),
                 "error_code": str(detail.get("error_code") or ""),
                 "elapsed_seconds": round(float(detail.get("elapsed_seconds") or 0.0), 3),
-                "window_index": detail.get("window_index"),
-                "window_total": detail.get("window_total"),
+                "window_index": detail.get("window_index", previous_filing_state.get("window_index")),
+                "window_total": detail.get("window_total", previous_filing_state.get("window_total")),
+                "page_index": detail.get("completed_page_count", previous_filing_state.get("page_index")),
+                "page_total": detail.get("candidate_page_count", previous_filing_state.get("page_total")),
                 "last_activity_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }
             for field in ("processing_state", "availability", "roles", "candidate_count", "admitted_count",
                           "quarantined_count", "issue_codes", "source_hash", "accession_number", "period_end", "fiscal_period",
                           "page_count", "native_text_page_count", "indexed_page_count", "window_total",
+                          "completed_page_count", "candidate_page_count",
+                          "page_index", "page_total",
+                          "parsed_page_count", "parsing_active_seconds", "last_product_at", "waiting_type", "parser_backend", "current_page",
                           "completed_window_count", "parse_elapsed_seconds", "failure_stage", "root_error_code",
                           "attempt_count", "cache_reused", "recognized_statements", "extracted_pages"):
                 if field in detail:
                     filing_states[filing_id][field] = deepcopy(detail[field])
+            if isinstance(detail.get('catalog_pages'), int):
+                filing_states[filing_id]['catalog_pages'] = max(0, detail['catalog_pages'])
+            if isinstance(detail.get('local_structure'), dict):
+                local = detail['local_structure']
+                filing_states[filing_id]['local_structure'] = {key:local[key] for key in (
+                    'backend','versions','ocr_calls','cache_hits','completed_pages','selected_pages',
+                    'worker_start_count','model_load_seconds','inference_seconds','peak_memory_bytes',
+                    'state','page','elapsed_seconds') if key in local}
+                filing_states[filing_id].update(parser_backend='paddle-structure-v3', waiting_type='native_parse',
+                    parsed_page_count=int(local.get('ocr_calls', 0)),
+                    parsing_active_seconds=float(local.get('inference_seconds', 0)),
+                    completed_page_count=int(local.get('completed_pages', 0)),
+                    candidate_page_count=int(local.get('selected_pages', 0)), current_page=local.get('page'))
+                if local.get('state') == 'ready':
+                    filing_states[filing_id]['last_product_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            elif stage == 'filing-validation':
+                filing_states[filing_id]['waiting_type'] = ('local_validation'
+                    if detail.get('processing_state') != 'completed' else None)
+            if isinstance(detail.get('work_progress'), dict):
+                work = detail['work_progress']
+                filing_states[filing_id]['work_progress'] = {
+                    'ready_items': max(0, int(work.get('ready_items') or 0)),
+                    'pending_input_count': len(work.get('pending_inputs') or ()),
+                }
             updates["filing_states"] = filing_states
         self._update_job(job, **updates)
 
@@ -2510,6 +2723,20 @@ def _report_projection_failure(error: Exception, *, technical: bool = False) -> 
 
 
 def _research_data_message(code: str, language: str) -> str:
+    from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
+    if code in PDF_RUNTIME_FAILURE_CODES:
+        return _ui_message(language,
+            'The local PDF component could not run. Your originals are preserved. Repair or update the application and export diagnostics; downloading the same reports again will not repair this component.',
+            '本地 PDF 组件未能运行，原件已保留。请修复或更新应用并导出诊断；重复下载相同财报不能修复该组件。',
+            '本機 PDF 元件未能執行，原件已保留。請修復或更新應用程式並匯出診斷；重複下載相同財報無法修復該元件。')
+    if code in {'PDF_SOURCE_NOT_FOUND', 'PDF_SOURCE_ACCESS_DENIED', 'PDF_SOURCE_INVALID'}:
+        return _ui_message(language, 'The registered PDF is missing, inaccessible or damaged. Restore the official original; this is not a financial-field conflict.',
+            '已登记的财报文件缺失、无法访问或损坏。请恢复官方原件；这不是财务字段冲突。',
+            '已登記的財報檔案遺失、無法存取或損壞。請恢復官方原件；這不是財務欄位衝突。')
+    if code == 'DOCUMENT_CONTEXT_OCR_REQUIRED':
+        return _ui_message(language, 'This PDF has no native text. Scanned pages need separately authorized OCR; no upload was started by this local check.',
+            '该 PDF 没有可读取的原生文字，扫描页需要另行授权 OCR；本地检查没有发起上传。',
+            '該 PDF 沒有可讀取的原生文字，掃描頁需要另行授權 OCR；本機檢查沒有發起上傳。')
     messages = {
         "zh-CN": {
             "PDF_WORKER_START_FAILED": "本地财报解析进程无法启动，并非已确认的财务字段冲突。已保留原件和完成的进度；请检查运行环境，或配置并授权云端识别后继续。",
@@ -3536,6 +3763,30 @@ def _financial_status(
         "attempt_count": 0, "last_stage": "", "last_error": "", "updated_at": ""
     }
     recovery_cases = storage.get_financial_recovery_cases(run_id) if run_id else []
+    registered_filings = storage.get_filings(company_cik) if company_cik else []
+    filing_periods = {item.accession_number: f"{str(item.period_end)[:4]} {item.fiscal_period}".strip()
+                      for item in registered_filings if item.period_end}
+    from .financial_source_errors import LOCAL_PARSER_AVAILABILITY_CODES, PDF_RUNTIME_FAILURE_CODES
+    recovery_cases = [{**case, "period": filing_periods.get(case.get('accession_number'), ''),
+        "stage": 'filing-parse' if case.get('error_code') in PDF_RUNTIME_FAILURE_CODES else case.get('stage', ''),
+        "raw_error_code": FinancialRecoveryController.raw_error_code(case.get('error_code', ''))}
+        for case in recovery_cases]
+    # Annual completeness is calculated from the active FY disclosure only.
+    # Interim statements remain visible as their own nodes and diagnostics,
+    # but must not turn a complete annual history into a rejected one.
+    superseded_references = {
+        str(item.supersedes_document_id)
+        for item in registered_filings if item.supersedes_document_id
+    }
+    active_filing_by_period: dict[tuple[str, str], Any] = {}
+    for filing in sorted(registered_filings, key=lambda item: (str(item.filed_at), str(item.document_id))):
+        if filing.document_id in superseded_references or filing.accession_number in superseded_references:
+            continue
+        period_key = (str(filing.fiscal_period or "").upper(), str(filing.period_end or ""))
+        prior = active_filing_by_period.get(period_key)
+        if prior is None or (str(filing.filed_at), str(filing.document_id)) > (str(prior.filed_at), str(prior.document_id)):
+            active_filing_by_period[period_key] = filing
+    active_accessions = {str(item.accession_number) for item in active_filing_by_period.values()}
     # The legacy retry aggregate is keyed only by security.  It is useful for
     # diagnostics while this run is incomplete, but must not leak a previous
     # run's failure into a completed report.
@@ -3595,8 +3846,27 @@ def _financial_status(
     # them with the persisted, verified facts for the same accession and
     # statement scope/currency before deciding a year is complete. Never let a
     # parent, foreign-currency, rejected, or warning fact fill a group gap.
-    verified_group_years: set[int] = set()
+    annual_groups: list[dict[str, Any]] = []
+    annual_target_groups: list[dict[str, Any]] = []
+    interim_groups: list[dict[str, Any]] = []
     for group in groups:
+        fiscal_period = str(group.get("fiscal_period", "FY")).upper()
+        accession = str(group.get("accession_number", ""))
+        if accession in {str(item.accession_number) for item in registered_filings} and accession not in active_accessions:
+            continue
+        if fiscal_period == "FY":
+            annual_groups.append(group)
+            if (
+                str(group.get("role", "target")).lower() == "target"
+                and str(group.get("consolidated_scope", "")).lower() == "consolidated"
+                and (not reporting_currency or str(group.get("currency", "")).upper() == reporting_currency)
+            ):
+                annual_target_groups.append(group)
+        else:
+            interim_groups.append(group)
+
+    verified_group_years: set[int] = set()
+    for group in annual_target_groups:
         period = str(group.get("period_end", ""))
         if not (
             str(group.get("status", "")).upper() == ValidationStatus.VERIFIED.value
@@ -3671,7 +3941,7 @@ def _financial_status(
         if str(case.get("status", "open")) == "resolved":
             continue
         issues.append({
-            "period": str(case.get("accession_number", "")),
+            "period": str(case.get("period", "")),
             "stage": str(case.get("stage", "financial-recovery")),
             "code": str(case.get("error_code", "RECOVERY_FAILED")),
             "status": str(case.get("status", "open")),
@@ -3697,14 +3967,17 @@ def _financial_status(
             return "warning"
         return "statement_unavailable"
 
-    for group in groups:
+    for group in (*annual_groups, *interim_groups):
         period = str(group.get("period_end", ""))
-        if len(period) >= 4 and period[:4].isdigit():
+        fiscal_period = str(group.get("fiscal_period", "FY")).upper()
+        if (fiscal_period == "FY" and group in annual_target_groups
+                and len(period) >= 4 and period[:4].isdigit()):
             group_by_year.setdefault(int(period[:4]), []).append(group)
         for issue in group.get("issues", []):
             issues.append({
                 "period": period,
-                "stage": "filing-validation",
+                "fiscal_period": fiscal_period,
+                "stage": "filing-validation" if fiscal_period == "FY" else "interim-validation",
                 "code": str(issue),
                 "status": str(group.get("status", "")),
                 "quality_class": quality_class(group),
@@ -3750,11 +4023,29 @@ def _financial_status(
             ValidationStatus.REJECTED.value,
             ValidationStatus.READY_WITH_WARNINGS.value,
         }
-        for item in groups
+        for item in annual_target_groups
     )
+    annual_recovery_cases = [
+        item for item in recovery_cases
+        if not item.get("period") or str(item.get("period", "")).upper().endswith(" FY")
+    ]
     unresolved_recovery = any(
-        str(item.get("status", "open")) != "resolved" for item in recovery_cases
+        str(item.get("status", "open")) != "resolved" for item in annual_recovery_cases
     )
+    interim_nodes = [
+        {
+            "period": str(item.get("period_end", "")),
+            "fiscal_period": str(item.get("fiscal_period", "")),
+            "state": "rejected" if str(item.get("status", "")).upper() == ValidationStatus.REJECTED.value
+                else "warning" if str(item.get("status", "")).upper() == ValidationStatus.READY_WITH_WARNINGS.value
+                else "verified" if str(item.get("status", "")).upper() == ValidationStatus.VERIFIED.value
+                else "unverified",
+            "quality_class": quality_class(item),
+            "scope": str(item.get("consolidated_scope", "unknown")),
+            "currency": str(item.get("currency", "")),
+        }
+        for item in interim_groups
+    ]
     retryable = (
         not available_years or bool(missing_years) or bool(unverified_years)
         or problematic_groups or unresolved_recovery
@@ -3787,19 +4078,46 @@ def _financial_status(
             # is unavailable. The report reader records that failure itself.
             continuity_snapshot = {}
     source_outcome = continuity_financial_outcome(continuity_snapshot)
+    open_codes = {str(case.get('error_code', '')) for case in recovery_cases if case.get('status') != 'resolved'}
+    # A completed local repair supersedes its source failure, not independent
+    # model attempts. The old continuity event stays in the audit trail.
+    if source_outcome and recovery_cases and source_outcome['diagnostic_code'] not in open_codes:
+        source_outcome = None
     if source_outcome is not None:
         next_action = source_outcome["next_actions"][0]
         retryable = source_outcome["state"] == "waiting_external"
         retry = {**retry, "last_stage": "data-unavailable", "last_error": source_outcome["diagnostic_code"]}
+    codes = open_codes | {str(retry.get('last_error', '')).rsplit(':', 1)[-1]}
+    if source_outcome:
+        codes.add(source_outcome['diagnostic_code'])
+    from .pdf_worker import current_runtime_failure
+    historical_runtime_fault = bool(codes & PDF_RUNTIME_FAILURE_CODES)
+    runtime_repair_required = historical_runtime_fault and current_runtime_failure()
+    failure_layer = ('runtime' if historical_runtime_fault else
+        'ocr' if 'DOCUMENT_CONTEXT_OCR_REQUIRED' in codes else
+        'source' if codes & {'PDF_SOURCE_NOT_FOUND', 'PDF_SOURCE_ACCESS_DENIED', 'PDF_SOURCE_INVALID'} else
+        'extraction' if codes & (LOCAL_PARSER_AVAILABILITY_CODES | {
+            'PERIOD_DECLARATION_NOT_FOUND', 'FILING_LOCAL_PARSE_FAILED'}) else
+        'ready' if available_years and not unresolved_recovery else 'validation')
+    if runtime_repair_required:
+        next_action = 'repair_local_pdf_runtime'
+        retryable = False
+    elif historical_runtime_fault:
+        # Updating the executable is a changed recovery path. Don't let an old
+        # failed build's label prevent the corrected build from reading again.
+        next_action, retryable = 'retry_local_parse', True
     return {
         "state": state,
         "retryable": retryable,
+        "failure_layer": failure_layer,
+        "runtime_repair_required": runtime_repair_required,
         "history_years": history_years,
         "expected_periods": [str(year) for year in expected_years],
         "available_periods": [str(year) for year in available_years],
         "missing_periods": [str(year) for year in missing_years],
         "unverified_periods": [str(year) for year in unverified_years],
         "nodes": nodes,
+        "interim_nodes": interim_nodes,
         "issues": issues,
         "recovery_cases": recovery_cases,
         "quality_summary": quality_summary,
@@ -3813,6 +4131,43 @@ def _financial_status(
         "snapshot_stale": snapshot_stale,
         "recovery_outcome": source_outcome,
     }
+
+
+def _safe_pdf_runtime_receipt(receipt):
+    """Export a typed receipt, not arbitrary local JSON or exception strings."""
+    workers = []
+    rows = receipt.get('workers', ())
+    for item in (rows if isinstance(rows, (list, tuple)) else ())[:1000]:
+        if not isinstance(item, dict):
+            continue
+        worker = {key: item.get(key) for key in ('ready_received', 'artifact_received') if type(item.get(key)) is bool}
+        for key, allowed in (('phase', {'startup','import','ready','open','extract','render','serialize'}),
+                             ('backend', {'pdfium','pypdf','pdfplumber'})):
+            if item.get(key) in allowed:
+                worker[key] = item[key]
+        for key in ('operation', 'exception_type'):
+            value = item.get(key)
+            if isinstance(value, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', value):
+                worker[key] = value
+        worker['raw_error_code'] = FinancialRecoveryController.raw_error_code(item.get('raw_error_code', ''))
+        for key in ('exit_code', 'elapsed_seconds'):
+            value = item.get(key)
+            if type(value) in (int, float) and math.isfinite(value):
+                worker[key] = value
+        pages = item.get('page_range')
+        if isinstance(pages, list) and len(pages) <= 128 and all(type(page) is int and 0 < page <= 100_000 for page in pages):
+            worker['page_range'] = pages
+        version = item.get('version', '')
+        if isinstance(version, str) and re.fullmatch(r'\d+(?:\.\d+){1,3}', version):
+            worker['version'] = version
+        workers.append(worker)
+    build = receipt.get('build', {})
+    safe_build = {key: value for key in ('version', 'build_id') if isinstance(value := build.get(key), str)
+                  and re.fullmatch(r'(?:\d+\.\d+\.\d+|[a-fA-F0-9]{64})', value)} if isinstance(build, dict) else {}
+    return {'source_hash': receipt.get('source_hash', ''), 'build': safe_build,
+        'raw_error_code': FinancialRecoveryController.raw_error_code(receipt.get('raw_error_code', '')),
+        'completed_pages': receipt.get('completed_pages') if type(receipt.get('completed_pages')) is int else None,
+        'workers': workers}
 
 
 def _financial_storage_key(company_payload: dict[str, Any]) -> str:

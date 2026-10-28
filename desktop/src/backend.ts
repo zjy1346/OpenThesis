@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import type {
   BootstrapResult,
@@ -17,15 +18,23 @@ import type {
   ProviderConnectionSummary,
   ProviderDefinition,
   ResearchJob,
+  StructureRuntimeStatus,
   ResearchReport,
   RecoveryStageTarget,
   ResearchRequest,
   ResearchPackSummary,
   ThesisVersion,
   FinancialDiagnostics,
+  ResearchDiagnostics,
+  ResearchBudgetPreview,
+  AdaptiveResearchRunEnvelope,
   MarketSnapshotPreview,
   ModelCallHistoryPage,
   ModelCallPlan,
+  ConnectionCapabilityProfile,
+  ConnectionTransportSettings,
+  ModelTestEvent,
+  ModelDirectory,
 } from "./types";
 import type {
   BackendMethod,
@@ -102,9 +111,17 @@ export function getResearchReport(
 }
 
 export function updatePreferences(
-  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy">>,
+  preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy" | "local_structure_enabled">>,
 ): Promise<Preferences> {
   return request("settings.update", { preferences });
+}
+
+export function getStructureStatus(): Promise<StructureRuntimeStatus> {
+  return request("structure.status", {});
+}
+
+export function startStructureInstall(pythonExecutable: string): Promise<ResearchJob> {
+  return request("structure.install", { python_executable: pythonExecutable, confirmed: true });
 }
 
 export async function searchCompanies(query: string, market: Market, requestId: string): Promise<CompanySearchResponse> {
@@ -141,11 +158,39 @@ export function getFinancialDiagnostics(runId: string): Promise<FinancialDiagnos
   return request("research.financial_diagnostics", { run_id: runId });
 }
 
+export function getResearchDiagnostics(runId: string): Promise<ResearchDiagnostics> {
+  return invoke<ResearchDiagnostics>("backend_request", { method: "research.diagnostics", params: { run_id: runId } }).then((diagnostics) => {
+    if (diagnostics?.schema !== "openthesis.research-diagnostics.v1" || diagnostics.run?.run_id !== runId) {
+      throw new Error("RESEARCH_DIAGNOSTICS_CONTRACT_MISMATCH");
+    }
+    return diagnostics;
+  });
+}
+
+export function getResearchBudgetPreview(runEnvelope?: AdaptiveResearchRunEnvelope): Promise<ResearchBudgetPreview> {
+  return invoke<ResearchBudgetPreview>("backend_request", {
+    method: "research.budget_preview",
+    params: runEnvelope ? { run_envelope: runEnvelope } : {},
+  }).then((preview) => {
+    if (preview?.schema !== "openthesis.research-budget-preview.v1"
+        || !preview.user_envelope
+        || !(preview.estimated_cost === null || typeof preview.estimated_cost === "number" && Number.isFinite(preview.estimated_cost))
+        || typeof preview.price_status !== "string"
+        || typeof preview.workload_status !== "string") {
+      throw new Error("RESEARCH_BUDGET_PREVIEW_CONTRACT_MISMATCH");
+    }
+    return preview;
+  });
+}
+
 export function listProviderConnections(): Promise<ProviderConnectionSummary[]> {
   return invoke<ProviderConnectionSummary[]>("model_center_list_connections");
 }
 
 export function saveProviderConnection(input: {
+  protocol?: "chat_completions" | "ollama";
+  capability_profile?: ConnectionCapabilityProfile;
+  transport?: ConnectionTransportSettings;
   connection_id: string;
   provider_id: string;
   display_name: string;
@@ -194,6 +239,7 @@ export function saveConfiguredModel(input: {
   capabilities: string[];
   timeout_seconds?: number;
   context_window_hint?: number | null;
+  temperature?: number | null;
 }): Promise<ConfiguredModelSummary> {
   return invoke<ConfiguredModelSummary>("model_center_save_configured_model", { input });
 }
@@ -205,13 +251,24 @@ export function deleteConfiguredModel(configuredModelId: string): Promise<void> 
 export function discoverConnectionModels(connectionId: string): Promise<DiscoveredModel[]> {
   return invoke<DiscoveredModel[]>("model_gateway_discover_connection", { connectionId });
 }
+export function getModelDirectory(refresh = false): Promise<ModelDirectory> {
+  return invoke<ModelDirectory>("model_center_model_directory", { refresh });
+}
 
 export function testProviderConnection(connectionId: string, modelId?: string): Promise<{ ok: boolean; message: string }> {
   return invoke<{ ok: boolean; message: string }>("model_gateway_test_connection", { connectionId, modelId });
 }
 
-export function testConfiguredModel(configuredModelId: string): Promise<{ ok: boolean; message: string }> {
-  return invoke<{ ok: boolean; message: string }>("model_gateway_test_model", { configuredModelId });
+export function testConfiguredModel(configuredModelId: string, testVision = false, operationId?: string): Promise<{ ok: boolean; message: string; capabilities?: { capability: string; status: string; error_code?: string | null; retry_after_seconds?: number | null }[] }> {
+  return invoke("model_gateway_test_model", { configuredModelId, testVision, ...(operationId ? { operationId } : {}) });
+}
+
+export function subscribeModelTestEvents(handler: (event: ModelTestEvent) => void): Promise<() => void> {
+  return listen<ModelTestEvent>("openthesis-model-test", (event) => handler(event.payload));
+}
+
+export function cancelModelTest(operationId: string): Promise<void> {
+  return invoke("model_gateway_cancel_test", { operationId });
 }
 
 export function validateOtDraft(draft: OtDraft): Promise<OtValidationResult> {
@@ -283,11 +340,13 @@ export function extendResearchBudget(
   runId: string,
   planDigest: string,
   gapIds: string[],
+  adaptiveChoice?: "keep" | "remove",
 ): Promise<ModelCallPlan> {
   return request("research.extend_budget", {
     run_id: runId,
     plan_digest: planDigest,
     gap_ids: gapIds,
+    ...(adaptiveChoice ? { adaptive_choice: adaptiveChoice } : {}),
   });
 }
 
@@ -385,6 +444,13 @@ export function exportResearchReport(report: ResearchReport): Promise<boolean> {
 export function exportFinancialDiagnostics(diagnostics: FinancialDiagnostics): Promise<boolean> {
   return invoke<boolean>("export_financial_diagnostics", {
     suggestedName: `OpenThesis-${diagnostics.company.ticker || "research"}-${diagnostics.run.run_id.slice(0, 12)}-diagnostics.json`,
+    dataJson: JSON.stringify(diagnostics, null, 2),
+  });
+}
+
+export function exportResearchDiagnostics(diagnostics: ResearchDiagnostics): Promise<boolean> {
+  return invoke<boolean>("export_financial_diagnostics", {
+    suggestedName: `OpenThesis-${diagnostics.run.run_id.slice(0, 12)}-research-diagnostics.json`,
     dataJson: JSON.stringify(diagnostics, null, 2),
   });
 }

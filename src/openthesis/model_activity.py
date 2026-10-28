@@ -21,7 +21,7 @@ class ModelActivityLedger:
             now = self.clock()
             key = (context["request_id"], context["attempt_id"])
             self._rows[key] = {**context, "state": "queued", "started": now,
-                "changed": now, "last_substantive": now, "first_content": None,
+                "changed": now, "last_substantive": now, "first_content": None, "first_response": None,
                 "content_bytes": 0, "reasoning_bytes": 0, "phase_seconds": {}, "seq": 0}
             # Only terminal historical observations may be evicted. Active
             # calls are bounded separately by the scheduler, not by UI limits.
@@ -50,8 +50,10 @@ class ModelActivityLedger:
                                 "reasoning_tokens", "answer_tokens"}
                     and (value is None or type(value) is int and value >= 0)}
             now = self.clock()
-            if state == "heartbeat":
-                return  # Not substantive; cannot reset idle or total timers.
+            if state == "connected" and row["first_response"] is None:
+                row["first_response"] = now
+            # Heartbeats change the observable connection state, not evidence of
+            # substantive progress. Only content/reasoning bytes reset idle.
             self.revision += 1
             if state in {"content", "reasoning"}:
                 count = event.get("bytes", 0)
@@ -95,6 +97,7 @@ class ModelActivityLedger:
                     "elapsed_seconds": max(0, end - row["started"]),
                     "idle_seconds": max(0, end - row["last_substantive"]),
                     "first_content_seconds": None if row["first_content"] is None else row["first_content"] - row["started"],
+                    "first_response_seconds": None if row["first_response"] is None else row["first_response"] - row["started"],
                     "phase_seconds": phases,
                     "usage": deepcopy(row.get("usage", {})),
                     **{name: row[name] for name in ("configured_model_id", "model_id", "alias", "provider_id") if name in row},

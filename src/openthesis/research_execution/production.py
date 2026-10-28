@@ -24,6 +24,26 @@ from .executor import StageExecutionCancelled, StageExecutor, StageResult, Stage
 from .model import SynthesisContextLimitError
 from .registry import SOURCE_ANALYSIS_STAGES, StageRegistry
 from .request_planning import RoleRequestMaterials, plan_role_requests
+from .source_compiler import packet_dispatch_group
+
+
+def _prepare_assertion_wave(workflow, journal, generations, validator, entries):
+    """One ready-wave proof preparation; ordinary validators still own trust."""
+    if not entries:
+        return
+    spec = entries[0][0]
+    factory = getattr(workflow, "_model_stage_executor", None)
+    if not callable(factory):
+        return
+    def collect():
+        for stage, candidate, frozen_inputs in entries:
+            validator(stage, candidate, frozen_inputs)
+        # This result is a collection envelope, never a trusted candidate.
+        return StageValidation(False, state="needs_action")
+    wave_id = spec.stage_id + ":wave:" + recovery_digest(sorted(item[0].stage_id for item in entries))[:16]
+    with workflow._bind_request_journal(journal), journal.bind(spec.stage_id, generations[spec.stage_id]):
+        validate_with_assertions(collect, stage_id=wave_id, journal=journal,
+            model_executor=factory(), allow_network=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +206,7 @@ def run_declarative_ot_workflow(
         shared_instructions=bindings.system_prompt,
     )
     raw_steps = {str(item["id"]).strip(): item for item in workflow.pack.workflow["steps"]}
+    context.source_reader_roles = tuple(sorted({spec.role for spec in registry.stages}))
     steps = {
         spec.stage_id: {**raw_steps[spec.stage_id], "id": spec.stage_id,
                         "prompt": spec.prompt_path, "role": spec.role,
@@ -309,14 +330,6 @@ def run_declarative_ot_workflow(
         return validate_with_assertions(lambda: validate_candidate(spec, candidate, frozen_inputs),
             stage_id=spec.stage_id, journal=request_journal)
 
-    def prepare_candidate(spec, candidate, frozen_inputs):
-        with workflow._bind_request_journal(request_journal), request_journal.bind(spec.stage_id, request_generations[spec.stage_id]):
-            factory = getattr(workflow, "_model_stage_executor", None)
-            if callable(factory):
-                validate_with_assertions(lambda: validate_candidate(spec, candidate, frozen_inputs),
-                    stage_id=spec.stage_id, journal=request_journal,
-                    model_executor=factory(), allow_network=True)
-
     saved = read_checkpoints(workflow.storage.get_artifacts(run.run_id), registry)
 
     executor = StageExecutor(
@@ -324,7 +337,10 @@ def run_declarative_ot_workflow(
         checkpoint=completed_stage, candidate_checkpoint=persist_ot_candidate,
         candidate_verifier=DurableStageVerifier(workflow.storage, run.run_id, cancel_check=workflow.cancel_check,
                                                request_generations=request_generations),
-        candidate_preparer=prepare_candidate,
+        candidate_wave_preparer=lambda entries: _prepare_assertion_wave(workflow, request_journal,
+            request_generations, validate_candidate, entries),
+        dispatch_group=packet_dispatch_group,
+        timing_observer=request_journal.record_stage_timing,
         cancel_check=workflow.cancel_check, progress=workflow._set_agent_state,
     )
     try:
@@ -460,6 +476,7 @@ def execute_official_model_graph(
         shared_instructions=bindings.system_prompt,
     )
     workflow.stage_registry = registry
+    context.source_reader_roles = tuple(sorted({spec.role for spec in registry.stages}))
     base_ids = tuple(
         spec.stage_id for spec in registry.stages if not spec.depends_on
     )
@@ -941,16 +958,6 @@ def execute_official_model_graph(
         with workflow._bind_request_journal(request_journal), request_journal.bind(spec.stage_id, request_generations[spec.stage_id]):
             return produce_unbound(spec, frozen_inputs, dependencies)
 
-    def prepare_candidate(spec, candidate, frozen_inputs):
-        # Called only for fresh candidates, after their durable checkpoint.
-        # Revalidation and history reads never enter this provider lane.
-        with workflow._bind_request_journal(request_journal), request_journal.bind(spec.stage_id, request_generations[spec.stage_id]):
-            factory = getattr(workflow, "_model_stage_executor", None)
-            if callable(factory):
-                validate_with_assertions(lambda: validate_candidate(spec, candidate, frozen_inputs),
-                    stage_id=spec.stage_id, journal=request_journal,
-                    model_executor=factory(), allow_network=True)
-
     produce_scoped = produce
 
     def produce(spec, frozen_inputs, dependencies):
@@ -971,7 +978,10 @@ def execute_official_model_graph(
         },
         checkpoint=persist_result,
         candidate_checkpoint=persist_candidate,
-        candidate_preparer=prepare_candidate,
+        candidate_wave_preparer=lambda entries: _prepare_assertion_wave(workflow, request_journal,
+            request_generations, validate_candidate, entries),
+        dispatch_group=packet_dispatch_group,
+        timing_observer=request_journal.record_stage_timing,
         candidate_verifier=DurableStageVerifier(workflow.storage, run.run_id, cancel_check=workflow.cancel_check,
                                                request_generations=request_generations),
         cancel_check=workflow.cancel_check,

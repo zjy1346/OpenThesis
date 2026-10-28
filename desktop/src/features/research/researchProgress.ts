@@ -13,6 +13,7 @@ const STAGES: Record<string, Record<string, StageCopy>> = {
     "filing-download": { title: "正在下载官方财报……", note: "文件正在抵达，下一步是核对其中真正重要的数据。" },
     "filing-parse": { title: "正在识别财务报表……", note: "表格被逐页读取，口径、单位与期间也会一并核对。" },
     "filing-window": { title: "正在逐窗口识别财报……", note: "当前文件的候选页分窗口处理，已完成窗口会保存进度。" },
+    "filing-page": { title: "正在逐页识别财报……", note: "已完成页面会立即保存，失败页面可单独恢复，不会重做整份文件。" },
     "filing-validation": { title: "正在校验财务数据……", note: "数字只有通过口径与勾稽校验，才会进入后续研究。" },
     "vision-approval": { title: "等待确认云端识图页面……", note: "只有本地识别失败的财务表页会在您同意后上传。" },
     "vision-processing": { title: "正在补充识别失败的财务表页……", note: "本地识别没有放行的数据，正在接受第二次核对。" },
@@ -37,6 +38,7 @@ const STAGES: Record<string, Record<string, StageCopy>> = {
     "filing-download": { title: "Downloading official filings…", note: "The filings are arriving; next we verify the numbers that truly matter." },
     "filing-parse": { title: "Reading financial statements…", note: "Each table is being read page by page, with periods, units, and scope checked along the way." },
     "filing-window": { title: "Parsing filing windows…", note: "Candidate pages are processed in windows, and completed windows are checkpointed." },
+    "filing-page": { title: "Reading filing pages…", note: "Completed pages are saved immediately; failed pages can resume without replaying the entire filing." },
     "filing-validation": { title: "Validating financial data…", note: "Only figures that pass scope and consistency checks move into the research." },
     "vision-approval": { title: "Waiting for cloud-vision approval…", note: "Only failed financial-table pages are uploaded, and only with your approval." },
     "vision-processing": { title: "Rechecking failed financial-table pages…", note: "Figures that failed local validation are receiving a second review." },
@@ -63,6 +65,7 @@ STAGES["zh-Hant"] = {
   "filing-download": { title: "正在下載官方財報……", note: "檔案正在抵達，接下來會核對重要數據。" },
   "filing-parse": { title: "正在識別財務報表……", note: "表格會逐頁讀取，並核對口徑、單位與期間。" },
   "filing-window": { title: "正在逐視窗識別財報……", note: "目前文件的候選頁分視窗處理，已完成視窗會保存進度。" },
+  "filing-page": { title: "正在逐頁識別財報……", note: "已完成頁面會立即保存，失敗頁面可單獨恢復，不必重做整份文件。" },
   "filing-validation": { title: "正在驗證財務資料……", note: "只有通過口徑與勾稽檢查的數字才會進入研究。" },
   "vision-approval": { title: "等待確認雲端識圖頁面……", note: "只有本地識別失敗的財務表頁會在您同意後上傳。" },
   "vision-processing": { title: "正在補充識別失敗的財務表頁……", note: "本地識別未放行的資料正在接受第二次核對。" },
@@ -257,6 +260,7 @@ export function progressStageDetail(
     if (stage === "filing-download") return `Downloading filing ${safeCurrent}/${total}`;
     if (stage === "filing-parse") return `Reading filing ${safeCurrent}/${total}`;
     if (stage === "filing-window") return `Parsing window ${safeCurrent}/${total}`;
+    if (stage === "filing-page") return `Candidate pages complete ${safeCurrent}/${total}`;
     if (stage === "filing-validation") return `Validated filing ${safeCurrent}/${total}`;
     return `Completed ${safeCurrent}/${total}`;
   }
@@ -264,12 +268,14 @@ export function progressStageDetail(
     if (stage === "filing-download") return `正在下載第 ${safeCurrent}/${total} 份官方財報`;
     if (stage === "filing-parse") return `正在識別第 ${safeCurrent}/${total} 份財報`;
     if (stage === "filing-window") return `正在識別財報窗口 ${safeCurrent}/${total}`;
+    if (stage === "filing-page") return `已完成候選頁 ${safeCurrent}/${total}`;
     if (stage === "filing-validation") return `已驗證第 ${safeCurrent}/${total} 份財報`;
     return `已完成 ${safeCurrent}/${total}`;
   }
   if (stage === "filing-download") return `正在下载第 ${safeCurrent}/${total} 份官方财报`;
   if (stage === "filing-parse") return `正在识别第 ${safeCurrent}/${total} 份财报`;
   if (stage === "filing-window") return `正在识别财报窗口 ${safeCurrent}/${total}`;
+  if (stage === "filing-page") return `已完成候选页 ${safeCurrent}/${total}`;
   if (stage === "filing-validation") return `已校验第 ${safeCurrent}/${total} 份财报`;
   return `已完成 ${safeCurrent}/${total}`;
 }

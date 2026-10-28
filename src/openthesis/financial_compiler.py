@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Sequence
 
 from .domain import CURRENT_DERIVED_VERSION, Company, EvidenceRef, FilingDocument, FinancialFact
+from .text_normalization import canonical_search_text
 from .financial_contracts import (
     CORE_CONCEPTS, CandidateBatch, FactCandidate, FactGroupValidation, FactValidationRecord,
     FinancialDataset, SourceIdentity, ValidationStatus, CompilationPolicy as CompilerPolicy,
@@ -38,7 +39,7 @@ class CoveragePlanner:
 
     def plan(self, subject: Company) -> CoverageProfile:
         company_type = str(getattr(subject, "company_type", "") or "")
-        descriptor = f"{subject.industry} {subject.industry_support} {company_type}".casefold()
+        descriptor = canonical_search_text(f"{subject.industry} {subject.industry_support} {company_type}").casefold()
         if any(term in descriptor for term in ("insurance", "保险")):
             return CoverageProfile(
                 "insurance",

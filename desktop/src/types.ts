@@ -13,6 +13,8 @@ export type Preferences = {
   vision_fallback_policy?: string;
   /** Serialized official-network policy returned by the settings store. */
   official_network_policy?: string;
+  /** Optional local PP-StructureV3 runtime; disabled unless explicitly opted in. */
+  local_structure_enabled?: string;
   [key: string]: string | undefined;
 };
 
@@ -194,6 +196,9 @@ export type ProviderDefinition = {
 };
 
 export type ProviderConnectionSummary = {
+  protocol?: "chat_completions" | "ollama";
+  capability_profile?: ConnectionCapabilityProfile | null;
+  transport?: ConnectionTransportSettings;
   connection_id: string;
   provider_id: string;
   display_name: string;
@@ -206,6 +211,41 @@ export type ProviderConnectionSummary = {
   last_tested_at?: number | null;
   last_error_code?: string | null;
   configuration_version?: number;
+};
+
+export type ConnectionCapabilityProfile = {
+  source?: "legacy" | "compatible_default" | "official" | "user";
+  json_output: "prompt_json" | "json_object";
+  stream: "none" | "sse" | "ndjson";
+  include_usage: boolean;
+  usage: "unknown" | "openai" | "deepseek" | "ollama";
+  output_parameter: "unknown" | "max_tokens" | "max_completion_tokens" | "num_predict";
+  output_semantics: "unknown" | "total_generated_tokens_including_reasoning" | "visible_output_tokens_only";
+  output_limit: number | null;
+  allow_unbounded_output: boolean;
+  upstream: "unknown" | "direct" | "proxy";
+};
+
+export type ConnectionTransportSettings = {
+  endpoint_mode: "base" | "full_request";
+  models_endpoint: string | null;
+  network_mode: "system" | "direct" | "proxy";
+  proxy_url: string | null;
+};
+
+export type ModelTestEvent = {
+  protocol: "model-events-v1";
+  context: {request_id: string; run_id: string; stage_id: string; generation: number; attempt_id: string};
+  seq: number;
+  kind: "activity" | "content" | "result" | "error";
+  data: {state?: string; bytes?: number; code?: string; [key: string]: unknown};
+};
+
+export type ModelDirectory = {
+  source: string; retrieved_at: string; license: string;
+  models: {provider_id: string; model_id: string; name: string; context: number | null; output: number | null;
+    input_price: number | null; output_price: number | null; cache_read_price: number | null;
+    image_input: boolean | null; structured_output: boolean | null;}[];
 };
 
 export type ConfiguredModelSummary = {
@@ -373,6 +413,76 @@ export type ResearchRequest = {
     as_of: string;
   };
   vision_fallback?: VisionFallbackSelection;
+  run_envelope?: AdaptiveResearchRunEnvelope;
+};
+
+export type AdaptiveResearchRunEnvelope = {
+  policy: "adaptive";
+  mode: "adaptive";
+  user_hard_limits: UserHardLimits;
+  max_input_tokens: number | null;
+  max_output_tokens: number | null;
+  max_total_tokens: number | null;
+  max_calls: number | null;
+  max_automatic_seconds: number | null;
+  max_cost: number | null;
+  warning_seconds: number;
+  price_quote?: Record<string, unknown> | null;
+};
+
+export type LegacyResearchRunEnvelope = {
+  policy?: "standard" | "deep";
+  mode: "standard" | "deep";
+  max_input_tokens: number;
+  max_output_tokens: number;
+  max_total_tokens: number;
+  max_calls: number;
+  max_automatic_seconds: number;
+  warning_seconds: number;
+};
+
+export type ResearchRunEnvelope = AdaptiveResearchRunEnvelope | LegacyResearchRunEnvelope;
+
+export type UserHardLimits = {
+  max_calls: number | null;
+  max_input_tokens: number | null;
+  max_output_tokens: number | null;
+  max_total_tokens: number | null;
+  max_automatic_seconds: number | null;
+  max_cost: number | null;
+};
+
+export type ResearchBudgetPreview = {
+  schema: "openthesis.research-budget-preview.v1";
+  user_envelope: ResearchRunEnvelope;
+  estimated_cost: number | null;
+  price_status: string;
+  workload_status: string;
+  [key: string]: unknown;
+};
+
+export type ResearchDiagnostics = {
+  schema: "openthesis.research-diagnostics.v1";
+  run: {
+    run_id: string;
+    status: string;
+    started_at?: string | null;
+    completed_at?: string | null;
+    wall_elapsed_seconds?: number | null;
+  };
+  calls?: Array<Record<string, unknown>>;
+  totals?: Record<string, { value: number | null; known_sum: number; unknown_attempts: number }>;
+  attempt_count?: number;
+  physical_requests?: number;
+  unknown_outcomes?: number;
+  cache_hit_rate?: number | null;
+  cache_evidence?: string;
+  actual_cost: { amount: number | null; currency: string | null; status: string };
+  critical_path?: Record<string, unknown>;
+  budget?: Record<string, unknown> | null;
+  financial?: Record<string, unknown>;
+  quality?: Record<string, unknown>;
+  [key: string]: unknown;
 };
 
 export type MarketSnapshotPreview = {
@@ -468,6 +578,9 @@ export type FinancialDiagnostics = {
     updated_at: string;
     next_action: string;
     snapshot_stale: boolean;
+    failure_layer?: "runtime" | "source" | "ocr" | "extraction" | "validation" | "ready";
+    runtime_repair_required?: boolean;
+    has_research_output?: boolean;
     quality_summary?: Record<string, number>;
   };
   recovery_cases: Array<{
@@ -477,6 +590,7 @@ export type FinancialDiagnostics = {
     fields: string[];
     stage: string;
     error_code: string;
+    raw_error_code?: string;
     attempts: number;
     status: string;
     next_action: string;
@@ -566,6 +680,14 @@ export type ResearchReport = {
     model_calls: number;
     token_delta: number;
     snapshot_stale?: boolean;
+    failure_layer?: "runtime" | "source" | "ocr" | "extraction" | "validation" | "ready";
+    runtime_repair_required?: boolean;
+    has_research_output?: boolean;
+    local_structure?: {
+      available: boolean;
+      enabled: boolean;
+      error_code: string;
+    };
     recovery_cases?: Array<{
       accession_number: string;
       period?: string;
@@ -573,6 +695,7 @@ export type ResearchReport = {
       fields?: string[];
       stage: string;
       error_code: string;
+      raw_error_code?: string;
       attempts: number;
       status: string;
       next_action: string;
@@ -621,9 +744,11 @@ export type FilingAvailability =
   | (string & {});
 
 export type ModelCallStatus = {
+  usage_source?: string;
+  usage_contract?: string;
   physical_attempt?: boolean;
   reuse_summary?: { local_result_reuses: number; saved_judgments: number };
-  call_plan?: { max_calls: number; max_input_estimate: number | null; max_output_tokens: number } | null;
+  call_plan?: Partial<ModelCallPlan> | null;
   configured_model_id?: string;
   model_id?: string;
   alias?: string;
@@ -665,11 +790,31 @@ export type PendingBudgetGap = {
 export type ModelCallPlan = {
   schema?: string;
   plan_digest: string;
-  max_calls: number;
+  policy?: "adaptive" | "legacy_default" | "user_explicit" | string;
+  forecast?: ModelCallForecast | null;
+  initial_forecast?: ModelCallForecast | null;
+  user_hard_limits?: UserHardLimits | null;
+  limit_source?: "adaptive" | "legacy_default" | "user_explicit" | "unknown" | string;
+  forecast_exceeded?: string[];
+  adaptive_resume_available?: boolean;
+  migration_choice_required?: boolean;
+  max_calls: number | null;
   max_input_estimate: number | null;
-  max_output_tokens: number;
+  max_output_tokens: number | null;
+  time_warning?: boolean;
+  remaining_calls?: number | null;
+  remaining_input_tokens?: number | null;
+  remaining_output_tokens?: number | null;
   pending_budget_gaps: PendingBudgetGap[];
   user_extensions?: Array<{ gap_ids: string[]; approved_at: number }>;
+};
+
+export type ModelCallForecast = {
+  max_calls?: number | null;
+  max_input_estimate?: number | null;
+  max_output_tokens?: number | null;
+  expected_seconds?: number | null;
+  estimated_cost?: number | null;
 };
 
 export type ModelCallHistoryPage = {
@@ -714,6 +859,15 @@ export type ResearchJob = {
     page_count?: number;
     native_text_page_count?: number;
     indexed_page_count?: number;
+    completed_page_count?: number;
+    candidate_page_count?: number;
+    parsed_page_count?: number;
+    parsing_active_seconds?: number;
+    parser_backend?: string | null;
+    last_product_at?: string | null;
+    waiting_type?: "native_parse" | "local_validation" | "cache_reuse" | "external" | (string & {}) | null;
+    current_page?: number | null;
+    fiscal_period?: string;
     window_total?: number;
     completed_window_count?: number;
     parse_elapsed_seconds?: number;
@@ -726,6 +880,8 @@ export type ResearchJob = {
     error_code?: string;
     elapsed_seconds?: number;
     window_index?: number | null;
+    page_index?: number | null;
+    page_total?: number | null;
     last_activity_at?: string;
   }>;
   error_code?: string | null;
@@ -748,6 +904,12 @@ export type ResearchJob = {
   attempt_complete?: boolean;
   research_complete?: boolean;
   action_required?: boolean;
+};
+
+export type StructureRuntimeStatus = {
+  available: boolean;
+  versions: Record<string, string>;
+  error_code: string;
 };
 
 export type ThesisVersion = {

@@ -14,7 +14,7 @@ from ..financial_cloud_proof import (
 from ..financial_table_text import CLOUD_TABLE_VERSION, observe_cells, read_text_tables
 
 
-def collect_markdown_cells(markdown, company, filing, page):
+def collect_markdown_cells(markdown, company, filing, page, *, source_structure=None):
     if not markdown.strip():
         return (), (), "VISION_EMPTY_MARKDOWN"
     if not filing.content_hash:
@@ -29,13 +29,21 @@ def collect_markdown_cells(markdown, company, filing, page):
             "fiscal_period": filing.fiscal_period,
             "unit_contexts": [asdict(item) for item in page.unit_contexts],
         }
+        if source_structure is not None:
+            payload['source_structure'] = source_structure
         proof_id = cloud_source_id(filing.document_id, payload)
         proof = EvidenceRef(proof_id, filing.document_id, filing.source_url,
             "Cloud table source / candidate only", f"page:{page.original_page}",
             canonical_cloud_source(payload), filing.filed_at, filing.content_hash)
         facts, refs = [], {proof_id: proof}
         for cell in cells:
-            unit = cloud_unit_for_table(tables[cell.table_index], payload["unit_contexts"], filing.content_hash)
+            try:
+                unit = cloud_unit_for_table(tables[cell.table_index], payload["unit_contexts"], filing.content_hash,
+                                            column_index=cell.column_index)
+            except ValueError:
+                # One unresolved column must not erase other independently
+                # bound cells or the complete unverified source structure.
+                continue
             if unit is None:
                 continue
             unit_text, currency, scale, unit_page = unit
@@ -53,6 +61,7 @@ def collect_markdown_cells(markdown, company, filing, page):
                 filing.fiscal_period, filing.form_type, start, cell.period_end,
                 filing.filed_at, filing.accession_number, filing.source_url,
                 entity=company.name, market=company.market, statement=cell.statement,
+                scope=cell.scope, consolidated_scope=cell.scope,
                 period_start=start, currency=currency, unit_scale=float(Decimal(scale)),
                 unit_provenance="vision_explicit", revision=cell.revision,
                 source_document=filing.primary_document, source_page=page.original_page,
@@ -66,7 +75,7 @@ def collect_markdown_cells(markdown, company, filing, page):
                 "Explicit financial-statement unit", f"page:{unit_page or page.original_page}",
                 unit_text, filing.filed_at, filing.content_hash)
         if not facts:
-            return (), (), "VISION_CONTEXT_NOT_EXPLICIT" if not cells else "VISION_UNIT_CONTEXT_REQUIRED"
+            return (), tuple(refs.values()), "VISION_CONTEXT_NOT_EXPLICIT" if not cells else "VISION_UNIT_CONTEXT_REQUIRED"
         return tuple(facts), tuple(refs.values()), None
     except (TypeError, ValueError, OverflowError):
         return (), (), "VISION_TABLE_SOURCE_INVALID"

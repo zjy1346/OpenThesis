@@ -128,8 +128,14 @@ class FinancialRepairer:
                     next_actions=failure.next_actions)
                 terminal_state = outcome.state.value
         check_cancelled()
-        if not errors and processed:
-            self.storage.resolve_financial_recovery_cases(request.run_id, processed)
+        if processed:
+            # A page-checkpoint publication can promote independently
+            # admitted facts and refresh the report without completing the
+            # source recovery. Keep that source's case open for the next repair.
+            incremental = set(prepared.view.incremental_accessions) if prepared else set()
+            completed = tuple(accession for accession in processed if accession not in incremental)
+            if completed:
+                self.storage.resolve_financial_recovery_cases(request.run_id, completed)
         status = "partial" if errors and (accepted or processed) else "failed" if errors else "succeeded"
         stage = ("filing-download" if any(":download:" in item for item in errors) else
                  "filing-parse" if any(":parse:" in item for item in errors) else

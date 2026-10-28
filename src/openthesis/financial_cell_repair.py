@@ -15,6 +15,10 @@ import time
 
 from .domain import EvidenceRef
 from .financial_contracts import CandidateBatch, FactCandidate, STATEMENT_FOR, fact_row_evidence_ids
+from .financial_taxonomy import (
+    cost_row_concept, cost_row_is_non_amount, cost_row_mentions,
+    cost_row_source_is_non_amount,
+)
 
 CELL_REPAIR_VERSION = "original-cell-mapping-v1"
 _KEYS = {"concept", "label", "row_quote", "original_page"}
@@ -40,6 +44,15 @@ def mapping_reference(mapping, filing, allowed_pages):
                    for key in ("label", "row_quote"))
             or len(mapping["label"]) > 300 or len(mapping["row_quote"]) > 4000
             or not re.fullmatch(r"[0-9a-f]{64}", filing.content_hash)):
+        return None
+    label, row_quote, concept = mapping["label"], mapping["row_quote"], mapping["concept"]
+    if (
+        (cost_row_mentions(label) and cost_row_is_non_amount(label))
+        or cost_row_source_is_non_amount(row_quote)
+    ):
+        return None
+    source_cost_concept = cost_row_concept(label) or cost_row_concept(row_quote)
+    if source_cost_concept is not None and source_cost_concept != concept:
         return None
     body = {"schema": CELL_REPAIR_VERSION, "document_hash": filing.content_hash,
             "mapping": mapping}
@@ -104,6 +117,15 @@ def _reread_worker(subject, filing, refs, original_rules):
             if (len(matches) != 1 or not label
                     or label != _label_compact(_row_label_source_text(matches[0]))):
                 diagnostics.append("CELL_REPAIR_ROW_NOT_UNIQUE")
+                continue
+            source_cost_concept = cost_row_concept(mapping["label"])
+            if (
+                (cost_row_mentions(mapping["label"])
+                 and cost_row_is_non_amount(mapping["label"]))
+                 or cost_row_source_is_non_amount(matches[0].text)
+                or (source_cost_concept is not None and source_cost_concept != mapping["concept"])
+            ):
+                diagnostics.append("CELL_REPAIR_KNOWN_LABEL_CONTRADICTION")
                 continue
             known = {concept for concept, aliases in label_registry.items()
                      if any(_label_compact(alias) == label for alias in aliases)}
@@ -206,6 +228,11 @@ def cell_repair_issue(fact, row, evidence):
                 or _text(body["label"]) != _text(fact.reported_concept) or mapping["concept"] != fact.concept
                 or _text(mapping["row_quote"]) != _text(row.excerpt)
                 or mapping["label"] != body["label"] or mapping["original_page"] != fact.source_page
+                or (cost_row_mentions(mapping["label"])
+                    and cost_row_is_non_amount(mapping["label"]))
+                or cost_row_source_is_non_amount(row.excerpt)
+                or (cost_row_concept(mapping["label"]) is not None
+                    and cost_row_concept(mapping["label"]) != fact.concept)
                 or any(ref.document_id != row.document_id or ref.content_hash != row.content_hash
                        or ref.source_url != row.source_url or ref.locator != row.locator for ref in (proof, proposal))):
             raise ValueError

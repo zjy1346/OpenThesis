@@ -11,11 +11,12 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, State, Emitter};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_GATEWAY_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -27,11 +28,15 @@ pub(crate) struct ModelGateway {
     center: Arc<ModelCenter>,
     events: Option<Arc<GatewayEventSink>>,
     max_output_tokens: Option<u32>,
+    probe: bool,
+    expected_configuration_version: Option<i64>,
+    probe_parent: String,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl ModelGateway {
     pub(crate) fn new(center: Arc<ModelCenter>) -> Self {
-        Self { center, events: None, max_output_tokens: None }
+        Self { center, events: None, max_output_tokens: None, probe: false, expected_configuration_version: None, probe_parent: String::new(), cancellation:None }
     }
 
     fn with_output_token_budget(mut self, max_output_tokens: Option<u32>) -> Self {
@@ -64,7 +69,7 @@ impl ModelGateway {
         }
         let provider = provider_registry::find(&connection.provider_id)
             .ok_or_else(|| GatewayError::configuration("Unknown provider."))?;
-        if !provider.supports_discovery || provider.models_path.is_none() {
+        if (!provider.supports_discovery || provider.models_path.is_none()) && connection.transport.models_endpoint.is_none() {
             return Err(GatewayError::new(
                 "MODEL_DISCOVERY_UNSUPPORTED",
                 "This provider does not expose model discovery; enter the model ID manually.",
@@ -81,15 +86,23 @@ impl ModelGateway {
         let secret_ref =
             secret_override.or_else(|| stored_secret.as_ref().map(|value| value.as_str()));
         let client = build_client(&connection, 30)?;
-        let url = endpoint_url(
-            &connection.endpoint,
-            provider.models_path.unwrap_or("/models"),
-        )?;
+        let url = connection.transport.url(&connection.endpoint, if connection.protocol == "ollama" { "/api/tags" } else { provider.models_path.unwrap_or("/models") }, true).map_err(GatewayError::configuration)?;
         let request = authorize(client.get(url), secret_ref)?;
-        let response = tauri::async_runtime::block_on(async { request.send().await })
-            .map_err(|_| GatewayError::network("Model discovery could not reach the provider."))?;
-        let payload = read_json_response(response, secret_ref)?;
-        let ids = if connection.provider_id == "ollama" {
+        let attempt=self.center.reserve_metadata_probe(connection_id,connection.configuration_version,connection.credential_version).map_err(GatewayError::configuration)?;
+        let received = tauri::async_runtime::block_on(async { request.send().await })
+            .map_err(GatewayError::delivery)
+            .and_then(|response| read_json_response(response,secret_ref)).map_err(|mut error| {
+                if matches!(error.http_status,Some(404|405)) {
+                    error.code="MODEL_DISCOVERY_UNSUPPORTED".into();
+                    error.message="This platform does not expose a model list; enter a model ID manually.".into(); error.retryable=false;
+                }
+                error
+            });
+        let _=self.center.finish_probe(&attempt,if received.is_ok(){"response_received"}else{"metadata_error"},&json!({"kind":"metadata","generation_calls":0,"error_code":received.as_ref().err().map(|e|&e.code)}).to_string());
+        // Listing authorization may differ from generation. Record it only in
+        // the metadata receipt; it must not pause otherwise configured models.
+        let payload = received?;
+        let ids = if connection.protocol == "ollama" {
             payload
                 .get("models")
                 .and_then(Value::as_array)
@@ -127,7 +140,7 @@ impl ModelGateway {
                 )
                 .to_string(),
                 model_id,
-                capabilities: vec!["text_chat".to_string(), "structured_json".to_string()],
+                capabilities: Vec::new(),
             })
             .collect())
     }
@@ -193,6 +206,7 @@ impl ModelGateway {
                 false,
             ));
         }
+        self.check_model_version(&model)?;
         if !model.capabilities.is_empty()
             && !model
                 .capabilities
@@ -209,6 +223,12 @@ impl ModelGateway {
             .center
             .connection_runtime(&model.connection_id)
             .map_err(GatewayError::configuration)?;
+        if connection.configuration_version != model.connection_configuration_version || connection.credential_version != model.credential_version {
+            return Err(GatewayError::new("MODEL_CONFIGURATION_CHANGED", "Connection changed before dispatch; no request sent.", false));
+        }
+        if !self.probe && connection.status == "unauthorized" {
+            return Err(GatewayError::new("MODEL_CONNECTION_AUTH_PAUSED", "This connection is paused after an authentication failure. Update its key or explicitly test it in Model Center.", false));
+        }
         let stored_secret = if secret_override.is_none() {
             self.center
                 .credential_for_connection(&connection)
@@ -222,7 +242,7 @@ impl ModelGateway {
             .unwrap_or(180)
             .clamp(5, 600);
         let client = build_client(&connection, timeout)?;
-        if model.provider_id == "ollama" {
+        let result = if model.protocol == "ollama" {
             self.generate_ollama(
                 &client,
                 &model,
@@ -241,7 +261,13 @@ impl ModelGateway {
                 json_mode,
                 allow_format_fallback,
             )
+        };
+        if let Err(error) = &result {
+            if secret_override.is_none() && error.code == "MODEL_UNAUTHORIZED" {
+                let _ = self.center.mark_probe_health_for_versions(&model.configured_model_id,"unauthorized",Some(&error.code),(model.configuration_version,model.connection_configuration_version,model.credential_version));
+            }
         }
+        result
     }
 
     fn generate_vision(
@@ -332,13 +358,17 @@ impl ModelGateway {
             .center
             .credential_for_connection(&connection)
             .map_err(GatewayError::configuration)?;
+        self.check_model_version(&model)?;
+        if connection.configuration_version != model.connection_configuration_version || connection.credential_version != model.credential_version { return Err(GatewayError::new("MODEL_CONFIGURATION_CHANGED","Connection changed before dispatch; no request sent.",false)); }
+        if !self.probe && connection.status == "unauthorized" { return Err(GatewayError::new("MODEL_CONNECTION_AUTH_PAUSED","Update the connection key or explicitly test it before sending more work.",false)); }
         let secret_ref = secret.as_ref().map(|value| value.as_str());
         let timeout = u64::try_from(model.timeout_seconds)
             .unwrap_or(180)
             .clamp(5, 600);
         let client = build_client(&connection, timeout)?;
-        let response = if model.provider_id == "ollama" {
-            let url = endpoint_url(&model.endpoint, "api/chat")?;
+        let declared_budget;
+        let response = if model.protocol == "ollama" {
+            let url = model.transport.url(&model.endpoint, "api/chat", false).map_err(GatewayError::configuration)?;
             let mut payload = json!({
                 "model": model.model_id,
                 "stream": false,
@@ -347,12 +377,13 @@ impl ModelGateway {
                     {"role": "user", "content": user_prompt, "images": [image_base64]}
                 ]
             });
-            if json_mode {
-                payload["format"] = json!("json");
-            }
-            post_json(&client, &url, &payload, secret_ref)?
+            if let Some(profile) = &model.capability_profile { profile.apply_json(&mut payload,&model.protocol,json_mode); }
+            else if json_mode { payload["format"] = json!("json"); }
+            declared_budget = self.apply_declared_budget(&model,&mut payload)?;
+            self.probe_wire(&model,"vision",||self.post_text_contract(&client, &url, &mut payload, secret_ref, &model.provider_id, model.capability_profile.as_ref()))
+                .map_err(|error| self.pause_on_auth_failure(&model, error))?
         } else {
-            let url = endpoint_url(&model.endpoint, "chat/completions")?;
+            let url = model.transport.url(&model.endpoint, "chat/completions", false).map_err(GatewayError::configuration)?;
             let mut payload = json!({
                 "model": model.model_id,
                 "messages": [
@@ -365,28 +396,20 @@ impl ModelGateway {
                     ]}
                 ]
             });
-            if json_mode {
+            if let Some(profile) = &model.capability_profile { profile.apply_json(&mut payload,&model.protocol,json_mode); }
+            else if json_mode && model.provider_id != "custom" {
                 payload["response_format"] = json!({"type": "json_object"});
             }
             if let Some(temperature) = model.temperature {
                 payload["temperature"] = json!(temperature);
             }
-            match post_json(&client, &url, &payload, secret_ref) {
-                Err(error)
-                    if json_mode
-                        && allow_format_fallback
-                        && response_format_is_unsupported(&error) =>
-                {
-                    payload
-                        .as_object_mut()
-                        .expect("gateway payload is an object")
-                        .remove("response_format");
-                    post_json(&client, &url, &payload, secret_ref)?
-                }
-                result => result?,
-            }
+            // A physical call is one attempt. Parameter repairs belong to the caller's budgeted ledger.
+            let _ = allow_format_fallback;
+            declared_budget = self.apply_declared_budget(&model,&mut payload)?;
+            self.probe_wire(&model,"vision",||self.post_text_contract(&client, &url, &mut payload, secret_ref, &model.provider_id, model.capability_profile.as_ref()))
+                .map_err(|error| self.pause_on_auth_failure(&model, error))?
         };
-        let (content, finish_reason) = if model.provider_id == "ollama" {
+        let (content, finish_reason) = if model.protocol == "ollama" {
             (
                 response
                     .pointer("/message/content")
@@ -410,7 +433,10 @@ impl ModelGateway {
                 "The vision response did not contain message.content.",
             )?
         };
-        Ok(self.result(&model, content, finish_reason))
+        let mut result = self.result(&model, content, finish_reason);
+        result.meta.apply_usage(&response);
+        if let Some((tokens,field,semantics)) = declared_budget { result.meta.output_budget_tokens=Some(tokens); result.meta.output_budget_wire_field=Some(field); result.meta.output_budget_semantics=Some(semantics); }
+        Ok(result)
     }
 
     fn generate_openai_compatible(
@@ -423,7 +449,7 @@ impl ModelGateway {
         json_mode: bool,
         allow_format_fallback: bool,
     ) -> Result<GatewayGenerateResult, GatewayError> {
-        let url = endpoint_url(&model.endpoint, "chat/completions")?;
+        let url = model.transport.url(&model.endpoint, "chat/completions", false).map_err(GatewayError::configuration)?;
         let mut payload = json!({
             "model": model.model_id,
             "messages": [
@@ -434,7 +460,8 @@ impl ModelGateway {
         if let Some(temperature) = model.temperature {
             payload["temperature"] = json!(temperature);
         }
-        if json_mode {
+        if let Some(profile) = &model.capability_profile { profile.apply_json(&mut payload,&model.protocol,json_mode); }
+        else if json_mode && model.provider_id != "custom" {
             payload["response_format"] = json!({"type": "json_object"});
         }
         let output_budget_support = self.max_output_tokens.map(|tokens| {
@@ -445,18 +472,9 @@ impl ModelGateway {
                 tokens,
             )
         });
-        let response = match self.post_text(client, &url, &mut payload, secret, &model.provider_id) {
-            Err(error)
-                if json_mode && allow_format_fallback && response_format_is_unsupported(&error) =>
-            {
-                payload
-                    .as_object_mut()
-                    .expect("gateway payload is an object")
-                    .remove("response_format");
-                self.post_text(client, &url, &mut payload, secret, &model.provider_id)?
-            }
-            result => result?,
-        };
+        let declared_budget = self.apply_declared_budget(model,&mut payload)?;
+        let _ = allow_format_fallback;
+        let response = self.probe_wire(model,"text",||self.post_text_contract(client, &url, &mut payload, secret, &model.provider_id, model.capability_profile.as_ref()))?;
         let (content, finish_reason) = parse_openai_compatible_message(
             &response,
             "The provider response did not contain message.content.",
@@ -464,6 +482,7 @@ impl ModelGateway {
         let mut result = self.result(model, content, finish_reason);
         result.meta.apply_usage(&response);
         apply_output_budget_receipt(&mut result.meta, output_budget_support);
+        if let Some((tokens,field,semantics)) = declared_budget { result.meta.output_budget_tokens=Some(tokens); result.meta.output_budget_wire_field=Some(field); result.meta.output_budget_semantics=Some(semantics); }
         Ok(result)
     }
 
@@ -476,7 +495,7 @@ impl ModelGateway {
         user_prompt: &str,
         json_mode: bool,
     ) -> Result<GatewayGenerateResult, GatewayError> {
-        let url = endpoint_url(&model.endpoint, "api/chat")?;
+        let url = model.transport.url(&model.endpoint, "api/chat", false).map_err(GatewayError::configuration)?;
         let mut payload = json!({
             "model": model.model_id,
             "stream": false,
@@ -485,7 +504,8 @@ impl ModelGateway {
                 {"role": "user", "content": user_prompt}
             ]
         });
-        if json_mode {
+        if let Some(profile) = &model.capability_profile { profile.apply_json(&mut payload,&model.protocol,json_mode); }
+        else if json_mode {
             payload["format"] = json!("json");
         }
         if let Some(temperature) = model.temperature {
@@ -499,7 +519,8 @@ impl ModelGateway {
                 tokens,
             )
         });
-        let response = self.post_text(client, &url, &mut payload, secret, &model.provider_id)?;
+        let declared_budget = self.apply_declared_budget(model,&mut payload)?;
+        let response = self.probe_wire(model,"text",||self.post_text_contract(client, &url, &mut payload, secret, &model.provider_id, model.capability_profile.as_ref()))?;
         let content = response
             .pointer("/message/content")
             .and_then(Value::as_str)
@@ -518,7 +539,59 @@ impl ModelGateway {
         let mut result = self.result(model, content, finish_reason);
         result.meta.apply_usage(&response);
         apply_output_budget_receipt(&mut result.meta, output_budget_support);
+        if let Some((tokens,field,semantics)) = declared_budget { result.meta.output_budget_tokens=Some(tokens); result.meta.output_budget_wire_field=Some(field); result.meta.output_budget_semantics=Some(semantics); }
         Ok(result)
+    }
+
+    fn pause_on_auth_failure(&self, model: &ConfiguredModelRuntime, error: GatewayError) -> GatewayError {
+        if error.code == "MODEL_UNAUTHORIZED" {
+            let _ = self.center.mark_probe_health_for_versions(
+                &model.configured_model_id, "unauthorized", Some(&error.code),
+                (model.configuration_version, model.connection_configuration_version, model.credential_version),
+            );
+        }
+        error
+    }
+
+    fn apply_declared_budget(&self, model: &ConfiguredModelRuntime, payload: &mut Value) -> Result<Option<(u32,String,String)>,GatewayError> {
+        let Some(profile) = &model.capability_profile else {
+            let known_budget = provider_registry::apply_output_token_budget(
+                &model.provider_id, &model.model_id, &mut json!({}), self.max_output_tokens.unwrap_or(1),
+            );
+            if matches!(known_budget, provider_registry::OutputTokenBudgetSupport::Unsupported) {
+                return Err(GatewayError::new("MODEL_OUTPUT_BUDGET_POLICY_REQUIRED","Declare an output parameter or acknowledge the absence of a verified hard output/cost cap in this connection's settings.",false));
+            }
+            return Ok(None);
+        };
+        profile.validate(&model.protocol).map_err(GatewayError::configuration)?;
+        // A user declaration is necessary for unknown compatible contracts, never inferred from a model ID.
+        let requested = self.max_output_tokens.or(profile.output_limit).unwrap_or(8192);
+        // A declaration replaces, rather than adds to, preset budget keys.
+        for key in ["max_tokens","max_completion_tokens"] { payload.as_object_mut().expect("gateway payload").remove(key); }
+        profile.apply_budget(payload,requested).map_err(|_| GatewayError::new("MODEL_OUTPUT_BUDGET_POLICY_REQUIRED","Set this connection's output parameter or explicitly acknowledge that output cost cannot be hard-capped.",false))
+    }
+    fn check_model_version(&self, model: &ConfiguredModelRuntime) -> Result<(),GatewayError> {
+        if self.expected_configuration_version.is_some_and(|version| version != model.configuration_version) {
+            return Err(GatewayError::new("MODEL_CONFIGURATION_CHANGED","Model connection or capabilities changed since this research was configured; select the updated configuration before sending.",false));
+        }
+        Ok(())
+    }
+    fn as_probe(&self) -> Self {
+        let mut probe=self.clone(); probe.probe=true; probe.max_output_tokens=Some(64);
+        probe.probe_parent=format!("probe:{}:{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_nanos()).unwrap_or_default());
+        probe
+    }
+    fn probe_wire(&self, model: &ConfiguredModelRuntime, operation: &str, send: impl FnOnce()->Result<Value,GatewayError>) -> Result<Value,GatewayError> {
+        if !self.probe { return send(); }
+        let attempt=self.center.reserve_probe(&self.probe_parent,model,operation).map_err(GatewayError::configuration)?;
+        let result=send();
+        let (outcome,receipt)=match &result {
+            Ok(response)=>{let mut meta=self.result(model,String::new(),None).meta; meta.apply_usage(response); ("response_received",json!({"attempt_id":attempt,"parent_request_id":self.probe_parent,"metadata":meta}))},
+            Err(error)=>(if error.http_status.is_some() {"rejected"} else {"remote_unknown"},json!({"attempt_id":attempt,"parent_request_id":self.probe_parent,"error_code":error.code,"http_status":error.http_status})),
+        };
+        // Preserve a received result even if local audit completion fails. The durable reservation remains unknown, never free/zero.
+        let _=self.center.finish_probe(&attempt,outcome,&receipt.to_string());
+        result
     }
 
     fn result(
@@ -558,6 +631,12 @@ impl ModelGateway {
                 cache_write_input_tokens: None,
                 reasoning_tokens: None,
                 answer_tokens: None,
+                usage_contract: model.capability_profile.as_ref().map(|p| p.usage.clone()),
+                http_status: None,
+                provider_request_id: None,
+                reasoning_in_output: None,
+                transport_observation: None,
+                usage_source: if model.capability_profile.as_ref().is_some_and(|p| p.upstream != "direct") || model.provider_id == "custom" { "endpoint_reported_upstream_unverified".into() } else { "provider_response".into() },
             },
             content,
         }
@@ -567,64 +646,105 @@ impl ModelGateway {
         &self, client: &Client, url: &reqwest::Url, payload: &mut Value,
         secret: Option<&str>, provider_id: &str,
     ) -> Result<Value, GatewayError> {
-        let Some(events) = self.events.as_ref() else {
-            return post_json(client, url, payload, secret);
-        };
-        let protocol = provider_registry::text_stream_protocol(provider_id);
+        self.post_text_contract(client,url,payload,secret,provider_id,None)
+    }
+    fn post_text_contract(
+        &self, client: &Client, url: &reqwest::Url, payload: &mut Value,
+        secret: Option<&str>, provider_id: &str, profile: Option<&crate::connection_contract::CapabilityProfile>,
+    ) -> Result<Value, GatewayError> {
+        let events = self.events.as_ref();
+        let protocol = profile.map(|p| p.stream.as_str()).filter(|p| *p != "none").or_else(|| if profile.is_none() { provider_registry::text_stream_protocol(provider_id) } else { None });
         if protocol.is_some() {
             payload["stream"] = json!(true);
             // These adapters explicitly document include_usage. Do not send it
             // to an arbitrary endpoint merely labelled OpenAI-compatible.
-            if provider_registry::stream_requests_usage(provider_id) {
+            if profile.map(|p| p.include_usage).unwrap_or_else(|| provider_registry::stream_requests_usage(provider_id)) {
                 payload["stream_options"] = json!({"include_usage": true});
             }
         }
-        events.activity("connecting", 0);
+        if let Some(events)=events { events.activity("connecting", 0); }
         let request = authorize(client.post(url.clone()).json(payload), secret)?;
-        let mut response = tauri::async_runtime::block_on(async { request.send().await })
-            .map_err(|_| GatewayError::network("The model provider could not be reached."))?;
-        events.activity("waiting_response", 0);
+        if let Some(events)=events { events.activity("waiting_response",0); }
+        let mut response = self.await_provider(||request.send())?;
+        if let Some(events)=events { events.activity("connected", 0); }
         if !response.status().is_success() {
-            return read_json_response(response, secret);
+            return self.await_gateway(read_json_response_async(response, secret));
         }
+        let status = response.status().as_u16();
+        let request_id = ["x-request-id", "request-id"].iter().find_map(|name|
+            response.headers().get(*name).and_then(|v| v.to_str().ok())
+                .filter(|v| v.len() <= 256 && v.chars().all(|c| c.is_ascii_alphanumeric() || "_.:-".contains(c))).map(str::to_string));
+        let annotate = |mut value: Value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("_openthesis_http_status".into(), json!(status));
+                object.insert("_openthesis_provider_request_id".into(), json!(request_id));
+            }
+            value
+        };
         let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
-        let format = match protocol {
-            Some("sse") if content_type.contains("text/event-stream") => StreamFormat::Sse,
-            Some("ndjson") if content_type.contains("ndjson") || content_type.contains("jsonl") => StreamFormat::Ndjson,
-            _ => return read_json_response(response, secret),
+        let format = match content_type.as_str() {
+            value if value.contains("text/event-stream") => StreamFormat::Sse,
+            value if value.contains("ndjson") || value.contains("jsonl") => StreamFormat::Ndjson,
+            _ => {
+                let mut value = self.await_gateway(read_json_response_async(response, secret))?;
+                if let Some(object) = value.as_object_mut() { object.insert("_openthesis_transport_observation".into(),json!(if protocol.is_some() {"declared_stream_returned_non_stream_body"} else {"non_streaming_response"})); }
+                return Ok(annotate(value));
+            }
         };
-        let mut decoder = ProviderStreamDecoder::new(format)
-            .with_reasoning_fields(provider_registry::stream_reasoning_fields(provider_id));
+        let mut decoder = ProviderStreamDecoder::new(format);
         loop {
             let previous_length = decoder.partial_content().len();
-            let chunk = match tauri::async_runtime::block_on(async { response.chunk().await }) {
+            let chunk = match self.await_provider(||response.chunk()) {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(error) => {
-                    events.preserve_partial(decoder.partial_content());
+                    if let Some(events)=events { events.preserve_partial(decoder.partial_content()); }
+                    if error.code=="MODEL_CALL_CANCELLED" { return Err(error); }
                     return Err(GatewayError::new(
-                        if error.is_timeout() { "MODEL_TIMEOUT" } else { "MODEL_STREAM_INTERRUPTED" },
+                        if error.code=="MODEL_SUBMISSION_UNKNOWN" { "MODEL_TIMEOUT" } else { "MODEL_STREAM_INTERRUPTED" },
                         "The remote stream did not complete within this request; submission outcome is unknown.", false));
                 }
             };
             match decoder.push(&chunk) {
                 Ok(activity) => {
                     let added = &decoder.partial_content()[previous_length..];
-                    if !added.is_empty() { events.frame("content", json!({"text": added})); }
-                    for item in activity { events.activity(item.kind, item.bytes); }
+                    if let Some(events)=events {
+                        if !added.is_empty() { events.frame("content", json!({"text": added})); }
+                        for item in activity { events.activity(item.kind, item.bytes); }
+                    }
                 },
                 Err(code) => {
-                    events.preserve_partial(decoder.partial_content());
+                    if let Some(events)=events { events.preserve_partial(decoder.partial_content()); }
                     return Err(GatewayError::new(code, "The remote stream could not be completed.", false));
                 }
             }
             if decoder.is_complete() { break; }
         }
         let partial = decoder.partial_content().to_string();
-        decoder.finish().map_err(|code| {
-            events.preserve_partial(&partial);
+        decoder.finish().map(annotate).map_err(|code| {
+            if let Some(events)=events { events.preserve_partial(&partial); }
             GatewayError::new(code, "The remote stream has no confirmed terminal record.", false)
+        })
+    }
+
+    fn await_provider<T,F:std::future::Future<Output=Result<T,reqwest::Error>>>(&self, make:impl FnOnce()->F) -> Result<T,GatewayError> {
+        // reqwest creates timeout timers in send(), so construct its future
+        // inside the same runtime used to poll/cancel it.
+        self.await_gateway(async {make().await.map_err(GatewayError::delivery)})
+    }
+
+    fn await_gateway<T>(&self, future:impl std::future::Future<Output=Result<T,GatewayError>>) -> Result<T,GatewayError> {
+        tauri::async_runtime::block_on(async {
+            if let Some(cancel)=&self.cancellation {
+                tokio::select! {
+                    result=future => result,
+                    _=async { while !cancel.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(75)).await; } } => {
+                        let mut error=GatewayError::new("MODEL_CALL_CANCELLED","Stopped waiting; the remote result may still be unknown. This request will not be resent.",false);
+                        error.delivery_state=Some("unknown".into()); Err(error)
+                    }
+                }
+            } else { future.await }
         })
     }
 
@@ -665,7 +785,8 @@ impl ModelGateway {
                         false,
                     )
                 })?;
-            self.generate_with_secret(
+            let probe = self.as_probe();
+            probe.generate_with_secret(
                 &configured_model_id,
                 "You are a connection test. Return JSON only.",
                 r#"{"task":"Return {\"ok\":true}."}"#,
@@ -686,7 +807,7 @@ impl ModelGateway {
             .map_err(GatewayError::configuration)?;
         let _ = self
             .center
-            .mark_connection_status(connection_id, "ready", None);
+            .mark_connection_status_for_versions(connection_id, "ready", None, summary.configuration_version, summary.credential_version);
         Ok(summary)
     }
     pub(crate) fn test_connection(
@@ -706,7 +827,7 @@ impl ModelGateway {
             );
             let _ =
                 self.center
-                    .mark_connection_status(connection_id, "disabled", Some(&error.code));
+                    .mark_connection_status_for_versions(connection_id, "disabled", Some(&error.code), connection.configuration_version, connection.credential_version);
             return Err(error);
         }
         let provider = provider_registry::find(&connection.provider_id)
@@ -746,9 +867,7 @@ impl ModelGateway {
             && configured_model.is_none()
         {
             let discovered = self.discover_models_with_secret(connection_id, None)?;
-            let _ = self
-                .center
-                .mark_connection_status(connection_id, "ready", None);
+            // Metadata access is not a successful generation test.
             let endpoint_host = reqwest::Url::parse(&connection.endpoint)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_string))
@@ -768,8 +887,8 @@ impl ModelGateway {
                     endpoint_host,
                     finish_reason: None,
                     content_length: 0,
-                    credential_version: 0,
-                    connection_configuration_version: 0,
+                    credential_version: connection.credential_version,
+                    connection_configuration_version: connection.configuration_version,
                     model_configuration_version: 0,
                     billing_class: "probe".to_string(),
                     free_source_url: None,
@@ -785,6 +904,12 @@ impl ModelGateway {
                     cache_write_input_tokens: None,
                     reasoning_tokens: None,
                     answer_tokens: None,
+                    usage_contract: connection.capability_profile.as_ref().map(|p| p.usage.clone()),
+                    transport_observation: None,
+                    usage_source: "endpoint_metadata_no_generation".into(),
+                    http_status: None,
+                    provider_request_id: None,
+                    reasoning_in_output: None,
                 },
                 capabilities: Vec::new(),
                 warnings: Vec::new(),
@@ -809,13 +934,15 @@ impl ModelGateway {
             .map_err(GatewayError::configuration)?;
         let secret_ref = secret.as_ref().map(|value| value.as_str());
         let model = ConfiguredModelRuntime {
+            transport: connection.transport.clone(),
+            protocol: connection.protocol.clone(), capability_profile: connection.capability_profile.clone(),
             configured_model_id: format!("connection-test.{connection_id}"),
             connection_id: connection_id.to_string(),
             provider_id: connection.provider_id.clone(),
             endpoint: connection.endpoint.clone(),
-            credential_version: 0,
+            credential_version: connection.credential_version,
             connection_enabled: true,
-            connection_configuration_version: 0,
+            connection_configuration_version: connection.configuration_version,
             model_id: model_id.clone(),
             alias: format!("{} connection test", provider.display_name),
             model_enabled: true,
@@ -830,17 +957,19 @@ impl ModelGateway {
             configuration_version: 0,
         };
         let client = build_client(&connection, 30)?;
-        let result = if connection.provider_id == "ollama" {
-            self.generate_ollama(
+        let mut probe = self.as_probe();
+        probe.expected_configuration_version = Some(model.configuration_version);
+        let result = if connection.protocol == "ollama" {
+            probe.generate_ollama(
                 &client,
                 &model,
                 secret_ref,
                 "You are a connection test. Return JSON only.",
                 r#"{"task":"Return {\"ok\":true}."}"#,
-                true,
+                false,
             )
         } else {
-            self.generate_openai_compatible(
+            probe.generate_openai_compatible(
                 &client,
                 &model,
                 secret_ref,
@@ -854,7 +983,7 @@ impl ModelGateway {
             Ok(result) => {
                 let _ = self
                     .center
-                    .mark_connection_status(connection_id, "ready", None);
+                    .mark_connection_status_for_versions(connection_id, "ready", None, connection.configuration_version, connection.credential_version);
                 Ok(GatewayTestResult {
                     ok: true,
                     message: format!("Connection test succeeded with {}.", model_id),
@@ -864,10 +993,11 @@ impl ModelGateway {
                 })
             }
             Err(error) => {
-                let _ = self.center.mark_connection_status(
+                let _ = self.center.mark_connection_status_for_versions(
                     connection_id,
                     health_status_for_error(&error.code),
                     Some(&error.code),
+                    connection.configuration_version, connection.credential_version,
                 );
                 Err(error)
             }
@@ -877,15 +1007,21 @@ impl ModelGateway {
         &self,
         configured_model_id: &str,
     ) -> Result<GatewayTestResult, GatewayError> {
+        self.test_model_capabilities(configured_model_id, false)
+    }
+    pub(crate) fn test_model_capabilities(&self, configured_model_id: &str, test_vision: bool) -> Result<GatewayTestResult,GatewayError> {
         let model = self
             .center
             .configured_model_runtime(configured_model_id)
             .map_err(GatewayError::configuration)?;
         let mut capabilities = Vec::new();
         let mut warnings = Vec::new();
+        let mut auth_error = None;
         let requested_versions = (model.configuration_version, model.connection_configuration_version,
                                   model.credential_version);
-        let text_result = match self.generate(
+        let mut probe = self.as_probe();
+        probe.expected_configuration_version = Some(model.configuration_version);
+        let text_result = match probe.generate_once(
             configured_model_id,
             "You are a connection test. Return JSON only.",
             r#"{"task":"Return {\"ok\":true}."}"#,
@@ -898,6 +1034,7 @@ impl ModelGateway {
                 result
             }
             Err(error) => {
+                if error.code=="MODEL_CALL_CANCELLED" { return Err(error); }
                 self.record_capability(
                     configured_model_id,
                     "text_chat",
@@ -941,13 +1078,13 @@ impl ModelGateway {
             }
         }
 
-        if model
+        if test_vision && model
             .capabilities
             .iter()
             .any(|capability| capability == "vision")
         {
             const TEST_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-            match self.generate_vision(
+            match probe.generate_vision(
                 configured_model_id,
                 "You are a vision connection test. Return JSON only.",
                 r#"{"task":"Confirm that an image was received and return {\"ok\":true}."}"#,
@@ -960,6 +1097,7 @@ impl ModelGateway {
                     capabilities.push(GatewayCapabilityResult::ready("vision"));
                 }
                 Err(error) => {
+                    if error.code == "MODEL_UNAUTHORIZED" { auth_error = Some(error.code.clone()); }
                     self.record_capability(
                         configured_model_id,
                         "vision",
@@ -974,7 +1112,10 @@ impl ModelGateway {
         }
 
         let ok = capabilities.iter().all(|check| check.status == "ready");
-        self.center.mark_probe_health_for_versions(configured_model_id, "ready", None,
+        // A successful text probe is not permission to undo a later vision 401/403.
+        // Keep the text observation, but pause new work on the rejected connection.
+        self.center.mark_probe_health_for_versions(configured_model_id,
+            if auth_error.is_some() { "unauthorized" } else { "ready" }, auth_error.as_deref(),
             probe_versions(&text_result.meta)).map_err(GatewayError::configuration)?;
         Ok(GatewayTestResult {
             ok,
@@ -1041,6 +1182,18 @@ pub struct DiscoveredModel {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayResponseMeta {
+    #[serde(default)]
+    pub http_status: Option<u16>,
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_in_output: Option<bool>,
+    #[serde(default)]
+    pub transport_observation: Option<String>,
+    #[serde(default)]
+    pub usage_contract: Option<String>,
+    #[serde(default)]
+    pub usage_source: String,
     pub configured_model_id: String,
     pub connection_id: String,
     pub provider_id: String,
@@ -1090,30 +1243,34 @@ fn apply_output_budget_receipt(
 
 impl GatewayResponseMeta {
     fn apply_usage(&mut self, response: &Value) {
+        self.http_status = response.get("_openthesis_http_status").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok());
+        self.provider_request_id = response.get("_openthesis_provider_request_id").and_then(Value::as_str).map(str::to_string);
+        self.transport_observation = response.get("_openthesis_transport_observation").and_then(Value::as_str).filter(|s| ["declared_stream_returned_non_stream_body","non_streaming_response"].contains(s)).map(str::to_string);
         // Missing is unknown, not zero. A cache miss is not a cache write.
         let integer = |paths: &[&str]| paths.iter().find_map(|path|
             response.pointer(path).and_then(Value::as_u64));
-        let ollama = self.provider_id == "ollama";
+        let contract = self.usage_contract.as_deref().unwrap_or(&self.provider_id);
+        let ollama = contract == "ollama";
         self.input_tokens = integer(if ollama { &["/prompt_eval_count"] } else { &["/usage/prompt_tokens"] });
         self.output_tokens = integer(if ollama { &["/eval_count"] } else { &["/usage/completion_tokens"] });
-        self.reasoning_tokens = match self.provider_id.as_str() {
+        self.reasoning_tokens = match contract {
             "openai" | "deepseek" | "qwen" | "openrouter" => integer(&["/usage/completion_tokens_details/reasoning_tokens"]),
             _ => None,
         };
         // Only a separately reported text counter proves visible-answer usage.
         // completion - reasoning is not safe with audio/prediction categories.
-        self.answer_tokens = match self.provider_id.as_str() {
+        self.answer_tokens = match contract {
             "openai" => integer(&["/usage/completion_tokens_details/text_tokens"]),
             _ => None,
         };
-        self.cache_read_input_tokens = match self.provider_id.as_str() {
+        self.cache_read_input_tokens = match contract {
             "deepseek" => integer(&["/usage/prompt_cache_hit_tokens"]),
             "ollama" => integer(&["/prompt_eval_cached_count"]),
             "qwen" | "kimi_cn" | "kimi_global" => integer(&["/usage/prompt_tokens_details/cached_tokens", "/usage/cached_tokens"]),
             "openai" | "glm" | "openrouter" => integer(&["/usage/prompt_tokens_details/cached_tokens"]),
             _ => None,
         };
-        self.cache_write_input_tokens = match self.provider_id.as_str() {
+        self.cache_write_input_tokens = match contract {
             "openai" | "kimi_cn" | "kimi_global" | "openrouter" => integer(&["/usage/prompt_tokens_details/cache_write_tokens"]),
             _ => None,
         };
@@ -1171,6 +1328,8 @@ impl GatewayCapabilityResult {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GatewayError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<String>,
     pub code: String,
     pub message: String,
     pub retryable: bool,
@@ -1183,6 +1342,7 @@ pub struct GatewayError {
 impl GatewayError {
     fn new(code: &str, message: impl Into<String>, retryable: bool) -> Self {
         Self {
+            delivery_state: if matches!(code,"MODEL_CONFIGURATION_CHANGED"|"MODEL_OUTPUT_BUDGET_POLICY_REQUIRED"|"MODEL_CONNECTION_AUTH_PAUSED") {Some("not_sent".into())} else {None},
             code: code.to_string(),
             message: message.into(),
             retryable,
@@ -1193,24 +1353,38 @@ impl GatewayError {
 
     fn configuration(message: impl Into<String>) -> Self {
         let message = message.into();
-        let code = if message == "MODEL_CREDENTIAL_MISSING"
+        let code = if ["MODEL_ENDPOINT_FORBIDDEN_TARGET","MODEL_PROXY_INVALID","MODEL_PROXY_PAC_UNSUPPORTED","MODEL_MODELS_ENDPOINT_ORIGIN","MODEL_TRANSPORT_INVALID","MODEL_TEST_BUSY","MODEL_TEST_ID_INVALID","MODEL_ENDPOINT_MODE_INVALID"].contains(&message.as_str()) { message.as_str() }
+        else if message == "MODEL_CREDENTIAL_MISSING"
             || message == "stored credential was not found"
         {
             "MODEL_CREDENTIAL_MISSING"
         } else {
             "MODEL_CONFIGURATION_ERROR"
-        };
+        }.to_string();
         let safe_message = if code == "MODEL_CREDENTIAL_MISSING" {
             "The saved credential is unavailable. Reconfigure this connection in Model Center."
                 .to_string()
         } else {
             message
         };
-        Self::new(code, safe_message, false)
+        let mut error=Self::new(&code, safe_message, false);
+        error.delivery_state=Some("not_sent".into()); error
     }
 
-    fn network(message: impl Into<String>) -> Self {
-        Self::new("MODEL_NETWORK_ERROR", message, true)
+    fn delivery(error: reqwest::Error) -> Self {
+        let not_sent=error.is_connect();
+        use std::error::Error;
+        let mut chain=error.to_string().to_ascii_lowercase(); let mut source=error.source();
+        while let Some(item)=source { chain.push_str(&item.to_string().to_ascii_lowercase()); source=item.source(); }
+        let code=if !not_sent {"MODEL_SUBMISSION_UNKNOWN"}
+            else if chain.contains("model_endpoint_forbidden_target") {"MODEL_ENDPOINT_FORBIDDEN_TARGET"}
+            else if chain.contains("certificate") || chain.contains("tls") || chain.contains("ssl") {"MODEL_TLS_ERROR"}
+            else if chain.contains("proxy") || chain.contains("tunnel") {"MODEL_PROXY_ERROR"}
+            else if chain.contains("dns") || chain.contains("resolve") || chain.contains("no such host") {"MODEL_DNS_ERROR"}
+            else {"MODEL_NETWORK_ERROR"};
+        let mut result=Self::new(code,if not_sent {"Connection could not be established; inspect the target and network settings. No request was sent."} else {"The request delivery outcome is unknown; it will not be resent automatically."},not_sent && code!="MODEL_ENDPOINT_FORBIDDEN_TARGET");
+        result.delivery_state=Some(if not_sent {"not_sent"} else {"unknown"}.into());
+        result
     }
 }
 
@@ -1224,10 +1398,7 @@ fn health_status_for_error(code: &str) -> &'static str {
 }
 
 fn endpoint_url(base: &str, path: &str) -> Result<reqwest::Url, GatewayError> {
-    let mut normalized = base.trim_end_matches('/').to_string();
-    normalized.push('/');
-    normalized.push_str(path.trim_start_matches('/'));
-    reqwest::Url::parse(&normalized).map_err(|_| {
+    crate::connection_contract::request_url(base,path).map_err(|_| {
         GatewayError::new(
             "MODEL_ENDPOINT_INVALID",
             "The configured endpoint is invalid.",
@@ -1242,45 +1413,24 @@ fn build_client(
 ) -> Result<Client, GatewayError> {
     provider_registry::validate_endpoint(&connection.provider_id, &connection.endpoint)
         .map_err(GatewayError::configuration)?;
-    let url = reqwest::Url::parse(&connection.endpoint).map_err(|_| {
-        GatewayError::new(
-            "MODEL_ENDPOINT_INVALID",
-            "The configured endpoint is invalid.",
-            false,
-        )
-    })?;
+    connection.transport.validate(&connection.endpoint).map_err(GatewayError::configuration)?;
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(timeout_seconds.clamp(5, 600)));
-
-    if connection.provider_id == "custom" && !is_loopback_host(url.host_str().unwrap_or_default()) {
-        let host = url.host_str().ok_or_else(|| {
-            GatewayError::new(
-                "MODEL_ENDPOINT_INVALID",
-                "The configured endpoint has no host.",
-                false,
-            )
-        })?;
-        let port = url.port_or_known_default().ok_or_else(|| {
-            GatewayError::new(
-                "MODEL_ENDPOINT_INVALID",
-                "The configured endpoint has no usable port.",
-                false,
-            )
-        })?;
-        let addresses = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| GatewayError::network("The custom endpoint could not be resolved."))?
-            .collect::<Vec<_>>();
-        if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
-            return Err(GatewayError::new(
-                "MODEL_ENDPOINT_PRIVATE",
-                "A remote custom endpoint must not resolve to a private or reserved address.",
-                false,
-            ));
+        .timeout(Duration::from_secs(timeout_seconds.clamp(5, 600)))
+        .dns_resolver(Arc::new(ModelTargetResolver));
+    match connection.transport.network_mode.as_str() {
+        "direct" => builder=builder.no_proxy(),
+        "proxy" => builder=builder.no_proxy().proxy(reqwest::Proxy::all(connection.transport.proxy_url.as_deref().unwrap_or_default())
+            .map_err(|_| GatewayError::configuration("MODEL_PROXY_INVALID"))?),
+        _ => {
+            // reqwest's system-proxy feature reads environment and Windows
+            // static settings. It does not execute PAC/WPAD scripts.
+            let loopback=reqwest::Url::parse(&connection.endpoint).ok().is_some_and(|url| is_loopback_host(url.host_str().unwrap_or_default()));
+            if !loopback && system_proxy_requires_pac() && !has_environment_proxy(&connection.endpoint) {
+                return Err(GatewayError::configuration("MODEL_PROXY_PAC_UNSUPPORTED"));
+            }
         }
-        builder = builder.resolve_to_addrs(host, &addresses);
     }
 
     builder.build().map_err(|_| {
@@ -1292,45 +1442,49 @@ fn build_client(
     })
 }
 
+/// Resolution happens inside the selected reqwest transport, never as a
+/// synchronous public-IP preflight. Private/Fake-IP targets remain allowed.
+#[derive(Debug)]
+struct ModelTargetResolver;
+impl reqwest::dns::Resolve for ModelTargetResolver {
+    fn resolve(&self,name:reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host=name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses=tokio::task::spawn_blocking(move || (host.as_str(),0).to_socket_addrs().map(|values| values.collect::<Vec<_>>())).await??;
+            if addresses.is_empty() || addresses.iter().any(|address| !provider_registry::allowed_model_ip(address.ip())) {
+                return Err(std::io::Error::other("MODEL_ENDPOINT_FORBIDDEN_TARGET").into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn has_environment_proxy(endpoint: &str) -> bool {
+    let scheme=reqwest::Url::parse(endpoint).ok().map(|url| url.scheme().to_string()).unwrap_or_default();
+    let keys=if scheme=="https" { ["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy"] } else { ["HTTP_PROXY","http_proxy","ALL_PROXY","all_proxy"] };
+    keys.iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
+}
+
+#[cfg(windows)]
+fn system_proxy_requires_pac() -> bool {
+    use windows_sys::Win32::{Foundation::GlobalFree, Networking::WinHttp::{WinHttpGetIEProxyConfigForCurrentUser,WINHTTP_CURRENT_USER_IE_PROXY_CONFIG}};
+    let mut config=WINHTTP_CURRENT_USER_IE_PROXY_CONFIG::default();
+    unsafe {
+        if WinHttpGetIEProxyConfigForCurrentUser(&mut config)==0 { return false; }
+        let automatic=!config.lpszAutoConfigUrl.is_null() && *config.lpszAutoConfigUrl!=0;
+        let has_static=!config.lpszProxy.is_null() && *config.lpszProxy!=0;
+        for pointer in [config.lpszAutoConfigUrl,config.lpszProxy,config.lpszProxyBypass] {
+            if !pointer.is_null() { GlobalFree(pointer.cast()); }
+        }
+        automatic && !has_static
+    }
+}
+#[cfg(not(windows))]
+fn system_proxy_requires_pac() -> bool { false }
+
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
-}
-
-fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(value) => is_public_ipv4(value),
-        IpAddr::V6(value) => is_public_ipv6(value),
-    }
-}
-
-fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    !(ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || octets[0] == 0
-        || octets[0] >= 224
-        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
-        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113))
-}
-
-fn is_public_ipv6(ip: Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    if let Some(mapped) = ip.to_ipv4_mapped() {
-        return is_public_ipv4(mapped);
-    }
-    !(ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || segments[0] == 0x2001 && segments[1] == 0x0db8)
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
 fn authorize(
@@ -1352,18 +1506,6 @@ fn authorize(
     } else {
         Ok(request)
     }
-}
-
-fn post_json(
-    client: &Client,
-    url: &reqwest::Url,
-    payload: &Value,
-    secret: Option<&str>,
-) -> Result<Value, GatewayError> {
-    let request = authorize(client.post(url.clone()).json(payload), secret)?;
-    let response = tauri::async_runtime::block_on(async { request.send().await })
-        .map_err(|_| GatewayError::network("The model provider could not be reached."))?;
-    read_json_response(response, secret)
 }
 
 fn read_json_response(response: Response, secret: Option<&str>) -> Result<Value, GatewayError> {
@@ -1482,6 +1624,9 @@ async fn read_json_response_async(mut response: Response, secret: Option<&str>) 
             429 => "MODEL_RATE_LIMITED",
             value if value >= 500 => "MODEL_PROVIDER_UNAVAILABLE",
             _ if context_capacity => "MODEL_CONTEXT_CAPACITY",
+            404 if lowered_detail.contains("model") => "MODEL_MODEL_NOT_FOUND",
+            400 | 422 if lowered_detail.contains("stream") && ["unsupported","not support","unknown parameter","not allowed"].iter().any(|marker|lowered_detail.contains(marker)) => "MODEL_STREAM_UNSUPPORTED",
+            400 | 422 if ["max_tokens","max_completion_tokens","num_predict"].iter().any(|field|lowered_detail.contains(field)) && ["unsupported","not support","unknown parameter","not allowed"].iter().any(|marker|lowered_detail.contains(marker)) => "MODEL_OUTPUT_PARAMETER_UNSUPPORTED",
             400 | 422
                 if lowered_detail.contains("response_format")
                     && ["unsupported", "not support", "unknown", "invalid"]
@@ -1582,6 +1727,8 @@ struct GatewayEventSink {
     context: GatewayEventContext,
     seq: Mutex<u64>,
     partial: Mutex<Option<String>>,
+    observer: Option<Arc<dyn Fn(&Value)+Send+Sync>>,
+    finished: AtomicBool,
 }
 
 impl GatewayEventSink {
@@ -1591,14 +1738,17 @@ impl GatewayEventSink {
                 .iter().any(|value| value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)) {
             return Err(GatewayError::new("MODEL_GATEWAY_PROTOCOL_ERROR", "Invalid event identity.", false));
         }
-        Ok(Self { context, seq: Mutex::new(0), partial: Mutex::new(None) })
+        Ok(Self { context, seq: Mutex::new(0), partial: Mutex::new(None), observer:None, finished:AtomicBool::new(false) })
     }
 
     fn frame(&self, kind: &str, data: Value) {
         let Ok(mut seq) = self.seq.lock() else { return; };
+        if self.finished.load(Ordering::Acquire) { return; }
+        if matches!(kind,"error"|"result") { self.finished.store(true,Ordering::Release); }
         *seq += 1;
         let frame = json!({"protocol": "model-events-v1", "context": self.context,
                            "seq": *seq, "kind": kind, "data": data});
+        if let Some(observer)=&self.observer { observer(&frame); return; }
         let mut stdout = std::io::stdout().lock();
         let _ = serde_json::to_writer(&mut stdout, &frame);
         let _ = stdout.write_all(b"\n");
@@ -1619,6 +1769,8 @@ impl GatewayEventSink {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct GatewayCliRequest {
+    #[serde(default)]
+    expected_configuration_version: Option<i64>,
     operation: String,
     configured_model_id: String,
     system_prompt: String,
@@ -1778,6 +1930,7 @@ fn run_cli_request_with_events(request: GatewayCliRequest, events: Option<Arc<Ga
         },
     );
     gateway.events = events;
+    gateway.expected_configuration_version = request.expected_configuration_version;
     match request.operation.as_str() {
         "generate" => gateway.generate_once(
             &request.configured_model_id,
@@ -1813,20 +1966,8 @@ pub async fn model_gateway_discover_connection(
     let result = tauri::async_runtime::spawn_blocking(move ||
         ModelGateway::new(worker_center).discover_models(&worker_connection)).await
         .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Model discovery worker stopped.", false))?;
-    match result {
-        Ok(models) => {
-            let _ = center.mark_connection_status(&connection_id, "ready", None);
-            Ok(models)
-        }
-        Err(error) => {
-            let _ = center.mark_connection_status(
-                &connection_id,
-                health_status_for_error(&error.code),
-                Some(&error.code),
-            );
-            Err(error)
-        }
-    }
+    // Listing proves only metadata access; 404/empty/stale results do not revoke text capabilities.
+    result
 }
 
 #[tauri::command]
@@ -1860,16 +2001,127 @@ pub async fn model_gateway_test_model(
     app: AppHandle,
     state: State<'_, ModelCenterState>,
     configured_model_id: String,
+    test_vision: Option<bool>,
+    operation_id: Option<String>,
 ) -> Result<GatewayTestResult, GatewayError> {
     let center = state.get(&app).map_err(GatewayError::configuration)?;
-    tauri::async_runtime::spawn_blocking(move ||
-        ModelGateway::new(center).test_model(&configured_model_id)).await
-        .map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE", "Model test worker stopped.", false))?
+    let model=center.configured_model_runtime(&configured_model_id).map_err(GatewayError::configuration)?;
+    let operation_id=operation_id.unwrap_or_else(||format!("test:{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v|v.as_nanos()).unwrap_or_default()));
+    let cancel=state.begin_test(&model.connection_id,&operation_id).map_err(GatewayError::configuration)?;
+    let mut sink=GatewayEventSink::new(GatewayEventContext {protocol:"model-events-v1".into(),request_id:operation_id.clone(),run_id:configured_model_id.clone(),stage_id:"model-test".into(),generation:model.configuration_version.max(0) as u64,attempt_id:operation_id.clone()})?;
+    sink.observer=Some(Arc::new(move |frame| {let _=app.emit("openthesis-model-test",frame);}));
+    let events=Arc::new(sink); let worker_events=events.clone();
+    events.activity("queued",0);
+    let result=tauri::async_runtime::spawn_blocking(move || {
+        let mut gateway=ModelGateway::new(center); gateway.events=Some(worker_events); gateway.cancellation=Some(cancel);
+        gateway.test_model_capabilities(&configured_model_id,test_vision.unwrap_or(false))
+    }).await.map_err(|_| GatewayError::new("MODEL_GATEWAY_UNAVAILABLE","Model test worker stopped.",false)).and_then(|result|result);
+    state.finish_test(&model.connection_id,&operation_id);
+    match &result {Ok(value)=>events.frame("result",json!({"ok":value.ok})),Err(error)=>events.frame("error",json!({"code":error.code}))};
+    result
+}
+
+#[tauri::command]
+pub async fn model_gateway_cancel_test(state:State<'_,ModelCenterState>,operation_id:String) -> Result<(),GatewayError> {
+    state.cancel_test(&operation_id); Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_auth_failure_does_not_pause_generation_321() {
+        let (center,_)=configured_custom(one_response_server("403 Forbidden",r#"{"error":{"message":"models listing permission unavailable"}}"#),None);
+        assert_eq!(ModelGateway::new(center.clone()).discover_models("custom-local").unwrap_err().http_status,Some(403));
+        assert_ne!(center.connection_runtime("custom-local").unwrap().status,"unauthorized");
+    }
+    #[test]
+    fn cancellation_interrupts_nonstream_body_without_retry_or_capability_failure_321() {
+        let (endpoint,release,server)=stalled_error_response_server("200 OK",None);
+        let (center,id)=configured_custom(endpoint,None);
+        let previous=center.list_models().unwrap()[0].health_status.clone();
+        let cancel=Arc::new(AtomicBool::new(false)); let signal=cancel.clone();
+        let worker=std::thread::spawn(move || {std::thread::sleep(Duration::from_millis(200));signal.store(true,Ordering::Release);});
+        let mut gateway=ModelGateway::new(center.clone()); gateway.cancellation=Some(cancel);
+        let started=Instant::now(); let result=gateway.test_model_capabilities(&id,false);
+        let _=release.send(()); server.join().unwrap(); worker.join().unwrap();
+        let error=result.unwrap_err(); assert_eq!(error.code,"MODEL_CALL_CANCELLED");
+        assert_eq!(error.delivery_state.as_deref(),Some("unknown")); assert!(!error.retryable);
+        assert!(started.elapsed()<Duration::from_secs(2));
+        assert_eq!(center.list_models().unwrap()[0].health_status,previous);
+    }
+    #[test]
+    fn configured_client_creation_does_not_resolve_or_pin_customer_dns_321() {
+        let (center, _) = configured_custom("https://customer-model.invalid/v1".into(), None);
+        let connection = center.connection_runtime("custom-local").unwrap();
+        assert!(build_client(&connection, 10).is_ok(), "creating a configured client must not require public DNS");
+    }
+
+    #[test]
+    fn custom_stream_without_observer_has_the_same_single_wire_contract_321() {
+        let body = format!("data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"index":0,"delta":{"content":"complete answer"},"finish_reason":"stop"}]}));
+        let (url, receiver) = recorded_wire_server("text/event-stream", body);
+        let gateway = ModelGateway::new(center());
+        let mut payload = json!({"model":"private/exact","messages":[]});
+        let profile = crate::connection_contract::CapabilityProfile { stream:"sse".into(), ..Default::default() };
+        let result = gateway.post_text_contract(&Client::new(), &url, &mut payload, None, "custom", Some(&profile));
+        assert!(result.is_ok(), "the optional event observer must not disable stream decoding: {result:?}");
+        assert_eq!(result.unwrap()["choices"][0]["message"]["content"], "complete answer");
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap()["stream"], true);
+    }
+    #[test]
+    fn full_completion_url_is_normalized_before_metadata_or_generation_320() {
+        assert_eq!(endpoint_url("https://proxy.example/team/v1/chat/completions/", "chat/completions").unwrap().as_str(), "https://proxy.example/team/v1/chat/completions");
+        assert_eq!(endpoint_url("https://proxy.example/team/v1/chat/completions/", "/models").unwrap().as_str(), "https://proxy.example/team/v1/models");
+    }
+    #[test]
+    fn custom_sse_usage_and_output_contract_are_connection_scoped_320() {
+        let body = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{"content":"完整材料"},"finish_reason":"stop"}]}),json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":80}}}));
+        let (url,receiver)=recorded_wire_server("text/event-stream",body);
+        let endpoint=url.origin().ascii_serialization();
+        let (center,id)=configured_custom(endpoint.clone(),None);
+        center.save_connection(SaveConnectionInput {transport:None,connection_id:"custom-local".into(),provider_id:"custom".into(),display_name:"Proxy".into(),region:"custom".into(),endpoint,enabled:true,protocol:Some("chat_completions".into()),capability_profile:Some(crate::connection_contract::CapabilityProfile {stream:"sse".into(),include_usage:true,usage:"openai".into(),output_parameter:"max_tokens".into(),output_limit:Some(2000),output_semantics:"visible_output_tokens_only".into(),upstream:"proxy".into(),..Default::default()})}).unwrap();
+        let mut gateway=ModelGateway::new(center).with_output_token_budget(Some(512));
+        gateway.events=Some(Arc::new(GatewayEventSink::new(GatewayEventContext{protocol:"model-events-v1".into(),request_id:"test320".into(),run_id:"isolation".into(),stage_id:"financial-analyst".into(),generation:1,attempt_id:"one".into()}).unwrap()));
+        let result=gateway.generate_once(&id,"full system","full source",true).unwrap();
+        let wire=receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(wire["stream"],true); assert_eq!(wire["stream_options"]["include_usage"],true);
+        assert_eq!(wire["max_tokens"],512); assert!(wire.get("max_completion_tokens").is_none()); assert!(wire.get("response_format").is_none());
+        assert_eq!(wire["messages"][1]["content"],"full source");
+        assert_eq!(result.content,"完整材料"); assert_eq!(result.meta.cache_read_input_tokens,Some(80));
+        assert_eq!(result.meta.usage_source,"endpoint_reported_upstream_unverified");
+        assert_eq!(result.meta.output_budget_semantics.as_deref(),Some("visible_output_tokens_only"));
+    }
+    #[test]
+    fn connection_auth_failure_pauses_later_work_without_another_wire_320() {
+        let (center,id)=configured_custom(one_response_server("401 Unauthorized",r#"{"error":{"message":"unauthorized"}}"#),None);
+        let gateway=ModelGateway::new(center);
+        assert_eq!(gateway.generate_once(&id,"system","source",false).unwrap_err().code,"MODEL_UNAUTHORIZED");
+        assert_eq!(gateway.generate_once(&id,"system","source",false).unwrap_err().code,"MODEL_CONNECTION_AUTH_PAUSED");
+    }
+    #[test]
+    fn text_test_does_not_implicitly_send_a_declared_image_320() {
+        let (center,id)=configured_vision(one_response_server("200 OK",r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#));
+        let result=ModelGateway::new(center.clone()).test_model(&id).unwrap();
+        assert!(result.ok); assert!(!result.capabilities.iter().any(|c|c.capability=="vision"));
+        assert!(!center.list_models().unwrap()[0].capability_checks.iter().any(|c|c.capability=="vision"));
+    }
+    #[test]
+    fn directory_discovery_does_not_certify_structured_json_320() {
+        let (center,_)=configured_custom(one_response_server("200 OK",r#"{"data":[{"id":"Private/Case-ID"}]}"#),None);
+        let discovered=ModelGateway::new(center).discover_models("custom-local").unwrap();
+        assert_eq!(discovered[0].model_id,"Private/Case-ID"); assert!(discovered[0].capabilities.is_empty());
+    }
+    #[test]
+    fn changed_configuration_and_unknown_budget_are_rejected_before_wire_320() {
+        let (center,id)=configured_custom("http://127.0.0.1:9".into(),None);
+        let mut gateway=ModelGateway::new(center.clone()); gateway.expected_configuration_version=Some(999);
+        assert_eq!(gateway.generate_once(&id,"system","source",true).unwrap_err().code,"MODEL_CONFIGURATION_CHANGED");
+        center.save_connection(SaveConnectionInput{transport:None,connection_id:"custom-local".into(),provider_id:"custom".into(),display_name:"Unknown".into(),region:"custom".into(),endpoint:"http://127.0.0.1:9".into(),enabled:true,protocol:Some("chat_completions".into()),capability_profile:Some(Default::default())}).unwrap();
+        let error=ModelGateway::new(center).generate_once(&id,"system","source",true).unwrap_err();
+        assert_eq!(error.code,"MODEL_OUTPUT_BUDGET_POLICY_REQUIRED"); assert_eq!(error.delivery_state.as_deref(),Some("not_sent"));
+    }
     use crate::credentials::InMemoryVault;
     use crate::model_center::{SaveConfiguredModelInput, SaveConnectionInput};
     use std::io::{BufRead, BufReader};
@@ -2006,6 +2258,7 @@ mod tests {
             ("gemini",None,None),("custom",None,None)] {
             let mut meta = gateway.result(&model, String::new(), None).meta;
             meta.provider_id = provider.into();
+            meta.usage_contract = None;
             meta.apply_usage(&response);
             assert_eq!(meta.cache_read_input_tokens, read, "{provider}");
             assert_eq!(meta.cache_write_input_tokens, write, "{provider}");
@@ -2098,6 +2351,8 @@ mod tests {
         center
             .save_connection(SaveConnectionInput {
                 connection_id: "custom-local".into(),
+                transport: None,
+                protocol: None, capability_profile: Some(crate::connection_contract::CapabilityProfile {allow_unbounded_output:true,..Default::default()}),
                 provider_id: "custom".into(),
                 display_name: "Custom local".into(),
                 region: "local".into(),
@@ -2483,6 +2738,7 @@ mod tests {
     #[test]
     fn legacy_vision_cli_contract_is_rejected_before_configuration_or_network() {
         let request = GatewayCliRequest {
+            expected_configuration_version: None,
             operation: "vision".into(),
             configured_model_id: "missing".into(),
             system_prompt: "system".into(),
@@ -2539,6 +2795,7 @@ mod tests {
         let (center, model_id) = configured_custom(capped_endpoint.to_string(), None);
         let mut capped_model = center.configured_model_runtime(&model_id).unwrap();
         capped_model.provider_id = "openai".into();
+        capped_model.capability_profile = None;
         capped_model.model_id = "gpt-5.6-sol".into();
         let mut uncapped_model = capped_model.clone();
         uncapped_model.endpoint = uncapped_endpoint.to_string();
@@ -2605,9 +2862,23 @@ mod tests {
                 .configured_model_runtime(&configured_model_id)
                 .unwrap();
             model.provider_id = provider.into();
+            if provider != "custom" { model.capability_profile = None; }
             model.model_id = model_id.into();
             model.endpoint = endpoint.to_string();
             let gateway = ModelGateway::new(center.clone()).with_output_token_budget(Some(requested));
+            if expected.is_none() {
+                model.capability_profile = None;
+                let error = gateway.generate_openai_compatible(
+                    &Client::new(), &model, None, "system", "evidence", false, false,
+                ).unwrap_err();
+                assert_eq!(error.code, "MODEL_OUTPUT_BUDGET_POLICY_REQUIRED", "{provider}/{model_id}");
+                assert_eq!(error.delivery_state.as_deref(), Some("not_sent"));
+                assert!(receiver.try_recv().is_err(), "unknown contract must not send a wire");
+                // Explicit consent is a connection policy, not a guessed vendor parameter.
+                model.capability_profile = Some(crate::connection_contract::CapabilityProfile {
+                    allow_unbounded_output: true, ..Default::default()
+                });
+            }
             let result = gateway
                 .generate_openai_compatible(
                     &Client::new(), &model, None, "system", "evidence", false, false,
@@ -2647,11 +2918,20 @@ mod tests {
             .configured_model_runtime(&configured_model_id)
             .unwrap();
         ollama_model.provider_id = "ollama".into();
+        ollama_model.capability_profile = None;
         ollama_model.model_id = "qwen3:8b".into();
         ollama_model.endpoint = endpoint.to_string();
         ollama_model.temperature = Some(0.4);
-        let result = ModelGateway::new(center)
-            .with_output_token_budget(Some(456))
+        let gateway = ModelGateway::new(center).with_output_token_budget(Some(456));
+        let error = gateway.generate_ollama(
+            &Client::new(), &ollama_model, None, "system", "evidence", false,
+        ).unwrap_err();
+        assert_eq!(error.code, "MODEL_OUTPUT_BUDGET_POLICY_REQUIRED");
+        assert!(receiver.try_recv().is_err());
+        ollama_model.capability_profile = Some(crate::connection_contract::CapabilityProfile {
+            allow_unbounded_output: true, ..Default::default()
+        });
+        let result = gateway
             .generate_ollama(
                 &Client::new(), &ollama_model, None, "system", "evidence", false,
             )
@@ -2679,6 +2959,7 @@ mod tests {
     #[test]
     fn legacy_text_cli_contract_is_rejected_before_configuration_or_network() {
         let request = GatewayCliRequest {
+            expected_configuration_version: None,
             operation: "generate".into(),
             configured_model_id: "missing".into(),
             system_prompt: "system".into(),
@@ -2782,7 +3063,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = ModelGateway::new(center.clone()).test_model(&model_id).unwrap();
+        let result = ModelGateway::new(center.clone()).test_model_capabilities(&model_id,true).unwrap();
         assert!(result.ok);
         assert!(result.message.contains("declared capabilities"));
         assert_eq!(
@@ -2837,6 +3118,42 @@ mod tests {
     }
 
     #[test]
+    fn vision_auth_failure_pauses_connection_even_after_text_test_succeeds_320() {
+        let endpoint = sequenced_response_server(&[
+            ("200 OK", r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#),
+            ("401 Unauthorized", r#"{"error":{"message":"vision access denied"}}"#),
+        ]);
+        let (center, id) = configured_custom(endpoint, None);
+        center.save_model(SaveConfiguredModelInput {
+            configured_model_id: id.clone(), connection_id: "custom-local".into(),
+            model_id: "test-model".into(), alias: "Vision auth check".into(), enabled: true,
+            capabilities: vec!["text_chat".into(), "vision".into()],
+            context_window_hint: None, temperature: None, timeout_seconds: None,
+        }).unwrap();
+        let result = ModelGateway::new(center.clone()).test_model_capabilities(&id, true).unwrap();
+        assert!(!result.ok);
+        assert!(result.capabilities.iter().any(|c| c.capability == "text_chat" && c.status == "ready"));
+        assert_eq!(center.connection_runtime("custom-local").unwrap().status, "unauthorized");
+        assert_eq!(ModelGateway::new(center).generate_once(&id, "system", "source", false).unwrap_err().code, "MODEL_CONNECTION_AUTH_PAUSED");
+    }
+
+    #[test]
+    fn vision_only_auth_failure_pauses_text_on_same_connection_320() {
+        let (center, id) = configured_custom(one_response_server("403 Forbidden", r#"{"error":{"message":"denied"}}"#), None);
+        center.save_model(SaveConfiguredModelInput {
+            configured_model_id: id.clone(), connection_id: "custom-local".into(),
+            model_id: "test-model".into(), alias: "Vision auth check".into(), enabled: true,
+            capabilities: vec!["text_chat".into(), "vision".into()],
+            context_window_hint: None, temperature: None, timeout_seconds: None,
+        }).unwrap();
+        let gateway = ModelGateway::new(center.clone());
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        assert_eq!(gateway.generate_vision(&id,"system","source","image/png",png).unwrap_err().code,"MODEL_UNAUTHORIZED");
+        assert_eq!(center.connection_runtime("custom-local").unwrap().status,"unauthorized");
+        assert_eq!(gateway.generate_once(&id,"system","source",false).unwrap_err().code,"MODEL_CONNECTION_AUTH_PAUSED");
+    }
+
+    #[test]
     fn model_test_vision_failure_does_not_revoke_text_success() {
         let endpoint = sequenced_response_server(&[
             ("200 OK", r#"{"choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}"#),
@@ -2857,7 +3174,7 @@ mod tests {
             })
             .unwrap();
 
-        let result = ModelGateway::new(center.clone()).test_model(&model_id).unwrap();
+        let result = ModelGateway::new(center.clone()).test_model_capabilities(&model_id,true).unwrap();
         assert!(!result.ok);
         assert!(result
             .capabilities
@@ -2923,6 +3240,8 @@ mod tests {
         center
             .save_connection(SaveConnectionInput {
                 connection_id: "custom-probe".into(),
+                transport: None,
+                protocol: None, capability_profile: None,
                 provider_id: "custom".into(),
                 display_name: "Custom probe".into(),
                 region: "global".into(),
@@ -2947,6 +3266,8 @@ mod tests {
         center
             .save_connection(SaveConnectionInput {
                 connection_id: "ollama-local".into(),
+                transport: None,
+                protocol: None, capability_profile: None,
                 provider_id: "ollama".into(),
                 display_name: "Ollama".into(),
                 region: "local".into(),
@@ -2973,16 +3294,17 @@ mod tests {
         );
         assert_eq!(
             provider_registry::billing_class_for("ollama", "qwen3:8b"),
-            "local_no_provider_fee"
+            "unknown"
         );
     }
 
     #[test]
-    fn private_address_policy_rejects_reserved_ranges() {
-        assert!(!is_public_ip("10.0.0.1".parse().unwrap()));
-        assert!(!is_public_ip("169.254.1.1".parse().unwrap()));
-        assert!(!is_public_ip("::1".parse().unwrap()));
-        assert!(!is_public_ip("2001:db8::1".parse().unwrap()));
-        assert!(is_public_ip("1.1.1.1".parse().unwrap()));
+    fn configured_targets_allow_private_and_fake_ip_but_not_metadata_or_nonunicast() {
+        for address in ["10.0.0.1", "127.0.0.1", "198.18.0.7", "::1", "fd00::1"] {
+            assert!(provider_registry::allowed_model_ip(address.parse().unwrap()));
+        }
+        for address in ["169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254", "0.0.0.0", "224.0.0.1", "255.255.255.255", "::", "ff02::1"] {
+            assert!(!provider_registry::allowed_model_ip(address.parse().unwrap()));
+        }
     }
 }

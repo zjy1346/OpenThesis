@@ -432,6 +432,40 @@ def _typed_section_nodes(section: str, value: Any, language: str) -> tuple[Repor
     if not allowed:
         return ()
 
+    sensitivity_currency = ""
+    if section == "valuation_and_sensitivity" and isinstance(value, dict):
+        candidate_currency = str(value.get("currency") or "").strip().upper()
+        sensitivity_currency = candidate_currency if re.fullmatch(r"[A-Z]{3}", candidate_currency) else "XXX"
+
+    def sensitivity_nodes(item: Any) -> list[ReportNode]:
+        if not isinstance(item, (list, tuple)):
+            return []
+        rows: list[tuple[str, str]] = []
+        extra_nodes: list[ReportNode] = []
+        for candidate in item:
+            if not isinstance(candidate, dict):
+                extra_nodes.extend(_semantic_nodes(candidate, language, field="sensitivity"))
+                continue
+            equity_value = candidate.get("equity_value")
+            fcf_growth = candidate.get("fcf_growth")
+            if (isinstance(equity_value, bool) or not isinstance(equity_value, (int, float))
+                    or not math.isfinite(float(equity_value))
+                    or isinstance(fcf_growth, bool) or not isinstance(fcf_growth, (int, float))
+                    or not math.isfinite(float(fcf_growth))):
+                extra_nodes.extend(_semantic_nodes(candidate, language, field="sensitivity"))
+                continue
+            rows.append((format_percent(float(fcf_growth)), format_money(float(equity_value), sensitivity_currency)))
+            extra_nodes.extend(_semantic_nodes({key: value for key, value in candidate.items()
+                if key not in {"equity_value", "fcf_growth"}}, language, field="sensitivity"))
+        if not rows:
+            return extra_nodes
+        headers = (
+            ("FCF growth", "Equity value") if language == EN else
+            ("自由現金流增速", "權益價值") if language == ZH_HANT else
+            ("自由现金流增速", "权益价值")
+        )
+        return [ReportNode("table", rows=(headers, *rows)), *extra_nodes]
+
     def ordered_keys(item: dict[str, Any], fields: tuple[str, ...] | frozenset[str]) -> tuple[str, ...]:
         preferred = order if fields is allowed else fields
         effective_fields = {*fields, "extensions"}
@@ -443,6 +477,10 @@ def _typed_section_nodes(section: str, value: Any, language: str) -> tuple[Repor
     def scalar_node(item: Any, field: str, depth: int) -> list[ReportNode]:
         if item is None or item == "":
             return []
+        if section == "source_risk_review" and field in {"body", "text", "summary"} and isinstance(item, str) and item.strip().casefold() == "acknowledged":
+            return []
+        if section == "valuation_and_sensitivity" and field == "sensitivity":
+            return sensitivity_nodes(item)
         label = report_field_label(field, language)
         if isinstance(item, (list, tuple)):
             from .report_projection import format_report_semantic_value
@@ -1231,6 +1269,55 @@ def _artifact_label(artifact: dict[str, Any], language: str) -> str:
 
     labels = ARTIFACT_LABELS.get(str(artifact.get("artifact_type", "")), ("研究资料", "Research material"))
     return labels[1] if language == EN else labels[0]
+
+
+def _process_stage_identity(artifact: dict[str, Any]) -> tuple[str, str] | None:
+    content = artifact.get("content")
+    if not isinstance(content, dict):
+        return None
+    result = content.get("result")
+    result = result if isinstance(result, dict) else {}
+    stage_id = (
+        result.get("stage_id") or content.get("stage_id") or content.get("stage")
+        or content.get("agent_id") or artifact.get("stage_id")
+    )
+    if not isinstance(stage_id, str) or not stage_id.strip():
+        return None
+    validation = result.get("validation")
+    validation = validation if isinstance(validation, dict) else content.get("validation")
+    validation = validation if isinstance(validation, dict) else {}
+    status = (validation.get("state") or result.get("status") or result.get("outcome")
+              or content.get("status") or content.get("outcome") or artifact.get("status"))
+    if not status and isinstance(validation.get("passed"), bool):
+        status = "validation_passed" if validation["passed"] else "validation_failed"
+    return stage_id.strip(), status.strip() if isinstance(status, str) and status.strip() else ""
+
+
+def _process_status_label(status: str, language: str) -> str:
+    labels = {
+        "completed_verified": ("已核验", "已核驗", "Verified"),
+        "completed_partial": ("部分完成", "部分完成", "Partially complete"),
+        "reused_verified": ("复用已核验结果", "複用已核驗結果", "Reused verified result"),
+        "complete": ("已完成", "已完成", "Completed"),
+        "completed": ("已完成", "已完成", "Completed"),
+        "partial": ("部分完成", "部分完成", "Partially complete"),
+        "running": ("进行中", "進行中", "In progress"),
+        "failed": ("失败", "失敗", "Failed"),
+        "failed_internal": ("执行失败", "執行失敗", "Execution failed"),
+        "failed_verification": ("核验未通过", "核驗未通過", "Verification failed"),
+        "validation_passed": ("核验通过", "核驗通過", "Verification passed"),
+        "validation_failed": ("核验未通过", "核驗未通過", "Verification failed"),
+        "needs_action": ("需处理", "需處理", "Action required"),
+        "waiting_retryable": ("等待重试", "等待重試", "Retry pending"),
+        "cancelled": ("已取消", "已取消", "Cancelled"),
+        "local_failure": ("本地处理失败", "本地處理失敗", "Local processing failed"),
+    }
+    label = labels.get(status.casefold(), ("状态未记录", "狀態未記錄", "Status not recorded"))
+    if language == EN:
+        return label[2]
+    if language == ZH_HANT:
+        return label[1]
+    return label[0]
 
 
 _REPORT_SECTION_KEYS = (
@@ -2097,10 +2184,23 @@ def assemble_report_document(
             quality_nodes = _semantic_nodes(projected_quality, locale)
             rejected = financial_quality.get("rejected_periods", [])
             continuity = financial_quality.get("period_continuity", [])
-            if rejected or (
-                isinstance(continuity, list)
-                and any(isinstance(item, dict) and item.get("status") != "accepted" for item in continuity)
-            ):
+            def is_annual_quality_item(item: Any) -> bool:
+                if not isinstance(item, dict):
+                    return False
+                fiscal_period = str(item.get("fiscal_period") or "").upper()
+                if fiscal_period:
+                    return fiscal_period == "FY"
+                form_type = str(item.get("form_type") or "").upper()
+                if form_type:
+                    return form_type in {"ANNUAL_REPORT", "10-K", "20-F", "40-F"}
+                # Older rejected-period records were annual by contract; for
+                # continuity records, unknown period type is not evidence of
+                # an annual failure and must not create a broad warning.
+                return item in rejected
+
+            annual_rejected = [item for item in rejected if is_annual_quality_item(item)] if isinstance(rejected, list) else []
+            annual_continuity = [item for item in continuity if is_annual_quality_item(item)] if isinstance(continuity, list) else []
+            if annual_rejected or any(item.get("status") != "accepted" for item in annual_continuity):
                 quality_nodes.insert(0, ReportNode(
                     "paragraph",
                     "Some annual data failed validation and was quarantined; it was not used for metrics or model analysis." if locale == EN else
@@ -2133,7 +2233,7 @@ def assemble_report_document(
             if quality_nodes:
                 add_section(
                     "financial-data-quality",
-                    "Annual Data Continuity" if locale == EN and (rejected or continuity) else "Financial data quality" if locale == EN else "年度數據連續性" if locale == ZH_HANT and (rejected or continuity) else "財務資料品質" if locale == ZH_HANT else "年度数据连续性" if rejected or continuity else "财务数据质量",
+                    "Annual Data Continuity" if locale == EN and (annual_rejected or annual_continuity) else "Financial data quality" if locale == EN else "年度數據連續性" if locale == ZH_HANT and (annual_rejected or annual_continuity) else "財務資料品質" if locale == ZH_HANT else "年度数据连续性" if annual_rejected or annual_continuity else "财务数据质量",
                     quality_nodes,
                     evidence_ids=all_financial_ids,
                 )
@@ -2472,14 +2572,26 @@ def assemble_report_document(
     if safe_artifacts:
         from .reporting import _artifact_title
         process_title = "Research Process" if locale == EN else "研究過程" if locale == ZH_HANT else "研究过程"
-        process_nodes = [
-            ReportNode(
+        process_nodes: list[ReportNode] = []
+        seen_stages: set[tuple[str, str]] = set()
+        for item in safe_artifacts:
+            stage_identity = _process_stage_identity(item)
+            if stage_identity is not None:
+                stage_id, status = stage_identity
+                if stage_identity in seen_stages:
+                    continue
+                seen_stages.add(stage_identity)
+                stage_title = _artifact_title(item, locale).strip() or stage_id
+                process_nodes.append(ReportNode(
+                    "list_item",
+                    f"{stage_title} · {_process_status_label(status, locale)}",
+                ))
+                continue
+            process_nodes.append(ReportNode(
                 "list_item",
                 f"{_artifact_label(item, locale)} · `{item.get('agent_id', '')}` · `{item.get('model_id', '')}`" if include_technical
                 else f"{_artifact_title(item, locale)} · {'Preserved' if locale == EN else '已保留'}",
-            )
-            for item in safe_artifacts
-        ]
+            ))
         add_section("research-process", process_title, process_nodes)
         method_title = "Methodology" if locale == EN else "方法說明" if locale == ZH_HANT else "方法说明"
         method = (

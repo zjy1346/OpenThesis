@@ -1,6 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ModelCallProgress } from "./ModelCallProgress";
+import { exportResearchDiagnostics, getResearchDiagnostics } from "../../backend";
+import { ModelCallProgress, ResearchDiagnosticsAction } from "./ModelCallProgress";
+
+vi.mock("../../backend", () => ({ getResearchDiagnostics: vi.fn(), exportResearchDiagnostics: vi.fn() }));
 
 const wireEvidence = import.meta.env.VITE_TEST_WIRE_SNAPSHOT;
 
@@ -67,6 +70,178 @@ describe("model call progress", () => {
     const currentStates = [...view.container.querySelectorAll(".model-call-status[data-kind='call']")].map((item) => item.textContent);
     expect(currentStates).toEqual(expect.arrayContaining(["Queued", "Running", "Reasoning activity received"]));
     expect(view.container.querySelector(".model-call-stage-row")).toHaveAttribute("data-active", "true");
+  });
+
+  it.each([
+    ["en", "Reasoning activity received", "Connection remains active", "Connected; waiting for response", "Answer saved", "Stop waiting for this call"],
+    ["zh-CN", "收到推理活动", "连接保持中", "已连接，等待响应", "正文已保存", "停止等待本次呼叫"],
+    ["zh-Hant", "收到推理活動", "連線保持中", "已連線，等待回應", "正文已儲存", "停止等待本次呼叫"],
+  ])("keeps connected and heartbeat states active and cancellable until saved in %s", (language, reasoning, heartbeat, connected, saved, cancelLabel) => {
+    const cancel = vi.fn();
+    const call = (state: string) => ({
+      request_id: "request-heartbeat", attempt_id: "attempt-heartbeat", generation: 1,
+      stage_id: "financial-analyst", state, elapsed_seconds: 8,
+    });
+    const view = render(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[call("reasoning")]} />);
+    const row = view.container.querySelector(".model-call-stage-row") as HTMLElement;
+    expect(within(row).getByText(reasoning)).toBeVisible();
+    fireEvent.click(within(row).getByRole("button", { name: cancelLabel }));
+    expect(cancel).toHaveBeenCalledWith("request-heartbeat", "attempt-heartbeat");
+
+    view.rerender(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[call("heartbeat")]} />);
+    expect(within(row).getByText(heartbeat)).toBeVisible();
+    expect(within(row).queryByText(reasoning)).not.toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: cancelLabel })).toBeEnabled();
+
+    view.rerender(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[call("connected")]} />);
+    expect(within(row).getByText(connected)).toBeVisible();
+    expect(within(row).queryByText(/thinking|思考中|正在思考/i)).not.toBeInTheDocument();
+    expect(row).toHaveAttribute("data-active", "true");
+    expect(within(row).getByRole("button", { name: cancelLabel })).toBeEnabled();
+
+    view.rerender(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[call("saved")]} />);
+    expect(within(row).getByText(saved)).toBeVisible();
+    expect(row).toHaveAttribute("data-active", "false");
+    expect(within(row).queryByRole("button", { name: cancelLabel })).not.toBeInTheDocument();
+  });
+
+  it("shows remaining plan budget separately from local reuse and provider cache, without turning unknown usage into zero", () => {
+    render(<ModelCallProgress language="en" cancelling={false} calls={[{
+      request_id: "planned-1", attempt_id: "attempt-1", generation: 1, stage_id: "business-analyst", state: "saved", elapsed_seconds: 1,
+      call_plan: { max_calls: 4, max_input_estimate: 1_000, max_output_tokens: 2_000 },
+      reuse_summary: { local_result_reuses: 2, saved_judgments: 1 },
+      usage: { input_tokens: 200, output_tokens: 500, cache_read_input_tokens: 50, cache_write_input_tokens: 0 },
+    }]} />);
+    const progress = screen.getAllByRole("region", { name: "Research activity" })[0];
+    fireEvent.click(within(progress).getByText("All physical calls, including verification and repair"));
+    expect(within(progress).getByText("Remaining automatic calls").nextElementSibling).toHaveTextContent("3");
+    expect(within(progress).getByText("Remaining input estimate").nextElementSibling).toHaveTextContent("800");
+    expect(within(progress).getByText("Remaining output budget").nextElementSibling).toHaveTextContent("1,500");
+    expect(within(progress).getByText("Local result reuse (no provider call)").nextElementSibling).toHaveTextContent("2");
+    expect(within(progress).getByText("Whole-research provider cache hit rate").nextElementSibling).toHaveTextContent("25%");
+
+    const unknown = render(<ModelCallProgress language="en" cancelling={false} calls={[{
+      request_id: "planned-2", attempt_id: "attempt-2", generation: 1, stage_id: "business-analyst", state: "saved", elapsed_seconds: 1,
+      call_plan: { max_calls: 4, max_input_estimate: 1_000, max_output_tokens: 2_000 },
+      reuse_summary: { local_result_reuses: 0, saved_judgments: 0 },
+    }]} />);
+    fireEvent.click(within(unknown.container).getByText("All physical calls, including verification and repair"));
+    expect(within(unknown.container).getByText("Remaining input estimate").nextElementSibling).toHaveTextContent("Unknown");
+    expect(within(unknown.container).getByText("Remaining output budget").nextElementSibling).toHaveTextContent("Unknown");
+    expect(within(unknown.container).getByText("Actual cost").nextElementSibling).toHaveTextContent("Unknown");
+  });
+
+  it("shows uncapped adaptive remaining work and a non-modal estimate-exceeded status", () => {
+    const view = render(<ModelCallProgress language="en" cancelling={false} calls={[{
+      request_id: "adaptive-plan", attempt_id: "attempt-adaptive", generation: 1,
+      stage_id: "business-analyst", state: "running", elapsed_seconds: 901,
+      call_plan: {
+        policy: "adaptive", max_calls: null, max_input_estimate: null, max_output_tokens: null,
+        remaining_calls: null, remaining_input_tokens: null, remaining_output_tokens: null,
+        forecast_exceeded: ["max_calls", "max_input_estimate"],
+        initial_forecast: { max_calls: 2, max_input_estimate: 1_000, max_output_tokens: 2_000,
+          expected_seconds: 900, estimated_cost: null },
+        forecast: { max_calls: 4, max_input_estimate: 2_200, max_output_tokens: 3_000,
+          expected_seconds: 1_800 },
+      },
+    }]} />);
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("The work forecast was exceeded; necessary research continues.");
+    expect(status).toHaveTextContent("Call count");
+    expect(status).toHaveTextContent("Input tokens");
+    expect(status).toHaveTextContent("This is an estimate signal, not a failure or automatic stop.");
+    expect(status).not.toHaveAttribute("role", "alert");
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    fireEvent.click(screen.getByText("All physical calls, including verification and repair"));
+    expect(screen.getByText("Remaining automatic calls").nextElementSibling).toHaveTextContent("No user-set cap");
+    expect(screen.getByText("Remaining input estimate").nextElementSibling).toHaveTextContent("No user-set cap");
+    expect(screen.getByText("Remaining output budget").nextElementSibling).toHaveTextContent("No user-set cap");
+    expect(screen.getByText("Initial calls estimate").nextElementSibling).toHaveTextContent("2");
+    expect(screen.getByText("Current calls forecast").nextElementSibling).toHaveTextContent("4");
+    expect(screen.getByText("Initial input-token estimate").nextElementSibling).toHaveTextContent("1,000");
+    expect(screen.getByText("Current input-token forecast").nextElementSibling).toHaveTextContent("2,200");
+  });
+
+  it.each([
+    ["en", "Initial estimated duration", "Current estimated duration", "Planning estimate only; not a countdown, hard time cap, or SLA.", "Unknown"],
+    ["zh-CN", "初始预计耗时", "当前预计耗时", "仅为规划耗时估算，并非倒计时、硬性时间上限或服务等级承诺。", "未知"],
+    ["zh-Hant", "初始預估耗時", "目前預估耗時", "僅為規劃耗時估算，並非倒數計時、硬性時間上限或服務等級承諾。", "未知"],
+  ])("shows localized forecast duration separately from any hard time cap (%s)", (language, initialLabel, currentLabel, note, unknown) => {
+    const plan = {
+      policy: "adaptive", max_calls: null, max_input_estimate: null, max_output_tokens: null,
+      remaining_calls: null, remaining_input_tokens: null, remaining_output_tokens: null,
+      initial_forecast: { expected_seconds: 900 }, forecast: { expected_seconds: 1_800 },
+    };
+    const call = {
+      request_id: "duration-forecast", attempt_id: "attempt-duration", generation: 1,
+      stage_id: "business-analyst", state: "running" as const, elapsed_seconds: 30, call_plan: plan,
+    };
+    const view = render(<ModelCallProgress language={language} cancelling={false} calls={[call]} />);
+    const usage = view.container.querySelector("details.model-call-run-usage")!;
+    fireEvent.click(usage.querySelector("summary")!);
+
+    expect(within(usage as HTMLElement).getByText(initialLabel).parentElement as HTMLElement).toHaveTextContent("15:00");
+    expect(within(usage as HTMLElement).getByText(currentLabel).parentElement as HTMLElement).toHaveTextContent("30:00");
+    expect(usage).toHaveTextContent(note);
+
+    view.rerender(<ModelCallProgress language={language} cancelling={false} calls={[{
+      ...call, call_plan: { ...plan, forecast: { expected_seconds: null } },
+    }]} />);
+    const updatedUsage = view.container.querySelector("details.model-call-run-usage")!;
+    expect(within(updatedUsage as HTMLElement).getByText(currentLabel).parentElement as HTMLElement).toHaveTextContent(unknown);
+  });
+
+  it.each([
+    ["en", "15-minute quality-first reminder", "continues unless you set a limit", "Stop waiting for this call"],
+    ["zh-CN", "15分钟质量优先提示", "除非你设置上限，进行中的工作会继续", "停止等待本次呼叫"],
+    ["zh-Hant", "15分鐘品質優先提示", "除非你設定上限，進行中的工作會繼續", "停止等待本次呼叫"],
+  ])("shows the localized quality-first reminder only when the run plan signals it for %s", (language, reminder, noHardStop, cancelLabel) => {
+    const cancel = vi.fn();
+    const warnedPlan = { max_calls: 4, max_input_estimate: 1_000, max_output_tokens: 2_000, time_warning: true };
+    const view = render(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[{
+      request_id: "warning", attempt_id: "attempt-warning", generation: 1, stage_id: "business-analyst", state: "running", elapsed_seconds: 901,
+      call_plan: warnedPlan,
+    }]} />);
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent(reminder);
+    expect(status).toHaveTextContent(noHardStop);
+    expect(view.container).not.toHaveTextContent(/time remaining|剩余时间|剩餘時間/);
+    const row = view.container.querySelector(".model-call-stage-row") as HTMLElement;
+    expect(row).toHaveAttribute("data-active", "true");
+    expect(within(row).getByRole("button", { name: cancelLabel })).toBeEnabled();
+    expect(cancel).not.toHaveBeenCalled();
+
+    const noWarningPlan = { max_calls: 4, max_input_estimate: 1_000, max_output_tokens: 2_000, time_warning: false };
+    view.rerender(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[{
+      request_id: "no-warning", attempt_id: "attempt-no-warning", generation: 1, stage_id: "business-analyst", state: "running", elapsed_seconds: 901,
+      call_plan: noWarningPlan,
+    }]} />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    view.rerender(<ModelCallProgress language={language} cancelling={false} onCancelCall={cancel} calls={[{
+      request_id: "unknown-warning", attempt_id: "attempt-unknown-warning", generation: 1,
+      stage_id: "business-analyst", state: "running", elapsed_seconds: 901,
+      call_plan: { max_calls: 4, max_input_estimate: 1_000, max_output_tokens: 2_000 },
+    }]} />);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("exports the in-progress run diagnostics only after the user activates the button", async () => {
+    const diagnostics = {
+      schema: "openthesis.research-diagnostics.v1",
+      run: { run_id: "active-run", status: "running", started_at: "now", completed_at: null, wall_elapsed_seconds: 12 },
+      totals: { input_tokens: { value: null, known_sum: 0, unknown_attempts: 1 } },
+      actual_cost: { amount: null, currency: null, status: "unknown" },
+    };
+    vi.mocked(getResearchDiagnostics).mockResolvedValue(diagnostics as never);
+    vi.mocked(exportResearchDiagnostics).mockResolvedValue(true);
+    render(<ResearchDiagnosticsAction runId="active-run" language="en" />);
+    expect(getResearchDiagnostics).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Export research diagnostics (cost and time)" }));
+    await waitFor(() => expect(getResearchDiagnostics).toHaveBeenCalledWith("active-run"));
+    await waitFor(() => expect(exportResearchDiagnostics).toHaveBeenCalledWith(diagnostics));
+    expect(screen.getByRole("status")).toHaveTextContent("Diagnostics exported.");
   });
 
   it.each([

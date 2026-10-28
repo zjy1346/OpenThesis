@@ -168,13 +168,23 @@ class FinancialMetricTests(unittest.TestCase):
         metrics = calculate_metrics(
             [
                 {
-                    "concept": "revenue", "value": 120.0, "fiscal_year": 2025,
+                    "fact_id": "revenue", "concept": "revenue", "value": 120.0, "fiscal_year": 2025,
                     "fiscal_period": "FY", "filed_at": "2026-03-01",
+                    "company_cik": "issuer-1", "accession_number": "filing-2025",
+                    "generation_id": "generation-2025", "parser_version": "pdf-v1",
+                    "source_document": "annual-2025.pdf", "currency": "USD",
+                    "scope": "consolidated", "consolidated_scope": "consolidated",
+                    "unit_provenance": "explicit", "start_date": "2025-01-01",
                     "end_date": "2025-12-31", "usage_status": "canonical_research",
                 },
                 {
-                    "concept": "cost_of_revenue", "value": 72.0, "fiscal_year": 2025,
+                    "fact_id": "cost", "concept": "cost_of_revenue", "value": 72.0, "fiscal_year": 2025,
                     "fiscal_period": "FY", "filed_at": "2026-03-01",
+                    "company_cik": "issuer-1", "accession_number": "filing-2025",
+                    "generation_id": "generation-2025", "parser_version": "pdf-v1",
+                    "source_document": "annual-2025.pdf", "currency": "USD",
+                    "scope": "consolidated", "consolidated_scope": "consolidated",
+                    "unit_provenance": "explicit", "start_date": "2025-01-01",
                     "end_date": "2025-12-31", "usage_status": "canonical_research",
                 },
             ]

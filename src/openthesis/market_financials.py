@@ -11,6 +11,8 @@ from typing import Iterable
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_contracts import FinancialValidation, ValidationStatus
 from .financial_taxonomy import FINANCIAL_LABEL_ALIASES, capex_component_kind
+from .financial_taxonomy import cost_row_concept
+from .financial_statement_identity import classify_statement_title
 
 
 class FinancialExtractionError(RuntimeError):
@@ -87,6 +89,7 @@ CONCEPT_PATTERNS: tuple[ConceptPattern, ...] = (
     ),
     ConceptPattern("gross_profit", FINANCIAL_LABEL_ALIASES["gross_profit"]),
     ConceptPattern("cost_of_revenue", FINANCIAL_LABEL_ALIASES["cost_of_revenue"]),
+    ConceptPattern("total_operating_cost", FINANCIAL_LABEL_ALIASES["total_operating_cost"]),
     ConceptPattern(
         "revenue",
         ("营业收入", "收入合计", "營業收入", "收入總額", "revenue", "turnover"),
@@ -143,6 +146,7 @@ _CANONICAL_LABELS: dict[str, tuple[str, ...]] = {
     "operating_income": FINANCIAL_LABEL_ALIASES["operating_income"],
     "gross_profit": FINANCIAL_LABEL_ALIASES["gross_profit"],
     "cost_of_revenue": FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
+    "total_operating_cost": FINANCIAL_LABEL_ALIASES["total_operating_cost"],
     "net_income": ("净利润", "归属于上市公司股东的净利润", "归属于母公司股东的净利润", "profit attributable to owners of the company", "net income"),
     "operating_cash_flow": ("经营活动产生的现金流量净额", "经营活动现金流量净额", "net cash generated from operating activities", "net cash flows from operating activities"),
     "capital_expenditure": FINANCIAL_LABEL_ALIASES["capital_expenditure"],
@@ -216,18 +220,7 @@ def _statement_title_legacy(text: str) -> tuple[str, str] | None:
 
 def _statement_title(text: str) -> tuple[str, str] | None:
     """Recognize only explicit financial statement headings."""
-    lowered = text.casefold()
-    heading = "\n".join(text.splitlines()[:2]).casefold()
-    for statement, labels in _STATEMENT_TITLES:
-        if any(label.casefold() in heading for label in labels):
-            if any(token in heading for token in ("consolidated", "鍚堝苟", "合并")):
-                scope = "consolidated"
-            elif any(token in heading for token in ("parent", "母公司")):
-                scope = "parent"
-            else:
-                scope = "unknown"
-            return statement, scope
-    return None
+    return classify_statement_title(text)
 
 
 def extract_pdf_financials(
@@ -835,6 +828,9 @@ def parse_financial_pages(
             for definition in CONCEPT_PATTERNS:
                 label = next((item for item in _labels_for(definition) if item.casefold() in lowered), "")
                 if not label or _reject_candidate(definition.concept, compact, label):
+                    continue
+                if (definition.concept in {"cost_of_revenue", "total_operating_cost"}
+                        and cost_row_concept(compact) != definition.concept):
                     continue
                 if any(marker in compact for marker in ("不是利润表", "不构成财务报表", "非财务报表")):
                     continue

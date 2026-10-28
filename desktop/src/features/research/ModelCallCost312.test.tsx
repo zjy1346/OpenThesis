@@ -3,6 +3,11 @@ import { describe, expect, it } from "vitest";
 import { ModelCallProgress } from "./ModelCallProgress";
 
 describe("3.1.2 whole-run call accounting", () => {
+  it("does not certify proxy-reported cache as upstream provider cache",()=>{
+    const view=render(<ModelCallProgress language="en" cancelling={false} calls={[{request_id:"proxy",attempt_id:"one",stage_id:"financial-analyst",generation:1,state:"saved",elapsed_seconds:1,provider_id:"custom",usage_source:"endpoint_reported_upstream_unverified",usage:{input_tokens:100,cache_read_input_tokens:90,output_tokens:10}}]}/>);
+    expect(view.container).toHaveTextContent("upstream calls and cache not independently verified");
+    expect(screen.queryByText("90%")).not.toBeInTheDocument();
+  });
   it("weights all provider input, including low-hit verification, and separates purposes", () => {
     const view = render(<ModelCallProgress language="en" cancelling={false} calls={[
       { request_id: "gen", attempt_id: "one", stage_id: "financial-analyst", generation: 1,

@@ -12,6 +12,7 @@ import hashlib
 import math
 import re
 import threading
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -132,6 +133,7 @@ class ModelStageRequest:
     claim_repair_contract: ClaimRepairContract | None = None
     purpose: str = "generation"
     max_output_tokens: int | None = None
+    reference_bindings: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if (self.purpose not in {"generation", "semantic_verification", "material_coverage", "section_delivery"}
@@ -144,6 +146,23 @@ class ModelStageRequest:
                 or (self.output_contract is not None and not isinstance(self.output_contract, ModelOutputContract))
                 or (self.claim_repair_contract is not None and not isinstance(self.claim_repair_contract, ClaimRepairContract))):
             raise ValueError("MODEL_STAGE_REQUEST_INVALID")
+        if (not isinstance(self.reference_bindings, tuple)
+                or any(not isinstance(pair, tuple) or len(pair) != 2
+                       or not isinstance(pair[0], str) or not re.fullmatch(r"@[EF]\d+", pair[0])
+                       or not isinstance(pair[1], str) or not pair[1] for pair in self.reference_bindings)
+                or len({pair[0] for pair in self.reference_bindings}) != len(self.reference_bindings)):
+            raise ValueError("MODEL_STAGE_REFERENCE_BINDINGS_INVALID")
+
+    def decode_candidate(self, candidate):
+        # Only run AFTER the exact received body has been durably journaled.
+        # Local decoding failure must never erase a paid reply or resend it.
+        if not self.reference_bindings:
+            return candidate
+        from .reference_aliases import decode_references
+        from .responses import ModelResponse
+        decoded = decode_references(candidate, dict(self.reference_bindings))
+        return (ModelResponse(decoded, candidate.receipt, candidate.diagnostics)
+                if isinstance(candidate, ModelResponse) else decoded)
 
     @property
     def input_bytes(self) -> int:
@@ -158,6 +177,13 @@ class ModelStageRequest:
             parts += (f"output-budget:{self.max_output_tokens}",)
         if self.purpose in {"material_coverage", "section_delivery"}:
             parts += (f"purpose:{self.purpose}",)
+        if self.reference_bindings:
+            # The same short wire names under another frozen source set must
+            # never reuse a candidate bound to different original evidence.
+            import json
+            parts += ("source-reference-v1:" + hashlib.sha256(json.dumps(
+                sorted(self.reference_bindings), separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")).hexdigest(),)
         encoded = b"".join(len(value.encode("utf-8")).to_bytes(8, "big")
                            + value.encode("utf-8") for value in parts)
         return hashlib.sha256(encoded).hexdigest()
@@ -211,9 +237,19 @@ class ModelStageExecutor:
                     try:
                         def scheduled_call(json_mode, *, format_compensation=False, output_repair=False,
                                            field_patch=(), claim_plan=None, transient_retry=False):
+                            queued_at = time.monotonic()
                             provider = self.provider
                             if request.max_output_tokens is not None and callable(getattr(provider, "for_output_budget", None)):
-                                provider = provider.for_output_budget(request.max_output_tokens)
+                                # Repairs deliver only a targeted delta, not a
+                                # rewritten full stage under its original cap.
+                                allowance = request.max_output_tokens
+                                provider = provider.for_output_budget(allowance)
+                            note_queued = getattr(self.request_journal, "note_queued_work", None)
+                            if callable(note_queued):
+                                note_queued("claim_repair" if claim_plan is not None else "field_repair" if field_patch
+                                    else "output_repair" if output_repair else "format_repair" if format_compensation
+                                    else "transport_retry" if transient_retry else request.purpose,
+                                    measurement["tokens"], provider_context_capability(provider).reserved_output_tokens)
                             context = self.request_journal.transport_context() if self.request_journal is not None else None
                             if context is not None:
                                 config = getattr(provider, "config", None)
@@ -224,6 +260,9 @@ class ModelStageExecutor:
                                     lambda event: self.request_journal.store.model_activity.update(context, event),
                                     lambda: self.request_journal.store.model_activity.is_cancel_requested(context))
                             def cancel_wait():
+                                time_gate = getattr(self.request_journal, "ensure_automatic_time_available", None)
+                                if callable(time_gate):
+                                    time_gate()
                                 if (context is not None and self.request_journal.store.model_activity.is_cancel_requested(context)):
                                     # This callback runs before a slot is acquired, and again
                                     # immediately before dispatch. No remote wire exists yet.
@@ -231,15 +270,18 @@ class ModelStageExecutor:
                                                         code="MODEL_CALL_CANCELLED_BEFORE_SEND")
                                 return self.cancel_check()
                             with self.scheduler.slot(cancel_wait):
+                                queue_seconds = max(0, time.monotonic() - queued_at)
                                 if self.cancel_check():
                                     raise ProviderError("Research cancelled before dispatch", code="MODEL_CALL_CANCELLED_BEFORE_SEND")
                                 cancel_wait()
                                 try:
+                                    preparation_at = time.monotonic()
                                     effective_prompt = (request.claim_repair_contract.prompt(request.user_prompt, candidate, claim_plan)
                                         if claim_plan is not None else
                                         field_repair_prompt(request.user_prompt, request.output_contract, field_patch) if field_patch else
                                         output_repair_prompt(request.user_prompt) if output_repair else request.user_prompt)
                                     if self.request_journal is not None:
+                                        self.request_journal.note_preparation(queue_seconds, max(0, time.monotonic() - preparation_at))
                                         self.request_journal.record_wire_diagnostics(request.system_prompt, effective_prompt,
                                             provider=provider, purpose="claim_repair" if claim_plan is not None else
                                             "field_repair" if field_patch else "output_repair" if output_repair else
@@ -300,6 +342,7 @@ class ModelStageExecutor:
                                     lambda: scheduled_call(False, format_compensation=True), request_scope)
                             else:
                                 raise
+                        candidate = request.decode_candidate(candidate)
                         if _incomplete_output(candidate):
                             # Length is not a new research gap or permission to
                             # resend all sources at successively larger limits.

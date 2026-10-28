@@ -187,6 +187,9 @@ try {
         }
     }
     Copy-Item -LiteralPath $desktopExecutable -Destination (Join-Path $portableRoot "OpenThesis.exe")
+    $catalogLicenseRoot = Join-Path $portableRoot "third-party-licenses"
+    New-Item -ItemType Directory -Path $catalogLicenseRoot -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $projectRoot "desktop\src-tauri\resources\models-dev-LICENSE.txt") -Destination (Join-Path $catalogLicenseRoot "models.dev-MIT.txt")
     Copy-Item -Path (Join-Path $sidecarBundle "*") -Destination $portableSidecar -Recurse
     $portableRuntimeFiles = @(Get-ChildItem -LiteralPath (Join-Path $portableSidecar "_internal") -File |
         Where-Object { $_.Name -match '^(VCRUNTIME|MSVCP).*\.bin$' })
@@ -218,6 +221,14 @@ try {
         }
     }
     Move-Item -LiteralPath $portableCandidate -Destination $portableZip
+    # Startup alone cannot catch a frozen PDF child that fails before ready.
+    # Check the actual ZIP, cold, with no development Python/PATH assistance.
+    & $python (Join-Path $PSScriptRoot "verify-packaged-pdf.py") `
+        --archive $portableZip --version $version `
+        --output (Join-Path $sidecarStageRoot "packaged-pdf-proof")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Packaged PDF worker verification failed with exit code $LASTEXITCODE"
+    }
     $portableHash = Get-FileHash -Algorithm SHA256 -LiteralPath $portableZip
     Set-Content -LiteralPath $portableChecksum `
         -Value "$($portableHash.Hash)  $([IO.Path]::GetFileName($portableZip))" `
