@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -25,6 +26,7 @@ class ProviderError(RuntimeError):
         safe_receipt: dict | None = None,
         diagnostic_trace_id: str = "",
         partial_content: str = "",
+        not_sent: bool = False,
     ):
         self.retryable = retryable
         self.code = code
@@ -36,6 +38,7 @@ class ProviderError(RuntimeError):
         self.safe_receipt = safe_receipt
         self.diagnostic_trace_id = diagnostic_trace_id
         self.partial_content = partial_content
+        self.not_sent = not_sent
         super().__init__(message)
 
 
@@ -223,6 +226,7 @@ class RustModelGatewayProvider:
         from .research_execution.input_budget import InputBudgetState
         self._input_budget = InputBudgetState()
         self._output_budget: int | None = None
+        self._output_observations: list[tuple[int, int]] = []
 
     @property
     def input_bytes_per_token(self) -> float:
@@ -233,6 +237,23 @@ class RustModelGatewayProvider:
 
     def observe_input_usage(self, **usage) -> None:
         self._input_budget.observe(**usage)
+
+    def observe_output_usage(self, output_tokens=None, reasoning_tokens=None, reasoning_in_output=None):
+        if (type(output_tokens) is not int or output_tokens < 0 or type(reasoning_tokens) is not int
+                or reasoning_tokens < 0 or type(reasoning_in_output) is not bool):
+            return
+        visible = output_tokens - reasoning_tokens if reasoning_in_output else output_tokens
+        if visible < 0:
+            return
+        self._output_observations.append((visible, reasoning_tokens))
+        del self._output_observations[:-16]
+
+    def output_allowance(self, visible_target: int, initial_reasoning_estimate: int) -> int:
+        """A route-observed forecast, never a claim about vendor capability."""
+        if not self._output_observations:
+            return visible_target + initial_reasoning_estimate
+        return max(visible_target + reasoning if visible == 0 else math.ceil(
+            visible_target * (visible + reasoning) / visible) for visible, reasoning in self._output_observations)
 
     def for_output_budget(self, tokens: int):
         if type(tokens) is not int or not 1 <= tokens <= 2_147_483_647:
@@ -294,6 +315,7 @@ class RustModelGatewayProvider:
             "user_prompt": str(user_prompt),
             "json_mode": bool(json_mode),
             "wire_contract": "text-single-request-v1",
+            "expected_configuration_version": self.config.configuration_version,
         }
         if self._output_budget is not None:
             request["max_output_tokens"] = self._output_budget
@@ -330,9 +352,12 @@ class RustModelGatewayProvider:
             "user_prompt": str(user_prompt),
             "json_mode": bool(json_mode),
             "wire_contract": "vision-single-request-v1",
+            "expected_configuration_version": self.config.configuration_version,
             "image_media_type": "image/png",
             "image_base64": base64.b64encode(image_png).decode("ascii"),
         }
+        if self._output_budget is not None:
+            request["max_output_tokens"] = self._output_budget
         return self._invoke_gateway(request)
 
     def _invoke_gateway(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -443,6 +468,7 @@ class RustModelGatewayProvider:
                 retry_after_seconds=retry_after_seconds,
                 http_status=error.get("http_status") if type(error.get("http_status")) is int else None,
                 partial_content=getattr(completed, "partial_content", ""),
+                not_sent=error.get("delivery_state") == "not_sent",
             )
         payload = response.get("result")
         if not isinstance(payload, dict):

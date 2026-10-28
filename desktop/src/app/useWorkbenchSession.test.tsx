@@ -421,6 +421,24 @@ describe("useWorkbenchSession financial jobs", () => {
     expect(result.current.report?.markdown).toBe("resumed gap report");
   });
 
+  it("passes adaptive migration choices through the existing budget-only resume path", async () => {
+    vi.mocked(extendResearchBudget).mockResolvedValue({
+      plan_digest: "digest-next", max_calls: null, max_input_estimate: null, max_output_tokens: null,
+      pending_budget_gaps: [], limit_source: "legacy_default", adaptive_resume_available: true,
+    } as never);
+    vi.mocked(retryResearchModelStages).mockResolvedValue(report("adaptive continuation"));
+    const { result } = renderHook(() => useWorkbenchSession());
+    await waitFor(() => expect(result.current.report?.markdown).toBe("initial report"));
+
+    await act(async () => {
+      await result.current.approveBudgetGaps("run-1", "digest-current", [], "remove");
+    });
+
+    expect(extendResearchBudget).toHaveBeenCalledWith("run-1", "digest-current", [], "remove");
+    expect(retryResearchModelStages).toHaveBeenCalledWith("run-1", undefined, true);
+    expect(result.current.report?.markdown).toBe("adaptive continuation");
+  });
+
   it("refreshes a changed plan while preserving saved report text when budget approval fails", async () => {
     const initial = { ...report("keep this saved body"), call_plan: { plan_digest: "old-digest", max_calls: 2,
       max_input_estimate: 8_000, max_output_tokens: 10_000, pending_budget_gaps: [] } };

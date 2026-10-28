@@ -14,9 +14,15 @@ def test_role_request_plan_sums_real_requests_not_graph_bytes_times_slots(tmp_pa
             {"stage_id": "synthesis", "purpose": "generation", "input_estimate": 200, "output_limit": 600},
             {"stage_id": "business", "purpose": "semantic_verification", "input_estimate": 80, "output_limit": 120}])
         plan = plan_status(db, journal.run_id)
-        assert plan["schema"] == "research-call-plan-v2-role-packets"
-        assert plan["max_calls"] == 5 and plan["verification_batches"] == 1
-        assert plan["max_input_estimate"] == 680
+        assert plan["schema"] == "research-call-plan-v4-adaptive"
+        assert plan["policy"] == "adaptive"
+        assert plan["workload_fits"] is True
+        assert plan["max_calls"] is None
+        assert plan["max_input_estimate"] is None
+        assert plan["max_output_tokens"] is None
+        assert plan["verification_batches"] == 1
+        assert plan["initial_forecast"]["max_calls"] == 5
+        assert plan["initial_forecast"]["max_input_estimate"] == 680
         prepare_plan(db, journal.run_id, ["business", "synthesis", "extra"], 9_000_000)
         assert plan_status(db, journal.run_id)["plan_digest"] == plan["plan_digest"], "restart cannot widen an existing run plan"
 

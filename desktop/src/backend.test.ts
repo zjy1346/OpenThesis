@@ -39,6 +39,20 @@ describe("research call-budget and history API", () => {
     });
   });
 
+  it("sends adaptive migration choice with an optional empty gap list", async () => {
+    const callPlan = {
+      plan_digest: "digest-1", max_calls: null, max_input_estimate: null, max_output_tokens: null,
+      pending_budget_gaps: [], limit_source: "legacy_default", adaptive_resume_available: true,
+    };
+    invokeMock.mockResolvedValueOnce(callPlan as never);
+
+    await expect(extendResearchBudget("run-1", "digest-1", [], "remove")).resolves.toEqual(callPlan);
+    expect(invokeMock).toHaveBeenCalledWith("backend_request", {
+      method: "research.extend_budget",
+      params: { run_id: "run-1", plan_digest: "digest-1", gap_ids: [], adaptive_choice: "remove" },
+    });
+  });
+
   it("requests one bounded history page for a single stage", async () => {
     const page = { revision: "5:9", calls: [], next_cursor: null };
     invokeMock.mockResolvedValueOnce(page as never);

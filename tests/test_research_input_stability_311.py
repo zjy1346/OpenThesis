@@ -194,28 +194,31 @@ def test_formal_preparation_finishes_before_any_research_wire(tmp_path):
     assert store.get_financial_research_snapshot(company.cik)["facts"]
 
 
-def test_missing_core_financial_scope_does_not_construct_provider_without_explicit_choice(tmp_path):
-    from openthesis.application.research_preparation import NewResearchPreparer, ResearchPreparationUnavailable
+def test_missing_core_financial_scope_uses_source_stage_without_global_confirmation_gate(tmp_path):
+    from openthesis.application.research_preparation import NewResearchPreparer
     from openthesis.application_services import ResearchOrchestrator
     from test_source_prefetch_overlap_303 import fixture
+    from test_research_workflow import SevenStageProvider
     company, _filing_value, official, store, request = fixture(tmp_path)
     original_prepare = official.prepare
     def missing(*args, **kwargs):
         result = original_prepare(*args, **kwargs)
+        profile = replace(result.view.profile, facts=(), fact_dicts=(), metrics=(), interim_metrics=())
         return replace(result, view=replace(result.view, fact_dicts=(), facts=(),
-            profile=replace(result.view.profile, metrics=(), interim_metrics=())))
+            evidence=(), canonical_dataset=None, profile=profile,
+            capabilities=tuple((key, False) for key, _value in result.view.capabilities)))
     official.prepare = missing
-    created = []
-    def provider(_config):
-        created.append(True)
-        raise AssertionError('Research provider constructed before scope approval')
-    orchestrator = ResearchOrchestrator(store, provider,
+    provider = SevenStageProvider()
+    orchestrator = ResearchOrchestrator(store, lambda _config: provider,
         new_research_preparer=NewResearchPreparer(store, official, SimpleNamespace()))
-    with pytest.raises(ResearchPreparationUnavailable) as failure:
-        orchestrator.start(request)
-    assert failure.value.code == 'FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED'
-    assert created == []
-    # The saved original and financial candidates survive the scope prompt.
+    run = orchestrator.start(request)
+    assert provider.calls.count('business-analyst') == 1
+    assert 'financial-analyst' not in provider.calls
+    assert run.data_snapshot['official_source_state']['scope_gaps']
+    assert run.data_snapshot['official_source_state']['recovery_targets'] == [_filing_value.accession_number]
+    assert run.data_snapshot['financial_capabilities']['quantitative_facts'] is False
+    assert run.data_snapshot['financial_capabilities']['business_disclosures'] is True
+    # The verified original remains available for independent source-stage work.
     assert store.get_filings(company.cik)
 
 

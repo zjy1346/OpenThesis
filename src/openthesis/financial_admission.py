@@ -16,6 +16,7 @@ from typing import Any, Sequence
 
 from .domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from .financial_contracts import PDF_PARSER_VERSION as _PDF_PARSER_VERSION
+from .financial_parser_compatibility import pdf_rules_compatible
 from .financial_profile import (
     FinancialProfile, build_financial_profile,
 )
@@ -68,6 +69,9 @@ class FinancialResearchView:
     admission_contract_version: str = FINANCIAL_ADMISSION_CONTRACT_VERSION
     canonical_dataset: Any = field(default=None, compare=False, repr=False)
     publishable_accessions: tuple[str, ...] = ()
+    # Independently admitted page fragments, not a complete-source claim.
+    # Publication still fences conflicting or concurrently changed generations.
+    incremental_accessions: tuple[str, ...] = ()
 
     @property
     def capability_map(self) -> dict[str, bool]:
@@ -88,6 +92,22 @@ class FinancialResearchView:
             self.readiness.can_continue
             and (self.model_ready or self.readiness.source_document_count > 0)
         )
+
+    def with_disclosures(self, evidence: Sequence[dict[str, Any]]) -> "FinancialResearchView":
+        """Complete capabilities after trusted original-text retrieval.
+
+        Body evidence may enable qualitative stages, never financial math.
+        Callers still own source identity/hash verification before this seam.
+        """
+        from .research_materials import material_capabilities
+        actual = material_capabilities({"evidence": list(evidence)})
+        capabilities = {**self.capability_map, "quantitative_facts": bool(self.facts)}
+        for name in ("sourced_disclosures", "business_disclosures", "mda_disclosures",
+                     "risk_disclosures", "audit_disclosures"):
+            capabilities[name] = name in actual
+        return replace(self, capabilities=tuple(sorted(capabilities.items())),
+            readiness=_research_readiness(capabilities, self.profile, self.facts,
+                self.diagnostics, self.readiness.source_document_count, bool(self.quarantined_facts)))
 
 
 class FinancialAdmission:
@@ -110,7 +130,7 @@ class FinancialAdmission:
         stale_pdf_facts = tuple(
             fact for fact in facts
             if (fact.parser_version.startswith("financial-ingestion-ast")
-                and fact.parser_version != _PDF_PARSER_VERSION)
+                and not pdf_rules_compatible(fact))
             or fact.parser_version in {"sec-companyfacts-v1", "sec-companyfacts-v2", "sec-companyfacts-v3"}
         )
         if stale_pdf_facts:

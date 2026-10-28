@@ -1,6 +1,6 @@
 [package]
 name = "openthesis-desktop"
-version = "3.1.4"
+version = "3.2.6"
 description = "OpenThesis desktop platform adapter"
 authors = ["OpenThesis Contributors"]
 edition = "2021"
@@ -21,10 +21,10 @@ tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 zeroize = { version = "1.8", features = ["alloc"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-tokio = { version = "1", features = ["time"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "system-proxy"] }
+tokio = { version = "1", features = ["time", "macros"] }
 httpdate = "1"
 tempfile = "3.23"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Networking_WinHttp"] }

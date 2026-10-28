@@ -374,6 +374,15 @@ class ResearchRecoveryPlanner:
     def _base_recoverable(
         items: tuple[dict[str, Any], ...], continuity: dict[str, Any] | None,
     ) -> bool:
+        summary = ResearchRecoveryPlanner._latest(items, 'deterministic-financial-summary')
+        material = summary.get('content', {}) if isinstance(summary, dict) else {}
+        if (isinstance(material, dict) and material.get('research_ready') is True
+                and isinstance(material.get('company'), dict)
+                and material['company'].get('cik') and material.get('evidence')):
+            # Local financial repair can finish before the very first model
+            # stage ever ran. Offer an explicit same-run model action; repairing
+            # the source alone never executes this plan.
+            return True
         for item in reversed(items):
             if item.get("artifact_type") == "stage-checkpoint":
                 content = item.get("content")

@@ -25,7 +25,7 @@ from .storage import StorageCorruptionError
 
 
 DEFERRED_METHODS = frozenset({
-    "research.get_report", "research.financial_diagnostics", "research.retry_synthesis",
+    "research.get_report", "research.financial_diagnostics", "research.pdf_runtime", "research.diagnostics", "research.budget_preview", "research.retry_synthesis",
     "research.retry_model_stages", "research.retry_growth", "research.retry_stage",
     "research.revalidate_saved", "research.refresh_financial_report", "research.retry_financials",
     "research.rebuild_financials", "research.market_snapshot", "company.search", "ot.suggest", "packs.install", "app.bootstrap",
@@ -155,6 +155,10 @@ class JsonLineServer:
             if not isinstance(preferences, dict):
                 raise ValueError("preferences are required")
             return self.service.update_preferences(preferences)
+        if method == 'structure.status':
+            return self.service.structure_status()
+        if method == 'structure.install':
+            return self.service.start_structure_install(params.get('python_executable'), confirmed=params.get('confirmed') is True)
         if method == "company.search":
             query = params.get("query")
             if not isinstance(query, str):
@@ -220,7 +224,7 @@ class JsonLineServer:
                 raise ValueError("run_id is required")
             return self.service.delete_research_run(run_id)
         if method == "research.extend_budget":
-            return self.service.extend_model_budget(params.get("run_id"), params.get("plan_digest"), params.get("gap_ids"))
+            return self.service.extend_model_budget(params.get("run_id"), params.get("plan_digest"), params.get("gap_ids"), params.get("adaptive_choice"))
         if method == "research.get_report":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -236,11 +240,16 @@ class JsonLineServer:
                 language=language,
                 include_technical=include_technical,
             )
-        if method == "research.financial_diagnostics":
+        if method == "research.budget_preview":
+            return self.service.research_budget_preview(params.get("run_envelope"))
+        if method == "research.pdf_runtime":
+            return self.service.pdf_runtime_diagnostics(params.get("run_id"), params.get("document_id"))
+        if method in {"research.financial_diagnostics", "research.diagnostics"}:
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
-            return self.service.financial_diagnostics(run_id)
+            return (self.service.research_diagnostics(run_id) if method == "research.diagnostics"
+                    else self.service.financial_diagnostics(run_id))
         if method == "research.start":
             return self.service.start_research(params)
         if method == "research.market_snapshot":

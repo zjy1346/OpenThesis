@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Sequence
 
 from .domain import FinancialFact, EvidenceRef
+from .financial_parser_compatibility import pdf_rules_compatible
 from .financial_contracts import (
     PDF_PARSER_VERSION as _PDF_PARSER_VERSION,
     STATEMENT_FOR as _STATEMENT_FOR,
@@ -20,7 +21,9 @@ from .financial_contracts import (
     missing_profile_concepts,
 )
 from .financial_taxonomy import (
-    FINANCIAL_LABEL_ALIASES, balance_component_row_concept, equity_row_concept, normalize_financial_label,
+    FINANCIAL_LABEL_ALIASES, balance_component_row_concept, cost_row_concept,
+    cost_row_is_non_amount, cost_row_mentions, cost_row_source_is_non_amount,
+    equity_row_concept, normalize_financial_label,
     cash_flow_total_label_matches, liability_total_label_matches, comprehensive_income_row_concept,
     profit_loss_value_transform, profit_row_concept,
     interest_income_row_concept,
@@ -86,7 +89,7 @@ def _statement_source_issue(
     ``classification_evidence_ids`` are role-prefixed: statement-title
     evidence is distinct from the following-row equity hierarchy proof.
     """
-    if fact.parser_version != _PDF_PARSER_VERSION:
+    if not pdf_rules_compatible(fact):
         return None
     title_ids = tuple(key for key in fact.classification_evidence_ids if key.startswith("statement:"))
     label = normalize_financial_label(fact.reported_concept)
@@ -200,7 +203,7 @@ class FinancialValidator:
                         node.method == "sum-absolute-components-v1"
                         and node.value_transform == "sum"
                         and fact.concept == "capital_expenditure"
-                        and fact.parser_version == _PDF_PARSER_VERSION
+                        and pdf_rules_compatible(fact)
                     ):
                         normalized = exact_decimal_arithmetic(child_values)
                     elif (
@@ -274,7 +277,7 @@ class FinancialValidator:
 
             try:
                 normalized = validate_node(lineage)
-                if fact.parser_version == _PDF_PARSER_VERSION:
+                if pdf_rules_compatible(fact):
                     if (
                         fact.source_page is None or fact.source_bbox is None
                         or row_ref.bbox != fact.source_bbox
@@ -330,7 +333,7 @@ class FinancialValidator:
                         return "normalization_unit_evidence_unbound"
                 if not lineage.unit_evidence_ids:
                     return "normalization_unit_evidence_missing"
-                if fact.parser_version == _PDF_PARSER_VERSION:
+                if pdf_rules_compatible(fact):
                     for leaf in source_leaves(lineage):
                         if leaf.quantity_kind == "money":
                             unit = bound_money_unit(fact, tuple(source_evidence_by_id[key]
@@ -402,7 +405,7 @@ class FinancialValidator:
                 # percentage or a decimal. Keep the field out of trusted
                 # research until the source explicitly establishes which.
                 isolate(fact, "ratio_unit_unknown")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept in {
+            if pdf_rules_compatible(fact) and fact.concept in {
                 "reported_roe", "reported_roe_excluding_nonrecurring"
             }:
                 ratio_label = normalize_financial_label(fact.reported_concept)
@@ -443,18 +446,18 @@ class FinancialValidator:
             if fact.parser_version.startswith("financial-ingestion-ast") and (ref is None or ref.bbox is None):
                 isolate(fact, "pdf_evidence_bbox_missing")
             if (
-                fact.parser_version == _PDF_PARSER_VERSION
+                pdf_rules_compatible(fact)
                 and fact.concept in {"net_income", "parent_net_income", "minority_interest_profit", "ordinary_shareholder_net_income"}
                 and profit_row_concept(fact.reported_concept, fact.raw_text) != fact.concept
             ):
                 isolate(fact, "profit_source_concept_mismatch")
             if (
-                fact.parser_version == _PDF_PARSER_VERSION
+                pdf_rules_compatible(fact)
                 and fact.concept in {"interest_revenue", "finance_interest_income"}
                 and interest_income_row_concept(fact.reported_concept, fact.raw_text) != fact.concept
             ):
                 isolate(fact, "interest_source_hierarchy_mismatch")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept in {"equity", "total_equity"}:
+            if pdf_rules_compatible(fact) and fact.concept in {"equity", "total_equity"}:
                 context = [source_evidence_by_id.get(item) for item in fact.classification_evidence_ids
                            if not item.startswith(("statement:", "cell-reread:"))]
                 prior_top = fact.source_bbox[3] if fact.source_bbox else float("inf")
@@ -484,17 +487,37 @@ class FinancialValidator:
                     # in the same bound row; never accept a generic owner label
                     # merely because its amount resembles assets-liabilities.
                     isolate(fact, "equity_source_concept_mismatch")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.statement == "comprehensive_income":
+            if pdf_rules_compatible(fact) and fact.statement == "comprehensive_income":
                 if (comprehensive_income_row_concept(fact.reported_concept) != fact.concept
                         or not _source_row_contains_label(fact.reported_concept, fact.raw_text)):
                     isolate(fact, "comprehensive_income_source_concept_mismatch")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept in {"mezzanine_equity", "minority_interest_equity"}:
+            # An explicit non-cost row label must not inherit the semantics of
+            # an unrelated cost-rate heading in a wider visual excerpt. When
+            # no literal label was supplied, retain the raw-row safety check.
+            cost_sources = (fact.reported_concept, fact.raw_text) if (
+                fact.concept in {"cost_of_revenue", "total_operating_cost"}
+                or cost_row_mentions(fact.reported_concept)
+                or not fact.reported_concept
+                or fact.reported_concept == fact.concept
+            ) else (fact.reported_concept,)
+            if (
+                (cost_row_mentions(fact.reported_concept)
+                 and cost_row_is_non_amount(fact.reported_concept))
+                or any(cost_row_source_is_non_amount(source) for source in cost_sources)
+            ):
+                isolate(fact, "cost_source_non_amount_label")
+            for source_label in cost_sources:
+                source_concept = cost_row_concept(source_label)
+                if source_concept is not None and source_concept != fact.concept:
+                    isolate(fact, "cost_source_concept_mismatch")
+                    break
+            if pdf_rules_compatible(fact) and fact.concept in {"mezzanine_equity", "minority_interest_equity"}:
                 if (
                     balance_component_row_concept(fact.reported_concept) != fact.concept
                     or not _source_row_contains_label(fact.reported_concept, fact.raw_text)
                 ):
                     isolate(fact, "balance_component_source_concept_mismatch")
-            if (fact.parser_version == _PDF_PARSER_VERSION
+            if (pdf_rules_compatible(fact)
                     and (fact.concept == "capital_expenditure" or fact.concept in CAPITAL_ALLOCATION_PAYMENT_ALIASES)):
                 allocation_concept = capital_allocation_payment_concept(fact.reported_concept)
                 source_row = re.sub(r"\s*\[column:(?:19|20)\d{2}\]\s*$", "", ref.excerpt) if ref is not None else ""
@@ -510,20 +533,20 @@ class FinancialValidator:
                              or not _source_row_contains_label(fact.reported_concept, fact.raw_text)))
                 ):
                     isolate(fact, "capital_allocation_source_concept_mismatch")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept == "liabilities":
+            if pdf_rules_compatible(fact) and fact.concept == "liabilities":
                 if not liability_total_label_matches(fact.reported_concept) or not liability_total_label_matches(fact.raw_text):
                     isolate(fact, "liability_source_concept_mismatch")
-            if fact.parser_version == _PDF_PARSER_VERSION and fact.concept == "operating_cash_flow":
+            if pdf_rules_compatible(fact) and fact.concept == "operating_cash_flow":
                 aliases = FINANCIAL_LABEL_ALIASES["operating_cash_flow"]
                 if not cash_flow_total_label_matches(fact.reported_concept, aliases) or not cash_flow_total_label_matches(fact.raw_text, aliases):
                     isolate(fact, "cash_flow_source_concept_mismatch")
             if (
                 fact.parser_version.startswith("financial-ingestion-ast")
-                and fact.parser_version != _PDF_PARSER_VERSION
+                and not pdf_rules_compatible(fact)
             ):
                 isolate(fact, "stale_financial_parser_contract")
             if (
-                fact.parser_version in {_PDF_PARSER_VERSION, "sec-companyfacts-v3", "sec-companyfacts-v4"}
+                pdf_rules_compatible(fact) or fact.parser_version in {"sec-companyfacts-v3", "sec-companyfacts-v4"}
                 or fact.parser_version in {GATEWAY_FACT_VERSION, "vision-json-v3", "vision-markdown-v3"}
                 or fact.normalization_lineage is not None
             ):
@@ -545,7 +568,9 @@ class FinancialValidator:
                     expected_vision_statement is None
                     or fact.statement != expected_vision_statement
                     or fact.unit_provenance != "vision_explicit"
-                    or fact.consolidated_scope != "consolidated"
+                    or (fact.consolidated_scope != "consolidated" and not (
+                        fact.parser_version == 'vision-markdown-v4'
+                        and fact.consolidated_scope == fact.scope == 'parent'))
                     or fact.unit_scale not in {1.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 100_000_000.0, 1_000_000_000.0}
                     or not fact.raw_text
                 ):
@@ -611,7 +636,7 @@ class FinancialValidator:
                 or not row.excerpt.strip()
             ):
                 return None
-            if fact.parser_version == _PDF_PARSER_VERSION and (
+            if pdf_rules_compatible(fact) and (
                 fact.source_page is None
                 or fact.source_bbox is None
                 or row.locator != f"page:{fact.source_page}"

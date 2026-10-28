@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -19,9 +20,11 @@ from openthesis.financial_ingestion import (
 )
 from openthesis.financial_checkpoint import (
     CheckpointKey,
+    PdfWorkerSession,
     PdfWindow,
     WindowCheckpoint,
     WindowCheckpointStore,
+    plan_checkpointed_page_windows,
     plan_page_windows,
     run_checkpointed_windows,
 )
@@ -42,7 +45,31 @@ def _large_result_window_worker(window: PdfWindow, context: dict[str, object]):
     return (), (), {"serialized_table_context": "x" * (512 * 1024)}
 
 
+class _SessionWindowProcessor:
+    def __call__(self, window: PdfWindow, context: dict[str, object]):
+        return (), (), {"last_page": window.pages[-1], "pid": os.getpid(), "prior": context.get("last_page", 0)}
+
+
+class _SessionWindowWorker:
+    def open_session(self):
+        return _SessionWindowProcessor()
+
+
 class FinancialCheckpointTests(unittest.TestCase):
+    def test_page_plan_reuses_valid_legacy_windows_and_stably_plans_missing_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WindowCheckpointStore(directory)
+            key = CheckpointKey("page-plan", "parser", "rules")
+            legacy = WindowCheckpoint(key, PdfWindow(0, (1, 2, 3, 4)), context={"last_page": 4})
+            store.save(legacy)
+
+            first = plan_checkpointed_page_windows(store, key, 5, range(1, 6))
+            second = plan_checkpointed_page_windows(store, key, 5, range(1, 6))
+
+        self.assertEqual(first, second)
+        self.assertEqual([window.pages for window in first], [(1, 2, 3, 4), (5,)])
+        self.assertEqual(first[0].index, legacy.window.index)
+
     def test_incomplete_candidate_index_fails_open_to_all_document_windows(self) -> None:
         """An incomplete fast index must not turn a real PDF into zero work."""
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +157,55 @@ class FinancialCheckpointTests(unittest.TestCase):
             )
         self.assertEqual(completed[1].context["prior"], 1)
 
+    def test_checkpointed_document_reuses_one_worker_session_across_windows(self) -> None:
+        """A document with several windows must not pay process startup per window."""
+        with tempfile.TemporaryDirectory() as directory:
+            with PdfWorkerSession(_SessionWindowWorker()) as session:
+                completed = run_checkpointed_windows(
+                    WindowCheckpointStore(directory),
+                    CheckpointKey("worker-session", "parser", "rules"),
+                    (PdfWindow(0, (1,)), PdfWindow(1, (2,)), PdfWindow(2, (3,))),
+                    session,
+                    timeout_seconds=5.0,
+                )
+
+        self.assertEqual(len(completed), 3)
+        self.assertEqual(len({item.context["pid"] for item in completed}), 1)
+        self.assertEqual(session.process_start_count, 1)
+
+    def test_adaptive_split_publishes_completed_child_before_waiting_for_sibling(self) -> None:
+        """A slow sibling must not hide a successfully checkpointed page range."""
+        progress_events: list[tuple[int, int, str]] = []
+        progress_at_sibling_start: list[tuple[int, int, str]] = []
+        store = None
+
+        def worker(window: PdfWindow, _context: dict[str, object]):
+            if window.pages == (1, 2, 3, 4):
+                raise TimeoutError("force deterministic split")
+            if window.pages == (3, 4):
+                progress_at_sibling_start.extend(progress_events)
+                raise RuntimeError("sibling is still blocked")
+            return (), (), {"last_page": window.pages[-1]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = WindowCheckpointStore(directory)
+            run_checkpointed_windows(
+                store,
+                CheckpointKey("child-progress", "parser", "rules"),
+                (PdfWindow(0, (1, 2, 3, 4)),),
+                worker,
+                progress=lambda current, total, status: progress_events.append((current, total, status)),
+                adaptive=True,
+                max_retries=0,
+            )
+            saved_children = list(Path(directory).glob("*.json"))
+
+        self.assertEqual(len(saved_children), 1, "the first child should already be durable")
+        self.assertTrue(
+            progress_at_sibling_start,
+            "progress must expose the completed child before processing its sibling",
+        )
+
     def test_non_picklable_timeout_seam_still_receives_context(self) -> None:
         seen: list[dict[str, object]] = []
 
@@ -181,22 +257,36 @@ class FinancialCheckpointTests(unittest.TestCase):
             engine = FinancialIngestionEngine(
                 checkpoint_dir=checkpoint_dir, parse_timeout_seconds=10
             )
-            first = engine.parse_local_pdf_resumable(
-                company, filing, manifest,
-                candidate_pages=frozenset((*range(1, 25), 220)), window_size=8,
-            )
-            self.assertEqual(first[2], ())
-            self.assertEqual(len(list(checkpoint_dir.glob("*.json"))), 4)
-            second_progress: list[str] = []
-            second = FinancialIngestionEngine(
-                checkpoint_dir=checkpoint_dir, parse_timeout_seconds=10
-            ).parse_local_pdf_resumable(
-                company, filing, manifest,
-                candidate_pages=frozenset((*range(1, 25), 220)), window_size=8,
-                progress=lambda current, total, status: second_progress.append(status),
-            )
+            # This test covers table-window checkpoint reuse, not the native
+            # document-text prepass or OCR classification. Keep that boundary
+            # deterministic; blank-PDF handling has dedicated coverage.
+            from openthesis.financial_sources.pdf_document_units import PdfDocumentContext
+            with patch(
+                "openthesis.financial_ingestion.read_document_context",
+                return_value=PdfDocumentContext(
+                    page_texts=("",) * 220, completed_pages=220,
+                ),
+            ):
+                first = engine.parse_local_pdf_resumable(
+                    company, filing, manifest,
+                    candidate_pages=frozenset((*range(1, 25), 220)), window_size=8,
+                )
+                self.assertEqual(first[2], ())
+                self.assertEqual(len(list(checkpoint_dir.glob("*.json"))), 25)
+                worker_diagnostics = engine._document_execution[filing.document_id]["pdf_worker_diagnostics"]
+                worker_pids = {item["worker_session_pid"] for item in worker_diagnostics}
+                self.assertEqual(len(worker_pids), 1)
+                self.assertTrue(all(item["worker_session_start_count"] == 1 for item in worker_diagnostics))
+                second_progress: list[str] = []
+                second = FinancialIngestionEngine(
+                    checkpoint_dir=checkpoint_dir, parse_timeout_seconds=10
+                ).parse_local_pdf_resumable(
+                    company, filing, manifest,
+                    candidate_pages=frozenset((*range(1, 25), 220)), window_size=8,
+                    progress=lambda current, total, status: second_progress.append(status),
+                )
             self.assertEqual(second[2], ())
-            self.assertEqual(second_progress, ["cache-hit"] * 4)
+            self.assertEqual(second_progress, ["cache-hit"] * 25)
 
     def test_cancel_terminates_a_running_picklable_window(self) -> None:
         cancelled = Event()
@@ -369,6 +459,29 @@ class FinancialCheckpointTests(unittest.TestCase):
             )
             self.assertEqual([item.window.index for item in completed], [0])
             self.assertEqual(calls, [0, 1, 1])
+
+    def test_independent_pages_continue_after_failure_without_inheriting_header(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WindowCheckpointStore(Path(directory))
+            key = CheckpointKey("independent", "parser", "rules")
+            windows = plan_page_windows(3, (1, 2, 3), window_size=1)
+            seen = []
+
+            def worker(window, context):
+                seen.append((window.pages, dict(context)))
+                if window.pages == (2,):
+                    raise ValueError("broken geometry")
+                return (), (), {"header": "prior-page"}
+
+            first = run_checkpointed_windows(store, key, windows, worker,
+                adaptive=True, independent_pages=True, deterministic_failure=lambda _: True)
+            self.assertEqual([item.window.pages for item in first], [(1,), (3,)])
+            self.assertEqual(seen[-1], ((3,), {}))
+            seen.clear()
+            second = run_checkpointed_windows(store, key, windows, worker,
+                adaptive=True, independent_pages=True, deterministic_failure=lambda _: True)
+            self.assertEqual([item.window.pages for item in second], [(1,), (3,)])
+            self.assertEqual(seen, [])
 
     def test_second_run_resumes_failed_window_and_suffix_without_repeating_cache_hit(self) -> None:
         """A failed boundary is retried, while prior windows stay cached."""

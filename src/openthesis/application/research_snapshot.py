@@ -23,7 +23,8 @@ def financial_semantics_digest(facts: Any) -> str:
     the historical meaning. Values, units, dates, scope and original proof are
     all retained; fact-ID equality alone cannot excuse a changed amount.
     """
-    statuses = {"validation_status", "extraction_status", "provenance_status", "derived_version"}
+    statuses = {"validation_status", "extraction_status", "provenance_status", "derived_version",
+                "parser_version", "generation_id"}
     rows = [{key: value for key, value in item.items() if key not in statuses} for item in facts]
     rows.sort(key=lambda item: (str(item.get("fact_id", "")), canonical_snapshot_digest(item)))
     return canonical_snapshot_digest(rows)

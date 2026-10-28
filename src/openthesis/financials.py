@@ -150,6 +150,8 @@ class FinancialTension:
 
 def _fact_money_metadata(fact: dict[str, Any]) -> dict[str, Any]:
     return {
+        "company_id": str(fact.get("company_cik") or fact.get("company_id") or ""),
+        "entity": str(fact.get("entity") or "").strip().casefold(),
         "currency": str(fact.get("currency") or fact.get("unit") or "").upper(),
         "unit_scale": float(fact.get("unit_scale") or 1.0),
         "unit_provenance": str(fact.get("unit_provenance") or "unknown"),
@@ -161,7 +163,7 @@ def _fact_money_metadata(fact: dict[str, Any]) -> dict[str, Any]:
         "source_document": str(fact.get("source_document", "")),
         "period": _period(fact.get("fiscal_period")),
         "period_end": str(fact.get("end_date", "")),
-        "period_start": str(fact.get("start_date", "")),
+        "period_start": str(fact.get("start_date") or fact.get("period_start") or ""),
     }
 
 
@@ -208,6 +210,33 @@ def _compatible_annual_money_inputs(
         and right.get("unit_provenance") not in (None, "", "unknown")
         and left.get("fact_id")
         and right.get("fact_id")
+    )
+
+
+def _compatible_gross_profit_inputs(
+    revenue: dict[str, Any] | None, cost: dict[str, Any] | None,
+) -> bool:
+    """Require same-subject, same-source annual inputs before deriving gross profit.
+
+    FCF retains its historical compatibility policy above. Gross profit is a
+    separate accounting inference and needs stronger identity evidence because
+    independently selected latest facts can otherwise cross filings or scopes.
+    Values are already normalized, so raw unit scales need not be equal.
+    """
+
+    return bool(
+        _compatible_annual_money_inputs(revenue, cost)
+        and revenue.get("company_id")
+        and revenue.get("company_id") == cost.get("company_id")
+        and revenue.get("entity", "") == cost.get("entity", "")
+        and revenue.get("accession_number")
+        and revenue.get("accession_number") == cost.get("accession_number")
+        and revenue.get("source_document")
+        and revenue.get("source_document") == cost.get("source_document")
+        and revenue.get("parser_version")
+        and revenue.get("parser_version") == cost.get("parser_version")
+        and revenue.get("period_start")
+        and revenue.get("period_start") == cost.get("period_start")
     )
 
 
@@ -892,6 +921,10 @@ def calculate_metrics(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             and revenue >= 0
             and cost_of_revenue is not None
             and cost_of_revenue >= 0
+            and _compatible_gross_profit_inputs(
+                money_fact_metadata.get((year, "revenue")),
+                money_fact_metadata.get((year, "cost_of_revenue")),
+            )
         ):
             gross_profit = revenue - cost_of_revenue
         operating_income = values.get("operating_income")

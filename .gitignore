@@ -23,7 +23,11 @@ installer-output/
 .venv/
 node_modules/
 target/
-desktop/src-tauri/resources/
+desktop/src-tauri/resources/*
+!desktop/src-tauri/resources/.gitkeep
+!desktop/src-tauri/resources/build-info.json
+!desktop/src-tauri/resources/models-dev-20261022.json
+!desktop/src-tauri/resources/models-dev-LICENSE.txt
 desktop/*.tsbuildinfo
 desktop/vite.config.js
 desktop/vite.config.d.ts

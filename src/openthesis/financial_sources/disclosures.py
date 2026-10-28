@@ -203,4 +203,7 @@ def financial_evidence_record(item: EvidenceRef) -> dict[str, Any]:
     if str(record.get("evidence_id", "")).startswith("observation:"):
         record.update({"kind": "unverified_visual_observation",
                        "verification_status": "unverified", "usable_for_calculation": False})
+    if str(record.get("evidence_id", "")).startswith("table-structure:"):
+        record.update({"kind": "unverified_table_structure",
+                       "verification_status": "unverified", "usable_for_calculation": False})
     return record

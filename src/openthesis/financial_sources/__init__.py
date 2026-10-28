@@ -40,6 +40,7 @@ class GapResolver:
     _ORDER = (
         GapStageKind.OFFICIAL_STRUCTURED,
         GapStageKind.PDF_AST,
+        GapStageKind.LOCAL_STRUCTURE,
         GapStageKind.SAME_YEAR_OFFICIAL,
         GapStageKind.MINERU,
     )
@@ -138,7 +139,9 @@ class GapResolver:
                 if cancel_check is not None and cancel_check():
                     return GapResolution(tuple(found), tuple(refs), tuple(stages), tuple(diagnostics), True)
                 try:
-                    batch = extractor.extract(subject, filing)
+                    targeted = getattr(extractor, 'extract_missing', None)
+                    batch = (targeted(subject, filing, wanted - admitted_concepts())
+                             if callable(targeted) else extractor.extract(subject, filing))
                 except Exception as exc:  # adapters are untrusted boundaries
                     diagnostics.append(f"{kind.value}:failed:{type(exc).__name__}")
                     continue

@@ -92,6 +92,44 @@ describe("budget gap approval", () => {
     expect(view.container).not.toHaveTextContent(/accounting-risk-analyst|source-industry-analysis|source-risk-analysis/);
   });
 
+  it("removes a known legacy default cap with one adaptive continuation action", () => {
+    const approve = vi.fn(async () => undefined);
+    const legacyPlan = { ...plan, limit_source: "legacy_default", adaptive_resume_available: true,
+      migration_choice_required: false, pending_budget_gaps: [] } as ModelCallPlan;
+    render(<BudgetGapApproval runId="run-legacy" callPlan={legacyPlan} language="en" onApprove={approve} />);
+
+    expect(screen.getByText("This run is still using an old default limit. Continue adaptively without that limit; saved work will be kept.")).toBeVisible();
+    expect(approve).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue using adaptive research" }));
+
+    expect(approve).toHaveBeenCalledWith("plan-v4", [], "remove");
+  });
+
+  it("requires an explicit keep-or-remove choice when the old cap source is unknown", () => {
+    const approve = vi.fn(async () => undefined);
+    const ambiguousPlan = { ...plan, limit_source: "unknown", adaptive_resume_available: true,
+      migration_choice_required: true, pending_budget_gaps: [] } as ModelCallPlan;
+    render(<BudgetGapApproval runId="run-migration" callPlan={ambiguousPlan} language="en" onApprove={approve} />);
+
+    expect(screen.getByText("The previous limit's source is unknown. Keep it or remove it to continue adaptively; saved work will be kept either way.")).toBeVisible();
+    expect(approve).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep current limit" }));
+    expect(approve).toHaveBeenCalledWith("plan-v4", [], "keep");
+  });
+
+  it.each([
+    ["zh-CN", "无法确定旧上限是否由你主动设置", "保留当前上限", "移除旧上限"],
+    ["zh-Hant", "無法判斷舊上限是否由你主動設定", "保留目前上限", "移除舊上限"],
+  ])("localizes the explicit migration choice in %s", (language, explanation, keep, remove) => {
+    const ambiguousPlan = { ...plan, limit_source: "unknown", adaptive_resume_available: true,
+      migration_choice_required: true, pending_budget_gaps: [] } as ModelCallPlan;
+    render(<BudgetGapApproval runId="run-migration" callPlan={ambiguousPlan} language={language} onApprove={vi.fn()} />);
+
+    expect(screen.getByText(new RegExp(explanation))).toBeVisible();
+    expect(screen.getByRole("button", { name: keep })).toBeEnabled();
+    expect(screen.getByRole("button", { name: remove })).toBeEnabled();
+  });
+
   it("does not render an approval action when no budget gap is pending", () => {
     const view = render(<BudgetGapApproval runId="run-1" callPlan={{ ...plan, pending_budget_gaps: [] }} language="en" onApprove={vi.fn()} />);
     expect(view.container).toBeEmptyDOMElement();

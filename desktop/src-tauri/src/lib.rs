@@ -5,6 +5,8 @@ mod model_center;
 mod model_gateway;
 mod model_stream;
 mod provider_registry;
+mod connection_contract;
+mod model_directory;
 
 pub use model_gateway::run_model_gateway_stdio;
 
@@ -147,7 +149,7 @@ async fn export_financial_diagnostics(
         let selected = app
             .dialog()
             .file()
-            .set_title("Export OpenThesis financial diagnostics")
+            .set_title("Export OpenThesis diagnostics")
             .set_file_name(file_name)
             .add_filter("JSON", &["json"])
             .blocking_save_file();
@@ -274,6 +276,7 @@ pub fn run() {
             backend::backend_request,
             backend::backend_initialization_status,
             model_center::model_center_list_providers,
+            model_center::model_center_model_directory,
             model_center::model_center_list_connections,
             model_center::model_center_save_connection,
             model_center::model_center_set_connection_secret,
@@ -284,6 +287,7 @@ pub fn run() {
             model_center::model_center_delete_configured_model,
             model_gateway::model_gateway_discover_connection,
             model_gateway::model_gateway_test_model,
+            model_gateway::model_gateway_cancel_test,
             model_gateway::model_gateway_test_connection,
             model_gateway::model_gateway_rotate_connection_secret,
             export_report,

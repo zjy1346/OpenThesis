@@ -8,14 +8,16 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Any, Callable
 import uuid
 
 from ..domain import Company, EvidenceRef, FilingDocument, FinancialFact
-from ..financial_admission import FinancialResearchView
+from ..financial_admission import FinancialResearchView, ReadinessLevel
 from ..financial_contracts import CompilationPolicy, GapStageKind
 from ..financial_compiler import CoveragePlanner, concepts_cover_profile
 from ..financial_pipeline import FinancialResearchSnapshot, disclosed_reporting_currency
+from ..financial_taxonomy import FINANCIAL_MAPPING_VERSION, cost_row_mentions
 from ..market_financials import FinancialValidation, ValidationStatus
 from ..financial_contracts import FinancialGroupValidation
 from ..financial_recovery import FinancialRecoveryController
@@ -24,6 +26,29 @@ from ..resilience.contracts import RecoveryOutcome, RecoveryState
 from .financial_outcomes import preparation_outcome, unavailable_outcome
 from ..financial_sources.recovery import DurableOfficialSource
 from ..resilience.contracts import RecoveryLimits
+
+
+_FINANCIAL_MAPPING_GENERATION_MARKER = f"financial-mapping:{FINANCIAL_MAPPING_VERSION}"
+
+
+def _publication_fact_key(fact):
+    """Canonical amount identity, not a parser/row/multiplier identity.
+
+    Values here have already passed the compiler's unit normalization. A
+    differently scaled source row must not disguise a conflicting base amount.
+    """
+    return (
+        fact.accession_number, fact.concept, fact.period_start or fact.start_date,
+        fact.end_date, str(fact.fiscal_period).upper(), str(fact.currency).upper(),
+        fact.consolidated_scope,
+        tuple(sorted((item.axis, item.member, item.kind) for item in fact.dimensions)),
+    )
+
+
+def _financial_mapping_generation_id() -> str:
+    """Persist the local semantic-mapping dependency with each active head."""
+
+    return f"{uuid.uuid4().hex}:{_FINANCIAL_MAPPING_GENERATION_MARKER}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +222,7 @@ class OfficialFinancialPreparer:
         ), CompilationPolicy(reporting_currency=subject.reporting_currency)) if parse_targets else cached_view
         errors.extend(f"{failure.accession_number}:{failure.stage}:{failure.code}"
             for failure in view.canonical_dataset.source_failures if failure.required)
+        parsing_observations = view.profile.parsing_observations
         if reused_accessions and parse_targets:
             parsed = view.canonical_dataset
             retained = cached_view.canonical_dataset
@@ -213,6 +239,7 @@ class OfficialFinancialPreparer:
                 source_failures=parsed.source_failures,
                 requested_annual_count=request.annual_history_years,
                 research_as_of=request.research_as_of, cancel_check=cancelled,
+                parsing_observations=parsing_observations,
             ), CompilationPolicy(reporting_currency=subject.reporting_currency))
         check_cancelled()
         canonical = view.canonical_dataset
@@ -240,10 +267,25 @@ class OfficialFinancialPreparer:
                 subject, filings, canonical, requested_annual_count=request.annual_history_years,
                 research_as_of=request.research_as_of, cancel_check=cancelled,
                 source_diagnostics=canonical.diagnostics,
+                parsing_observations=parsing_observations,
             ), CompilationPolicy(reporting_currency=currency))
             canonical = view.canonical_dataset
         self.storage.save_company(subject)
         self.storage.save_filings(list(filings))
+        current_filings = {item.accession_number:item for item in filings}
+        # The source resolver may correct captured period metadata from the
+        # same original. Bind its execution metrics to that confirmed identity.
+        parsing_observations = tuple({**item,
+            "period_end":current_filings[item["accession_number"]].period_end,
+            "fiscal_period":current_filings[item["accession_number"]].fiscal_period}
+            for item in parsing_observations
+            if item.get("accession_number") in current_filings
+            and item.get("source_hash") == current_filings[item["accession_number"]].content_hash)
+        view = self._merge_incremental_view(
+            subject, filings, stored_filings, view, cached_view, request, cancelled,
+            parsing_observations, initial_generations,
+        )
+        canonical = view.canonical_dataset
         check_cancelled()
         accepted_ids = {fact.fact_id for fact in view.facts}
         audit_only = [fact for fact in canonical.resolved_facts
@@ -255,7 +297,8 @@ class OfficialFinancialPreparer:
             compiler_validation_groups(tuple(group for group in canonical.validations
                                              if group.identity[0] in target_accessions)),
             [ref for ref in canonical.evidence if ref.document_id in {
-                item.document_id for item in parse_targets}], audit_only, generation_id=uuid.uuid4().hex,
+                item.document_id for item in parse_targets}], audit_only,
+            generation_id=_financial_mapping_generation_id(),
             parser_version=",".join(sorted({fact.parser_version for fact in
                 (*view.facts, *canonical.quarantined_facts, *audit_only) if fact.parser_version})),
             source_hashes={item.accession_number: item.content_hash for item in filings
@@ -264,7 +307,8 @@ class OfficialFinancialPreparer:
             candidate_diagnostics=list(canonical.diagnostics),
             source_failures=canonical.source_failures, cancel_check=cancelled,
             fact_validation_records=canonical.coverage.get("fact_validation_records", {}),
-            parsing_observations=tuple({
+            parsing_observations=tuple(item for item in parsing_observations
+                if item.get("accession_number") in target_accessions) or tuple({
                 "accession_number": filing.accession_number, "period_end": filing.period_end,
                 "fiscal_period": filing.fiscal_period, "source_hash": filing.content_hash,
             } for filing in filings if filing.accession_number in target_accessions and filing.content_hash
@@ -283,10 +327,24 @@ class OfficialFinancialPreparer:
             subject, filings, request, cancelled, source_manifests=canonical.manifests)
         # Preserve candidate diagnostics and quarantine separately from the
         # active research values. A retained good cache is not proof of repair.
+        committed_readiness = committed.readiness
+        if view.incremental_accessions:
+            committed_readiness = replace(committed_readiness,
+                level=(ReadinessLevel.PARTIAL if committed_readiness.level is ReadinessLevel.FULL
+                       else committed_readiness.level),
+                reasons=tuple(dict.fromkeys((*committed_readiness.reasons, "source_page_plan_incomplete"))),
+                actions=tuple(dict.fromkeys((*committed_readiness.actions, "source_page_plan_incomplete"))))
         committed = replace(committed,
             diagnostics=tuple(dict.fromkeys((*view.diagnostics, *committed.diagnostics))),
             quarantined_facts=tuple(canonical.quarantined_facts),
             publishable_accessions=view.publishable_accessions,
+            incremental_accessions=view.incremental_accessions,
+            readiness=committed_readiness,
+            canonical_dataset=replace(committed.canonical_dataset,
+                source_failures=tuple(dict.fromkeys((*canonical.source_failures,
+                    *committed.canonical_dataset.source_failures))),
+                diagnostics=tuple(dict.fromkeys((*canonical.diagnostics,
+                    *committed.canonical_dataset.diagnostics)))),
         )
         if currency_ambiguous:
             committed = replace(committed,
@@ -294,6 +352,53 @@ class OfficialFinancialPreparer:
                     "reporting_currency_ambiguous": True}.items())),
                 diagnostics=(*committed.diagnostics, "FINANCIAL_CURRENCY_LANE_AMBIGUOUS"))
         notify("filing-validation", len(filings), len(filings))
+        if request.run_id:
+            from .financial_outcomes import unavailable_outcome
+            from ..financial_source_errors import LOCAL_PARSER_AVAILABILITY_CODES
+            by_accession = {item.accession_number: item for item in filings}
+            for failure in canonical.source_failures:
+                filing = by_accession.get(failure.accession_number)
+                if filing is None:
+                    continue
+                failed_outcome = unavailable_outcome(failure.code, stage=failure.stage)
+                self.storage.save_financial_recovery_case(run_id=request.run_id, company_cik=storage_key,
+                    accession_number=filing.accession_number, document_hash=filing.content_hash,
+                    stage='filing-parse' if failure.stage in {'parse', 'worker', 'index'} else failure.stage,
+                    error_code=failure.code, next_action=next(iter(failed_outcome.next_actions), 'repair_required_official_evidence'))
+            if publication is not None and publication.get("state") != "stale_generation":
+                failed_accessions = {failure.accession_number for failure in canonical.source_failures}
+                validation_accessions = {
+                    group.identity[0] for group in canonical.validations
+                    if group.identity and group.identity[0] in target_accessions
+                }
+                parser_failure_codes = LOCAL_PARSER_AVAILABILITY_CODES | {
+                    "FILING_LOCAL_PARSE_FAILED", "PERIOD_DECLARATION_NOT_FOUND",
+                }
+                validation_outcome = unavailable_outcome(
+                    "FILING_DATA_QUALITY_FAILED", stage="validation")
+                for case in self.storage.get_financial_recovery_cases(request.run_id):
+                    accession = case.get("accession_number")
+                    if (case.get("status") != "open"
+                            or case.get("stage") != "filing-parse"
+                            or case.get("error_code") not in parser_failure_codes
+                            or accession not in target_accessions
+                            or accession in failed_accessions
+                            or accession not in validation_accessions
+                            or accession in view.publishable_accessions):
+                        continue
+                    filing = by_accession.get(accession)
+                    if filing is None:
+                        continue
+                    self.storage.save_financial_recovery_case(
+                        run_id=request.run_id, company_cik=storage_key,
+                        accession_number=accession,
+                        document_hash=filing.content_hash,
+                        pages=case.get("pages", ()), fields=case.get("fields", ()),
+                        stage="filing-validation", error_code="FILING_DATA_QUALITY_FAILED",
+                        next_action=next(iter(validation_outcome.next_actions),
+                            "repair_required_official_evidence"),
+                        status="open", diagnostics=case.get("diagnostics", {}),
+                    )
         outcome = preparation_outcome(committed, publication, errors, currency_ambiguous=currency_ambiguous)
         if outcome.state != RecoveryState.COMMITTED and not errors:
             errors = [outcome.diagnostic_code]
@@ -326,11 +431,91 @@ class OfficialFinancialPreparer:
             for accession, generation in active["generations"].items() if accession in selected))
         return view, generations
 
+    def _merge_incremental_view(
+        self, subject, filings, stored_filings, view, cached_view, request, cancelled,
+        parsing_observations, initial_generations,
+    ):
+        """Merge verified fragments at the existing compiler/publication seam.
+
+        Page completion cannot promote facts by itself. Older admitted values
+        must survive the same compiler and a partial repair cannot choose a
+        conflicting replacement, even if source priority would otherwise do so.
+        """
+        incremental = set(view.incremental_accessions)
+        if not incremental:
+            return view
+        cached_view = cached_view or self._active_view(subject, filings, request, cancelled)
+        previous = {item.accession_number: item for item in stored_filings}
+        current = {item.accession_number: item for item in filings}
+        replaced_sources = {accession for accession in incremental
+            if accession in initial_generations and accession in previous and accession in current
+            and previous[accession].content_hash.casefold() != current[accession].content_hash.casefold()}
+        if replaced_sources:
+            codes = tuple(f"{item}:incremental_source_changed_preserved_previous_generation"
+                for item in sorted(replaced_sources))
+            view = replace(view,
+                publishable_accessions=tuple(item for item in view.publishable_accessions
+                    if item not in replaced_sources),
+                canonical_dataset=replace(view.canonical_dataset,
+                    diagnostics=tuple(dict.fromkeys((*view.canonical_dataset.diagnostics, *codes)))),
+                diagnostics=tuple(dict.fromkeys((*view.diagnostics, *codes))))
+        same_sources = {accession for accession in incremental
+            if accession in previous and accession in current
+            and previous[accession].content_hash
+            and previous[accession].content_hash.casefold() == current[accession].content_hash.casefold()
+            and previous[accession].period_end == current[accession].period_end
+            and previous[accession].fiscal_period == current[accession].fiscal_period}
+        retained = tuple(fact for fact in cached_view.facts if fact.accession_number in same_sources)
+        if not retained:
+            return view
+        old_values = {_publication_fact_key(fact): Decimal(str(fact.value)) for fact in retained}
+        conflicting = {fact.accession_number for fact in view.facts
+            if (key := _publication_fact_key(fact)) in old_values
+            and Decimal(str(fact.value)) != old_values[key]}
+        source = view.canonical_dataset
+        manifests = {item.document_id: item for item in cached_view.canonical_dataset.manifests}
+        manifests.update({item.document_id: item for item in source.manifests})
+        merged = self.pipeline.prepare(FinancialResearchSnapshot.from_facts(
+            subject, filings, (*retained, *source.resolved_facts, *source.quarantined_facts),
+            evidence=(*cached_view.canonical_dataset.evidence, *source.evidence),
+            source_manifests=tuple(manifests.values()),
+            source_diagnostics=source.diagnostics, source_failures=source.source_failures,
+            requested_annual_count=request.annual_history_years,
+            research_as_of=request.research_as_of, cancel_check=cancelled,
+            parsing_observations=parsing_observations,
+        ), CompilationPolicy(reporting_currency=subject.reporting_currency))
+        new_values = {(_publication_fact_key(fact), Decimal(str(fact.value))) for fact in merged.facts}
+        blocked = replaced_sources | conflicting | {fact.accession_number for fact in retained
+            if (_publication_fact_key(fact), Decimal(str(fact.value))) not in new_values}
+        diagnostics = tuple(dict.fromkeys((*merged.diagnostics,
+            *(f"{item}:incremental_publication_preserved_previous_generation" for item in sorted(blocked)))))
+        return replace(merged,
+            publishable_accessions=tuple(item for item in merged.publishable_accessions if item not in blocked),
+            incremental_accessions=tuple(sorted(incremental)),
+            canonical_dataset=replace(merged.canonical_dataset,
+                diagnostics=tuple(dict.fromkeys((*merged.canonical_dataset.diagnostics,
+                    *(f"{item}:incremental_publication_preserved_previous_generation" for item in sorted(blocked)))))),
+            diagnostics=diagnostics)
+
     def _healthy_accessions(self, subject, filings, view):
-        pending_mappings = self.pipeline.pending_local_mappings(subject, filings)
+        pending_mappings = set(self.pipeline.pending_local_mappings(subject, filings))
+        # Parse-cache files are disposable. The active generation is the
+        # durable fallback: if it predates the independent cost mapping and
+        # its validated facts/source labels touch either cost family, reparse
+        # only that accession even when its parse cache is absent or corrupt.
+        pending_mappings.update(self._pending_persisted_cost_mappings(subject, filings))
+        # Having all core fields does not prove that the remaining page plan
+        # completed. Keep these sources eligible for checkpointed recovery.
+        incomplete_pages = {str(item.get("accession_number", ""))
+            for item in view.profile.parsing_observations
+            if item.get("parse_strategy") == "positioned-page-checkpoint"
+            and type(item.get("completed_page_count")) is int
+            and type(item.get("candidate_page_count")) is int
+            and item["completed_page_count"] < item["candidate_page_count"]}
         return {
             filing.accession_number for filing in filings
             if filing.accession_number not in pending_mappings
+            and filing.accession_number not in incomplete_pages
             and self.acquisition.verified_cache(filing) is not None
             and any(group.identity[0] == filing.accession_number
                     and group.identity[1] == filing.period_end
@@ -341,6 +526,97 @@ class OfficialFinancialPreparer:
                                                CoveragePlanner().plan(subject).required_concepts)
                     for group in view.canonical_dataset.validations)
         }
+
+    def _pending_persisted_cost_mappings(self, subject, filings):
+        key = subject.cik if subject.market == "US" else subject.security_id
+        snapshot = self.storage.get_financial_research_snapshot(key, include_evidence=True)
+        generations = snapshot.get("generations", {})
+        by_accession: dict[str, list[dict[str, Any]]] = {}
+        for fact in (*snapshot.get("facts", ()), *snapshot.get("supplemental_facts", ())):
+            if isinstance(fact, dict):
+                by_accession.setdefault(str(fact.get("accession_number", "")), []).append(fact)
+        evidence = tuple(item for item in snapshot.get("evidence", ()) if isinstance(item, dict))
+        parsing_observations = tuple(
+            item for item in snapshot.get("parsing_observations", ()) if isinstance(item, dict)
+        )
+        # Parsing observations only prove that a source/hash/period was parsed;
+        # they intentionally carry no source-row semantics. The audit view
+        # supplies isolated candidate facts whose amount evidence can be bound
+        # back to the exact filing document/hash before triggering a remap.
+        audit_facts = tuple(self.storage.get_facts_audit(key))
+        pending = set()
+        for filing in filings:
+            generation = str(generations.get(filing.accession_number, ""))
+            if generation.endswith(_FINANCIAL_MAPPING_GENERATION_MARKER):
+                continue
+            facts = by_accession.get(filing.accession_number, ())
+            if any(
+                fact.get("concept") in {"cost_of_revenue", "total_operating_cost"}
+                or any(cost_row_mentions(fact.get(field, ""))
+                       for field in ("reported_concept", "raw_text"))
+                for fact in facts
+            ):
+                pending.add(filing.accession_number)
+                continue
+
+            matching_observation = any(
+                item.get("accession_number") == filing.accession_number
+                and item.get("period_end") == filing.period_end
+                and item.get("fiscal_period") == filing.fiscal_period
+                and item.get("source_hash") == filing.content_hash
+                for item in parsing_observations
+            )
+            for fact in audit_facts:
+                if (not isinstance(fact, dict)
+                        or fact.get("accession_number") != filing.accession_number
+                        or not (fact.get("concept") in {"cost_of_revenue", "total_operating_cost"}
+                                or any(cost_row_mentions(fact.get(field, ""))
+                                       for field in ("reported_concept", "raw_text")))):
+                    continue
+                validation_record = fact.get("fact_validation_record", {})
+                components = validation_record.get("components", {}) if isinstance(validation_record, dict) else {}
+                amount = components.get("amount", {}) if isinstance(components, dict) else {}
+                amount_evidence_ids = set(amount.get("evidence_ids", ())) if isinstance(amount, dict) else set()
+                fact_evidence_id = f"fact:{fact.get('fact_id', '')}"
+                if any(
+                    ref.get("document_id") == filing.document_id
+                    and ref.get("content_hash") == filing.content_hash
+                    and ref.get("excerpt") == fact.get("raw_text")
+                    and (ref.get("evidence_id") in amount_evidence_ids
+                         or ref.get("evidence_id") == fact_evidence_id)
+                    for ref in evidence
+                ):
+                    pending.add(filing.accession_number)
+                    break
+
+            if filing.accession_number in pending:
+                continue
+            # An old failed mapping may retain only its original source row,
+            # with no admitted fact or model observation. Bound evidence is
+            # enough to invalidate that document, never enough to admit a value.
+            if any(ref.get("document_id") == filing.document_id
+                   and ref.get("content_hash") == filing.content_hash
+                   and cost_row_mentions(ref.get("excerpt", "")) for ref in evidence):
+                pending.add(filing.accession_number)
+                continue
+            if not matching_observation:
+                # Do not use unbound historical candidate evidence to schedule
+                # work for a source that is not the observed current document.
+                continue
+            # Unverified visual observations can be the only durable trace of a
+            # cost row when admission isolated it before facts were committed.
+            # Their document and source hash are checked against this exact
+            # accession; unrelated observations never fan out across filings.
+            if any(
+                ref.get("evidence_id", "").startswith("observation:")
+                and ref.get("document_id") == filing.document_id
+                and ref.get("content_hash") == filing.content_hash
+                and (cost_row_mentions(ref.get("title", ""))
+                     or cost_row_mentions(ref.get("excerpt", "")))
+                for ref in evidence
+            ):
+                pending.add(filing.accession_number)
+        return pending
 
 
 def compiler_validation_groups(validations):

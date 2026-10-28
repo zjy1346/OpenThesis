@@ -1,0 +1,25 @@
+{
+  "wire_contract": "text-single-request-v1",
+  "ok": true,
+  "result": {
+    "content": "{\"business_model\":{\"summary\":\"identity mismatch must not promote\"},\"structured_output_valid\":true}",
+    "meta": {
+      "configured_model_id": "different-model",
+      "connection_id": "offline-connection",
+      "provider_id": "gateway",
+      "model_id": "different-model-runtime",
+      "alias": "Wrong fixture model",
+      "endpoint_host": "fixture.invalid",
+      "finish_reason": "stop",
+      "content_length": 97,
+      "credential_version": 4,
+      "connection_configuration_version": 11,
+      "model_configuration_version": 7,
+      "billing_class": "standard",
+      "free_source_url": null,
+      "free_verified_at": null,
+      "temperature": 0.0,
+      "timeout_seconds": 180
+    }
+  }
+}

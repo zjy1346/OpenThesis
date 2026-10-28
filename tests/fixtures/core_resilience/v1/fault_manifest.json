@@ -1,0 +1,478 @@
+{
+  "schema_version": "openthesis.resilience.fixtures.v1",
+  "status": "PLANNED",
+  "policy_version": "recovery-v1",
+  "expected_repair_rate_basis": "Only fixtures declared recoverable before execution",
+  "forbidden_outcomes": [
+    "incorrect_fact_accepted",
+    "placeholder_promoted",
+    "false_complete",
+    "unbounded_retry",
+    "unauthorized_request",
+    "stale_commit"
+  ],
+  "cases": [
+    {
+      "family": "source_discovery",
+      "scope": "source-discovery",
+      "validator": "source_identity_and_hash",
+      "fixtures": [
+        {
+          "id": "source_discovery.recoverable",
+          "symptom": "verified_cache_available",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "source_discovery.unrecoverable",
+          "symptom": "all_official_sources_unavailable",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "source_integrity",
+      "scope": "document",
+      "validator": "byte_hash_and_source_identity",
+      "fixtures": [
+        {
+          "id": "source_integrity.recoverable",
+          "symptom": "truncated_cache_with_verified_official_original",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "source_integrity.unrecoverable",
+          "symptom": "hash_conflict_without_valid_original",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "document_layout",
+      "scope": "document",
+      "validator": "page_cell_period_unit_mapping",
+      "fixtures": [
+        {
+          "id": "document_layout.recoverable",
+          "symptom": "scan_or_cross_page_with_observed_header",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "document_layout.unrecoverable",
+          "symptom": "scan_without_source_context",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "numeric_extraction",
+      "scope": "fact",
+      "validator": "source_numeric_identity",
+      "fixtures": [
+        {
+          "id": "numeric_extraction.recoverable",
+          "symptom": "ocr_sign_corrected_from_source_row",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "numeric_extraction.unrecoverable",
+          "symptom": "no_source_row_for_missing_value",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "unit_normalization",
+      "scope": "fact",
+      "validator": "normalization_lineage",
+      "fixtures": [
+        {
+          "id": "unit_normalization.recoverable",
+          "symptom": "header_unit_restored",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "unit_normalization.unrecoverable",
+          "symptom": "contradictory_units_without_authority",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "currency_quantity",
+      "scope": "fact",
+      "validator": "quantity_currency_fx_identity",
+      "fixtures": [
+        {
+          "id": "currency_quantity.recoverable",
+          "symptom": "explicit_currency_and_fx_snapshot",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "currency_quantity.unrecoverable",
+          "symptom": "unknown_currency_or_no_fx",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "period_identity",
+      "scope": "fact",
+      "validator": "source_period_shape",
+      "fixtures": [
+        {
+          "id": "period_identity.recoverable",
+          "symptom": "non_december_year_from_source_header",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "period_identity.unrecoverable",
+          "symptom": "ambiguous_fy_or_transition_interval",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "accounting_scope",
+      "scope": "fact",
+      "validator": "scope_concept_revision",
+      "fixtures": [
+        {
+          "id": "accounting_scope.recoverable",
+          "symptom": "explicit_consolidated_parent_scope",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "accounting_scope.unrecoverable",
+          "symptom": "uncorrected_scope_conflict",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "derived_inputs",
+      "scope": "fact",
+      "validator": "decimal_formula_lineage",
+      "fixtures": [
+        {
+          "id": "derived_inputs.recoverable",
+          "symptom": "same_identity_formula_inputs_restored",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "derived_inputs.unrecoverable",
+          "symptom": "zero_denominator_or_missing_input",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "market_snapshot",
+      "scope": "stage",
+      "validator": "security_quote_cutoff",
+      "fixtures": [
+        {
+          "id": "market_snapshot.recoverable",
+          "symptom": "authorized_frozen_quote_restored",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "market_snapshot.unrecoverable",
+          "symptom": "no_compatible_share_basis_or_fx",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "evidence_coverage",
+      "scope": "stage",
+      "validator": "claim_evidence_and_risks",
+      "fixtures": [
+        {
+          "id": "evidence_coverage.recoverable",
+          "symptom": "source_references_restored",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "evidence_coverage.unrecoverable",
+          "symptom": "unsupported_material_claim",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "model_capacity",
+      "scope": "stage",
+      "validator": "material_coverage",
+      "fixtures": [
+        {
+          "id": "model_capacity.recoverable",
+          "symptom": "partition_and_authorized_model_checkpoint",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "model_capacity.unrecoverable",
+          "symptom": "no_authorized_capacity",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "model_output",
+      "scope": "stage",
+      "validator": "schema_business_evidence",
+      "fixtures": [
+        {
+          "id": "model_output.recoverable",
+          "symptom": "syntax_or_field_regeneration_validated",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "model_output.unrecoverable",
+          "symptom": "duplicate_key_conflict_or_refusal",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "stage_lifecycle",
+      "scope": "stage",
+      "validator": "dag_identity_and_cancellation",
+      "fixtures": [
+        {
+          "id": "stage_lifecycle.recoverable",
+          "symptom": "checkpoint_resume_minimal_descendants",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "stage_lifecycle.unrecoverable",
+          "symptom": "cancelled_or_unknown_pack",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "report_projection",
+      "scope": "section",
+      "validator": "typed_document_consistency",
+      "fixtures": [
+        {
+          "id": "report_projection.recoverable",
+          "symptom": "optional_projection_failure_with_preserved_nodes",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "report_projection.unrecoverable",
+          "symptom": "no_verified_body_nodes",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "presentation",
+      "scope": "section",
+      "validator": "semantic_content_role",
+      "fixtures": [
+        {
+          "id": "presentation.recoverable",
+          "symptom": "localized_semantic_nodes",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "presentation.unrecoverable",
+          "symptom": "placeholder_or_notice_only",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "protocol_history",
+      "scope": "run",
+      "validator": "protocol_schema_identity",
+      "fixtures": [
+        {
+          "id": "protocol_history.recoverable",
+          "symptom": "known_read_only_legacy_adapter",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "protocol_history.unrecoverable",
+          "symptom": "unknown_incompatible_schema",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "export_io",
+      "scope": "export",
+      "validator": "export_bytes_and_previous_file",
+      "fixtures": [
+        {
+          "id": "export_io.recoverable",
+          "symptom": "atomic_export_to_available_destination",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "export_io.unrecoverable",
+          "symptom": "permission_or_disk_failure",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "storage_transaction",
+      "scope": "run",
+      "validator": "transaction_commit_identity",
+      "fixtures": [
+        {
+          "id": "storage_transaction.recoverable",
+          "symptom": "busy_then_atomic_commit",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "storage_transaction.unrecoverable",
+          "symptom": "disk_full_or_cas_failure",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "storage_recovery",
+      "scope": "run",
+      "validator": "schema_backup_integrity",
+      "fixtures": [
+        {
+          "id": "storage_recovery.recoverable",
+          "symptom": "online_backup_migration_and_restore",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "storage_recovery.unrecoverable",
+          "symptom": "corrupt_database_without_valid_backup",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "concurrency_generation",
+      "scope": "stage",
+      "validator": "lease_cas_action_identity",
+      "fixtures": [
+        {
+          "id": "concurrency_generation.recoverable",
+          "symptom": "same_action_idempotent_resume",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "concurrency_generation.unrecoverable",
+          "symptom": "stale_generation_or_competing_model",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    },
+    {
+      "family": "unknown_exception",
+      "scope": "stage",
+      "validator": "last_committed_state",
+      "fixtures": [
+        {
+          "id": "unknown_exception.recoverable",
+          "symptom": "preserved_checkpoint_with_next_action",
+          "expected": "validated_repair",
+          "required_test_ids": [],
+          "status": "PENDING"
+        },
+        {
+          "id": "unknown_exception.unrecoverable",
+          "symptom": "unclassified_internal_failure",
+          "expected": "preserved_with_explicit_next_action",
+          "required_test_ids": [],
+          "status": "PENDING"
+        }
+      ]
+    }
+  ]
+}

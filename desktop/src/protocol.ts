@@ -12,6 +12,7 @@ import type {
   OtValidationResult,
   Preferences,
   ResearchJob,
+  StructureRuntimeStatus,
   ResearchPackSummary,
   ResearchReport,
   ResearchRequest,
@@ -31,6 +32,8 @@ import type {
 export const BACKEND_METHODS = [
   "app.bootstrap",
   "settings.update",
+  "structure.status",
+  "structure.install",
   "company.search",
   "packs.install",
   "ot.validate",
@@ -72,8 +75,10 @@ type EmptyParams = Record<string, never>;
 export type BackendParams = {
   "app.bootstrap": { minimal?: boolean };
   "settings.update": {
-    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy">>;
+    preferences: Partial<Pick<Preferences, "ui_language" | "report_language" | "sidebar_collapsed" | "parallel_agents" | "research_market" | "official_network_policy" | "local_structure_enabled">>;
   };
+  "structure.status": EmptyParams;
+  "structure.install": { python_executable: string; confirmed: true };
   "company.search": { query: string; market: Market; request_id?: string };
   "packs.install": { filename: string; data_base64: string };
   "ot.validate": { draft: OtDraft };
@@ -99,7 +104,7 @@ export type BackendParams = {
   "research.revalidate_saved": { run_id: string };
   "research.retry_model_stages": { run_id: string; model?: ModelSelection; budget_only?: boolean };
   "research.call_history": { run_id: string; stage_id: string; after?: string; limit?: number };
-  "research.extend_budget": { run_id: string; plan_digest: string; gap_ids: string[] };
+  "research.extend_budget": { run_id: string; plan_digest: string; gap_ids: string[]; adaptive_choice?: "keep" | "remove" };
   "research.retry_financials": { run_id: string };
   "research.refresh_financial_report": { run_id: string; language?: Language };
   "research.start_financial_retry": { run_id: string };
@@ -115,6 +120,8 @@ export type BackendParams = {
 export type BackendResult = {
   "app.bootstrap": BootstrapResult;
   "settings.update": Preferences;
+  "structure.status": StructureRuntimeStatus;
+  "structure.install": ResearchJob;
   "company.search": CompanySearchResponse;
   "packs.install": ResearchPackSummary;
   "ot.validate": OtValidationResult;

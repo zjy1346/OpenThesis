@@ -1,0 +1,25 @@
+{
+  "wire_contract": "text-single-request-v1",
+  "ok": true,
+  "result": {
+    "content": "{\"business_model\":{\"summary\":\"offline business fixture\"},\"token_economics\":{\"prompt_tokens\":17,\"completion_tokens\":9},\"structured_output_valid\":true}",
+    "meta": {
+      "configured_model_id": "offline-model",
+      "connection_id": "offline-connection",
+      "provider_id": "gateway",
+      "model_id": "offline-model-runtime",
+      "alias": "Offline fixture model",
+      "endpoint_host": "fixture.invalid",
+      "finish_reason": "stop",
+      "content_length": 145,
+      "credential_version": 4,
+      "connection_configuration_version": 11,
+      "model_configuration_version": 7,
+      "billing_class": "standard",
+      "free_source_url": null,
+      "free_verified_at": null,
+      "temperature": 0.0,
+      "timeout_seconds": 180
+    }
+  }
+}

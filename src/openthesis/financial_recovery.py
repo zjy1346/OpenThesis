@@ -326,6 +326,14 @@ class FinancialRecoveryController:
         return filing_cache_valid(filing)
 
     @staticmethod
+    def raw_error_code(value: Any) -> str:
+        """Return an error code without normalizing away its source spelling."""
+        code = getattr(value, "code", None)
+        if code is not None and str(code):
+            return str(code)
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
     def classify_error(value: Any, *, stage: str = "") -> str:
         """Map provider/parser exceptions to a stable, user-facing catalog code.
 
@@ -348,8 +356,10 @@ class FinancialRecoveryController:
             "OFFICIAL_RECEIPT_IDENTITY_INVALID", "RECOVERY_EXECUTION_INTERRUPTED",
             "RECOVERY_CANCELLED", "RECOVERY_RUN_NOT_FOUND",
             "OFFICIAL_SOURCE_REDIRECT_UNSAFE",
+            "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED",
         }
-        text = str(getattr(value, "code", value) or "").strip().upper()
+        raw_code = FinancialRecoveryController.raw_error_code(value)
+        text = str(raw_code or value or "").strip().upper()
         if text == "REMOTE_TRANSPORT_FAILED" or text in {
             "REMOTE_HTTP_408", "REMOTE_HTTP_425", "REMOTE_HTTP_429", "REMOTE_HTTP_500",
             "REMOTE_HTTP_502", "REMOTE_HTTP_503", "REMOTE_HTTP_504"}:
@@ -364,6 +374,13 @@ class FinancialRecoveryController:
             if text in {"VISION_NETWORK_ERROR", "VISION_TIMEOUT", "VISION_RATE_LIMITED"}:
                 return "VISION_EXTERNAL_FAILED"
             return text
+        # An explicit but unknown code is meaningful diagnostic data, not
+        # evidence that filing discovery or download failed.
+        has_explicit_code = getattr(value, "code", None) not in (None, "")
+        if isinstance(value, str):
+            has_explicit_code = bool(text) and "_" in text and not any(char.isspace() for char in text)
+        if has_explicit_code:
+            return "UNCLASSIFIED_ERROR"
         message = str(value or "").upper()
         if any(token in message for token in ("HASH", "INTEGRITY", "CHECKSUM", "CONTENT_UNSAFE")):
             return "FILING_CONTENT_INTEGRITY_FAILED"
@@ -377,6 +394,6 @@ class FinancialRecoveryController:
             "discovery": "FILING_FETCH_FAILED",
             "download": "FILING_DOWNLOAD_FAILED",
             "parse": "FILING_LOCAL_PARSE_FAILED",
-        }.get(stage, "FILING_FETCH_FAILED")
+        }.get(stage, "UNCLASSIFIED_ERROR")
 
     _catalog_error_code = classify_error

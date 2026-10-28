@@ -53,8 +53,8 @@ def cloud_period_start(fiscal_period: str, end: str, statement: str) -> str | No
     return following_month.isoformat()
 
 
-def cloud_unit_for_table(table, contexts, document_hash):
-    local = explicit_table_unit(table)
+def cloud_unit_for_table(table, contexts, document_hash, *, column_index=None):
+    local = explicit_table_unit(table, column_index)
     if local is not None and local[1] and local[2]:
         return (*local, None)
     applicable = []
@@ -95,6 +95,10 @@ def _source_observations(excerpt):
     payload = json.loads(excerpt)
     if not isinstance(payload, dict):
         raise ValueError("CLOUD_SOURCE_OBJECT_REQUIRED")
+    if payload.get('source_structure') is not None:
+        from .financial_sources.structure import structure_to_markdown
+        if structure_to_markdown(payload['source_structure']) != payload['markdown']:
+            raise ValueError('CLOUD_STRUCTURE_SOURCE_MISMATCH')
     tables = read_text_tables(payload["markdown"])
     cells = observe_cells(tables, payload["period_end"], payload["fiscal_period"])
     return payload, tables, cells
@@ -122,12 +126,14 @@ def cloud_table_source_issue(fact, row_ref, evidence_by_id) -> str | None:
             fact.source_page, payload["page_hash"], item) == fact.fact_id), None)
         if cell is None:
             return "cloud_table_cell_unproven"
-        unit = cloud_unit_for_table(tables[cell.table_index], payload.get("unit_contexts", []), proof.content_hash)
+        unit = cloud_unit_for_table(tables[cell.table_index], payload.get("unit_contexts", []), proof.content_hash,
+                                    column_index=cell.column_index)
         if (unit is None or fact.currency != unit[1] or float(fact.unit_scale) != float(unit[2])
                 or fact.reported_concept != cell.label or fact.concept != cell.concept
                 or fact.statement != cell.statement or fact.source_column != cell.column_text
                 or fact.end_date != cell.period_end or fact.fiscal_year != int(cell.period_end[:4])
-                or fact.revision != cell.revision or fact.consolidated_scope != "consolidated"
+                or fact.revision != cell.revision or fact.consolidated_scope != cell.scope
+                or fact.scope != cell.scope
                 or fact.start_date != cloud_period_start(fact.fiscal_period, cell.period_end, cell.statement)
                 or fact.period_start != fact.start_date):
             return "cloud_table_cell_identity_mismatch"

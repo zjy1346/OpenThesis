@@ -9,6 +9,7 @@ from decimal import Decimal
 import hashlib
 import json
 import re
+from types import SimpleNamespace
 
 from ..domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from ..financial_contracts import QuantityKind, SourceAmount, STATEMENT_FOR
@@ -30,6 +31,11 @@ _REVENUE_CAPTION = re.compile(r"^\s*(?:[（(][一二三四五六七八九十百\
 _REVENUE_DETAIL = re.compile(r"^\s*(?:[（(]1[）)]|1[.．])\s*营业收入[和、]营业成本情况\s*$")
 _REVENUE_TOTAL = re.compile(r"^\s*合计\s+(?P<revenue>" + _NUMBER + r")\s+(?P<cost>" + _NUMBER
     + r")\s+(?P<prior_revenue>" + _NUMBER + r")\s+(?P<prior_cost>" + _NUMBER + r")\s*$")
+_NOTE_TOTAL_LAYOUT_SCHEMA = "note-total-row-layout-v1"
+_REVENUE_COLUMN_LABELS = {
+    ("收入", "成本", "收入", "成本"),
+    ("营业收入", "营业成本", "营业收入", "营业成本"),
+}
 
 
 def _note_content_lines(text: str) -> list[str]:
@@ -37,7 +43,130 @@ def _note_content_lines(text: str) -> list[str]:
             and not _ANNUAL.search(line) and not re.fullmatch(r"\s*\d{1,4}\s*", line)]
 
 
-def _revenue_note_rows(text: str, continuation_text: str = ""):
+def _layout_row(row):
+    return {
+        "text": row.text,
+        "bbox": list(row.bbox),
+        "top": float(row.top),
+        "cells": [
+            {"text": cell.text, "bbox": [cell.x0, cell.top, cell.x1, cell.bottom]}
+            for cell in row.cells
+        ],
+    }
+
+
+def _positioned_revenue_total(positioned_rows, period_header: str, columns_header: str):
+    """Bind a split visual total row to its four explicit revenue/cost columns."""
+    rows = tuple(positioned_rows or ())
+    if not rows:
+        return None
+    header_rows = []
+    for index, row in enumerate(rows):
+        labels = tuple(canonical_search_text(cell.text) for cell in row.cells)
+        if labels in _REVENUE_COLUMN_LABELS:
+            header_rows.append((index, row))
+    if not header_rows:
+        return None
+    header_index, header_row = header_rows[0]
+    next_header = next((index for index, _row in header_rows[1:]), len(rows))
+    header_cells = tuple(sorted(header_row.cells, key=lambda cell: cell.x0))
+    if any(left.x1 >= right.x0 for left, right in zip(header_cells, header_cells[1:])):
+        return None
+
+    def amount_cells(row):
+        values = []
+        labels = []
+        for cell in row.cells:
+            token = cell.text.strip()
+            if re.fullmatch(_NUMBER, token):
+                values.append(cell)
+            elif token:
+                labels.append(canonical_search_text(token))
+        return values, labels
+
+    for index in range(header_index + 1, next_header - 1):
+        first, second = rows[index], rows[index + 1]
+        first_values, first_labels = amount_cells(first)
+        second_values, second_labels = amount_cells(second)
+        if tuple(first_labels) != ("合计",) or len(first_values) != 3 or second_labels or len(second_values) != 1:
+            continue
+        if not 0 < float(second.top) - float(first.top) <= 12.0:
+            continue
+        ordered = tuple(sorted((*first_values, *second_values), key=lambda cell: cell.x0))
+        if any(left.x0 >= right.x0 for left, right in zip(ordered, ordered[1:])):
+            continue
+        aligned = all(
+            header.x0 - 3.0 <= (cell.x0 + cell.x1) / 2.0 <= header.x1 + 3.0
+            for cell, header in zip(ordered, header_cells)
+        )
+        if not aligned:
+            continue
+        quote = f"{first.text}\n{second.text}"
+        witness = {
+            "schema": _NOTE_TOTAL_LAYOUT_SCHEMA,
+            "period_header": period_header,
+            "columns_header": columns_header,
+            "rows": [_layout_row(header_row), _layout_row(first), _layout_row(second)],
+        }
+        return {
+            "amounts": tuple(cell.text.strip() for cell in ordered),
+            "quote": quote,
+            "witness": witness,
+        }
+    return None
+
+
+def _replay_total_layout(witness):
+    if (not isinstance(witness, dict)
+            or set(witness) != {"schema", "period_header", "columns_header", "rows"}
+            or witness.get("schema") != _NOTE_TOTAL_LAYOUT_SCHEMA
+            or not isinstance(witness.get("period_header"), str)
+            or not isinstance(witness.get("columns_header"), str)
+            or not isinstance(witness.get("rows"), list)
+            or len(witness["rows"]) != 3):
+        return None
+    decoded = []
+    for item in witness["rows"]:
+        if (not isinstance(item, dict) or set(item) != {"text", "bbox", "top", "cells"}
+                or not isinstance(item.get("text"), str)
+                or not isinstance(item.get("bbox"), list) or len(item["bbox"]) != 4
+                or not isinstance(item.get("cells"), list)):
+            return None
+        try:
+            bbox = tuple(float(value) for value in item["bbox"])
+            top = float(item["top"])
+            if any(not value == value or abs(value) == float("inf") for value in (*bbox, top)):
+                return None
+            cells = []
+            for cell in item["cells"]:
+                if (not isinstance(cell, dict) or set(cell) != {"text", "bbox"}
+                        or not isinstance(cell.get("text"), str)
+                        or not isinstance(cell.get("bbox"), list) or len(cell["bbox"]) != 4):
+                    return None
+                x0, cell_top, x1, bottom = (float(value) for value in cell["bbox"])
+                if (any(not value == value or abs(value) == float("inf")
+                        for value in (x0, cell_top, x1, bottom))
+                        or x0 >= x1 or cell_top >= bottom):
+                    return None
+                cells.append(SimpleNamespace(
+                    text=cell["text"], x0=x0, top=cell_top, x1=x1, bottom=bottom,
+                ))
+            if not cells:
+                return None
+            decoded.append(SimpleNamespace(
+                text=item["text"], bbox=bbox, top=top, cells=tuple(cells),
+            ))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    replayed = _positioned_revenue_total(
+        decoded, witness["period_header"], witness["columns_header"],
+    )
+    if replayed is None or replayed["witness"] != witness:
+        return None
+    return replayed, tuple(decoded)
+
+
+def _revenue_note_rows(text: str, continuation_text: str = "", positioned_rows=()):
     """One captioned total with two observed header levels, never a subtotal.
 
     A continuation needs the preceding original's terminal caption, not a
@@ -62,32 +191,54 @@ def _revenue_note_rows(text: str, continuation_text: str = ""):
         return ()
     if start + 2 >= len(lines):
         return ()
-    header, columns = lines[start + 1:start + 3]
-    if (canonical_search_text(header) not in {"项目本期发生额上期发生额", "项目本期金额上期金额"}
-            or canonical_search_text(columns) not in {
-                "收入成本收入成本", "营业收入营业成本营业收入营业成本"}):
+    period_header = lines[start + 1]
+    normalized_period = canonical_search_text(period_header)
+    if normalized_period in {"项目本期发生额上期发生额", "项目本期金额上期金额"}:
+        columns_index = start + 2
+    elif normalized_period in {"本期发生额上期发生额", "本期金额上期金额"}:
+        columns_index = start + 2
+        if columns_index < len(lines) and canonical_search_text(lines[columns_index]) == "项目":
+            # This nonstandard order occurs in the original source under test;
+            # accept it only when positioned cells can bind the next header
+            # and split total back to their visual columns.
+            if not positioned_rows:
+                return ()
+            columns_index += 1
+    else:
         return ()
-    for line in lines[start + 3:]:
+    if columns_index >= len(lines):
+        return ()
+    columns = lines[columns_index]
+    if (canonical_search_text(columns) not in {"收入成本收入成本", "营业收入营业成本营业收入营业成本"}
+    ):
+        return ()
+    column_identity = period_header + "\n" + columns
+    for index, line in enumerate(lines[columns_index + 1:], columns_index + 1):
         # The next detail/section caption terminates the total table even if
         # another table happens to repeat the same column labels.
         if re.match(r"^\s*(?:[（(][一二三四五六七八九十百\d]+[）)]|\d+[、.．])", line):
             break
         row = _REVENUE_TOTAL.fullmatch(line)
         if row:
-            column_identity = header + "\n" + columns
             return (("营业收入", row["revenue"], line, column_identity),
                     ("营业成本", row["cost"], line, column_identity))
+        if canonical_search_text(line.split(maxsplit=1)[0] if line.split() else "") == "合计":
+            positioned = _positioned_revenue_total(positioned_rows, period_header, columns)
+            if positioned is not None and positioned["quote"].splitlines()[0].strip() == line:
+                amounts = positioned["amounts"]
+                return (("营业收入", amounts[0], positioned["quote"], column_identity),
+                        ("营业成本", amounts[1], positioned["quote"], column_identity))
     return ()
 
 
-def note_row_disclosures(text: str, year: int, continuation_text: str = "", *, wrapped_pairs=()):
+def note_row_disclosures(text: str, year: int, continuation_text: str = "", *, wrapped_pairs=(), positioned_rows=()):
     """Two clearly labelled columns only; never choose a nearby monetary row."""
     if set(_ANNUAL.findall(text)) != {str(year)}:
         return ()
     if continuation_text:
         if set(_ANNUAL.findall(continuation_text)) != {str(year)}:
             return ()
-        return _revenue_note_rows(text, continuation_text)
+        return _revenue_note_rows(text, continuation_text, positioned_rows)
     active_header, result, cash_reconciliation = "", [], False
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -122,7 +273,7 @@ def note_row_disclosures(text: str, year: int, continuation_text: str = "", *, w
                     result.append((row["label"], matches[0]["current"], quote, active_header))
                 continue
             result.append((row["label"], row["current"], line.strip(), active_header))
-    return (*result, *_revenue_note_rows(text))
+    return (*result, *_revenue_note_rows(text, positioned_rows=positioned_rows))
 
 
 def _ref_id(role: str, document: str, page: int, excerpt: str) -> str:
@@ -145,7 +296,9 @@ def extract_note_candidates(company: Company, filing: FilingDocument, page: int,
         return [], []
     from .numeric_continuations import collect_wrapped_pairs
     wrapped = collect_wrapped_pairs(positioned_rows)
-    rows = note_row_disclosures(text, year, prior_text, wrapped_pairs=wrapped)
+    rows = note_row_disclosures(
+        text, year, prior_text, wrapped_pairs=wrapped, positioned_rows=positioned_rows,
+    )
     if not rows:
         return [], []
     if _local_unit_conflicts(text, region.declaration.currency, region.declaration.scale):
@@ -174,6 +327,19 @@ def extract_note_candidates(company: Company, filing: FilingDocument, page: int,
         layout_ids = ()
         layouts = [pair for pair in wrapped
                    if re.sub(r"\s+", "", pair["quote"]) == re.sub(r"\s+", "", row)]
+        total_layout = None
+        if "\n" in row and "\n" in header:
+            period_header, columns_header = header.split("\n", 1)
+            total_layout = _positioned_revenue_total(positioned_rows, period_header, columns_header)
+            if total_layout is not None and total_layout["quote"] == row:
+                layouts = []
+                payload = json.dumps(total_layout["witness"], ensure_ascii=False,
+                    sort_keys=True, separators=(",", ":"), allow_nan=False)
+                layout_id = _ref_id("layout", filing.document_id, page, payload)
+                common.append(EvidenceRef(layout_id, filing.document_id, filing.source_url,
+                    "original total-row column alignment", f"page:{page}", payload,
+                    filing.filed_at, filing.content_hash, bbox))
+                layout_ids = (layout_id,)
         if len(layouts) == 1:
             payload = json.dumps(layouts[0]["witness"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
             layout_id = _ref_id("layout", filing.document_id, page, payload)
@@ -254,6 +420,7 @@ def note_source_issue(fact: FinancialFact, row: EvidenceRef | None, evidence: di
     expected_scope = note_chapter_scope(scope.excerpt)
     literal = literal_money_unit(unit.excerpt)
     wrapped = ()
+    positioned_rows = ()
     if layouts:
         from .numeric_continuations import replay_wrapped_pair
         layout = layouts[0]
@@ -266,12 +433,22 @@ def note_source_issue(fact: FinancialFact, row: EvidenceRef | None, evidence: di
             return "note_numeric_continuation_unproven"
         try:
             payload = json.loads(layout.excerpt)
-            pair = replay_wrapped_pair(payload)
-            if pair is None or any(not (context.bbox[0] <= cell["bbox"][0] < cell["bbox"][2] <= context.bbox[2]
-                    and context.bbox[1] <= cell["bbox"][1] < cell["bbox"][3] <= context.bbox[3])
-                    for line in payload["rows"] for cell in line["cells"]):
-                return "note_numeric_continuation_unproven"
-            wrapped = (pair,)
+            if payload.get("schema") == _NOTE_TOTAL_LAYOUT_SCHEMA:
+                replayed = _replay_total_layout(payload)
+                if replayed is None:
+                    return "note_numeric_continuation_unproven"
+                _total, positioned_rows = replayed
+                if any(not (context.bbox[0] <= cell.x0 < cell.x1 <= context.bbox[2]
+                        and context.bbox[1] <= cell.top < cell.bottom <= context.bbox[3])
+                        for line in positioned_rows for cell in line.cells):
+                    return "note_numeric_continuation_unproven"
+            else:
+                pair = replay_wrapped_pair(payload)
+                if pair is None or any(not (context.bbox[0] <= cell["bbox"][0] < cell["bbox"][2] <= context.bbox[2]
+                        and context.bbox[1] <= cell["bbox"][1] < cell["bbox"][3] <= context.bbox[3])
+                        for line in payload["rows"] for cell in line["cells"]):
+                    return "note_numeric_continuation_unproven"
+                wrapped = (pair,)
         except (ValueError, KeyError, TypeError, IndexError):
             return "note_numeric_continuation_unproven"
     row_in_context = row.excerpt in context.excerpt or (wrapped and
@@ -289,8 +466,11 @@ def note_source_issue(fact: FinancialFact, row: EvidenceRef | None, evidence: di
             or _local_unit_conflicts(context.excerpt, fact.currency, lineage.scale)
             or not fact.entity or canonical_search_text(fact.entity) not in canonical_search_text(context.excerpt)):
         return "note_scope_period_unit_unproven"
-    matching = [item for item in note_row_disclosures(context.excerpt, fact.fiscal_year,
-                                                    continuation.excerpt if continuation else "", wrapped_pairs=wrapped)
+    matching = [item for item in note_row_disclosures(
+        context.excerpt, fact.fiscal_year,
+        continuation.excerpt if continuation else "",
+        wrapped_pairs=wrapped, positioned_rows=positioned_rows,
+    )
                 if item[0] == fact.reported_concept and item[2] == fact.raw_text and item[3] == fact.source_column]
     if len(matching) != 1:
         return "note_column_identity_unproven"

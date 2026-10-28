@@ -362,8 +362,9 @@ def _verification_batches(queries, provider):
     from .research_execution.model import provider_context_capability, provider_declares_context_capability
     effective = provider.for_output_budget(32_000) if callable(getattr(provider, "for_output_budget", None)) else provider
     limit = provider_context_capability(effective).available_input_tokens if provider_declares_context_capability(effective) else None
-    # Source-connected components keep related work together. Unrelated source
-    # groups never get packed merely because the model advertises a big window.
+    # Source-connected components keep related assertions adjacent. Several
+    # complete groups may share one bounded verdict request: a separate wire
+    # for every disjoint footnote needlessly multiplies cold starts.
     groups = []
     for query in sorted(queries, key=lambda item: item["assertion_id"]):
         sources = {source["source_block_id"] for source in query["sources"]}
@@ -386,8 +387,8 @@ def _verification_batches(queries, provider):
         else:
             yield items
 
+    batch, included, estimate = [], set(), base
     for source_ids, members in sorted(groups, key=lambda group: tuple(sorted(group[0]))):
-        batch, included, estimate = [], set(), base
         for query in sorted(members, key=lambda item: item["assertion_id"]):
             additions = 0
             for source in query["sources"]:
@@ -409,8 +410,8 @@ def _verification_batches(queries, provider):
             batch.append(query)
             estimate += additions + query_size
             included.update(source["source_block_id"] for source in query["sources"])
-        if batch:
-            yield from exact_batches(batch)
+    if batch:
+        yield from exact_batches(batch)
 
 
 def validate_with_assertions(validate: Callable[[], Any], *, stage_id: str, journal: Any,

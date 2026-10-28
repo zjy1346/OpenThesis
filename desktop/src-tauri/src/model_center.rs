@@ -1,9 +1,12 @@
 use crate::credentials::{credential_target, platform_vault, validate_secret, CredentialVault};
 use crate::provider_registry;
+use crate::connection_contract::{CapabilityProfile, ConnectionTransportSettings};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use zeroize::Zeroizing;
@@ -55,6 +58,9 @@ impl ModelCenter {
             .map_err(|_| "model center database could not be initialized".to_string())?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS model_center_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS provider_connections (connection_id TEXT PRIMARY KEY NOT NULL, provider_id TEXT NOT NULL, display_name TEXT NOT NULL, region TEXT NOT NULL, endpoint TEXT NOT NULL, credential_ref TEXT, credential_version INTEGER NOT NULL DEFAULT 0, has_secret INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE TABLE IF NOT EXISTS configured_models (configured_model_id TEXT PRIMARY KEY NOT NULL, connection_id TEXT NOT NULL REFERENCES provider_connections(connection_id) ON DELETE CASCADE, model_id TEXT NOT NULL, alias TEXT NOT NULL, free_tier INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, capabilities_json TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch()), UNIQUE(connection_id, model_id)); CREATE TABLE IF NOT EXISTS model_capability_checks (configured_model_id TEXT NOT NULL REFERENCES configured_models(configured_model_id) ON DELETE CASCADE, capability TEXT NOT NULL, model_configuration_version INTEGER NOT NULL, connection_configuration_version INTEGER NOT NULL, credential_version INTEGER NOT NULL, status TEXT NOT NULL, checked_at INTEGER NOT NULL, error_code TEXT, retry_after_seconds INTEGER, PRIMARY KEY(configured_model_id, capability, model_configuration_version, connection_configuration_version, credential_version)); INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;").map_err(|_| "model center database could not be initialized".to_string())?;
         for (table, column, definition) in [
+            ("provider_connections", "protocol", "TEXT"),
+            ("provider_connections", "capability_profile", "TEXT"),
+            ("provider_connections", "transport_settings", "TEXT NOT NULL DEFAULT '{}'"),
             (
                 "provider_connections",
                 "status",
@@ -95,6 +101,10 @@ impl ModelCenter {
         ] {
             ensure_column(&connection, table, column, definition)?;
         }
+        connection.execute("UPDATE provider_connections SET protocol=CASE WHEN provider_id='ollama' THEN 'ollama' ELSE 'chat_completions' END WHERE protocol IS NULL", []).map_err(|_| "Connection protocol migration failed")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS model_directory_cache (id INTEGER PRIMARY KEY CHECK(id=1), snapshot TEXT NOT NULL);").map_err(|_| "Model directory cache unavailable")?;
+        connection.execute("UPDATE configured_models SET billing_class='unknown',free_tier=0,free_source_url=NULL,free_verified_at=NULL WHERE billing_class='local_no_provider_fee' AND connection_id IN (SELECT connection_id FROM provider_connections WHERE provider_id='ollama')",[]).map_err(|_| "Ollama billing declaration migration failed")?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS model_probe_receipts (attempt_id TEXT PRIMARY KEY,parent_request_id TEXT NOT NULL,connection_id TEXT NOT NULL,configured_model_id TEXT NOT NULL,connection_version INTEGER NOT NULL,credential_version INTEGER NOT NULL,operation TEXT NOT NULL,reserved_calls INTEGER NOT NULL CHECK(reserved_calls=1),outcome TEXT NOT NULL,receipt TEXT,created_at INTEGER NOT NULL DEFAULT(unixepoch()));").map_err(|_| "Model test receipts unavailable")?;
         connection
             .execute(
                 "INSERT INTO model_center_meta(key, value) VALUES ('schema_version', '3') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -147,7 +157,11 @@ impl ModelCenter {
                     Some(target) => self.vault.has(target)?,
                     None => false,
                 };
+                let id: String = row.get(0).map_err(|_| "model center database is unavailable")?;
+                let (protocol, capability_profile) = load_contract(&connection, &id)?;
                 summaries.push(ConnectionSummary {
+                    transport: load_transport(&connection, &id)?,
+                    protocol, capability_profile,
                     connection_id: row.get(0).map_err(|_| "model center database is unavailable".to_string())?,
                     provider_id: row.get(1).map_err(|_| "model center database is unavailable".to_string())?,
                     display_name: row.get(2).map_err(|_| "model center database is unavailable".to_string())?,
@@ -165,8 +179,34 @@ impl ModelCenter {
             Ok(summaries)
         })
     }
+    pub fn model_directory(&self, refresh: bool) -> Result<crate::model_directory::DirectorySnapshot,String> {
+        if refresh {
+            let snapshot = crate::model_directory::refresh()?;
+            let text = serde_json::to_string(&snapshot).map_err(|_| "Directory serialization failed")?;
+            self.with_connection(|connection| { connection.execute("INSERT INTO model_directory_cache(id,snapshot) VALUES (1,?1) ON CONFLICT(id) DO UPDATE SET snapshot=excluded.snapshot",[text]).map_err(|_| "Directory cache write failed")?; Ok(()) })?;
+            return Ok(snapshot);
+        }
+        let cached: Option<String> = self.with_connection(|connection| connection.query_row("SELECT snapshot FROM model_directory_cache WHERE id=1",[],|row| row.get(0)).optional().map_err(|_| "Directory cache unavailable".into()))?;
+        if let Some(cached) = cached { if let Ok(snapshot) = serde_json::from_str(&cached) { return Ok(snapshot); } }
+        crate::model_directory::bundled()
+    }
+    pub(crate) fn reserve_probe(&self, parent: &str, model: &ConfiguredModelRuntime, operation: &str) -> Result<String,String> {
+        let attempt=format!("{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "Clock unavailable")?.as_nanos());
+        self.with_connection(|connection| {
+            let changed=connection.execute("INSERT INTO model_probe_receipts(attempt_id,parent_request_id,connection_id,configured_model_id,connection_version,credential_version,operation,reserved_calls,outcome) SELECT ?1,?2,?3,?4,?5,?6,?7,1,'reserved' WHERE EXISTS (SELECT 1 FROM provider_connections WHERE connection_id=?3 AND configuration_version=?5 AND credential_version=?6) AND ((?8=0 AND ?4='connection-test.'||?3) OR EXISTS (SELECT 1 FROM configured_models WHERE connection_id=?3 AND configured_model_id=?4 AND configuration_version=?8)) AND (SELECT COUNT(*) FROM model_probe_receipts WHERE parent_request_id=?2)<2",params![attempt,parent,model.connection_id,model.configured_model_id,model.connection_configuration_version,model.credential_version,operation,model.configuration_version]).map_err(|_| "Model test reservation failed")?;
+            if changed != 1 { return Err("Model test configuration changed or its two-request limit was reached before send".into()); }
+            Ok(attempt)
+        })
+    }
+    pub(crate) fn finish_probe(&self, id: &str, outcome: &str, receipt: &str) -> Result<(),String> {
+        self.with_connection(|connection| { connection.execute("UPDATE model_probe_receipts SET outcome=?1,receipt=?2 WHERE attempt_id=?3 AND outcome='reserved'",params![outcome,receipt,id]).map_err(|_| "Model test receipt could not be saved")?; Ok(()) })
+    }
+    pub(crate) fn reserve_metadata_probe(&self, id: &str, version: i64, credential_version: i64) -> Result<String,String> {
+        let attempt=format!("metadata-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "Clock unavailable")?.as_nanos());
+        self.with_connection(|connection| { let changed=connection.execute("INSERT INTO model_probe_receipts(attempt_id,parent_request_id,connection_id,configured_model_id,connection_version,credential_version,operation,reserved_calls,outcome) SELECT ?1,?1,?2,'',?3,?4,'metadata',1,'reserved' WHERE EXISTS (SELECT 1 FROM provider_connections WHERE connection_id=?2 AND configuration_version=?3 AND credential_version=?4)",params![attempt,id,version,credential_version]).map_err(|_| "Metadata reservation failed")?; if changed!=1 { return Err("Metadata connection changed".into()); } Ok(attempt) })
+    }
 
-    pub fn save_connection(&self, input: SaveConnectionInput) -> Result<ConnectionSummary, String> {
+    pub fn save_connection(&self, mut input: SaveConnectionInput) -> Result<ConnectionSummary, String> {
         provider_registry::validate_connection_id(&input.connection_id)?;
         provider_registry::validate_provider_id(&input.provider_id)?;
         let provider = provider_registry::find(&input.provider_id)
@@ -180,16 +220,39 @@ impl ModelCenter {
         if input.region.len() > 64 || input.region.chars().any(char::is_control) {
             return Err("region is invalid".to_string());
         }
-        provider_registry::validate_endpoint(&input.provider_id, &input.endpoint)?;
+        let protocol = input.protocol.clone().unwrap_or_else(|| if input.provider_id == "ollama" { "ollama".into() } else { "chat_completions".into() });
+        if !["chat_completions", "ollama"].contains(&protocol.as_str()) || (input.provider_id != "custom" && (protocol == "ollama") != (input.provider_id == "ollama")) { return Err("Unsupported connection protocol".into()); }
         if provider.provider_id != "custom" && input.endpoint.is_empty() {
             return Err("endpoint is required".to_string());
         }
         self.with_connection(|connection| {
             let existing: Option<(String, Option<String>, i64)> = connection.query_row("SELECT provider_id, credential_ref, has_secret FROM provider_connections WHERE connection_id=?1", [&input.connection_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional().map_err(|_| "model connection could not be read".to_string())?;
+            let transaction = connection.unchecked_transaction().map_err(|_| "Connection transaction unavailable")?;
             if let Some((existing_provider, credential_ref, has_secret)) = existing { if existing_provider != input.provider_id && (credential_ref.is_some() || has_secret != 0) { return Err("delete the existing connection before changing its provider".to_string()); } }
-            connection.execute("INSERT INTO provider_connections(connection_id, provider_id, display_name, region, endpoint, enabled, updated_at) VALUES (?1,?2,?3,?4,?5,?6,unixepoch()) ON CONFLICT(connection_id) DO UPDATE SET provider_id=excluded.provider_id, display_name=excluded.display_name, region=excluded.region, endpoint=excluded.endpoint, enabled=excluded.enabled, status='untested', last_tested_at=NULL, last_error_code=NULL, configuration_version=provider_connections.configuration_version+1, updated_at=unixepoch()", params![input.connection_id, input.provider_id, input.display_name, input.region, input.endpoint, input.enabled as i64]).map_err(|_| "model connection could not be saved".to_string())?;
-            connection.execute("UPDATE configured_models SET health_status='unverified', configuration_version=configuration_version+1, updated_at=unixepoch() WHERE connection_id=?1", [&input.connection_id]).map_err(|_| "configured model health could not be invalidated".to_string())?;
-            self.connection_summary(connection, &input.connection_id)
+            let previous: Option<(String,String,i64,String,Option<String>,String)> = connection.query_row("SELECT provider_id,endpoint,enabled,protocol,capability_profile,transport_settings FROM provider_connections WHERE connection_id=?1", [&input.connection_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(|_| "model connection could not be read")?;
+            let protocol = if input.protocol.is_none() { previous.as_ref().map(|row| row.3.clone()).unwrap_or(protocol) } else { protocol };
+            let transport = match input.transport.as_ref() {
+                Some(value) => value.clone(),
+                None => previous.as_ref().map(|row| serde_json::from_str(&row.5)).transpose().map_err(|_| "MODEL_TRANSPORT_INVALID")?.unwrap_or_default(),
+            };
+            input.endpoint = transport.normalize_endpoint(&input.endpoint,&protocol)?;
+            provider_registry::validate_endpoint(&input.provider_id,&input.endpoint)?;
+            transport.validate(&input.endpoint)?;
+            let transport_json = serde_json::to_string(&transport).map_err(|_| "MODEL_TRANSPORT_INVALID")?;
+            if previous.is_none() && input.provider_id == "custom" && input.capability_profile.is_none() {
+                input.capability_profile = Some(CapabilityProfile::compatible_default(&protocol));
+            }
+            if let Some(profile)=&input.capability_profile { profile.validate(&protocol)?; }
+            let profile_json = match &input.capability_profile {
+                Some(profile) => Some(serde_json::to_string(profile).map_err(|_| "Invalid capability profile")?),
+                None => previous.as_ref().and_then(|row| row.4.clone()),
+            };
+            let changed = previous.as_ref().is_some_and(|row| row.0 != input.provider_id || row.1 != input.endpoint || row.2 != input.enabled as i64 || row.3 != protocol || !profile_wire_equal(row.4.as_deref(),profile_json.as_deref()) || serde_json::from_str::<ConnectionTransportSettings>(&row.5).ok().as_ref() != Some(&transport));
+            connection.execute("INSERT INTO provider_connections(connection_id,provider_id,display_name,region,endpoint,enabled,protocol,capability_profile,transport_settings,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?10,unixepoch()) ON CONFLICT(connection_id) DO UPDATE SET provider_id=excluded.provider_id,display_name=excluded.display_name,region=excluded.region,endpoint=excluded.endpoint,enabled=excluded.enabled,protocol=excluded.protocol,capability_profile=excluded.capability_profile,transport_settings=excluded.transport_settings,status=CASE WHEN ?9 THEN 'untested' ELSE provider_connections.status END,last_tested_at=CASE WHEN ?9 THEN NULL ELSE provider_connections.last_tested_at END,last_error_code=CASE WHEN ?9 THEN NULL ELSE provider_connections.last_error_code END,configuration_version=provider_connections.configuration_version+?9,updated_at=unixepoch()",params![input.connection_id,input.provider_id,input.display_name,input.region,input.endpoint,input.enabled as i64,protocol,profile_json,changed as i64,transport_json]).map_err(|_| "model connection could not be saved")?;
+            if changed { connection.execute("UPDATE configured_models SET health_status='unverified', configuration_version=configuration_version+1, updated_at=unixepoch() WHERE connection_id=?1", [&input.connection_id]).map_err(|_| "configured model health could not be invalidated")?; }
+            let summary = self.connection_summary(connection, &input.connection_id)?;
+            transaction.commit().map_err(|_| "Connection transaction could not be committed")?;
+            Ok(summary)
         })
     }
     pub fn set_secret(
@@ -268,6 +331,7 @@ impl ModelCenter {
             if changed != 1 {
                 return Err("model connection changed during credential rotation".to_string());
             }
+            connection.execute("UPDATE configured_models SET health_status='unverified',configuration_version=configuration_version+1 WHERE connection_id=?1",[&rotation.connection_id]).map_err(|_| "Model credential generation invalidation failed")?;
             self.connection_summary(connection, &rotation.connection_id)
         });
         if result.is_err() {
@@ -376,6 +440,7 @@ impl ModelCenter {
             return Err("model capabilities are invalid".to_string());
         }
         let timeout_seconds = input.timeout_seconds.unwrap_or(180);
+        if input.context_window_hint.is_some_and(|n| !(1..=2_147_483_647).contains(&n)) { return Err("Invalid declared context capacity".into()); }
         if !(5..=600).contains(&timeout_seconds) {
             return Err("model timeout must be between 5 and 600 seconds".to_string());
         }
@@ -402,9 +467,12 @@ impl ModelCenter {
                 provider_registry::billing_class_for(&provider_id, &input.model_id).to_string();
             let free_source_url = provider_registry::free_source_url(&provider_id, &input.model_id);
             let free_tier = matches!(billing_class.as_str(), "free_tier" | "local_no_provider_fee");
+            let transaction = connection.unchecked_transaction().map_err(|_| "Model transaction unavailable")?;
+            let previous: Option<(String,String,i64,String,Option<i64>,Option<f64>,i64)> = connection.query_row("SELECT connection_id,model_id,enabled,capabilities_json,context_window_hint,temperature,timeout_seconds FROM configured_models WHERE configured_model_id=?1",[&input.configured_model_id],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?))).optional().map_err(|_| "configured model could not be read")?;
+            let changed = previous.is_some_and(|row| row.0 != input.connection_id || row.1 != input.model_id || row.2 != input.enabled as i64 || row.3 != capabilities || row.4 != input.context_window_hint || row.5 != input.temperature || row.6 != timeout_seconds);
             connection
                 .execute(
-                    "INSERT INTO configured_models(configured_model_id, connection_id, model_id, alias, free_tier, enabled, capabilities_json, billing_class, free_source_url, free_verified_at, health_status, last_discovered_at, context_window_hint, temperature, timeout_seconds, configuration_version, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,CASE WHEN ?9 IS NULL THEN NULL ELSE unixepoch() END,'unverified',unixepoch(),?10,?11,?12,1,unixepoch()) ON CONFLICT(configured_model_id) DO UPDATE SET connection_id=excluded.connection_id, model_id=excluded.model_id, alias=excluded.alias, free_tier=excluded.free_tier, enabled=excluded.enabled, capabilities_json=excluded.capabilities_json, billing_class=excluded.billing_class, free_source_url=excluded.free_source_url, free_verified_at=excluded.free_verified_at, health_status='unverified', last_discovered_at=excluded.last_discovered_at, context_window_hint=excluded.context_window_hint, temperature=excluded.temperature, timeout_seconds=excluded.timeout_seconds, configuration_version=configured_models.configuration_version+1, updated_at=unixepoch()",
+                    "INSERT INTO configured_models(configured_model_id, connection_id, model_id, alias, free_tier, enabled, capabilities_json, billing_class, free_source_url, free_verified_at, health_status, last_discovered_at, context_window_hint, temperature, timeout_seconds, configuration_version, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,CASE WHEN ?9 IS NULL THEN NULL ELSE unixepoch() END,'unverified',unixepoch(),?10,?11,?12,1,unixepoch()) ON CONFLICT(configured_model_id) DO UPDATE SET connection_id=excluded.connection_id, model_id=excluded.model_id, alias=excluded.alias, free_tier=excluded.free_tier, enabled=excluded.enabled, capabilities_json=excluded.capabilities_json, billing_class=excluded.billing_class, free_source_url=excluded.free_source_url, free_verified_at=excluded.free_verified_at, health_status=CASE WHEN ?13 THEN 'unverified' ELSE configured_models.health_status END, last_discovered_at=excluded.last_discovered_at, context_window_hint=excluded.context_window_hint, temperature=excluded.temperature, timeout_seconds=excluded.timeout_seconds, configuration_version=configured_models.configuration_version+?13, updated_at=unixepoch()",
                     params![
                         input.configured_model_id,
                         input.connection_id,
@@ -418,10 +486,13 @@ impl ModelCenter {
                         input.context_window_hint,
                         input.temperature,
                         timeout_seconds,
+                        changed as i64,
                     ],
                 )
                 .map_err(|_| "configured model could not be saved".to_string())?;
-            self.model_summary(connection, &input.configured_model_id)
+            let summary = self.model_summary(connection, &input.configured_model_id)?;
+            transaction.commit().map_err(|_| "Model transaction could not be committed")?;
+            Ok(summary)
         })
     }
 
@@ -433,14 +504,19 @@ impl ModelCenter {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT provider_id, endpoint, credential_ref, enabled FROM provider_connections WHERE connection_id=?1",
+                    "SELECT provider_id, endpoint, credential_ref, enabled, protocol, capability_profile, status, configuration_version, credential_version,transport_settings FROM provider_connections WHERE connection_id=?1",
                     [connection_id],
                     |row| {
                         Ok(ConnectionRuntime {
+                            transport: decode_transport(row.get(9)?)?,
                             provider_id: row.get(0)?,
                             endpoint: row.get(1)?,
                             credential_ref: row.get(2)?,
                             enabled: row.get::<_, i64>(3)? != 0,
+                            protocol: row.get(4)?,
+                            capability_profile: decode_profile(row.get(5)?)?,
+                            status: row.get(6)?,
+                            configuration_version: row.get(7)?, credential_version: row.get(8)?,
                         })
                     },
                 )
@@ -458,13 +534,14 @@ impl ModelCenter {
         self.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT m.configured_model_id, m.connection_id, c.provider_id, c.endpoint, c.credential_version, c.enabled, c.configuration_version, m.model_id, m.alias, m.enabled, m.capabilities_json, m.billing_class, m.free_tier, m.free_source_url, m.free_verified_at, m.temperature, m.timeout_seconds, m.configuration_version FROM configured_models m JOIN provider_connections c ON c.connection_id=m.connection_id WHERE m.configured_model_id=?1",
+                    "SELECT m.configured_model_id, m.connection_id, c.provider_id, c.endpoint, c.credential_version, c.enabled, c.configuration_version, m.model_id, m.alias, m.enabled, m.capabilities_json, m.billing_class, m.free_tier, m.free_source_url, m.free_verified_at, m.temperature, m.timeout_seconds, m.configuration_version, c.protocol, c.capability_profile,c.transport_settings FROM configured_models m JOIN provider_connections c ON c.connection_id=m.connection_id WHERE m.configured_model_id=?1",
                     [configured_model_id],
                     |row| {
                         let capabilities_json: String = row.get(10)?;
                         let billing_class: String = row.get(11)?;
                         let legacy_free = row.get::<_, i64>(12)? != 0;
                         Ok(ConfiguredModelRuntime {
+                            transport: decode_transport(row.get(20)?)?,
                             configured_model_id: row.get(0)?,
                             connection_id: row.get(1)?,
                             provider_id: row.get(2)?,
@@ -486,6 +563,7 @@ impl ModelCenter {
                             temperature: row.get(15)?,
                             timeout_seconds: row.get(16)?,
                             configuration_version: row.get(17)?,
+                            protocol: row.get(18)?, capability_profile: decode_profile(row.get(19)?)?,
                         })
                     },
                 )
@@ -579,6 +657,10 @@ impl ModelCenter {
             }
             Ok(())
         })
+    }
+    pub(crate) fn mark_connection_status_for_versions(&self, id: &str, status: &str, code: Option<&str>, version: i64, credential_version: i64) -> Result<(),String> {
+        validate_health_status(status)?;
+        self.with_connection(|connection| { connection.execute("UPDATE provider_connections SET status=?1,last_tested_at=unixepoch(),last_error_code=?2 WHERE connection_id=?3 AND configuration_version=?4 AND credential_version=?5",params![status,code,id,version,credential_version]).map_err(|_| "Connection status unavailable")?; Ok(()) })
     }
 
     pub(crate) fn mark_probe_health_for_versions(
@@ -683,7 +765,10 @@ impl ModelCenter {
             Some(target) => self.vault.has(target)?,
             None => false,
         };
+        let (protocol, capability_profile) = load_contract(connection, &connection_id)?;
         Ok(ConnectionSummary {
+            transport: load_transport(connection, &connection_id)?,
+            protocol, capability_profile,
             connection_id,
             provider_id,
             display_name,
@@ -827,6 +912,29 @@ fn validate_configured_model_id(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_profile(value: Option<String>) -> rusqlite::Result<Option<CapabilityProfile>> {
+    value.map(|text| serde_json::from_str(&text).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(error)))).transpose()
+}
+fn profile_wire_equal(left:Option<&str>,right:Option<&str>) -> bool {
+    match (left,right) {
+        (None,None)=>true,
+        (Some(left),Some(right))=>match (serde_json::from_str::<CapabilityProfile>(left),serde_json::from_str::<CapabilityProfile>(right)) {
+            (Ok(mut left),Ok(mut right))=>{left.source="legacy".into(); right.source="legacy".into(); left==right},
+            _=>false,
+        },
+        _=>false,
+    }
+}
+fn decode_transport(value: String) -> rusqlite::Result<ConnectionTransportSettings> {
+    serde_json::from_str(&value).map_err(|error| rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(error)))
+}
+fn load_transport(connection: &Connection,id: &str) -> Result<ConnectionTransportSettings,String> {
+    connection.query_row("SELECT transport_settings FROM provider_connections WHERE connection_id=?1",[id],|row| decode_transport(row.get(0)?)).map_err(|_| "MODEL_TRANSPORT_INVALID".into())
+}
+fn load_contract(connection: &Connection, id: &str) -> Result<(String,Option<CapabilityProfile>),String> {
+    connection.query_row("SELECT protocol,capability_profile FROM provider_connections WHERE connection_id=?1",[id],|row| Ok((row.get(0)?,decode_profile(row.get(1)?)?))).map_err(|_| "Connection contract could not be read".into())
+}
+
 fn validate_health_status(value: &str) -> Result<(), String> {
     if matches!(
         value,
@@ -878,6 +986,12 @@ pub(crate) struct SecretRotation {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConnectionRuntime {
+    pub(crate) transport: ConnectionTransportSettings,
+    pub(crate) protocol: String,
+    pub(crate) capability_profile: Option<CapabilityProfile>,
+    pub(crate) status: String,
+    pub(crate) configuration_version: i64,
+    pub(crate) credential_version: i64,
     pub(crate) provider_id: String,
     pub(crate) endpoint: String,
     pub(crate) credential_ref: Option<String>,
@@ -886,6 +1000,9 @@ pub(crate) struct ConnectionRuntime {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfiguredModelRuntime {
+    pub(crate) transport: ConnectionTransportSettings,
+    pub(crate) protocol: String,
+    pub(crate) capability_profile: Option<CapabilityProfile>,
     pub(crate) configured_model_id: String,
     pub(crate) connection_id: String,
     pub(crate) provider_id: String,
@@ -908,8 +1025,27 @@ pub(crate) struct ConfiguredModelRuntime {
 #[derive(Default)]
 pub struct ModelCenterState {
     center: Mutex<Option<Arc<ModelCenter>>>,
+    tests: Mutex<HashMap<String,(String,Arc<AtomicBool>)>>,
 }
 impl ModelCenterState {
+    pub(crate) fn begin_test(&self, connection_id:&str, operation_id:&str) -> Result<Arc<AtomicBool>,String> {
+        if operation_id.is_empty() || operation_id.len()>128 || operation_id.chars().any(char::is_control) { return Err("MODEL_TEST_ID_INVALID".into()); }
+        let mut tests=self.tests.lock().map_err(|_| "MODEL_TEST_BUSY")?;
+        if tests.contains_key(connection_id) || tests.values().any(|(id,_)|id==operation_id) { return Err("MODEL_TEST_BUSY".into()); }
+        let cancel=Arc::new(AtomicBool::new(false));
+        tests.insert(connection_id.into(),(operation_id.into(),cancel.clone()));
+        Ok(cancel)
+    }
+    pub(crate) fn finish_test(&self,connection_id:&str,operation_id:&str) {
+        if let Ok(mut tests)=self.tests.lock() {
+            if tests.get(connection_id).is_some_and(|(id,_)|id==operation_id) { tests.remove(connection_id); }
+        }
+    }
+    pub(crate) fn cancel_test(&self,operation_id:&str) {
+        if let Ok(tests)=self.tests.lock() {
+            if let Some((_,cancel))=tests.values().find(|(id,_)|id==operation_id) { cancel.store(true,Ordering::Release); }
+        }
+    }
     pub(crate) fn get(&self, app: &AppHandle) -> Result<Arc<ModelCenter>, String> {
         let mut slot = self
             .center
@@ -933,6 +1069,12 @@ impl ModelCenterState {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SaveConnectionInput {
+    #[serde(default)]
+    pub transport: Option<ConnectionTransportSettings>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub capability_profile: Option<CapabilityProfile>,
     pub connection_id: String,
     pub provider_id: String,
     pub display_name: String,
@@ -957,6 +1099,9 @@ pub struct SaveConfiguredModelInput {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConnectionSummary {
+    pub transport: ConnectionTransportSettings,
+    pub protocol: String,
+    pub capability_profile: Option<CapabilityProfile>,
     pub connection_id: String,
     pub provider_id: String,
     pub display_name: String,
@@ -1009,6 +1154,11 @@ pub struct CapabilityCheckSummary {
 #[tauri::command]
 pub fn model_center_list_providers() -> Vec<provider_registry::ProviderDefinition> {
     provider_registry::all()
+}
+#[tauri::command]
+pub async fn model_center_model_directory(app: AppHandle, state: State<'_,ModelCenterState>, refresh: Option<bool>) -> Result<crate::model_directory::DirectorySnapshot,String> {
+    let center = state.get(&app)?;
+    tauri::async_runtime::spawn_blocking(move || center.model_directory(refresh.unwrap_or(false))).await.map_err(|_| "Directory worker unavailable")?
 }
 #[tauri::command]
 pub fn model_center_list_connections(
@@ -1092,6 +1242,8 @@ mod tests {
     }
     fn connection() -> SaveConnectionInput {
         SaveConnectionInput {
+            transport: None,
+            protocol: None, capability_profile: None,
             connection_id: "primary".into(),
             provider_id: "openai".into(),
             display_name: "Primary".into(),
@@ -1099,6 +1251,70 @@ mod tests {
             endpoint: "https://api.openai.com/v1".into(),
             enabled: true,
         }
+    }
+    #[test]
+    fn new_custom_defaults_and_legacy_override_preservation_321() {
+        let center=center(); let mut input=connection();
+        input.provider_id="custom".into(); input.endpoint="https://customer.example".into();
+        let saved=center.save_connection(input.clone()).unwrap();
+        assert_eq!(saved.endpoint,"https://customer.example/v1");
+        assert_eq!(saved.capability_profile.as_ref().unwrap().source,"compatible_default");
+        let mut declared=saved.capability_profile.clone().unwrap(); declared.source="user".into();
+        input.capability_profile=Some(declared); input.display_name="Renamed".into();
+        assert_eq!(center.save_connection(input.clone()).unwrap().configuration_version,saved.configuration_version);
+        center.with_connection(|db| {db.execute("UPDATE provider_connections SET capability_profile=NULL WHERE connection_id='primary'",[]).unwrap();Ok(())}).unwrap();
+        input.capability_profile=None;
+        assert!(center.save_connection(input).unwrap().capability_profile.is_none(),"legacy unknowns must not be silently migrated");
+    }
+    #[test]
+    fn model_tests_are_isolated_by_connection_and_cancel_token_321() {
+        let state=ModelCenterState::default();
+        let first=state.begin_test("one","op1").unwrap();
+        assert!(state.begin_test("one","other").is_err());
+        let second=state.begin_test("two","op2").unwrap();
+        state.cancel_test("op1");
+        assert!(first.load(Ordering::Acquire)); assert!(!second.load(Ordering::Acquire));
+        state.finish_test("one","op1"); assert!(state.begin_test("one","op3").is_ok());
+    }
+    #[test]
+    fn cosmetic_connection_rename_preserves_wire_version_320() {
+        let center = center();
+        let saved = center.save_connection(connection()).unwrap();
+        let mut renamed = connection();
+        renamed.display_name = "Only a display rename".into();
+        let after = center.save_connection(renamed).unwrap();
+        assert_eq!(saved.configuration_version, after.configuration_version);
+        assert_eq!(saved.connection_id, after.connection_id);
+    }
+    #[test]
+    fn catalog_and_alias_updates_do_not_invalidate_capabilities_320() {
+        let center=center(); center.save_connection(connection()).unwrap();
+        let mut input=SaveConfiguredModelInput{configured_model_id:"kept-id".into(),connection_id:"primary".into(),model_id:"Private/Exact-ID".into(),alias:"Before".into(),enabled:true,capabilities:vec!["text_chat".into()],context_window_hint:Some(12345),temperature:None,timeout_seconds:Some(180)};
+        let before=center.save_model(input.clone()).unwrap();
+        center.record_capability_check("kept-id","text_chat","ready",None,None).unwrap();
+        input.alias="After".into(); let after=center.save_model(input).unwrap();
+        assert_eq!(after.configuration_version,before.configuration_version); assert_eq!(after.capability_checks.len(),1);
+        let snapshot=center.model_directory(false).unwrap(); assert!(!snapshot.models.is_empty());
+        assert_eq!(center.list_models().unwrap()[0].context_window_hint,Some(12345));
+        assert_eq!(center.list_connections().unwrap()[0].configuration_version,1);
+    }
+    #[test]
+    fn probe_reservation_is_durable_without_prompts_or_credentials_320() {
+        let center=center(); center.save_connection(connection()).unwrap();
+        let id=center.reserve_metadata_probe("primary",1,0).unwrap();
+        center.finish_probe(&id,"response_received",r#"{"generation_calls":0}"#).unwrap();
+        center.with_connection(|db| { let row:(String,String,i64)=db.query_row("SELECT operation,outcome,reserved_calls FROM model_probe_receipts WHERE attempt_id=?1",[id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|e|e.to_string())?; assert_eq!(row,("metadata".into(),"response_received".into(),1)); Ok(()) }).unwrap();
+    }
+    #[test]
+    fn probe_parent_budget_is_atomic_and_configuration_bound_320() {
+        let center=center(); center.save_connection(connection()).unwrap();
+        center.save_model(SaveConfiguredModelInput{configured_model_id:"test-budget".into(),connection_id:"primary".into(),model_id:"Exact-ID".into(),alias:"Budget".into(),enabled:true,capabilities:vec!["text_chat".into()],context_window_hint:None,temperature:None,timeout_seconds:Some(180)}).unwrap();
+        let model=center.configured_model_runtime("test-budget").unwrap();
+        center.reserve_probe("one-test",&model,"text").unwrap();
+        center.reserve_probe("one-test",&model,"vision").unwrap();
+        assert!(center.reserve_probe("one-test",&model,"unexpected-third-wire").is_err());
+        let mut stale=model; stale.configuration_version+=1;
+        assert!(center.reserve_probe("new-test",&stale,"text").is_err());
     }
     struct FailingVault;
     impl CredentialVault for FailingVault {
@@ -1148,11 +1364,11 @@ mod tests {
     fn rotation_advances_version_without_returning_secret() {
         let center = center();
         center.save_connection(connection()).unwrap();
-        center.set_secret("primary", "one").unwrap();
-        let second = center.set_secret("primary", "two").unwrap();
+        center.set_secret("primary", "rotation-first-secret-321").unwrap();
+        let second = center.set_secret("primary", "rotation-second-secret-321").unwrap();
         assert_eq!(second.credential_version, 2);
         assert!(second.has_secret);
-        assert!(!serde_json::to_string(&second).unwrap().contains("two"));
+        assert!(!serde_json::to_string(&second).unwrap().contains("rotation-second-secret-321"));
     }
     #[test]
     fn delete_disables_then_removes_connection_and_models() {
@@ -1181,6 +1397,8 @@ mod tests {
         let center = center();
         center
             .save_connection(SaveConnectionInput {
+                transport: None,
+                protocol: None, capability_profile: None,
                 connection_id: "local".into(),
                 provider_id: "ollama".into(),
                 display_name: "Local".into(),

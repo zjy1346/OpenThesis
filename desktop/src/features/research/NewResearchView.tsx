@@ -8,6 +8,7 @@ import {
   listConfiguredModels,
   openExternalUrl,
   captureMarketSnapshot,
+  getResearchBudgetPreview,
   searchCompanies,
 } from "../../backend";
 import type {
@@ -19,6 +20,8 @@ import type {
   ModelReference,
   Preferences,
   ResearchPackSummary,
+  ResearchBudgetPreview,
+  AdaptiveResearchRunEnvelope,
   ResearchRequest,
 } from "../../types";
 import { parseVisionFallbackPolicy, visionFallbackSelectionFromPolicy } from "../../types";
@@ -80,6 +83,26 @@ type ResearchCopy = {
   discountRate: string;
   terminalGrowth: string;
   launchResearch: string;
+  runBudgetTitle: string;
+  runBudgetAdaptive: string;
+  runBudgetAdaptiveSummary: string;
+  runBudgetOptionalLimits: string;
+  runBudgetOptionalHint: string;
+  runBudgetDisclaimer: string;
+  runBudgetInputTokens: string;
+  runBudgetOutputTokens: string;
+  runBudgetTotalTokens: string;
+  runBudgetCalls: string;
+  runBudgetSeconds: string;
+  runBudgetCost: string;
+  runBudgetQuoteRequired: string;
+  runBudgetPreview: string;
+  runBudgetPreviewing: string;
+  runBudgetPriceUnknown: string;
+  runBudgetCostLabel: string;
+  runBudgetWorkloadPending: string;
+  runBudgetPreviewFailed: string;
+  runBudgetInvalid: string;
   modelProvider: string;
   offlineModel: string;
   modelName: string;
@@ -122,6 +145,44 @@ type ResearchCopy = {
 };
 
 const SEC_DEVELOPER_DOCS = "https://www.sec.gov/search-filings/edgar-application-programming-interfaces";
+type EditableRunLimits = Pick<AdaptiveResearchRunEnvelope,
+  "max_input_tokens" | "max_output_tokens" | "max_total_tokens" | "max_calls" | "max_automatic_seconds" | "max_cost">;
+
+const RUN_LIMIT_FIELDS: Array<{ key: keyof EditableRunLimits; copyKey: keyof ResearchCopy; integer: boolean }> = [
+  { key: "max_input_tokens", copyKey: "runBudgetInputTokens", integer: true },
+  { key: "max_output_tokens", copyKey: "runBudgetOutputTokens", integer: true },
+  { key: "max_total_tokens", copyKey: "runBudgetTotalTokens", integer: true },
+  { key: "max_calls", copyKey: "runBudgetCalls", integer: true },
+  { key: "max_automatic_seconds", copyKey: "runBudgetSeconds", integer: true },
+  { key: "max_cost", copyKey: "runBudgetCost", integer: false },
+];
+
+function buildRunEnvelope(
+  editable: Record<keyof EditableRunLimits, string>,
+  priceQuote: Record<string, unknown> | null,
+): AdaptiveResearchRunEnvelope | null {
+  const parsed = {} as EditableRunLimits;
+  for (const { key, integer } of RUN_LIMIT_FIELDS) {
+    const raw = editable[key].trim();
+    if (!raw) {
+      parsed[key] = null;
+      continue;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0 || (integer && !Number.isSafeInteger(value))) return null;
+    if (key === "max_cost" && !priceQuote) return null;
+    parsed[key] = value;
+  }
+  const hardLimits = { ...parsed };
+  return {
+    policy: "adaptive",
+    mode: "adaptive",
+    user_hard_limits: hardLimits,
+    ...hardLimits,
+    warning_seconds: 900,
+    ...(priceQuote ? { price_quote: priceQuote } : {}),
+  };
+}
 
 export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisionSettings, onSavePreferences, onStart }: {
   bootstrap: BootstrapResult;
@@ -164,6 +225,18 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [parallelAgents, setParallelAgents] = useState(
     bootstrap.preferences.parallel_agents === "true",
   );
+  const [runBudgetLimits, setRunBudgetLimits] = useState<Record<keyof EditableRunLimits, string>>({
+    max_input_tokens: "",
+    max_output_tokens: "",
+    max_total_tokens: "",
+    max_calls: "",
+    max_automatic_seconds: "",
+    max_cost: "",
+  });
+  const [priceQuote, setPriceQuote] = useState<Record<string, unknown> | null>(null);
+  const [runBudgetPreview, setRunBudgetPreview] = useState<ResearchBudgetPreview | null>(null);
+  const [runBudgetPreviewLoading, setRunBudgetPreviewLoading] = useState(false);
+  const [runBudgetError, setRunBudgetError] = useState("");
   const [downloadFilings, setDownloadFilings] = useState(true);
   const [packId, setPackId] = useState(bootstrap.research_packs[0]?.pack_id ?? "");
   const [packs, setPacks] = useState<ResearchPackSummary[]>(bootstrap.research_packs);
@@ -345,6 +418,12 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       setSearchError(copy.visionMissing);
       return;
     }
+    const runEnvelope = buildRunEnvelope(runBudgetLimits, priceQuote);
+    if (!runEnvelope) {
+      setRunBudgetError(copy.runBudgetInvalid);
+      return;
+    }
+    setRunBudgetError("");
     setLaunching(true);
     setSearchError("");
     try {
@@ -369,6 +448,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
         compare_enabled: comparisons.length > 0,
         comparison_models: comparisons,
         parallel_agents: parallelAgents,
+        run_envelope: runEnvelope,
         auto_market_snapshot: true,
         ...(hasValuationOverride ? { valuation: {
           market_cap_billions: Number(marketCap) || 0,
@@ -388,6 +468,28 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       setSearchError(errorCode ? searchErrorMessage(errorCode, copy, copy.launchFailed ?? copy.coreUnavailable) : (copy.launchFailed ?? copy.coreUnavailable));
     } finally {
       setLaunching(false);
+    }
+  };
+
+  const previewRunBudget = async () => {
+    const runEnvelope = buildRunEnvelope(runBudgetLimits, priceQuote);
+    if (!runEnvelope || runBudgetPreviewLoading) {
+      if (!runEnvelope) setRunBudgetError(copy.runBudgetInvalid);
+      return;
+    }
+    setRunBudgetError("");
+    setRunBudgetPreviewLoading(true);
+    setRunBudgetPreview(null);
+    try {
+      const preview = await getResearchBudgetPreview(runEnvelope);
+      setRunBudgetPreview(preview);
+      const quote = preview.price_quote;
+      setPriceQuote(quote && typeof quote === "object" && !Array.isArray(quote)
+        ? quote as Record<string, unknown> : null);
+    } catch {
+      setRunBudgetError(copy.runBudgetPreviewFailed);
+    } finally {
+      setRunBudgetPreviewLoading(false);
     }
   };
 
@@ -555,10 +657,10 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
             <label className="check-row"><input type="checkbox" checked={parallelAgents} aria-describedby={parallelHintId} onChange={(event) => setParallelAgents(event.target.checked)} />{copy.parallelAgents}</label>
             <p className="field-caption" id={parallelHintId}>{copy.parallelAgentsHint}</p>
             <p className="field-caption" data-testid="research-call-plan">{bootstrap.preferences.ui_language === "en"
-              ? "Call plan: one generation per stage; at most one automatic model repair per stage and two across the research run. Verification is batched over deduplicated sources and shares the run budget. Token and cost estimates are not supplier bills; unknown usage remains reserved."
+              ? "The plan adapts to remaining research work. It prevents unchanged requests from repeating; estimates are not supplier bills, and only limits you set can pause cumulative work."
               : bootstrap.preferences.ui_language === "zh-Hant"
-                ? "呼叫計畫：每階段生成一次；自動模型修復每階段最多一次，全研究合計最多兩次。核驗按去重來源分批，並共用研究預算。Token／費用估算不等於供應商帳單；未知用量保留預算預留。"
-                : "调用计划：每阶段生成一次；自动模型修复每阶段最多一次，全研究合计最多两次。核验按去重来源分批，并共用研究预算。Token／费用估算不等于供应商账单；未知用量保留预算预留。"}</p>
+                ? "計畫會依剩餘研究工作調整，並阻止沒有變化的請求重複執行；估算不等於供應商帳單，只有你設定的上限會暫停累計工作。"
+                : "计划会按剩余研究工作调整，并阻止没有变化的请求重复执行；估算不等于供应商账单，只有你设置的上限会暂停累计工作。"}</p>
           </> : <div className="model-picker-empty" role="status">
             <p>{modelLoadError || copy.modelsEmpty}</p>
             <button className="secondary-button" type="button" onClick={onOpenModelCenter}>{copy.modelCenter}</button>
@@ -573,6 +675,41 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
           </div>
           <label className="pack-import">{copy.importPack}<input type="file" accept=".ot" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
+          <section className="run-budget-settings" aria-labelledby="run-budget-title">
+            <h4 id="run-budget-title">{copy.runBudgetTitle}</h4>
+            <p className="field-caption" data-testid="run-budget-adaptive">{copy.runBudgetAdaptive}</p>
+            <p className="field-caption">{copy.runBudgetAdaptiveSummary}</p>
+            <details className="run-budget-optional-limits">
+              <summary>{copy.runBudgetOptionalLimits}</summary>
+              <p className="field-caption">{copy.runBudgetOptionalHint}</p>
+              <div className="run-budget-limits">
+                {RUN_LIMIT_FIELDS.map(({ key, copyKey, integer }) => <label key={key}>
+                  {copy[copyKey]}
+                  <input aria-label={copy[copyKey]} type="number" min="0" step={integer ? "1" : "any"}
+                    disabled={key === "max_cost" && !priceQuote}
+                    value={runBudgetLimits[key]} onChange={(event) => {
+                      setRunBudgetLimits((current) => ({ ...current, [key]: event.target.value }));
+                      setRunBudgetPreview(null);
+                      setRunBudgetError("");
+                    }} />
+                  {key === "max_cost" && !priceQuote && <small className="field-caption">{copy.runBudgetQuoteRequired}</small>}
+                </label>)}
+              </div>
+            </details>
+            <p className="field-caption" data-testid="run-budget-disclaimer">{copy.runBudgetDisclaimer}</p>
+            <div className="run-budget-preview-row">
+              <button className="secondary-button" type="button" disabled={runBudgetPreviewLoading || !buildRunEnvelope(runBudgetLimits, priceQuote)} onClick={() => void previewRunBudget()}>
+                {runBudgetPreviewLoading ? copy.runBudgetPreviewing : copy.runBudgetPreview}
+              </button>
+              {runBudgetPreview && <span className="run-budget-preview" data-testid="run-budget-preview-result" role="status">
+                {copy.runBudgetCostLabel}: {runBudgetPreview.price_status !== "known" || runBudgetPreview.estimated_cost === null
+                  ? copy.runBudgetPriceUnknown
+                  : runBudgetPreview.estimated_cost.toLocaleString(bootstrap.preferences.ui_language === "en" ? "en-US" : "zh-CN")}
+                {runBudgetPreview.workload_status === "pending_material_compilation" && ` · ${copy.runBudgetWorkloadPending}`}
+              </span>}
+            </div>
+            {runBudgetError && <p className="inline-error" role="alert">{runBudgetError}</p>}
+          </section>
           <section className="vision-policy-summary" data-testid="vision-policy-summary">
             <h4>{copy.visionSettingsTitle ?? "Vision fallback"}</h4>
             <p className="field-caption">{copy.visionSettingsSummary ?? "The persistent visual fallback is managed in Settings and snapshotted for this research run."}</p>

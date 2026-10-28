@@ -44,7 +44,7 @@ def test_repair_reference_closure_and_numeric_risk_context_are_self_contained():
         repair_context(json.dumps({'research_context': context, 'material_registry': registry}), ('financial_quality',))
 
 
-def test_length_supplement_is_one_grouped_missing_only_call_and_keeps_closed_body():
+def test_length_supplement_calls_each_missing_section_once_and_keeps_closed_body():
     from openthesis.packs import builtin_pack
     from openthesis.providers import ModelConfig
     workflow = ResearchWorkflow(None, builtin_pack(), None, ModelConfig())
@@ -58,8 +58,13 @@ def test_length_supplement_is_one_grouped_missing_only_call_and_keeps_closed_bod
         return {section: {'analysis': 'New complete section.'} for section in missing}
     workflow._run_agent_adaptive = supplement
     result = workflow._recover_synthesis_output_sections('{}', {}, original)
-    assert len(calls) == 1
-    assert 'business_model' not in calls[0][0][3]['sectional_delivery']['sections']
+    all_sections = calls[0][0][3]['sectional_delivery']['all_sections']
+    missing_sections = [section for section in all_sections if section not in original]
+    requested_sections = [call[0][3]['sectional_delivery']['sections'] for call in calls]
+    assert len(calls) == len(missing_sections)
+    assert requested_sections == [[section] for section in missing_sections]
+    assert all('business_model' not in sections for sections in requested_sections)
+    assert all(result[section]['analysis'] == 'New complete section.' for section in missing_sections)
     assert result['business_model'] == original['business_model']
 
 

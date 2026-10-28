@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from collections.abc import Sequence
 
 from .text_normalization import canonical_search_text
+
+
+# Kept independent from the PDF parser contract so the cache layer can remap
+# only documents/windows whose saved rows were affected by a concept change.
+FINANCIAL_MAPPING_VERSION = "financial-concept-mapping-v2"
 
 
 FINANCIAL_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
@@ -92,13 +98,17 @@ FINANCIAL_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
     "cost_of_revenue": (
         "营业成本",
         "營業成本",
-        "营业总成本",
-        "營業總成本",
         "销售成本",
         "銷售成本",
         "cost of revenue",
         "cost of revenues",
         "cost of sales",
+    ),
+    "total_operating_cost": (
+        "营业总成本",
+        "營業總成本",
+        "total operating cost",
+        "total operating costs",
     ),
     "capital_expenditure": (
         "购建固定资产、无形资产和其他长期资产支付的现金",
@@ -255,8 +265,161 @@ def profit_row_concept(label: object, attribution: object = "") -> str | None:
 
 def normalize_financial_label(value: object) -> str:
     """Canonicalize label typography while leaving source text untouched."""
+    text = str(value or "")
+    # Row/alias matching revisits the same strings millions of times. Cache
+    # this pure transform, while bounding both entry count and retained text.
+    return _cached_canonical_financial_label(text) if len(text) <= 512 else canonical_search_text(text)
 
-    return canonical_search_text(value)
+
+@lru_cache(maxsize=16_384)
+def _cached_canonical_financial_label(text: str) -> str:
+    return canonical_search_text(text)
+
+
+_COST_ROW_QUALIFIERS = frozenset({
+    "本期金额", "本期发生额", "本年金额", "本年发生额",
+    "上期金额", "上期发生额", "上年金额", "上年发生额",
+    "currentperiod", "currentperiodamount", "currentperiodincurred",
+    "priorperiod", "priorperiodamount", "previousperiod", "previousperiodamount",
+})
+_COST_NON_AMOUNT_MARKERS = (
+    "增长", "同比", "环比", "占比", "比例", "增长率", "率",
+    "growth", "margin", "ratio", "percentage", "percent", "rate", "yield",
+)
+
+
+def cost_row_mentions(label: object) -> frozenset[str]:
+    """Return fixed cost families named anywhere in an alias or source row."""
+
+    source = _COST_ROW_NUMBER.sub(" ", financial_label_body(label))
+    normalized = normalize_financial_label(source)
+    for prefix in ("其中", "including", "ofwhich"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    return frozenset(
+        concept
+        for concept in ("cost_of_revenue", "total_operating_cost")
+        if any(normalize_financial_label(alias) in normalized
+               for alias in FINANCIAL_LABEL_ALIASES[concept])
+    )
+
+
+def cost_row_is_non_amount(label: object) -> bool:
+    """Identify cost growth/rate/margin labels that are not monetary rows."""
+
+    raw = financial_label_body(label).casefold()
+    normalized = normalize_financial_label(raw)
+    return ("%" in raw or "％" in raw
+            or any(normalize_financial_label(marker) in normalized
+                   for marker in _COST_NON_AMOUNT_MARKERS))
+
+
+def cost_row_source_is_non_amount(source_row: object) -> bool:
+    """Check only the local text following a cost alias in a source-row excerpt.
+
+    Vision excerpts may include a statement title, unit, period, or another
+    table heading before the actual row. Those surrounding headers must not
+    make a monetary cost row look like a ratio. Inspect the row-local suffix
+    after the cost alias through the first displayed number instead.
+    """
+
+    source = financial_label_body(source_row)
+    for aliases in (FINANCIAL_LABEL_ALIASES["cost_of_revenue"],
+                    FINANCIAL_LABEL_ALIASES["total_operating_cost"]):
+        for alias in aliases:
+            pattern = re.escape(alias).replace(r"\ ", r"\s+")
+            match = re.search(pattern, source, flags=re.IGNORECASE)
+            if match is None:
+                continue
+            suffix = source[match.end():].partition("\n")[0]
+            number = _COST_ROW_NUMBER.search(suffix)
+            label_suffix = suffix[:number.start()] if number else suffix[:120]
+            if cost_row_is_non_amount(alias + label_suffix):
+                return True
+            # A percent immediately attached to the displayed value is also
+            # a ratio even if the model omitted the word "rate" from the label.
+            if number is not None and re.match(r"\s*%", suffix[number.end():]):
+                return True
+    return False
+
+
+def cost_row_alias_conflicts(label: object, concept: str) -> bool:
+    """Protect fixed cost families when compatible packs add aliases."""
+
+    mentions = cost_row_mentions(label)
+    if not mentions:
+        return False
+    return bool(
+        concept not in {"cost_of_revenue", "total_operating_cost"}
+        or len(mentions) != 1
+        or concept not in mentions
+        or cost_row_is_non_amount(label)
+        or cost_row_concept(label) != concept
+    )
+
+
+_COST_ROW_NUMBER = re.compile(
+    r"(?:\(\s*[+-]?\d[\d,]*(?:\.\d+)?\s*\)|[+-]?\d[\d,]*(?:\.\d+)?)"
+)
+
+
+def cost_row_concept(label: object) -> str | None:
+    """Classify only an explicit cost row; total operating cost is not COGS.
+
+    This accepts a row label by itself or its source row with numeric cells,
+    and removes only a leading component marker such as ``其中``.  It does not
+    infer semantics from relative amounts or arbitrary substring matches.
+    """
+
+    source = financial_label_body(label)
+    source = _COST_ROW_NUMBER.sub(" ", source)
+    normalized = normalize_financial_label(source)
+    for prefix in ("其中", "including", "ofwhich"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    if normalized in {
+        normalize_financial_label(alias)
+        for concept in ("cost_of_revenue", "total_operating_cost")
+        for alias in FINANCIAL_LABEL_ALIASES[concept]
+    }:
+        for concept in ("cost_of_revenue", "total_operating_cost"):
+            if normalized in {
+                normalize_financial_label(alias)
+                for alias in FINANCIAL_LABEL_ALIASES[concept]
+            }:
+                return concept
+
+    # Only narrow statement-column qualifiers are allowed after a known row.
+    # Arbitrary suffixes (notably growth/rate labels) are not cost amounts.
+    for concept in ("cost_of_revenue", "total_operating_cost"):
+        for alias in FINANCIAL_LABEL_ALIASES[concept]:
+            needle = normalize_financial_label(alias)
+            if not normalized.startswith(needle):
+                continue
+            tail = normalized[len(needle):]
+            if tail in _COST_ROW_QUALIFIERS and not cost_row_is_non_amount(source):
+                return concept
+
+    # Vision's source-bound row excerpt also carries table headers and period
+    # labels. Accept an embedded concept only when no non-numeric row label
+    # follows it; this excludes e.g. "营业成本率".
+    matches: list[tuple[int, str]] = []
+    for concept in ("cost_of_revenue", "total_operating_cost"):
+        for alias in FINANCIAL_LABEL_ALIASES[concept]:
+            needle = normalize_financial_label(alias)
+            start = normalized.find(needle)
+            if start < 0:
+                continue
+            tail = normalized[start + len(needle):]
+            if not tail:
+                matches.append((len(needle), concept))
+    if not matches:
+        return None
+    longest = max(length for length, _concept in matches)
+    concepts = {concept for length, concept in matches if length == longest}
+    return next(iter(concepts)) if len(concepts) == 1 else None
 
 
 def interest_income_row_concept(label: object, heading: object = "") -> str | None:

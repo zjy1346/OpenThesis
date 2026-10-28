@@ -63,11 +63,11 @@ def check_unknown_format_submission(store, run_id, stage_id, input_digest, now, 
         rows = db.execute("""SELECT a.action_id,a.state,a.lease_until FROM recovery_actions a
             JOIN recovery_plans p ON p.plan_id=a.plan_id
             JOIN recovery_incidents i ON i.incident_id=a.incident_id
-            WHERE i.run_id=? AND p.payload_json IS NOT NULL AND i.target=?
+            WHERE i.run_id=? AND p.payload_json IS NOT NULL AND (i.target=? OR i.target LIKE ?)
               AND a.external_intent=1 AND a.external_task_id='' AND a.result_json IS NULL
               AND a.response_received=0
             ORDER BY a.updated_at DESC""",
-            (run_id, format_target(stage_id, input_digest))).fetchall()
+            (run_id, format_target(stage_id, input_digest), format_target(stage_id, input_digest) + ':work:%')).fetchall()
     row = next((row for row in rows if row["action_id"] not in excluded_actions), None)
     if row:
         code = ("MODEL_REQUEST_IN_PROGRESS" if row["state"] == RecoveryState.RUNNING
@@ -103,6 +103,7 @@ class ModelFormatRecovery:
                  journal._transient_rejection_proof(original) if transient and original is not None
                  else journal._format_rejection_status(original) if original is not None else None)
         if isinstance(proof, dict):
+            proof = request.decode_candidate(proof)
             proof = normalize_stage_output(proof, request.output_contract)
         fields = repairable_fields(proof, request.output_contract) if field_repair else ()
         claim_contract = request.claim_repair_contract if claim_repair else None
@@ -135,6 +136,11 @@ class ModelFormatRecovery:
         preconditions = ((claim_plan.version, digest(proof), digest(claim_plan.to_dict())) if claim_repair else
                          (FIELD_REPAIR_VERSION, digest(proof), contract_digest, *fields) if field_repair else
                          (OUTPUT_REPAIR_VERSION, digest(proof)) if output_repair else ())
+        if candidate_repair:
+            # A bounded incident owns one concrete repair state, not all
+            # future gaps in this stage. New target/content is new work; the
+            # same state reuses its prior outcome without another charge.
+            target += ":work:" + digest({"verifier": verifier_id, "preconditions": preconditions})
         action = RecoveryAction("model-text-claims" if claim_repair else "model-text-fields" if field_repair else "model-text-output" if output_repair else
             "model-text-rate" if transient else "model-text-format", "v1", (stage_id,), request.input_digest,
             verifier_id, configuration_fingerprint=configuration,
@@ -252,7 +258,8 @@ class ModelFormatRecovery:
         def verify(candidate, _plan):
             if journal.is_cancelled():
                 raise RecoveryConflict("RECOVERY_CANCELLED")
-            value, result = candidate.payload, candidate.payload.get("result")
+            value = candidate.payload
+            result = request.decode_candidate(candidate.payload.get("result"))
             expected_keys = {*identity, "result", *(["original_result"] if candidate_repair else [])}
             valid = (digest({key: value.get(key) for key in identity}) == digest(identity)
                      and set(value) == expected_keys and isinstance(result, dict)
@@ -280,6 +287,7 @@ class ModelFormatRecovery:
                                       () if valid else (issue.issue_id,))
 
         def target_merge(result):
+            result = request.decode_candidate(result)
             return (claim_contract.merge_targets(proof, result, claim_plan) if claim_repair else
                     merge_field_targets(proof, result, request.output_contract, fields))
 
@@ -292,6 +300,8 @@ class ModelFormatRecovery:
                            and saved["state"] == "candidate" else
                            journal._transient_rejection_proof(saved) if transient and saved is not None
                            else journal._format_rejection_status(saved) if saved is not None else None)
+            if isinstance(saved_proof, dict):
+                saved_proof = normalize_stage_output(request.decode_candidate(saved_proof), request.output_contract)
             verified = verify(CandidateResult(value), plan)
             if (saved is None or saved["state"] != expected_state
                     or digest(saved_proof) != digest(proof)
@@ -312,8 +322,10 @@ class ModelFormatRecovery:
                 if isinstance(proof, ModelResponse):
                     result = ModelResponse(result, proof.receipt, proof.diagnostics)
             else:
-                result = value["result"]
+                result = request.decode_candidate(value["result"])
             record, receipt = response_record(result)
+            from .reference_aliases import bind_response_record
+            record, receipt = bind_response_record(record, receipt, getattr(request, "reference_bindings", ()), request.input_digest)
             # The stored stage body may become a repaired answer, but that
             # never changes which physical wire incurred the original usage.
             # Preserve the first wire's receipt separately from the candidate's

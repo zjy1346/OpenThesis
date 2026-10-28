@@ -407,6 +407,7 @@ class ReportingTests(unittest.TestCase):
                     "period_continuity": [{
                         "accession_number": "private-accession-123",
                         "period_end": "2023-12-31",
+                        "fiscal_period": "FY",
                         "status": "no_facts",
                         "issues": ("core_missing",),
                     }],
@@ -420,6 +421,31 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Some annual data failed validation", rendered)
             self.assertNotIn("private-accession-123", rendered)
             self.assertNotIn("core_missing", rendered)
+
+    def test_quarterly_continuity_does_not_render_as_an_annual_failure(self) -> None:
+        artifacts = [{
+            "artifact_type": "deterministic-financial-summary",
+            "title": "Financial",
+            "agent_id": "calculation-engine",
+            "model_id": "deterministic",
+            "content": {
+                "metrics": [{"year": 2025, "period": "FY", "revenue": 10.0}],
+                "currency": "CNY",
+                "financial_quality": {
+                    "rejected_periods": [],
+                    "period_continuity": [{
+                        "period_end": "2025-03-31", "fiscal_period": "Q1",
+                        "status": "no_facts", "issues": ("quarterly_data_missing",),
+                    }],
+                },
+                "evidence": [],
+            },
+        }]
+        markdown = render_research_run("run-quarterly-gap", artifacts, "zh-CN", company_name="Example")
+        html = render_research_html("run-quarterly-gap", artifacts, "zh-CN", company_name="Example")
+        for rendered in (markdown, html):
+            self.assertNotIn("部分年度数据校验未通过", rendered)
+            self.assertNotIn("年度数据连续性", rendered)
 
     def test_renders_deterministic_and_structured_sections(self) -> None:
         artifacts = [

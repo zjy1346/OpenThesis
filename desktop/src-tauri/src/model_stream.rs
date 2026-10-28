@@ -343,7 +343,7 @@ impl ProviderStreamDecoder {
     fn reasoning_field_enabled(&self, field: &str) -> bool {
         match &self.reasoning_fields {
             Some(fields) => fields.contains(&field),
-            None => matches!(field, "reasoning_content" | "thinking"),
+            None => matches!(field, "reasoning_content" | "thinking" | "reasoning" | "reasoning_details"),
         }
     }
 
@@ -488,6 +488,22 @@ fn merge_non_null(target: &mut Value, incoming: &Value) {
 mod tests {
     use super::{ProviderStreamDecoder, StreamFormat};
     use serde_json::json;
+
+    #[test]
+    fn universal_chat_reasoning_fields_are_observed_without_usage_brand_321() {
+        for (field, value) in [("reasoning_content", json!("not persisted")),
+            ("reasoning", json!("not persisted")), ("thinking", json!("not persisted")),
+            ("reasoning_details", json!([{"text":"not persisted"}]))] {
+            let mut decoder = ProviderStreamDecoder::new(StreamFormat::Sse);
+            let mut delta=json!({}); delta[field]=value;
+            let frame = format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":delta}]}));
+            let activities = decoder.push(frame.as_bytes()).unwrap();
+            assert!(activities.iter().any(|activity| activity.kind == "reasoning"), "missing {field}");
+            decoder.push(b"data: [DONE]\n\n").unwrap();
+            let output = decoder.finish().unwrap().to_string();
+            assert!(!output.contains("not persisted"));
+        }
+    }
 
     #[test]
     fn completion_requires_protocol_terminal_not_finish_reason() {

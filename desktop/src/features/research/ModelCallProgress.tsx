@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { exportResearchDiagnostics, getResearchDiagnostics } from "../../backend";
 import type { ModelCallHistoryPage, ModelCallStatus } from "../../types";
 import { agentDisplayName, formatElapsedTime } from "./researchProgress";
 
@@ -7,7 +8,10 @@ const COPY = {
     title: "Research activity", unknown: "Unknown", details: "Usage and call history", attempts: "calls",
     attempt: "Call", history: "Earlier calls", input: "Input", output: "Output",
     verification: "Verification", repair: "Repair", retry: "Retry", cacheRate: "Whole-research provider cache hit rate", uncached: "Uncached input", totalUsage: "All physical calls, including verification and repair", cost: "Actual cost",
-    localReuse: "Local result reuse (no provider call)", judgments: "Saved source judgments (not financial facts)", plannedCalls: "Planned automatic call ceiling", plannedInput: "Planning input-token ceiling (estimate)", plannedOutput: "Reserved output-token ceiling",
+    localReuse: "Local result reuse (no provider call)", judgments: "Saved source judgments (not financial facts)", plannedCalls: "Initial calls estimate", plannedInput: "Initial input-token estimate", plannedOutput: "Initial output-token estimate", currentCallsForecast: "Current calls forecast", currentInputForecast: "Current input-token forecast", currentOutputForecast: "Current output-token forecast", initialDuration: "Initial estimated duration", currentDuration: "Current estimated duration", estimatedDurationNote: "Planning estimate only; not a countdown, hard time cap, or SLA.", remainingCalls: "Remaining automatic calls", remainingInput: "Remaining input estimate", remainingOutput: "Remaining output budget",
+    noUserCap: "No user-set cap", forecastExceededTitle: "The work forecast was exceeded; necessary research continues.",
+    forecastExceededReason: "Exceeded estimate metrics:", forecastExceededNonFailure: "This is an estimate signal, not a failure or automatic stop.",
+    forecastMetrics: { max_calls: "Call count", max_input_estimate: "Input tokens", max_output_tokens: "Output tokens", expected_seconds: "Elapsed time" },
     purpose: "Purpose", generation: "Generation", semanticVerification: "Semantic verification", claimRepair: "Claim repair", formatRepair: "Format repair",
     inputBytes: "Input bytes", estimatedInputTokens: "Estimated input tokens", estimationMethod: "Estimation method", tokenizer: "Tokenizer", contextHint: "Context window hint",
     reasoningTokens: "Reasoning tokens", answerTokens: "Answer/body tokens", providerTokenizer: "Provider tokenizer", utf8Estimate: "UTF-8 bytes ÷ 3",
@@ -20,7 +24,8 @@ const COPY = {
     loadMore: "Load more calls", loadingHistory: "Loading call history…", retryHistory: "Retry loading this page", noHistory: "No call details are available.",
     partial: "Processed; verification incomplete", needsAction: "Action required", reused: "Reused result",
     completed: "Completed", failed: "Failed", cancelled: "Cancelled", waiting: "Waiting",
-    states: { queued: "Queued", connecting: "Connecting", waiting_response: "Waiting for response", running: "Running", reasoning: "Reasoning activity received",
+    timeWarning: "15-minute quality-first reminder: review research progress. This is a reminder only; active work continues unless you set a limit.",
+    states: { queued: "Queued", connecting: "Connecting", connected: "Connected; waiting for response", waiting_response: "Waiting for response", running: "Running", reasoning: "Reasoning activity received", heartbeat: "Connection remains active",
       content: "Receiving answer", verifying: "Processing received answer", saved: "Answer saved", cancelled: "Local wait cancelled",
       rate_limited: "Rate limited", rejected: "Rejected by provider", remote_unknown: "Remote outcome unknown", local_failure: "Local processing needs attention" } as Record<string, string>,
     boundary: "Stopping local waiting does not guarantee that remote processing or billing has stopped. No automatic resend.",
@@ -29,7 +34,10 @@ const COPY = {
     title: "研究活動", unknown: "未知", details: "用量與呼叫紀錄", attempts: "次呼叫",
     attempt: "呼叫", history: "先前呼叫", input: "輸入", output: "輸出",
     verification: "核驗", repair: "修復", retry: "重試", cacheRate: "全研究供應商快取命中率", uncached: "未命中輸入", totalUsage: "包含核驗及修復的全部實際呼叫", cost: "實際費用",
-    localReuse: "本地結果重用（不呼叫供應商）", judgments: "已存來源核驗（不是財務事實）", plannedCalls: "計畫自動呼叫上限", plannedInput: "規劃輸入Token上限（估算）", plannedOutput: "預留輸出Token上限",
+    localReuse: "本地結果重用（不呼叫供應商）", judgments: "已存來源核驗（不是財務事實）", plannedCalls: "初始呼叫次數估算", plannedInput: "初始輸入Token估算", plannedOutput: "初始輸出Token估算", currentCallsForecast: "目前呼叫次數預估", currentInputForecast: "目前輸入Token預估", currentOutputForecast: "目前輸出Token預估", initialDuration: "初始預估耗時", currentDuration: "目前預估耗時", estimatedDurationNote: "僅為規劃耗時估算，並非倒數計時、硬性時間上限或服務等級承諾。", remainingCalls: "剩餘自動呼叫次數", remainingInput: "剩餘輸入估算", remainingOutput: "剩餘輸出預算",
+    noUserCap: "未設定使用者上限", forecastExceededTitle: "工作量預估已超出；必要研究會繼續。",
+    forecastExceededReason: "超出預估的指標：", forecastExceededNonFailure: "這是預估提示，不代表失敗，也不會自動停止。",
+    forecastMetrics: { max_calls: "呼叫次數", max_input_estimate: "輸入 tokens", max_output_tokens: "輸出 tokens", expected_seconds: "經過時間" },
     purpose: "用途", generation: "生成", semanticVerification: "語意核驗", claimRepair: "主張修復", formatRepair: "格式修復",
     inputBytes: "輸入位元組", estimatedInputTokens: "估算輸入 tokens", estimationMethod: "估算方式", tokenizer: "Tokenizer", contextHint: "上下文 tokens 提示",
     reasoningTokens: "推理 tokens", answerTokens: "正文 tokens", providerTokenizer: "供應商 tokenizer", utf8Estimate: "UTF-8 位元組 ÷ 3",
@@ -42,7 +50,8 @@ const COPY = {
     loadMore: "載入更多呼叫", loadingHistory: "正在載入呼叫紀錄…", retryHistory: "重試載入此頁", noHistory: "沒有可用的呼叫詳情。",
     partial: "已處理，核驗尚未完整", needsAction: "需要處理", reused: "已重用結果",
     completed: "已完成", failed: "失敗", cancelled: "已取消", waiting: "等待中",
-    states: { queued: "排隊中", connecting: "連線中", waiting_response: "等待遠端回應", running: "執行中", reasoning: "收到推理活動",
+    timeWarning: "15分鐘品質優先提示：請先檢視研究進度。這只是提醒；除非你設定上限，進行中的工作會繼續。",
+    states: { queued: "排隊中", connecting: "連線中", connected: "已連線，等待回應", waiting_response: "等待遠端回應", running: "執行中", reasoning: "收到推理活動", heartbeat: "連線保持中",
       content: "接收正文中", verifying: "正在整理已接收正文", saved: "正文已儲存", cancelled: "已停止本地等待",
       rate_limited: "供應商限流", rejected: "供應商拒絕請求", remote_unknown: "遠端結果未知", local_failure: "本地處理待恢復" } as Record<string, string>,
     boundary: "停止本地等待不保證遠端計算或計費已停止；系統不會自動重送。",
@@ -51,7 +60,10 @@ const COPY = {
     title: "研究活动", unknown: "未知", details: "用量与调用记录", attempts: "次调用",
     attempt: "调用", history: "先前调用", input: "输入", output: "输出",
     verification: "核验", repair: "修复", retry: "重试", cacheRate: "全研究供应商缓存命中率", uncached: "未命中输入", totalUsage: "包含核验及修复的全部实际调用", cost: "实际费用",
-    localReuse: "本地结果复用（不调用供应商）", judgments: "已存来源核验（不是财务事实）", plannedCalls: "计划自动调用上限", plannedInput: "规划输入Token上限（估算）", plannedOutput: "预留输出Token上限",
+    localReuse: "本地结果复用（不调用供应商）", judgments: "已存来源核验（不是财务事实）", plannedCalls: "初始调用次数估算", plannedInput: "初始输入Token估算", plannedOutput: "初始输出Token估算", currentCallsForecast: "当前调用次数预估", currentInputForecast: "当前输入Token预估", currentOutputForecast: "当前输出Token预估", initialDuration: "初始预计耗时", currentDuration: "当前预计耗时", estimatedDurationNote: "仅为规划耗时估算，并非倒计时、硬性时间上限或服务等级承诺。", remainingCalls: "剩余自动调用次数", remainingInput: "剩余输入估算", remainingOutput: "剩余输出预算",
+    noUserCap: "未设置用户上限", forecastExceededTitle: "工作量预估已超出；必要研究会继续。",
+    forecastExceededReason: "超出预估的指标：", forecastExceededNonFailure: "这是预估提示，不代表失败，也不会自动停止。",
+    forecastMetrics: { max_calls: "调用次数", max_input_estimate: "输入 tokens", max_output_tokens: "输出 tokens", expected_seconds: "已耗时间" },
     purpose: "用途", generation: "生成", semanticVerification: "语义核验", claimRepair: "主张修复", formatRepair: "格式修复",
     inputBytes: "输入字节", estimatedInputTokens: "估算输入 tokens", estimationMethod: "估算方式", tokenizer: "Tokenizer", contextHint: "上下文 tokens 提示",
     reasoningTokens: "推理 tokens", answerTokens: "正文 tokens", providerTokenizer: "供应商 tokenizer", utf8Estimate: "UTF-8 字节 ÷ 3",
@@ -64,14 +76,15 @@ const COPY = {
     loadMore: "加载更多调用", loadingHistory: "正在加载调用记录…", retryHistory: "重试加载此页", noHistory: "没有可用的调用详情。",
     partial: "已处理，核验尚未完整", needsAction: "需要处理", reused: "已复用结果",
     completed: "已完成", failed: "失败", cancelled: "已取消", waiting: "等待中",
-    states: { queued: "排队中", connecting: "连接中", waiting_response: "等待远端响应", running: "运行中", reasoning: "收到推理活动",
+    timeWarning: "15分钟质量优先提示：请先检查研究进展。这只是提醒；除非你设置上限，进行中的工作会继续。",
+    states: { queued: "排队中", connecting: "连接中", connected: "已连接，等待响应", waiting_response: "等待远端响应", running: "运行中", reasoning: "收到推理活动", heartbeat: "连接保持中",
       content: "接收正文中", verifying: "正在整理已接收正文", saved: "正文已保存", cancelled: "已停止本地等待",
       rate_limited: "供应商限流", rejected: "供应商拒绝请求", remote_unknown: "远端结果未知", local_failure: "本地处理待恢复" } as Record<string, string>,
     boundary: "停止本地等待不保证远端计算或计费已停止；系统不会自动重发。",
   },
 };
 
-const ACTIVE = new Set(["queued", "connecting", "waiting_response", "running", "reasoning", "content"]);
+const ACTIVE = new Set(["queued", "connecting", "connected", "waiting_response", "running", "reasoning", "heartbeat", "content"]);
 const COMPLETED_AGENT_STATES = new Set(["completed", "completed_verified", "completed_partial", "reused_verified"]);
 const USAGE_KEYS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens"] as const;
 
@@ -296,29 +309,68 @@ export function ModelCallProgress({ calls, agentStates = {}, language, cancellin
   const input = totalKnown("input_tokens");
   const read = totalKnown("cache_read_input_tokens");
   const validCache = input !== null && read !== null && input > 0 && read <= input;
-  const rate = validCache ? new Intl.NumberFormat(language === "en" ? "en-US" : "zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(read / input) : copy.unknown;
+  const upstreamUnverified = physicalCalls.some(call=>call.usage_source === "endpoint_reported_upstream_unverified" || call.provider_id === "custom");
+  const sourceLabel = language === "en" ? "Endpoint-reported usage; upstream calls and cache not independently verified" : language === "zh-Hant" ? "介面回報用量；上游呼叫與快取未經獨立核實" : "接口报告用量；上游调用与缓存未经独立核实";
+  const rate = validCache && !upstreamUnverified ? new Intl.NumberFormat(language === "en" ? "en-US" : "zh-CN", { style: "percent", maximumFractionDigits: 2 }).format(read / input) : copy.unknown;
   const plan = calls.find((call) => call.call_plan)?.call_plan;
   const reuses = calls.find((call) => call.reuse_summary)?.reuse_summary;
+  const requestCount = new Set(physicalCalls.map((call) => call.request_id)).size;
+  const remaining = (supplied: number | null | undefined, ceiling: number | null | undefined, used: number | null) =>
+    supplied !== undefined ? supplied : ceiling !== null && ceiling !== undefined && used !== null ? Math.max(0, ceiling - used) : null;
+  const remainingCalls = remaining(plan?.remaining_calls, plan?.max_calls, physicalCalls.length ? requestCount : 0);
+  const remainingInput = remaining(plan?.remaining_input_tokens, plan?.max_input_estimate, physicalCalls.length ? input : 0);
+  const remainingOutput = remaining(plan?.remaining_output_tokens, plan?.max_output_tokens, physicalCalls.length ? totalKnown("output_tokens") : 0);
+  const timeWarning = Boolean(plan && "time_warning" in plan && plan.time_warning === true);
+  const forecastExceededMetrics = (plan?.forecast_exceeded ?? []).map((metric) =>
+    copy.forecastMetrics[metric as keyof typeof copy.forecastMetrics]).filter((metric): metric is string => Boolean(metric));
+  const initialForecast = plan?.initial_forecast;
+  const currentForecast = plan?.forecast ?? initialForecast;
+  const currentDurationEstimate = plan?.forecast === undefined
+    ? initialForecast?.expected_seconds : plan.forecast?.expected_seconds;
+  const remainingDisplay = (value: number | null, supplied: number | null | undefined, hardLimit: number | null | undefined) =>
+    supplied === null || supplied === undefined && hardLimit === null
+    ? copy.noUserCap : usageValue(value, language, copy.unknown);
   return <div className="model-call-progress" role="region" aria-label={copy.title}>
     <div className="agent-progress-heading"><span>{copy.title}</span>{total > 0 && <span>{completed}/{total}</span>}</div>
-    {physicalCalls.length > 0 && <details className="model-call-details model-call-run-usage">
+    {(timeWarning || forecastExceededMetrics.length > 0) && <div className="model-call-time-warning" role="status">
+      {timeWarning && <p className="model-call-warning">{copy.timeWarning}</p>}
+      {forecastExceededMetrics.length > 0 && <div className="model-call-warning">
+        <strong>{copy.forecastExceededTitle}</strong>
+        <p>{copy.forecastExceededReason}</p>
+        <ul>{forecastExceededMetrics.map((metric) => <li key={metric}>{metric}</li>)}</ul>
+        <p>{copy.forecastExceededNonFailure}</p>
+      </div>}
+    </div>}
+    {(physicalCalls.length > 0 || plan || reuses) && <details className="model-call-details model-call-run-usage">
       <summary>{copy.totalUsage}</summary>
+      {upstreamUnverified && <p className="field-caption">{sourceLabel}</p>}
       <dl>
-        <div><dt>{copy.input}</dt><dd>{usageValue(input, language, copy.unknown)}</dd></div>
-        <div><dt>{copy.uncached}</dt><dd>{usageValue(validCache ? input - read : null, language, copy.unknown)}</dd></div>
-        <div><dt>{copy.output}</dt><dd>{usageValue(totalKnown("output_tokens"), language, copy.unknown)}</dd></div>
-        <div><dt>{copy.cacheRate}</dt><dd>{rate}</dd></div>
-        <div><dt>{copy.cost}</dt><dd>{copy.unknown}</dd></div>
+        {physicalCalls.length > 0 && <>
+          <div><dt>{copy.input}</dt><dd>{usageValue(input, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.uncached}</dt><dd>{usageValue(validCache ? input - read : null, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.output}</dt><dd>{usageValue(totalKnown("output_tokens"), language, copy.unknown)}</dd></div>
+          <div><dt>{copy.cacheRate}</dt><dd>{rate}</dd></div>
+          <div><dt>{copy.cost}</dt><dd>{copy.unknown}</dd></div>
+        </>}
         {reuses && <>
           <div><dt>{copy.localReuse}</dt><dd>{usageValue(reuses.local_result_reuses, language, copy.unknown)}</dd></div>
           <div><dt>{copy.judgments}</dt><dd>{usageValue(reuses.saved_judgments, language, copy.unknown)}</dd></div>
         </>}
         {plan && <>
-          <div><dt>{copy.plannedCalls}</dt><dd>{usageValue(plan.max_calls, language, copy.unknown)}</dd></div>
-          <div><dt>{copy.plannedInput}</dt><dd>{usageValue(plan.max_input_estimate, language, copy.unknown)}</dd></div>
-          <div><dt>{copy.plannedOutput}</dt><dd>{usageValue(plan.max_output_tokens, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.remainingCalls}</dt><dd>{remainingDisplay(remainingCalls, plan.remaining_calls, plan.max_calls)}</dd></div>
+          <div><dt>{copy.remainingInput}</dt><dd>{remainingDisplay(remainingInput, plan.remaining_input_tokens, plan.max_input_estimate)}</dd></div>
+          <div><dt>{copy.remainingOutput}</dt><dd>{remainingDisplay(remainingOutput, plan.remaining_output_tokens, plan.max_output_tokens)}</dd></div>
+          <div><dt>{copy.plannedCalls}</dt><dd>{usageValue(initialForecast?.max_calls, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.plannedInput}</dt><dd>{usageValue(initialForecast?.max_input_estimate, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.plannedOutput}</dt><dd>{usageValue(initialForecast?.max_output_tokens, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.currentCallsForecast}</dt><dd>{usageValue(currentForecast?.max_calls, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.currentInputForecast}</dt><dd>{usageValue(currentForecast?.max_input_estimate, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.currentOutputForecast}</dt><dd>{usageValue(currentForecast?.max_output_tokens, language, copy.unknown)}</dd></div>
+          <div><dt>{copy.initialDuration}</dt><dd>{elapsedValue(initialForecast?.expected_seconds, copy.unknown)}</dd></div>
+          <div><dt>{copy.currentDuration}</dt><dd>{elapsedValue(currentDurationEstimate, copy.unknown)}</dd></div>
         </>}
       </dl>
+      {plan && <p className="field-caption">{copy.estimatedDurationNote}</p>}
     </details>}
     <div className="model-call-stage-list">
       {rows.map((stage) => {
@@ -397,5 +449,34 @@ export function ModelCallProgress({ calls, agentStates = {}, language, cancellin
       })}
     </div>
     {calls.length > 0 && <small className="model-call-boundary">{copy.boundary}</small>}
+  </div>;
+}
+
+const RESEARCH_DIAGNOSTICS_COPY = {
+  en: { label: "Export research diagnostics (cost and time)", exporting: "Exporting diagnostics…", exported: "Diagnostics exported.", failed: "Diagnostics export failed." },
+  "zh-Hant": { label: "匯出研究診斷（成本與時間）", exporting: "正在匯出研究診斷…", exported: "研究診斷已匯出。", failed: "研究診斷匯出失敗。" },
+  "zh-CN": { label: "导出研究诊断（成本与时间）", exporting: "正在导出研究诊断…", exported: "研究诊断已导出。", failed: "研究诊断导出失败。" },
+};
+
+export function ResearchDiagnosticsAction({ runId, language }: { runId: string; language: string }) {
+  const copy = RESEARCH_DIAGNOSTICS_COPY[language === "en" ? "en" : language === "zh-Hant" ? "zh-Hant" : "zh-CN"];
+  const [state, setState] = useState<"idle" | "exporting" | "exported" | "failed">("idle");
+  if (!runId) return null;
+  const exportRunDiagnostics = async () => {
+    if (state === "exporting") return;
+    setState("exporting");
+    try {
+      const diagnostics = await getResearchDiagnostics(runId);
+      const saved = await exportResearchDiagnostics(diagnostics);
+      setState(saved ? "exported" : "idle");
+    } catch {
+      setState("failed");
+    }
+  };
+  return <div className="research-diagnostics-action">
+    <button type="button" disabled={state === "exporting"} onClick={() => void exportRunDiagnostics()}>
+      {state === "exporting" ? copy.exporting : copy.label}
+    </button>
+    {state !== "idle" && state !== "exporting" && <span role="status">{state === "exported" ? copy.exported : copy.failed}</span>}
   </div>;
 }

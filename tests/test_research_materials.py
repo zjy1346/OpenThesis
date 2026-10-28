@@ -8,9 +8,65 @@ from openthesis.domain import FilingDocument
 from openthesis.filing_parser import extract_topic_evidence
 from openthesis.research import _agent_prompt_bundle
 from openthesis.research import ResearchWorkflow, verify_agent_output
+from openthesis.research_execution.reference_aliases import decode_references, reference_aliases
+from openthesis.research_execution.source_compiler import expand_record_tables
 from openthesis.packs import builtin_pack
 from openthesis.providers import ModelConfig
 from openthesis.storage import Storage
+
+
+def _reading_material_adequacy(payload):
+    reference = payload["research_context"]["material_adequacy"]["request_path_ref"]
+    value = payload
+    for component in reference:
+        value = value[component]
+    return value
+
+
+def _expand_and_decode_request(payload, original_context_json):
+    expanded = expand_record_tables(payload)
+
+    def resolve(node, path_stack=()):
+        if isinstance(node, dict):
+            if set(node) == {"request_path_ref"}:
+                path = node["request_path_ref"]
+                assert isinstance(path, list)
+                identity = tuple(path)
+                assert identity not in path_stack, f"request_path_ref cycle at {path!r}"
+                target = expanded
+                for component in path:
+                    target = target[component]
+                return resolve(target, (*path_stack, identity))
+            return {key: resolve(child, path_stack) for key, child in node.items()}
+        if isinstance(node, list):
+            return [resolve(child, path_stack) for child in node]
+        return node
+
+    resolved = resolve(expanded)
+    return decode_references(resolved, reference_aliases(original_context_json))
+
+
+def _expand_and_decode_request(payload, original_context_json):
+    expanded = expand_record_tables(payload)
+
+    def resolve(node, path_stack=()):
+        if isinstance(node, dict):
+            if set(node) == {"request_path_ref"}:
+                path = node["request_path_ref"]
+                assert isinstance(path, list)
+                identity = tuple(path)
+                assert identity not in path_stack, f"request_path_ref cycle at {path!r}"
+                target = expanded
+                for component in path:
+                    target = target[component]
+                return resolve(target, (*path_stack, identity))
+            return {key: resolve(child, path_stack) for key, child in node.items()}
+        if isinstance(node, list):
+            return [resolve(child, path_stack) for child in node]
+        return node
+
+    resolved = resolve(expanded)
+    return decode_references(resolved, reference_aliases(original_context_json))
 
 
 def test_chinese_official_body_reaches_topic_evidence():
@@ -28,12 +84,15 @@ def test_actual_prompt_partitions_body_after_35_financial_facts():
     body = {'evidence_id': 'filing:business', 'title': 'ANNUAL_REPORT · business',
             'excerpt': 'We manufacture storage equipment and depend on concentrated customers.',
             'source_url': 'https://example.test/annual', 'document_id': 'doc'}
+    original_context_json = json.dumps({'evidence': facts + [body]})
     _, prompt = _agent_prompt_bundle('business-analyst', 'Analyze business', 'en',
-                                     json.dumps({'evidence': facts + [body]}), {})
-    context = json.loads(prompt)['research_context']
+                                     original_context_json, {})
+    payload = _expand_and_decode_request(json.loads(prompt), original_context_json)
+    context = payload['research_context']
     assert context['evidence_partitions']['business_disclosures'][0] == body
-    assert len(context['evidence_partitions']['quantitative_facts']) == 35
-    assert context['material_adequacy']['status'] == 'ready'
+    quantitative = expand_record_tables(context['evidence_partitions']['quantitative_facts'])
+    assert len(quantitative) == 35
+    assert payload['reading_assignment']['material_adequacy']['status'] == 'ready'
 
 
 def test_numeric_cell_text_does_not_satisfy_qualitative_gate():
@@ -41,14 +100,16 @@ def test_numeric_cell_text_does_not_satisfy_qualitative_gate():
                  'excerpt': 'Revenue 2025 100 2024 90', 'locator': 'page:100'}]
     _, prompt = _agent_prompt_bundle('business-analyst', 'Analyze business', 'en',
                                      json.dumps({'evidence': evidence}), {})
-    gate = json.loads(prompt)['research_context']['material_adequacy']
+    gate = _reading_material_adequacy(json.loads(prompt))
     assert gate['status'] == 'insufficient'
     assert gate['missing'] == ['business_disclosures']
 
 
 def test_missing_body_blocks_provider_memory_and_persists_explicit_unknown():
     with TemporaryDirectory() as directory:
-        provider = Mock()
+        # A real provider lacking optional budget hooks, not Mock's fabricated
+        # callable output_allowance/for_output_budget returning more Mocks.
+        provider = Mock(spec=['generate'])
         workflow = ResearchWorkflow(Storage(Path(directory)), builtin_pack(), provider, ModelConfig(), report_language='en')
         result = workflow._run_agent('business-analyst', 'prompts/business-analyst.md',
                                      json.dumps({'evidence': [{'evidence_id': 'fact:1', 'kind': 'financial_fact'}]}), {})

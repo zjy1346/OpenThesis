@@ -23,6 +23,8 @@ from typing import Any, Mapping
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from .financial_taxonomy import cost_row_alias_conflicts, cost_row_concept, cost_row_is_non_amount
+
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -261,13 +263,27 @@ def _freeze_rules(rules: Mapping[str, Any]) -> Mapping[str, Mapping[str, tuple[s
         for canonical, aliases in rule_value.items():
             key = _string(canonical, f"rules.{rule_name} key")
             if isinstance(aliases, str):
-                mapped[key] = _string(aliases, f"rules.{rule_name}.{key}")
+                values = (_string(aliases, f"rules.{rule_name}.{key}"),)
             elif isinstance(aliases, list):
-                mapped[key] = _string_list(aliases, f"rules.{rule_name}.{key}")
+                values = _string_list(aliases, f"rules.{rule_name}.{key}")
             else:
                 raise CompatibilityPackError(
                     f"rules.{rule_name}.{key} must be a string or string array"
                 )
+            if rule_name == "taxonomy_aliases":
+                target_concept = key.casefold()
+                if target_concept not in {"cost_of_revenue", "total_operating_cost"}:
+                    target_concept = cost_row_concept(key) or target_concept
+                if any(
+                    cost_row_alias_conflicts(alias, target_concept)
+                    or (target_concept in {"cost_of_revenue", "total_operating_cost"}
+                        and cost_row_is_non_amount(alias))
+                    for alias in values
+                ):
+                    raise CompatibilityPackError(
+                        f"rules.{rule_name}.{key} conflicts with a fixed accounting concept"
+                    )
+            mapped[key] = values[0] if isinstance(aliases, str) else values
         frozen[rule_name] = MappingProxyType(mapped)
     return MappingProxyType(frozen)
 

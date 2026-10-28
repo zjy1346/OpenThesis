@@ -26,6 +26,7 @@ import { ModelCenterView } from "./features/models/ModelCenterView";
 import { OtStudioView } from "./features/ot-studio/OtStudioView";
 import { ReportWorkspace } from "./features/report/ReportWorkspace";
 import { NewResearchView } from "./features/research/NewResearchView";
+import { ResearchDiagnosticsAction } from "./features/research/ModelCallProgress";
 import { BudgetGapApproval } from "./features/research/BudgetGapApproval";
 import { SettingsView } from "./features/settings/SettingsView";
 import { ThesisView } from "./features/thesis/ThesisView";
@@ -243,6 +244,7 @@ export default function App() {
             {copy.interruptedRecovery.replace("{count}", String(bootstrap.interrupted_runs))}
           </div>
         )}
+        {isActiveResearchJob(job) && job.run_id && !storageRecoveryRequired && <ResearchDiagnosticsAction runId={job.run_id} language={bootstrap?.preferences.ui_language ?? language} />}
         {isActiveResearchJob(job) && (
           <ResearchProgress
             job={job}
@@ -276,8 +278,10 @@ export default function App() {
         )}
         {isActiveResearchJob(job) && job.run_id && !storageRecoveryRequired && <BudgetGapApproval runId={job.run_id} callPlan={job.call_plan}
           language={bootstrap?.preferences.ui_language ?? language}
-          onApprove={(planDigest, gapIds) => approveBudgetGaps(job.run_id!, planDigest, gapIds)} />}
-        <section className="report-stage" aria-label={copy.report}>
+          onApprove={(planDigest, gapIds, adaptiveChoice) => adaptiveChoice
+            ? approveBudgetGaps(job.run_id!, planDigest, gapIds, adaptiveChoice)
+            : approveBudgetGaps(job.run_id!, planDigest, gapIds)} />}
+        <section className={`report-stage${activeView === "models" ? " model-center-stage" : ""}`} aria-label={copy.report}>
           {activeView === "settings" && bootstrap ? (
             <SettingsView language={language} preferences={bootstrap.preferences} copy={copy} onSave={savePreferences} />
           ) : activeView === "models" ? (

@@ -4,13 +4,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import {
   bootstrapBackend,
+  exportResearchDiagnostics,
   exportResearchReport,
   extendResearchBudget,
   installResearchPack,
+  getModelDirectory,
   listConfiguredModels,
+  listModelProviders,
+  listProviderConnections,
   openExternalUrl,
   searchCompanies,
   getResearchReport,
+  getResearchDiagnostics,
   getResearchStatus,
   startResearch,
   updatePreferences,
@@ -25,7 +30,10 @@ vi.mock("./backend", () => ({
   saveThesis: vi.fn(),
   updatePreferences: vi.fn(),
   exportResearchReport: vi.fn(),
+  getResearchDiagnostics: vi.fn(),
+  exportResearchDiagnostics: vi.fn(),
   installResearchPack: vi.fn(),
+  getModelDirectory: vi.fn(),
   listConfiguredModels: vi.fn(),
   listModelProviders: vi.fn(),
   listProviderConnections: vi.fn(),
@@ -41,6 +49,9 @@ vi.mock("./backend", () => ({
 describe("report-first workbench", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getModelDirectory).mockResolvedValue({ source: "https://models.dev/api.json", retrieved_at: "2026-10-22", license: "MIT", models: [] });
+    vi.mocked(listModelProviders).mockResolvedValue([]);
+    vi.mocked(listProviderConnections).mockResolvedValue([]);
     vi.mocked(listConfiguredModels).mockResolvedValue([
       {
         configured_model_id: "openai-primary",
@@ -107,6 +118,17 @@ describe("report-first workbench", () => {
     });
   });
 
+  it("offers research diagnostics for a running job as soon as a run id exists", async () => {
+    vi.mocked(startResearch).mockResolvedValue({
+      job_id: "job-diagnostics", state: "running", message: "Working", percent: 5, run_id: "run-diagnostics",
+      model_calls: [],
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    expect(await screen.findByRole("button", { name: "Export research diagnostics (cost and time)" })).toBeVisible();
+    expect(getResearchDiagnostics).not.toHaveBeenCalled();
+  });
+
   it("shows concrete current-run budget gaps without approving them automatically", async () => {
     vi.mocked(startResearch).mockResolvedValue({
       job_id: "job-budget", state: "running", message: "Working", percent: 35, run_id: "run-budget",
@@ -130,6 +152,15 @@ describe("report-first workbench", () => {
     expect(await screen.findByRole("heading", { name: "Research report" })).toBeVisible();
     expect(screen.getByText("No research reports yet")).toBeVisible();
     expect(screen.getByRole("button", { name: "Open navigation" })).toBeVisible();
+  });
+
+  it("gives Model Center its own report-stage scroll container", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: "Open navigation" });
+    fireEvent.click(screen.getAllByRole("button", { name: "Model Center" })[0]);
+
+    expect(await screen.findByRole("complementary", { name: "Connections" })).toBeVisible();
+    expect(screen.getByRole("region", { name: "Research report" })).toHaveClass("report-stage", "model-center-stage");
   });
 
   it("shows a local database recovery warning instead of research actions on startup corruption", async () => {
