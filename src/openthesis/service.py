@@ -14,7 +14,7 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +35,7 @@ from .application.reports import (
 )
 from .application.financial_refresh import FinancialArtifactRefresher
 from .application.financial_repair import FinancialRepairer, FinancialRetryResult
+from .application.research_tasks import ResearchTaskDispatcher, ResearchTaskYield
 from .application.financial_outcomes import unavailable_outcome, continuity_financial_outcome
 from .application.research_requests import (
     ResearchResumeRequest, ResearchExecutionProgress,
@@ -108,7 +109,7 @@ from .packs import (
     install_pack,
     list_installed_packs,
 )
-from .providers import ModelConfig, ProviderError, create_provider
+from .providers import ModelConfig, ProviderError, RustModelGatewayProvider, create_provider
 from .report_html import render_research_html
 from .research import ResearchCancelled
 from .research_continuity import ResearchContinuityCoordinator, StageOutcome
@@ -265,6 +266,13 @@ class _ResearchJob:
     operation_result: dict[str, Any] | None = None
     recovery_outcome: dict[str, Any] | None = None
     run: ResearchRun | None = field(default=None, repr=False)
+    request_snapshot: dict[str, Any] = field(default_factory=dict, repr=False)
+    queue_metadata: dict[str, Any] = field(default_factory=dict, repr=False)
+    elapsed_offset: float = 0.0
+    suspension: ResearchTaskYield | None = field(default=None, repr=False)
+    shutdown_requested: bool = False
+    _cancel_probe_at: float = field(default=0.0, repr=False)
+    blocked_reason: str = ""
 
     @staticmethod
     def _is_external_stage(stage: str) -> bool:
@@ -292,7 +300,7 @@ class _ResearchJob:
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
-        now = self.finished_at or time.perf_counter()
+        now = (self.finished_at or time.perf_counter()) if self.state != "queued" else self.started_at
         timings = dict(self.stage_timings)
         timings[self.stage] = timings.get(self.stage, 0.0) + max(
             0.0, now - self.stage_started_at
@@ -310,8 +318,13 @@ class _ResearchJob:
             and self.run is not None
             and self.run.status is RunStatus.COMPLETED
         )
+        executing = self.state in {"running", "cancelling"}
         return {
+            **self.queue_metadata,
             "job_id": self.job_id,
+            "generation": self.generation,
+            "operation_type": self.operation_type,
+            "blocked_reason": self.blocked_reason,
             "revision": self.revision,
             "state": self.state,
             "message": self.message,
@@ -325,7 +338,8 @@ class _ResearchJob:
                                     for state in self.agent_states.values()),
             "total_agents": len(self.agent_states),
             "cancel_requested": self.cancel_requested,
-            "elapsed_seconds": int(max(0, now - self.started_at)),
+            "elapsed_seconds": int(self.elapsed_offset + (max(0, now - self.started_at)
+                if executing or self.finished_at is not None else 0)),
             "stage_elapsed_seconds": round(max(0.0, now - self.stage_started_at), 3),
             "stage_timings": {
                 key: round(value, 3) for key, value in timings.items()
@@ -345,7 +359,7 @@ class _ResearchJob:
             "recovery_outcome": dict(self.recovery_outcome) if self.recovery_outcome else None,
             "attempt_complete": attempt_complete,
             "research_complete": research_complete,
-            "action_required": bool(attempt_complete and not research_complete),
+            "action_required": self.state in {"waiting_input", "interrupted"} or bool(attempt_complete and not research_complete),
         }
 
 
@@ -359,6 +373,7 @@ class AppService:
         app_version: str = __version__,
         sec_client_factory: Callable[[str, Path], Any] = SecClient,
         provider_factory: Callable[[ModelConfig], Any] = create_provider,
+        model_configuration_validator: Callable[[ModelConfig], None] | None = None,
         market_data: Any | None = None,
         market_snapshot_module: MarketSnapshotModule | None = None,
         market_quote_adapter_factory: Callable[[Storage], Any | None] | None = None,
@@ -374,6 +389,12 @@ class AppService:
         self.app_version = app_version
         self._sec_client_factory = sec_client_factory
         self._provider_factory = provider_factory
+        # Configuration lookup is a local credential-gateway operation, not
+        # construction of a provider or a connection test. Test/custom adapters
+        # can inject their own zero-wire validation without factory side effects.
+        self._model_configuration_validator = model_configuration_validator or (
+            (lambda config: RustModelGatewayProvider(config).validate_configuration())
+            if provider_factory is create_provider else (lambda _config: None))
         self._market_data = market_data or MarketDataModule()
         self._configure_official_network(self.storage.get_setting("official_network_policy", ""))
         self._company_search = OfficialCompanySearch(self.storage, decorate=self._company_search_result)
@@ -441,6 +462,22 @@ class AppService:
         self._jobs_lock = threading.Lock()
         self._recovery_planner = ResearchRecoveryPlanner()
         self._active_recoveries: dict[tuple[str, str], tuple[threading.Event, str]] = {}
+        self._task_local = threading.local()
+        self._task_dispatcher = ResearchTaskDispatcher(
+            self.storage, self._execute_queued_task, on_failure=self._queued_task_failure)
+        recovered = self._task_dispatcher.recover()
+        self.interrupted_run_count += len(recovered.get("interrupted_job_ids", ()))
+        for job_id in recovered.get("interrupted_job_ids", ()):
+            previous = self.storage.get_research_job(job_id)
+            if not previous or not previous.get("run_id"):
+                continue
+            stored_run = self.storage.get_run(previous["run_id"])
+            if stored_run and stored_run.get("status") == RunStatus.RUNNING.value:
+                self._continuity.preserve_interruption(previous["run_id"],
+                    stage=str(previous.get("stage") or "interrupted"), outcome=StageOutcome.NEEDS_ACTION,
+                    error_code="EXECUTION_INTERRUPTED", message="Execution interrupted; progress preserved")
+        # Recovery restores identities only. It must never wake paid execution
+        # merely because the application or WebView was opened again.
         if initialization_progress:
             initialization_progress("ready")
 
@@ -478,7 +515,7 @@ class AppService:
         revocation takes effect immediately.
         """
 
-        preferences = self.preferences()
+        preferences = self._task_preferences(job)
         structured_sources: tuple[Any, ...] = ()
         sec_mapping = SEC_HK_ISSUERS.get(company.ticker.upper())
         sec_email = str(preferences.get("sec_contact_email", "")).strip()
@@ -520,31 +557,19 @@ class AppService:
                     )
                     if key in summary
                 }
-                with self._jobs_lock:
-                    if job.cancel_event.is_set() or job.state not in {"queued", "running"}:
+                identity = self._task_request_hash(safe_summary)
+                grants = job.request_snapshot.get("_vision_grants", {})
+                if identity in grants:
+                    if not grants[identity] or job.cancel_event.is_set():
                         return False
-                    job.vision_approval_event.clear()
-                    job.vision_approval = None
-                    job.vision_approval_pending = True
-                    job.vision_upload_preview = safe_summary
-                self._update_job(job, active_only=True, stage="vision-approval",
-                    message=_ui_message(
-                        job.ui_language,
-                        "Review failed financial pages before upload",
-                        "上传前请审核本地识别失败的财务表页",
-                        "上傳前請審核本地辨識失敗的財務表頁",
-                    ))
-                while not job.vision_approval_event.wait(0.1):
-                    if job.cancel_event.is_set():
-                        with self._jobs_lock:
-                            job.vision_approval_pending = False
-                        return False
-                with self._jobs_lock:
-                    approved = bool(job.vision_approval)
-                    job.vision_approval_pending = False
-                    job.vision_upload_preview = None
-                if not approved or job.cancel_event.is_set():
-                    return False
+                    # Exact consent is necessary but never bypasses the
+                    # cumulative upload accounting below.
+                else:
+                    with self._jobs_lock:
+                        pause = ResearchTaskYield("VISION_CONSENT_REQUIRED", preview=safe_summary)
+                        job.suspension = job.suspension or pause
+                        job.cancel_event.set()
+                    raise job.suspension
             # Re-check after the dialog, then account concurrent page plans in
             # one run-local critical section. A stale dialog cannot restore
             # settings authorization or race past the cumulative page cap.
@@ -645,6 +670,11 @@ class AppService:
                 "research.cancel",
                 "research.cancel_model_call",
                 "research.vision_decision",
+                "research.jobs.list",
+                "research.jobs.resume",
+                "research.jobs.archive",
+                "research.queue.continue",
+                "research.queue.shutdown",
             ],
         }
 
@@ -1116,6 +1146,8 @@ class AppService:
         report_revision = {
             key: value for key, value in raw_revision.items() if key != "payload"
         } if isinstance(raw_revision, dict) else None
+        from .financial_metric_policy import project_metric_artifacts
+        artifacts = project_metric_artifacts(artifacts, company, run_id=run_id)
         snapshot = ReportReadSnapshot(
             run_id=run_id,
             company_name=str(run.get("name") or ""),
@@ -1371,6 +1403,11 @@ class AppService:
                 "attempts": int(case.get("attempts", 0) or 0),
                 "status": str(case.get("status", "open"))[:40],
                 "next_action": str(case.get("next_action", ""))[:160],
+                "diagnostics": {str(key): str(value)[:800]
+                    for key, value in case.get("diagnostics", {}).items()
+                    if key in {"period_end", "fiscal_period", "scope", "missing_core_fields", "unverified_fields",
+                        "failure_stage", "issues", "previous_strategy", "next_strategy", "target_location",
+                        "model_rerun", "original_hash"}},
                 "freshness": "stale" if status.get("snapshot_stale") else "current",
             })
         from .financial_sources.pdf_document_units import runtime_receipt_path
@@ -1410,6 +1447,11 @@ class AppService:
         }
 
     def refresh_financial_report(
+        self, run_id: str, *, language: str | None = None, client_request_id: str | None = None
+    ) -> dict[str, Any]:
+        return self._queue_operation(run_id, "report_refresh", {"language": language}, client_request_id=client_request_id)
+
+    def _refresh_financial_report_once(
         self, run_id: str, *, language: str | None = None
     ) -> dict[str, Any]:
         """Rebuild only deterministic report artifacts from stored facts.
@@ -1447,6 +1489,11 @@ class AppService:
         return report
 
     def retry_financials(
+        self, run_id: str, *, force: bool = False, client_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.start_financial_retry(run_id, force=force, confirmed=force, client_request_id=client_request_id)
+
+    def _retry_financials_once(
         self, run_id: str, *, force: bool = False,
         progress: Callable[[str, int, int], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
@@ -1493,7 +1540,8 @@ class AppService:
         return report
 
     def start_financial_retry(
-        self, run_id: str, *, force: bool = False, confirmed: bool = False
+        self, run_id: str, *, force: bool = False, confirmed: bool = False,
+        client_request_id: str | None = None,
     ) -> dict[str, Any]:
         """Start a non-model financial repair without occupying the RPC loop."""
 
@@ -1502,25 +1550,8 @@ class AppService:
             raise KeyError("research run not found")
         if force and confirmed is not True:
             raise ValueError("explicit confirmation is required")
-        if str(stored.get("status", "")) in {
-            RunStatus.CREATED.value, RunStatus.RUNNING.value,
-        }:
-            raise ValueError("an active research run cannot rebuild financial cache")
-        job = _ResearchJob(
-            job_id=uuid.uuid4().hex,
-            run_id=run_id,
-            stage="filing-discovery",
-        )
-        with self._jobs_lock:
-            self._jobs[job.job_id] = job
-        threading.Thread(
-            target=self._run_financial_retry_job,
-            args=(job, run_id, force),
-            name=f"openthesis-financial-{job.job_id[:8]}",
-            daemon=True,
-        ).start()
-        with self._jobs_lock:
-            return job.visible_snapshot()
+        return self._queue_operation(run_id, "financial_rebuild" if force else "financial_retry",
+                                     client_request_id=client_request_id)
 
     def _run_financial_retry_job(
         self, job: _ResearchJob, run_id: str, force: bool
@@ -1529,9 +1560,8 @@ class AppService:
         # hooks on Windows.  Resolve them after returning control to the RPC
         # loop so retry/cancel/status controls never wait on that I/O.
         try:
-            language = normalize_language(
-                self.preferences().get("ui_language", job.ui_language)
-            )
+            language = normalize_language(job.request_snapshot.get("_frozen", {}).get(
+                "preferences", {}).get("ui_language", job.ui_language))
         except Exception:
             language = job.ui_language
         job.ui_language = language
@@ -1577,9 +1607,9 @@ class AppService:
             )
 
         try:
-            report = self.retry_financials(
+            report = self._retry_financials_once(
                 run_id, force=force, progress=update,
-                cancel_check=job.cancel_event.is_set,
+                cancel_check=lambda: self._task_cancelled(job),
                 _vision_job=job,
             )
             retry = report.get("financial_retry", {})
@@ -1621,6 +1651,7 @@ class AppService:
                 ),
             )
         except ResearchCancelled:
+            self._raise_task_pause(job)
             self._update_job(
                 job, state="cancelled", stage="cancelled",
                 message=_ui_message(language, "Financial refresh cancelled", "财务数据刷新已取消", "財務資料刷新已取消"),
@@ -1646,7 +1677,7 @@ class AppService:
             )
 
     def rebuild_financials(
-        self, run_id: str, *, confirmed: bool = False
+        self, run_id: str, *, confirmed: bool = False, client_request_id: str | None = None
     ) -> dict[str, Any]:
         """Force a safe full refresh while preserving the last good cache.
 
@@ -1657,15 +1688,7 @@ class AppService:
 
         if confirmed is not True:
             raise ValueError("explicit confirmation is required")
-        stored = self.storage.get_run(run_id)
-        if stored is None:
-            raise KeyError("research run not found")
-        if str(stored.get("status", "")) in {
-            RunStatus.CREATED.value,
-            RunStatus.RUNNING.value,
-        }:
-            raise ValueError("an active research run cannot rebuild financial cache")
-        return self.retry_financials(run_id, force=True)
+        return self.start_financial_retry(run_id, force=True, confirmed=True, client_request_id=client_request_id)
 
     def _rebuild_financial_artifacts(
         self,
@@ -1886,17 +1909,13 @@ class AppService:
                 event.set()
 
     def retry_research_synthesis(
-        self, run_id: str, model: dict[str, Any] | None = None
+        self, run_id: str, model: dict[str, Any] | None = None, *, client_request_id: str | None = None
     ) -> dict[str, Any]:
-        return self._execute_recovery_plan(
-            run_id,
-            target="synthesis",
-            model=model,
-            operation=lambda _plan, _authorization: self._retry_research_synthesis_once(run_id, model),
-        )
+        return self._queue_operation(run_id, "model_recovery", {"target": "synthesis", "model": model}, client_request_id=client_request_id)
 
     def retry_research_model_stages(
-        self, run_id: str, model: dict[str, Any] | None = None, *, budget_only: bool = False
+        self, run_id: str, model: dict[str, Any] | None = None, *, budget_only: bool = False,
+        client_request_id: str | None = None,
     ) -> dict[str, Any]:
         if type(budget_only) is not bool:
             raise ValueError("RESEARCH_BUDGET_RESUME_INVALID")
@@ -1906,27 +1925,13 @@ class AppService:
                 plan = plan_status(db, run_id) or {}
                 if not (plan.get("policy_migrations") and plan.get("policy") == "adaptive") and not db.execute("SELECT 1 FROM model_budget_gaps WHERE run_id=? AND state='approved'", (run_id,)).fetchone():
                     raise ValueError("MODEL_BUDGET_APPROVAL_REQUIRED")
-            return self._retry_research_model_stages_once(run_id, model, budget_only=True)
-        return self._execute_recovery_plan(
-            run_id,
-            target="model-stages",
-            model=model,
-            operation=lambda plan, _authorization: self._retry_research_model_stages_once(
-                run_id, model, resume_target=plan.target
-            ),
-        )
+        return self._queue_operation(run_id, "model_recovery", {"target": "model-stages", "model": model,
+            "budget_only": budget_only}, client_request_id=client_request_id)
 
     def retry_research_growth(
-        self, run_id: str, model: dict[str, Any]
+        self, run_id: str, model: dict[str, Any], *, client_request_id: str | None = None
     ) -> dict[str, Any]:
-        return self._execute_recovery_plan(
-            run_id,
-            target="growth",
-            model=model,
-            operation=lambda plan, _authorization: self._retry_research_model_stages_once(
-                run_id, model, resume_target=plan.target
-            ),
-        )
+        return self._queue_operation(run_id, "model_recovery", {"target": "growth", "model": model}, client_request_id=client_request_id)
 
     def retry_research_stage(
         self,
@@ -1935,6 +1940,7 @@ class AppService:
         model: dict[str, Any] | None,
         plan_hash: str | None = None,
         confirm_new_attempt: bool = False,
+        client_request_id: str | None = None,
     ) -> dict[str, Any]:
         """Resume exactly one planner-selected stage chain with an explicit model."""
         if target not in {
@@ -1946,24 +1952,18 @@ class AppService:
             raise ValueError("MODEL_NEW_ATTEMPT_CONFIRMATION_INVALID")
         if confirm_new_attempt and not plan_hash:
             raise ValueError("MODEL_NEW_ATTEMPT_PLAN_REQUIRED")
-        operation = lambda plan, authorization: self._retry_research_model_stages_once(
-            run_id, model, resume_target=plan.target, manual_authorization_id=authorization
-        )
-        return self._execute_recovery_plan(
-            run_id,
-            target=target,
-            model=model,
-            plan_hash=plan_hash,
-            confirm_new_attempt=confirm_new_attempt,
-            operation=operation,
-        )
+        return self._queue_operation(run_id, "model_recovery", {"target": target, "model": model,
+            "plan_hash": plan_hash, "confirm_new_attempt": confirm_new_attempt}, client_request_id=client_request_id)
 
     def _retry_research_synthesis_once(
         self, run_id: str, model: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         return self._retry_research_model_stages_once(run_id, model, resume_target="synthesis")
 
-    def revalidate_saved_research(self, run_id: str) -> dict[str, Any]:
+    def revalidate_saved_research(self, run_id: str, *, client_request_id: str | None = None) -> dict[str, Any]:
+        return self._queue_operation(run_id, "revalidate_saved", client_request_id=client_request_id)
+
+    def _revalidate_saved_research_once(self, run_id: str) -> dict[str, Any]:
         """Explicit zero-provider action; does not clear unknown wire history."""
         if any(item.get("active") for item in self._recovery_wire_states(run_id)):
             raise ValueError("MODEL_REQUEST_IN_PROGRESS")
@@ -2040,16 +2040,20 @@ class AppService:
             research_configuration=dict(research_configuration),
             data_snapshot=dict(payload.get("data_snapshot", {})),
         )
+        task = self._jobs.get(getattr(self._task_local, "job_id", ""))
+        def resume_progress(message, percent):
+            if task is not None:
+                self._update_job(task, active_only=True, message=str(message), percent=percent)
         self._research_orchestrator.resume(ResearchResumeRequest(
             run=run, selected_pack=self._select_pack(run.research_pack_id), model=config,
             facts=tuple(fact.to_dict() for fact in retry_facts), artifacts=tuple(artifacts),
             filing_evidence=tuple(filing_evidence), target=resume_target,
-            ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
+            ui_language=normalize_language(task.ui_language if task else self.preferences().get("ui_language", "zh-CN")),
             parallel_agents=bool(research_configuration.get("parallel_agents", True)),
             manual_authorization_id=manual_authorization_id,
             local_only=local_only,
             budget_only=budget_only,
-        ))
+        ), cancel_check=(lambda: self._task_cancelled(task)) if task else None, progress=resume_progress if task else None)
         return self.get_report(run_id, language=run.report_language)
 
     def _retry_research_growth_once(
@@ -2094,12 +2098,6 @@ class AppService:
             raise ValueError("comparison requires an enabled primary model")
 
         company = DEMO_COMPANY if mode == "demo" else _company_from_request(request.get("company"))
-        if mode == "company":
-            try:
-                company = self._company_search.require_identity(company,
-                    lambda: self._fetch_official_companies(company.ticker, normalize_market(company.market)))
-            except OfficialNetworkError as error:
-                raise ServiceConfigurationError(error.code) from error
         selected_pack = self._select_pack(str(request.get("pack_id", "")))
         report_language = normalize_language(self.preferences().get("report_language", "zh-CN"))
         self.storage.save_company(company)
@@ -2111,7 +2109,7 @@ class AppService:
             research_pack_version=selected_pack.version,
             provider_id=primary_config.provider,
             model_id=primary_config.model,
-            data_as_of=utc_now_iso(),
+            data_as_of="",
             status=RunStatus.CREATED,
             report_language=report_language,
             model_configuration={
@@ -2128,48 +2126,411 @@ class AppService:
                 "run_envelope": envelope,
             },
         )
-        self._continuity.start(run)
-        # Start the one run clock before PDF/visual preparation. Compiling the
-        # later text plan preserves this clock and all early vision spending.
-        from .research_execution.call_budget import prepare_external_plan
-        with self.storage.connect() as db:
-            prepare_external_plan(db, run.run_id, envelope)
         job = _ResearchJob(
             job_id=uuid.uuid4().hex,
             ui_language=normalize_language(self.preferences().get("ui_language", "zh-CN")),
             run_id=run.run_id,
             run=run,
         )
-        with self._jobs_lock:
-            self._jobs[job.job_id] = job
-        request_payload = dict(request)
+        request_payload = {key: deepcopy(request[key]) for key in (
+            "mode", "company", "pack_id", "model", "comparison_models", "compare_enabled",
+            "parallel_agents", "valuation", "market_snapshot", "auto_market_snapshot",
+            "download_filings", "allow_partial_research", "annual_history_years", "evidence_policy", "run_envelope",
+        ) if key in request}
+        request_payload["_legacy_vision_requested"] = bool(
+            isinstance(request.get("vision_fallback"), dict) and request["vision_fallback"].get("enabled"))
+        request_hash = self._task_request_hash(request_payload)
         request_payload["company"] = company.to_dict()
         request_payload["_financial_recovery_session_id"] = run.run_id
-        self.storage.save_research_job(job.snapshot())
-        threading.Thread(
-            target=self._run_research,
-            args=(job, request_payload),
-            name=f"openthesis-research-{job.job_id[:8]}",
-            daemon=True,
-        ).start()
+        request_payload["pack_id"] = selected_pack.pack_id
+        request_payload["annual_history_years"] = _research_history_years(request, selected_pack)
+        request_payload["evidence_policy"] = {"annual_history_years": request_payload["annual_history_years"]}
+        request_payload["run_envelope"] = envelope
+        request_payload["_frozen"] = self._freeze_task_inputs(selected_pack=selected_pack)
+        job.queue_metadata = {"company": company.to_dict(), "model": primary_config.configured_model_id,
+                              "report_language": report_language}
+        result = self.storage.enqueue_research_job(job.snapshot(), request_payload,
+            client_request_id=self._task_client_id(request.get("client_request_id")),
+            request_hash=request_hash, run=run)
+        self._task_dispatcher.wake()
+        return result
+
+    @staticmethod
+    def _task_request_hash(payload: dict) -> str:
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _task_client_id(value) -> str:
+        if value is None:
+            return uuid.uuid4().hex  # Older callers retain their start contract.
+        if not isinstance(value, str) or not 8 <= len(value) <= 128 or not all(
+            char.isascii() and (char.isalnum() or char in "-_.:") for char in value):
+            raise ValueError("RESEARCH_REQUEST_ID_INVALID")
+        return value
+
+    def _freeze_task_inputs(self, *, selected_pack=None) -> dict:
+        preferences = self.preferences()
+        pack = selected_pack or self._select_pack("")
+        return {"schema_version": 1, "queued_at": utc_now_iso(),
+                "preferences": {key: preferences[key] for key in ("ui_language", "report_language", "parallel_agents")},
+                "vision_policy": _vision_policy_snapshot(preferences),
+                "vision_preferences": self._freeze_vision_preferences(preferences),
+                "pack_id": pack.pack_id, "pack_version": pack.version, "pack_content_hash": pack.content_hash}
+
+    def _freeze_vision_preferences(self, preferences=None) -> dict:
+        values = preferences if preferences is not None else self.preferences()
+        return {key: value for key, value in values.items() if key.startswith("vision_")}
+
+    def _task_preferences(self, job: _ResearchJob | None) -> dict:
+        current = self.preferences()
+        if job is None or not job.request_snapshot:
+            return current
+        frozen = job.request_snapshot.get("_frozen", {})
+        if frozen.get("vision_policy") != _vision_policy_snapshot(current):
+            raise ResearchTaskYield("TASK_VISION_POLICY_CHANGED")
+        return {**current, **frozen.get("preferences", {}), **frozen.get("vision_preferences", {})}
+
+    @staticmethod
+    def _raise_task_pause(job: _ResearchJob) -> None:
+        if job.suspension is not None:
+            raise job.suspension
+        if job.shutdown_requested:
+            raise ResearchTaskYield("APPLICATION_EXITED", interrupted=True)
+
+    def _queue_operation(self, run_id: str, operation: str, parameters: dict | None = None,
+                         *, client_request_id=None) -> dict:
+        stored = self.storage.get_run(run_id)
+        if stored is None:
+            raise KeyError("research run not found")
+        payload = _decode_payload(stored.get("payload_json"))
+        values = deepcopy(parameters or {})
+        if isinstance(values.get("model"), dict):
+            _model_config_from_request(values["model"])
+        pack_id = str(payload.get("research_pack_id") or "")
+        try:
+            selected_pack = self._select_pack(pack_id)
+            frozen = self._freeze_task_inputs(selected_pack=selected_pack)
+        except (ValueError, KeyError, FileNotFoundError):
+            # A removed historical pack still has a visible resumable task;
+            # never substitute the current default for its frozen identity.
+            frozen = self._freeze_task_inputs()
+            frozen.update(pack_id=pack_id, pack_version=str(payload.get("research_pack_version", "")),
+                pack_content_hash=(payload.get("research_configuration") or {}).get("research_pack_content_identity", ""))
+        snapshot = {"operation_type": operation, "run_id": run_id, "parameters": values,
+                    "_frozen": frozen}
+        frozen["uses_research_pack"] = operation in {"model_recovery", "revalidate_saved"}
+        # Resume defaults belong to the saved run, never the current UI model.
+        if not values.get("model") and payload.get("model_configuration"):
+            values["model"] = deepcopy(payload["model_configuration"])
+        request_hash = self._task_request_hash({"run_id": run_id, "operation_type": operation,
+                                               "parameters": parameters or {}})
+        job = _ResearchJob(uuid.uuid4().hex, operation_type=operation, run_id=run_id,
+                           ui_language=snapshot["_frozen"]["preferences"]["ui_language"])
+        job.queue_metadata = {"company": deepcopy(payload.get("company", {})),
+            "model": (str((values.get("model") or {}).get("configured_model_id", ""))
+                      if operation == "model_recovery" else ""),
+            "report_language": str(payload.get("report_language", "zh-CN"))}
+        result = self.storage.enqueue_research_job(job.snapshot(), snapshot,
+            client_request_id=self._task_client_id(client_request_id), request_hash=request_hash)
+        self._task_dispatcher.wake()
+        return result
+
+    def list_research_tasks(self, **options) -> dict:
+        return self.storage.list_research_jobs(**options)
+
+    def continue_research_queue(self) -> dict:
+        self._task_dispatcher.reopen_after_shutdown()
+        self.storage.set_research_queue_paused(False)
+        self._task_dispatcher.wake()
+        return self.list_research_tasks()
+
+    @staticmethod
+    def _restore_task_job(record: dict) -> _ResearchJob:
+        job = _ResearchJob(str(record["job_id"]), operation_type=str(record.get("operation_type", "research")))
+        for key in ("revision", "generation", "state", "message", "percent", "run_id", "stage",
+                    "stage_current", "stage_total", "agent_states", "cancel_requested", "ui_language",
+                    "error_code", "market", "disclosure_url", "stage_timings", "engine_active_seconds",
+                    "external_wait_seconds", "filing_states", "vision_upload_preview", "vision_approval",
+                    "vision_approval_pending", "operation_result", "recovery_outcome", "blocked_reason"):
+            if key in record:
+                setattr(job, key, deepcopy(record[key]))
+        job.elapsed_offset = max(0.0, float(record.get("elapsed_seconds", 0)))
+        job.queue_metadata = {key: deepcopy(record[key]) for key in (
+            "company", "model", "report_language", "created_at", "started_at", "finished_at",
+            "queue_sequence", "queue_position", "ahead_count", "snapshot_schema_version",
+        ) if key in record}
+        job.request_snapshot = deepcopy(record.get("request_snapshot") or {})
+        if job.state not in {"queued", "running", "cancelling"}:
+            job.finished_at = time.perf_counter()
+        return job
+
+    def _stored_task_run(self, run_id: str) -> ResearchRun:
+        record = self.storage.get_run(run_id)
+        if record is None:
+            raise KeyError("research run not found")
+        payload = _decode_payload(record["payload_json"])
+        values = {key: deepcopy(value) for key, value in payload.items()
+                  if key in {item.name for item in fields(ResearchRun)}}
+        values["company"] = Company(**payload["company"])
+        values["status"] = RunStatus(record["status"])
+        return ResearchRun(**values)
+
+    def _execute_queued_task(self, record: dict) -> None:
+        job = self._restore_task_job(record)
         with self._jobs_lock:
-            return job.visible_snapshot()
+            finished = [key for key, value in self._jobs.items()
+                        if value.state in {"completed", "failed", "cancelled", "waiting_input", "interrupted"}]
+            for key in finished[:-100]:
+                self._jobs.pop(key, None)
+            self._jobs[job.job_id] = job
+        self._task_local.job_id = job.job_id
+        try:
+            job.run = self._stored_task_run(job.run_id)
+            request = job.request_snapshot
+            frozen = request.get("_frozen", {})
+            if frozen.get("schema_version") != 1:
+                raise ResearchTaskYield("TASK_REQUEST_UNAVAILABLE")
+            job.ui_language = frozen.get("preferences", {}).get("ui_language", "zh-CN")
+            if frozen.get("uses_research_pack", job.operation_type in {"research", "model_recovery", "revalidate_saved"}):
+                try:
+                    selected_pack = self._select_pack(str(frozen.get("pack_id", "")))
+                except (ValueError, KeyError, FileNotFoundError) as error:
+                    raise ResearchTaskYield("TASK_PACK_UNAVAILABLE") from error
+                if (selected_pack.version, selected_pack.content_hash) != (
+                        frozen.get("pack_version"), frozen.get("pack_content_hash")):
+                    raise ResearchTaskYield("TASK_PACK_CHANGED")
+            # The same exact configuration reference goes to the credential
+            # gateway. Never replace it with the current UI/default model.
+            models = ([request.get("model", {})] + (list(request.get("comparison_models") or ()) if request.get("compare_enabled") else [])
+                      if job.operation_type == "research" else
+                      [request.get("parameters", {}).get("model", {})] if job.operation_type == "model_recovery" else [])
+            for reference in models:
+                config = _model_config_from_request(reference or {})
+                if config.enabled:
+                    self._model_configuration_validator(config)
+            if (job.operation_type in {"research", "model_recovery"} and request.get("_resume_existing")) and any(item.get("unknown") or item.get("active")
+                    for item in self._recovery_wire_states(job.run_id)):
+                raise ResearchTaskYield("MODEL_REMOTE_RESULT_UNKNOWN")
+            self._resume_task_clock(job)
+            if job.operation_type == "research":
+                if request.get("_resume_existing") and any(item.get("artifact_type") == "agent-analysis"
+                        for item in self.storage.get_artifacts(job.run_id)):
+                    self._retry_research_model_stages_once(job.run_id, request.get("model"),
+                                                         budget_only=bool(request.get("_budget_resume")))
+                    job.run = self._stored_task_run(job.run_id)
+                    self._update_job(job, state="completed", stage="completed", percent=100,
+                                     operation_result={"status": "resumed"})
+                else:
+                    if request.get("mode") == "company":
+                        company = _company_from_request(request.get("company"))
+                        self._update_job(job, stage="company-identity", percent=1)
+                        company = self._company_search.require_identity(company,
+                            lambda: self._fetch_official_companies(company.ticker, normalize_market(company.market)))
+                        request = {**request, "company": company.to_dict()}
+                        job.run.company = company
+                        self.storage.save_company(company)
+                    if job.run.status is RunStatus.CREATED:
+                        job.run.status = RunStatus.RUNNING
+                        job.run.data_as_of = utc_now_iso()
+                        self.storage.save_run(job.run)
+                        self._continuity.checkpoint(job.run_id, "created", StageOutcome.COMPLETE)
+                    from .research_execution.call_budget import prepare_external_plan
+                    with self.storage.connect() as db:
+                        prepare_external_plan(db, job.run_id, request.get("run_envelope"))
+                    self._run_research(job, request)
+            elif job.operation_type in {"financial_retry", "financial_rebuild"}:
+                self._run_financial_retry_job(job, job.run_id, job.operation_type == "financial_rebuild")
+            else:
+                self._execute_queued_recovery(job)
+            if job.suspension is not None:
+                raise job.suspension
+            if job.shutdown_requested:
+                raise ResearchTaskYield("APPLICATION_EXITED", interrupted=True)
+            if (job.operation_type in {"research", "model_recovery"} and job.run is not None
+                    and job.run.status is not RunStatus.COMPLETED):
+                plan = self.storage.model_call_plan(job.run_id) or {}
+                if plan.get("pending_budget_gaps"):
+                    job.request_snapshot["_budget_resume"] = True
+                    raise ResearchTaskYield("MODEL_RUN_PLAN_REQUIRES_APPROVAL")
+            if job.error_code in {"MODEL_CONFIGURATION_CHANGED", "MODEL_CONFIGURATION_ERROR",
+                                  "MODEL_UNAUTHORIZED", "MODEL_RUN_PLAN_REQUIRES_APPROVAL",
+                                  "MODEL_RUN_CALL_BUDGET_EXHAUSTED", "MODEL_RUN_INPUT_BUDGET_EXHAUSTED",
+                                  "MODEL_RUN_OUTPUT_BUDGET_EXHAUSTED", "MODEL_DISABLED", "MODEL_CREDENTIAL_MISSING",
+                                  "MODEL_CONNECTION_AUTH_PAUSED", "MODEL_GATEWAY_CONFIGURATION_ERROR"}:
+                raise ResearchTaskYield(job.error_code)
+        except ResearchTaskYield:
+            raise
+        except ProviderError as error:
+            if error.code in {"MODEL_CONFIGURATION_CHANGED", "MODEL_CONFIGURATION_ERROR", "MODEL_UNAUTHORIZED",
+                              "MODEL_GATEWAY_CONFIGURATION_ERROR", "MODEL_GATEWAY_UNAVAILABLE", "MODEL_DISABLED",
+                              "MODEL_CREDENTIAL_MISSING", "MODEL_CONNECTION_AUTH_PAUSED"}:
+                raise ResearchTaskYield(error.code) from error
+            raise
+        finally:
+            self._task_local.job_id = None
+            with self.storage.connect() as db:
+                row = db.execute("SELECT plan_json FROM model_run_call_plans WHERE run_id=?", (job.run_id,)).fetchone()
+                if row:
+                    plan = json.loads(row["plan_json"])
+                    plan.setdefault("execution_paused_at", time.time())
+                    db.execute("UPDATE model_run_call_plans SET plan_json=? WHERE run_id=?",
+                               (json.dumps(plan, ensure_ascii=False), job.run_id))
+
+    def _execute_queued_recovery(self, job: _ResearchJob) -> None:
+        parameters = job.request_snapshot.get("parameters", {})
+        model = parameters.get("model")
+        self._update_job(job, state="running", stage=job.operation_type)
+        if job.operation_type == "report_refresh":
+            self._refresh_financial_report_once(job.run_id, language=parameters.get("language"))
+        elif job.operation_type == "revalidate_saved":
+            self._revalidate_saved_research_once(job.run_id)
+        else:
+            target = parameters.get("target", "model-stages")
+            budget_only = parameters.get("budget_only", False) or job.request_snapshot.get("_budget_resume", False)
+            if budget_only:
+                self._retry_research_model_stages_once(job.run_id, model, budget_only=True)
+            else:
+                self._execute_recovery_plan(job.run_id, target=target, model=model,
+                    plan_hash=parameters.get("plan_hash"), confirm_new_attempt=parameters.get("confirm_new_attempt", False),
+                    operation=lambda plan, authorization: self._retry_research_model_stages_once(
+                        job.run_id, model, resume_target=plan.target, manual_authorization_id=authorization))
+        job.run = self._stored_task_run(job.run_id)
+        self._update_job(job, state="completed", stage="completed", percent=100)
+
+    def _task_cancelled(self, job: _ResearchJob) -> bool:
+        if job.cancel_event.is_set():
+            return True
+        # A second window/sidecar can request cancellation, but cannot release
+        # this worker's lease. Poll just its tiny durable row, not report data.
+        now = time.monotonic()
+        if now - getattr(job, "_cancel_probe_at", 0.0) >= 0.25:
+            job._cancel_probe_at = now
+            record = self.storage.get_research_job(job.job_id)
+            if record and record.get("cancel_requested"):
+                with self._jobs_lock:
+                    job.revision = max(job.revision, record.get("revision", 0))
+                    job.cancel_requested = True
+                    job.cancel_event.set()
+        return job.cancel_event.is_set()
+
+    def _queued_task_failure(self, record: dict, error: BaseException) -> None:
+        job = self._jobs.get(record["job_id"]) or self._restore_task_job(record)
+        if not isinstance(error, ResearchTaskYield):
+            if job.suspension is not None:
+                error = job.suspension
+            elif job.shutdown_requested:
+                error = ResearchTaskYield("APPLICATION_EXITED", interrupted=True)
+        if isinstance(error, ResearchTaskYield):
+            if job.run is not None and job.run.status is not RunStatus.COMPLETED:
+                job.run = self._continuity.preserve_interruption(job.run_id,
+                    stage=job.stage, outcome=StageOutcome.NEEDS_ACTION, error_code=error.reason,
+                    message=_ui_message(job.ui_language, "Research progress saved", "研究进度已保存", "研究進度已儲存"))
+            self._update_job(job, state="interrupted" if error.interrupted else "waiting_input",
+                blocked_reason=error.reason, error_code=error.reason,
+                vision_upload_preview=error.preview or job.vision_upload_preview,
+                vision_approval_pending=bool(error.preview),
+                message=_ui_message(job.ui_language, "Progress saved; action required", "进度已保存，等待处理", "進度已儲存，等待處理"))
+            request = deepcopy(job.request_snapshot)
+            request["_waiting_since"] = time.time()
+            request["_resume_existing"] = True
+            # Persist the resumable request without changing ownership. The
+            # store provides a private request update under the same row CAS.
+            with self.storage.connect() as db:
+                db.execute("UPDATE research_jobs SET request_snapshot_json=? WHERE job_id=? AND execution_owner=?",
+                    (json.dumps(request, ensure_ascii=False, allow_nan=False), job.job_id, self._task_dispatcher.owner))
+        else:
+            if isinstance(error, (ResearchCancelled, CancelledError)) or job.cancel_requested:
+                state, code = "cancelled", "RESEARCH_CANCELLED"
+            else:
+                state, code = "failed", str(getattr(error, "code", "RESEARCH_TASK_FAILED"))[:100]
+            self._update_job(job, state=state, stage=state, error_code=code, message=code)
+
+    def _resume_task_clock(self, job: _ResearchJob) -> None:
+        waiting_since = job.request_snapshot.pop("_waiting_since", None)
+        with self.storage.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT plan_json FROM model_run_call_plans WHERE run_id=?", (job.run_id,)).fetchone()
+            if row:
+                plan = json.loads(row["plan_json"])
+                paused_at = plan.pop("execution_paused_at", waiting_since)
+                if not isinstance(paused_at, (int, float)):
+                    paused_at = time.time()
+                    if job.operation_type != "research" and job.queue_metadata.get("created_at"):
+                        paused_at = datetime.fromisoformat(job.queue_metadata["created_at"]).timestamp()
+                waiting = max(0.0, time.time() - paused_at)
+                if isinstance(plan.get("started_at"), (int, float)):
+                    plan["started_at"] += waiting
+                    plan["queue_wait_seconds"] = plan.get("queue_wait_seconds", 0) + waiting
+                    db.execute("UPDATE model_run_call_plans SET plan_json=? WHERE run_id=?",
+                               (json.dumps(plan, ensure_ascii=False), job.run_id))
+            db.execute("UPDATE research_jobs SET request_snapshot_json=? WHERE job_id=? AND execution_owner=?",
+                (json.dumps(job.request_snapshot, ensure_ascii=False, allow_nan=False), job.job_id, self._task_dispatcher.owner))
+
+    def resume_research_task(self, job_id: str, expected_revision: int, *, model=None,
+                             use_current_vision_settings: bool = False) -> dict:
+        record = self.storage.get_research_job_record(job_id)
+        if record is None:
+            raise KeyError("research job not found")
+        request = deepcopy(record["request_snapshot"])
+        if model is not None:
+            _model_config_from_request(model)
+            previous = request.get("model") if record["operation_type"] == "research" else request.get("parameters", {}).get("model")
+            request.setdefault("configuration_changes", []).append({"at": utc_now_iso(), "from": previous, "to": deepcopy(model)})
+            if record["operation_type"] == "research":
+                request["model"] = deepcopy(model)
+            else:
+                request.setdefault("parameters", {})["model"] = deepcopy(model)
+        if use_current_vision_settings:
+            request["_frozen"]["vision_policy"] = _vision_policy_snapshot(self.preferences())
+            request["_frozen"]["vision_preferences"] = self._freeze_vision_preferences()
+            request.pop("_vision_grants", None)
+        request["_resume_existing"] = True
+        self.storage.requeue_research_job(job_id, expected_revision, request_snapshot=request)
+        with self._jobs_lock:
+            self._jobs.pop(job_id, None)
+        self._task_dispatcher.wake()
+        return self.get_research_status(job_id)
+
+    def archive_research_task(self, job_id: str, expected_revision: int) -> dict:
+        self.storage.archive_research_job(job_id, expected_revision)
+        return {"job_id": job_id, "archived": True}
+
+    def shutdown_research_tasks(self, *, timeout: float = 10.0) -> dict:
+        self.storage.set_research_queue_paused(True)
+        with self._jobs_lock:
+            for job in self._jobs.values():
+                if job.state in {"running", "cancelling"}:
+                    job.shutdown_requested = True
+                    job.cancel_event.set()
+        drained = self._task_dispatcher.close(timeout=timeout)
+        return {"queue_paused": True, "safe_to_exit": drained, "progress_preserved": True,
+                "remote_billing_stopped": False}
 
     def get_research_status(self, job_id: str) -> dict[str, Any]:
+        durable = self.storage.get_research_job(job_id)
         with self._jobs_lock:
             job = self._jobs.get(job_id)
             snapshot = job.visible_snapshot() if job is not None else None
+        if durable is not None and (snapshot is None or durable.get("revision", 0) > snapshot.get("revision", 0)):
+            snapshot = durable
         if snapshot is None:
-            snapshot = self.storage.get_research_job(job_id)
-            if snapshot is None:
-                raise KeyError("research job not found")
+            raise KeyError("research job not found")
         progress = self.storage.model_call_progress(snapshot.get("run_id") or "")
         # Storage work is outside the job lock. Re-copy the latest memory
         # revision rather than returning an older running/cancel state.
         with self._jobs_lock:
             current = self._jobs.get(job_id)
-            if current is not None:
+            if current is not None and current.revision >= snapshot.get("revision", 0):
                 snapshot = current.visible_snapshot()
+        if snapshot.get("state") in {"completed", "failed", "cancelled", "waiting_input", "interrupted"}:
+            # The worker can commit a new checkpoint while the model read
+            # model above is loading. Recheck durable release, not a stale
+            # pre-commit owner snapshot, before enabling terminal/input actions.
+            latest = self.storage.get_research_job(job_id)
+            if latest is not None:
+                durable = latest
+                snapshot = latest
         snapshot["model_calls"] = progress["calls"]
         snapshot["call_plan"] = self.storage.model_call_plan(snapshot.get("run_id") or "")
         # The durable call read model deliberately does not rebuild on every
@@ -2180,6 +2541,16 @@ class AppService:
                 call["call_plan"] = snapshot["call_plan"]
         warning = (snapshot["call_plan"] or {}).get("time_warning") is True
         snapshot["status_revision"] = f"{snapshot.get('revision', 0)}:{progress['revision']}:w{int(warning)}"
+        if durable and durable.get("execution_draining"):
+            durable_state = durable.get("state")
+            snapshot.update(
+                state=durable_state if durable_state in {"running", "cancelling"} else "running",
+                execution_draining=True,
+                attempt_complete=False,
+                research_complete=False,
+                action_required=False,
+                vision_approval_pending=False,
+            )
         return snapshot
 
     def cancel_model_call(self, job_id: str, request_id: str, attempt_id: str) -> dict:
@@ -2195,9 +2566,27 @@ class AppService:
 
     def cancel_research(self, job_id: str) -> dict[str, Any]:
         with self._jobs_lock:
+            local_active = self._jobs.get(job_id)
+            local_active = local_active is not None and local_active.state in {"running", "cancelling"}
+        cancelled = None if local_active else self.storage.cancel_waiting_research_job(job_id)
+        if cancelled is not None:
+            with self._jobs_lock:
+                self._jobs.pop(job_id, None)
+            self._task_dispatcher.wake()
+            return cancelled
+        with self._jobs_lock:
             job = self._jobs.get(job_id)
             if job is None:
-                raise KeyError("research job not found")
+                # A different live sidecar owns it. Persist a request that its
+                # cancel probe observes; never claim that foreign workers exited.
+                record = self.storage.get_research_job(job_id)
+                if record is None:
+                    raise KeyError("research job not found")
+                if record["state"] in {"completed", "failed", "cancelled"}:
+                    return record
+                record.update(cancel_requested=True, state="cancelling", revision=record.get("revision", 0) + 1)
+                self.storage.save_research_job(record)
+                return record
             job.cancel_event.set()
             job.revision += 1
             if job.vision_approval_pending:
@@ -2218,10 +2607,29 @@ class AppService:
                 for agent_id, state in list(job.agent_states.items()):
                     if state in {"queued", "running"}:
                         job.agent_states[agent_id] = "cancelled"
-            return job.visible_snapshot()
+            snapshot = job.visible_snapshot()
+        self.storage.save_research_job(snapshot)
+        return snapshot
 
-    def vision_decision(self, job_id: str, approved: bool) -> dict[str, Any]:
+    def vision_decision(self, job_id: str, approved: bool, *, expected_revision: int | None = None,
+                        plan_id: str | None = None) -> dict[str, Any]:
         """Resolve a session-only failed-page upload approval request."""
+        record = self.storage.get_research_job_record(job_id)
+        if record and record.get("snapshot_schema_version") == 1:
+            preview = record.get("vision_upload_preview") or {}
+            if (record["state"] != "waiting_input" or not record.get("vision_approval_pending")
+                    or expected_revision != record["revision"] or not plan_id or plan_id != preview.get("plan_id")):
+                raise ValueError("VISION_TASK_APPROVAL_CONFLICT")
+            request = deepcopy(record["request_snapshot"])
+            if request["_frozen"]["vision_policy"] != _vision_policy_snapshot(self.preferences()):
+                raise ValueError("VISION_POLICY_CHANGED")
+            request.setdefault("_vision_grants", {})[self._task_request_hash(preview)] = bool(approved)
+            request["_resume_existing"] = True
+            self.storage.requeue_research_job(job_id, expected_revision, request_snapshot=request)
+            with self._jobs_lock:
+                self._jobs.pop(job_id, None)
+            self._task_dispatcher.wake()
+            return self.get_research_status(job_id)
         with self._jobs_lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -2266,7 +2674,7 @@ class AppService:
                 job.stage_started_at = now
                 updates.setdefault("stage_current", None)
                 updates.setdefault("stage_total", None)
-            if updates.get("state") in {"completed", "failed", "cancelled"}:
+            if updates.get("state") in {"completed", "failed", "cancelled", "waiting_input", "interrupted"}:
                 job.finished_at = time.perf_counter()
             for key, value in updates.items():
                 setattr(job, key, value)
@@ -2365,7 +2773,7 @@ class AppService:
 
     def _run_research(self, job: _ResearchJob, request: dict[str, Any]) -> None:
         progress_generation = job.generation
-        preferences = self.preferences()
+        preferences = self._task_preferences(job)
         ui_language = normalize_language(preferences["ui_language"])
         report_language = normalize_language(preferences["report_language"])
         secrets = _request_secrets(request)
@@ -2438,8 +2846,8 @@ class AppService:
             # reactivate cloud page uploads after the user revoked the policy.
             legacy_vision_request = request.get("vision_fallback")
             if (
-                isinstance(legacy_vision_request, dict)
-                and bool(legacy_vision_request.get("enabled"))
+                (isinstance(legacy_vision_request, dict) and bool(legacy_vision_request.get("enabled"))
+                 or request.get("_legacy_vision_requested"))
                 and not bool(_vision_policy_snapshot(preferences).get("enabled"))
             ):
                 raise _ResearchDataUnavailable("VISION_CONSENT_REQUIRED")
@@ -2562,7 +2970,7 @@ class AppService:
                 )
 
             primary = self._research_orchestrator.start(captured_start,
-                cancel_check=job.cancel_event.is_set, progress=progress,
+                cancel_check=lambda: self._task_cancelled(job), progress=progress,
                 preparation_progress=preparation_progress,
                 disclosure_coverage=lambda coverage: self._record_disclosure_coverage(job, coverage),
                 agent_progress=agent_progress)
@@ -2584,6 +2992,7 @@ class AppService:
                 run_id=primary.run_id,
             )
         except ResearchCancelled as exc:
+            self._raise_task_pause(job)
             # Optional comparison cancellation keeps the committed primary
             # result and its quality status. Only unfinished primary research
             # is itself cancelled; job completion and report quality differ.
@@ -3108,6 +3517,8 @@ def _synthesis_error_code(artifacts: list[dict[str, Any]]) -> str:
         return ""
     diagnostics = content.get("diagnostics")
     diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    if diagnostics.get("processing_phase") == "request_compilation":
+        return "MODEL_REQUEST_COMPILATION_FAILED"
     provider_code = str(diagnostics.get("provider_error_code") or "")
     if provider_code:
         return provider_code[:80]
@@ -3868,8 +4279,10 @@ def _financial_status(
     verified_group_years: set[int] = set()
     for group in annual_target_groups:
         period = str(group.get("period_end", ""))
+        group_status = str(group.get("status", "")).upper()
         if not (
-            str(group.get("status", "")).upper() == ValidationStatus.VERIFIED.value
+            group_status in {ValidationStatus.VERIFIED.value, "PARTIAL", "INCOMPLETE",
+                             ValidationStatus.READY_WITH_WARNINGS.value}
             and str(group.get("consolidated_scope", "")).lower() == "consolidated"
             and str(group.get("fiscal_period", "FY")).upper() == "FY"
             and period[:4].isdigit()
@@ -3880,7 +4293,12 @@ def _financial_status(
         ):
             continue
         accession = str(group.get("accession_number", ""))
-        covered = {str(item) for item in group.get("covered_concepts", [])}
+        # Compiler cohort debt does not revoke individually admitted cells.
+        # In a non-VERIFIED cohort, summary metadata alone cannot establish
+        # availability: require every profile concept from persisted VERIFIED
+        # facts in this exact accession, period, scope and currency instead.
+        covered = ({str(item) for item in group.get("covered_concepts", [])}
+                   if group_status == ValidationStatus.VERIFIED.value else set())
         for fact in facts:
             if (
                 str(fact.get("accession_number", "")) == accession
@@ -3963,7 +4381,7 @@ def _financial_status(
             return "verified"
         if issue_codes & coverage_issue_codes:
             return "field_missing"
-        if status == ValidationStatus.READY_WITH_WARNINGS.value:
+        if status in {ValidationStatus.READY_WITH_WARNINGS.value, "PARTIAL", "INCOMPLETE"}:
             return "warning"
         return "statement_unavailable"
 
@@ -3994,20 +4412,11 @@ def _financial_status(
                 quality_class(year_groups[0])
                 if year_groups else "statement_unavailable"
             )
-        elif any(str(item.get("status", "")) == ValidationStatus.REJECTED.value for item in year_groups):
-            state = "rejected"
-            category = next(
-                (quality_class(item) for item in year_groups
-                 if str(item.get("status", "")) == ValidationStatus.REJECTED.value),
-                "statement_unavailable",
-            )
-        elif any(str(item.get("status", "")) == ValidationStatus.READY_WITH_WARNINGS.value for item in year_groups):
+        elif any(str(item.get("status", "")) != ValidationStatus.VERIFIED.value for item in year_groups):
             state = "warning"
-            category = next(
-                (quality_class(item) for item in year_groups
-                 if str(item.get("status", "")) == ValidationStatus.READY_WITH_WARNINGS.value),
-                "warning",
-            )
+            # Core availability was proved above. Missing/rejected siblings
+            # remain in issues, but must not relabel the whole year missing.
+            category = "warning"
         else:
             state = "verified"
             category = "verified"
@@ -4022,6 +4431,7 @@ def _financial_status(
         str(item.get("status", "")) in {
             ValidationStatus.REJECTED.value,
             ValidationStatus.READY_WITH_WARNINGS.value,
+            "PARTIAL", "INCOMPLETE", "CONFLICTED", "UNVERIFIABLE",
         }
         for item in annual_target_groups
     )

@@ -29,11 +29,18 @@ def research_diagnostic_snapshot(store, run_id):
             return None
     fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens", "reasoning_tokens", "answer_tokens")
     calls = []
+    compilation_failures = []
     stage_timeline = {}
     job_phases = None
     quality = {"run_status": token(payload.get("status")), "assessment": "not_reassessed_by_export",
         "saved_report_result": None}
     with store.connect() as db:
+        from .research_execution.request_diagnostics import safe_compilation_diagnostic
+        from .resilience.payloads import load_payload
+        for artifact in db.execute("SELECT payload_json FROM artifacts WHERE run_id=? AND artifact_type='request-compilation-diagnostic' ORDER BY created_at,rowid", (run_id,)):
+            safe = safe_compilation_diagnostic(load_payload(db, artifact[0]))
+            if safe is not None:
+                compilation_failures.append(safe)
         report = db.execute("SELECT payload_json FROM artifacts WHERE run_id=? AND artifact_type='research-report' ORDER BY created_at DESC,rowid DESC LIMIT 1",
             (run_id,)).fetchone()
         if report:
@@ -73,6 +80,10 @@ def research_diagnostic_snapshot(store, run_id):
                 stage_timeline[token(item["stage_id"])] = safe
             reservation = reservations.get((item["request_id"], item["attempt_id"]), {})
             usage = {key: count(mapping(raw.get("usage")).get(key)) for key in fields}
+            ledger = mapping(raw.get("final_message_ledger"))
+            capacity = mapping(raw.get("capacity"))
+            comparison = mapping(raw.get("prefix_comparison"))
+            forecast = mapping(raw.get("planned_request"))
             calls.append({"request_id": token(item["request_id"]), "attempt_id": token(item["attempt_id"]),
                 "stage_id": token(item["stage_id"]), "purpose": token(item["purpose"]),
                 "parent_request_id": token(reservation.get("parent_request_id")),
@@ -91,7 +102,23 @@ def research_diagnostic_snapshot(store, run_id):
                 "prefix": {key: token(raw.get(key)) for key in ("common_prefix_digest", "source_package_digest", "task_tail_digest", "message_boundary_version", "wire_prefix_digest")},
                 "wire_prefix_bytes": count(raw.get("wire_prefix_bytes")),
                 "component_bytes": {token(key): number(value) for key, value in mapping(raw.get("component_bytes")).items() if token(key)},
-                "input_tokens_estimate": number(raw.get("input_tokens_estimate"))})
+                "input_tokens_estimate": number(raw.get("input_tokens_estimate")),
+                "input_bytes": count(raw.get("input_bytes")), "job_id": token(raw.get("job_id")),
+                "error_origin": token(raw.get("error_origin")),
+                "final_message_ledger": {"schema": token(ledger.get("schema")),
+                    **{key: number(ledger.get(key)) for key in ("input_bytes", "accounted_bytes", "input_tokens")},
+                    "counting_method": token(ledger.get("counting_method")), "tokenizer": token(ledger.get("tokenizer")),
+                    "component_token_method": token(ledger.get("component_token_method")),
+                    "component_bytes": {key: number(mapping(ledger.get("component_bytes")).get(key))
+                        for key in ("fixed_contract", "common_facts", "originals", "upstream_findings", "supplements", "task_control", "json_envelope")}},
+                "capacity": {**{key: number(capacity.get(key)) for key in ("context_tokens", "planning_context_tokens",
+                        "physical_input_bytes", "current_output_reserve", "available_input_tokens")},
+                    "source": token(capacity.get("source")), "route_identity": token(capacity.get("route_identity"))},
+                "planned_request": {key: number(forecast.get(key)) for key in
+                    ("input_estimate", "compiled_input_estimate", "pending_dependency_output_estimate", "input_bytes", "output_limit")},
+                "prefix_comparison": {"group": token(comparison.get("group")), "observation": token(comparison.get("observation")),
+                    "lcp_bytes": count(comparison.get("lcp_bytes")), "first_difference_field": token(comparison.get("first_difference_field")),
+                    "not_provider_cache_usage": True}})
     physical = [call for call in calls if call["wire_state"] != "not_sent"]
     def summed(key):
         values = [call["usage"].get(key) for call in physical]
@@ -163,7 +190,13 @@ def research_diagnostic_snapshot(store, run_id):
         "attempt_count": len(calls), "physical_requests": len(physical),
         "physical_count_basis": "conservative_includes_unknown_submissions_not_UI_polls",
         "unknown_outcomes": sum(call["wire_state"] in {"remote_unknown", "send_intent_recorded"} for call in physical),
-        "calls": calls, "totals": totals, "cache_hit_rate": rate,
+        "calls": calls, "local_compilation_failures": compilation_failures,
+        "totals": totals, "cache_hit_rate": rate,
+        "request_sizes": {"max_input_bytes": max((call["input_bytes"] for call in physical if call["input_bytes"] is not None), default=None),
+            "known_total_input_bytes": sum(call["input_bytes"] for call in physical if call["input_bytes"] is not None),
+            "max_supplier_input_tokens": max((call["usage"]["input_tokens"] for call in physical if call["usage"]["input_tokens"] is not None), default=None),
+            "max_local_input_tokens_estimate": max((call["input_tokens_estimate"] for call in physical if call["input_tokens_estimate"] is not None), default=None),
+            "unknown_size_attempts": sum(call["input_bytes"] is None for call in physical)},
         "cache_evidence": "endpoint_reported_upstream_unverified" if any(call["usage_source"] == "endpoint_reported_upstream_unverified" for call in physical) else "provider_receipts_or_unknown",
         "actual_cost": {"amount": actual, "currency": next(iter(currencies)) if actual is not None else None,
             "status": "endpoint_reported" if actual is not None else "unknown_without_complete_route_bound_tariffs_and_receipts"},

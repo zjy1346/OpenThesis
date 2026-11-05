@@ -20,11 +20,12 @@ from ..storage_research_publication import ResearchPublicationSnapshot
 from ..valuation_claims import enforce_valuation_consistency
 from .checkpoints import candidate_checkpoint, completed_checkpoint, checkpoint_artifact_id, read_checkpoints
 from .durable import DurableStageVerifier
-from .executor import StageExecutionCancelled, StageExecutor, StageResult, StageValidation, stage_input_digest
+from .executor import (StageExecutionCancelled, StageExecutor, StageResult, StageValidation,
+                       stage_generation_matches, stage_material_identities)
 from .model import SynthesisContextLimitError
 from .registry import SOURCE_ANALYSIS_STAGES, StageRegistry
 from .request_planning import RoleRequestMaterials, plan_role_requests
-from .source_compiler import packet_dispatch_group
+from .source_compiler import FrozenSourceContext, packet_dispatch_group, read_source_context
 
 
 def _prepare_assertion_wave(workflow, journal, generations, validator, entries):
@@ -66,13 +67,26 @@ class GraphBindings:
 
 
 def _save_stage_flow(workflow, run, result, sources, generation):
+    compilation = result.diagnostics.get("request_compilation")
+    if compilation:
+        from .request_diagnostics import safe_compilation_diagnostic
+        safe = safe_compilation_diagnostic(compilation)
+        if safe is not None:
+            workflow._save(run, "request-compilation-diagnostic", result.stage_id, safe,
+                agent_id="local-request-compiler")
     with workflow.storage.connect() as db:
         rows = db.execute("""SELECT response_received,state FROM model_request_journal
             WHERE run_id=? AND stage_id=? AND generation=?
               AND purpose IN ('generation','material_coverage','section_delivery')""",
             (run.run_id, result.stage_id, generation)).fetchall()
-    workflow._save(run, "stage-content-flow", result.stage_id,
-        stage_flow(result, sources, generation=generation, request_rows=rows), agent_id="content-observability")
+    flow = stage_flow(result, sources, generation=generation, request_rows=rows)
+    coverage = result.candidate.get("_source_reading_coverage") if isinstance(result.candidate, dict) else None
+    if isinstance(coverage, dict):
+        flow["requested_materials"] = len(coverage.get("physically_supplied_evidence_ids", ()))
+        flow["requested_materials_basis"] = "actual_complete_input_sources_not_host_inventory"
+        flow["source_reading_coverage"] = {**coverage, "validation_state": result.validation.state,
+            "completed": result.validation.passed and not coverage.get("missing_assigned_evidence_ids")}
+    workflow._save(run, "stage-content-flow", result.stage_id, flow, agent_id="content-observability")
 
 
 def _local_journal_candidates(journal, registry, saved, *, on_read_issues=None):
@@ -142,7 +156,7 @@ def _source_business_inputs(inputs: dict[str, Any], context_json: str,
             source_evidence.append(current)
             seen.add(identity)
     source_evidence.sort(key=lambda item: (str(item.get("evidence_id", "")), recovery_digest(item)))
-    source_context = json.loads(context_json)
+    source_context = dict(read_source_context(context_json))
     for key in ("facts", "accepted_facts", "metrics", "latest_interim_metrics", "valuation", "market_snapshot",
                 "financial_period_coverage", "financial_capabilities", "repair_observations", "issues",
                 "compiled_disclosure_binding"):
@@ -150,12 +164,13 @@ def _source_business_inputs(inputs: dict[str, Any], context_json: str,
     source_context["evidence"] = source_evidence
     company = source_context.get("company", {})
     if isinstance(company, dict):
+        company = source_context["company"] = dict(company)
         company.pop("reporting_currency", None)
     capabilities = material_capabilities({"evidence": source_evidence})
     if isinstance(company, dict) and company.get("cik") and company.get("ticker"):
         capabilities.add("company_identity")
-    return {**inputs, "context_json": json.dumps(source_context, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":")), "available": sorted(item["evidence_id"] for item in source_evidence
+    return {**inputs, "context_json": FrozenSourceContext(source_context),
+        "available": sorted(item["evidence_id"] for item in source_evidence
         if item.get("evidence_id")), "evidence_records": {item["evidence_id"]: item for item in source_evidence
         if item.get("evidence_id")}, "capabilities": sorted(capabilities),
         "material_scope_policy": "source-independent-analysis-v4-canonical-originals"}
@@ -163,7 +178,8 @@ def _source_business_inputs(inputs: dict[str, Any], context_json: str,
 
 def stage_execution_plan(registry: StageRegistry, saved: dict[str, StageResult],
                          model_identity: str, invalidated: tuple[str, ...], *,
-                         scoped_resume: bool, material_digest: str | dict[str, str]) -> tuple[dict[str, str], tuple[str, ...]]:
+                         scoped_resume: bool, material_digest: str | dict[str, str],
+                         legacy_material_digests: dict[str, str] | None = None) -> tuple[dict[str, str], tuple[str, ...]]:
     """Preserve independent stage identities, never mislabel a new model call.
 
     Downstream producers use the current configured model too. Their identity
@@ -176,9 +192,10 @@ def stage_execution_plan(registry: StageRegistry, saved: dict[str, StageResult],
         previous = saved.get(spec.stage_id)
         compatible = (previous is not None and previous.stage_identity == spec.identity
             and all(key in saved for key in spec.depends_on)
-            and previous.input_digest == stage_input_digest(
+            and stage_generation_matches(
                 spec, material_digest.get(spec.stage_id, "") if isinstance(material_digest, dict) else material_digest,
-                previous.execution_fingerprint, saved))
+                previous.execution_fingerprint, saved, saved, previous.input_digest,
+                legacy_material_identity=(legacy_material_digests or {}).get(spec.stage_id)))
         fingerprints[spec.stage_id] = (
             previous.execution_fingerprint
             if scoped_resume and spec.stage_id not in affected and previous is not None
@@ -302,7 +319,7 @@ def run_declarative_ot_workflow(
                20 + round(completed * 68 / len(order)))
 
     graph_inputs = {
-        "context_json": context.compact_json(), "available": sorted(available),
+        "context_json": FrozenSourceContext(context.compact_payload()), "available": sorted(available),
         "evidence_records": evidence_records,
         "workflow_settings": workflow.pack.workflow.get("settings", {}),
         "report_language": workflow.report_language,
@@ -314,13 +331,18 @@ def run_declarative_ot_workflow(
     received_candidates = (_local_journal_candidates(request_journal, registry, {},
         on_read_issues=lambda issues: workflow._save(run, "model-candidate-read-diagnostic", "Saved candidate integrity", {"issues": issues}, agent_id="local-revalidation"))
         if getattr(workflow, "local_revalidation", False) else {})
-    request_generations = request_journal.prepare(registry, recovery_digest(graph_inputs),
+    compilation_errors = {}
+    request_generations = request_journal.prepare(registry,
+        stage_material_identities(registry, graph_inputs, {})[registry.stages[0].stage_id],
         local_only=bool(getattr(workflow, "local_revalidation", False)),
-        planned_requests=plan_role_requests(workflow, registry, graph_inputs, request_materials=request_materials))
+        planned_requests=plan_role_requests(workflow, registry, graph_inputs, request_materials=request_materials,
+            compilation_errors=compilation_errors))
     publication = workflow.storage.bind_research_publication_stages(publication, request_generations)
     produce_unbound = produce
 
     def produce(spec, frozen_inputs, dependencies):
+        if spec.stage_id in compilation_errors:
+            raise compilation_errors[spec.stage_id]
         with workflow._bind_request_journal(request_journal), request_journal.bind(spec.stage_id, request_generations[spec.stage_id]):
             return produce_unbound(spec, frozen_inputs, dependencies)
 
@@ -480,6 +502,14 @@ def execute_official_model_graph(
     base_ids = tuple(
         spec.stage_id for spec in registry.stages if not spec.depends_on
     )
+    context.source_reader_stages = base_ids
+    from .reading_view import reading_manifest
+    frozen_context_json = FrozenSourceContext(context.compact_payload())
+    frozen_context = read_source_context(frozen_context_json)
+    manifest = reading_manifest(route_materials(frozen_context, ""),
+        readers=context.source_reader_roles, stages=base_ids)
+    workflow._save(run, "source-reading-manifest", workflow._report_text("原始材料阅读分工", "Frozen original reading assignments"), manifest,
+        agent_id="host-source-compiler")
     aliases = {
         "growth": "growth-opportunities",
         "synthesis": "final-synthesis",
@@ -510,12 +540,7 @@ def execute_official_model_graph(
         # Stored deterministic metrics are JSON-decoded with sorted object
         # keys. Canonicalize the exact prompt material here so replayed
         # stage inputs keep the same identity across that round-trip.
-        "context_json": json.dumps(
-            json.loads(context.compact_json()),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+        "context_json": frozen_context_json,
         "available": sorted(available),
         "evidence_records": evidence_records,
         "report_language": workflow.report_language,
@@ -525,19 +550,20 @@ def execute_official_model_graph(
         "research_coverage_contract": bindings.coverage_version,
         "research_verification_contract": bindings.verification_version,
         "capabilities": sorted([
-            *material_capabilities(json.loads(context.compact_json())),
+            *material_capabilities(frozen_context),
             *( ["company_identity"] if context.company.cik and context.company.ticker else []),
         ]),
     }
     # Source-independent business work must use source-independent ACTUAL
     # inputs, not merely a narrower cache digest over a larger prompt.
-    source_inputs = _source_business_inputs(inputs, context.compact_json(), evidence)
+    source_inputs = _source_business_inputs(inputs, frozen_context_json, evidence)
     stage_inputs = {spec.stage_id: source_inputs if spec.stage_id in SOURCE_ANALYSIS_STAGES and not spec.depends_on else inputs
                     for spec in registry.stages}
-    stage_material_digests = {key: recovery_digest(value) for key, value in stage_inputs.items()}
+    stage_material_digests = stage_material_identities(registry, inputs, stage_inputs)
     saved_artifacts = artifacts or []
     checkpoint_read = read_checkpoints(saved_artifacts, registry)
     previous = checkpoint_read.results
+    legacy_material_digests = stage_material_identities(registry, inputs, stage_inputs, legacy=True) if previous else {}
     request_journal = workflow._new_request_journal(run)
     local_candidates = (_local_journal_candidates(request_journal, registry, checkpoint_read.revalidation_candidates,
         on_read_issues=lambda issues: workflow._save(run, "model-candidate-read-diagnostic", "Saved candidate integrity", {"issues": issues}, agent_id="local-revalidation"))
@@ -554,7 +580,8 @@ def execute_official_model_graph(
         invalidated = ()
     fingerprints, invalidated = stage_execution_plan(
         registry, previous, workflow.model_config.public_id, tuple(invalidated),
-        scoped_resume=bool(invalidated) or bool(saved_artifacts), material_digest=stage_material_digests)
+        scoped_resume=bool(invalidated) or bool(saved_artifacts), material_digest=stage_material_digests,
+        legacy_material_digests=legacy_material_digests)
     completed_base: set[str] = set()
 
     def progress(stage_id: str, state: str) -> None:
@@ -617,7 +644,8 @@ def execute_official_model_graph(
             "company": context.company.to_dict(),
             "metrics": context.metrics[:5],
             "analyses": analyses,
-            "verified_analyses": analyses,
+            "verified_analyses": {key: value for key, value in analyses.items()
+                if value.get("_verification_state") == "completed_verified"},
             "source_analyses": {key: value for key, value in analyses.items()
                                 if key in SOURCE_ANALYSIS_STAGES},
             "dependency_gaps": dependencies.get("_dependency_gaps", []),
@@ -668,7 +696,7 @@ def execute_official_model_graph(
                 })
         forecast = dependencies.get("forecast-scenarios", {})
         from ..research import _synthesis_prior_artifacts
-        return RoleRequestMaterials("research-synthesizer", context.compact_json(),
+        return RoleRequestMaterials("research-synthesizer", frozen_inputs["context_json"],
             _synthesis_prior_artifacts(dossier, growth, skeptic, forecast))
 
     def produce_unbound(spec, frozen_inputs, dependencies):
@@ -683,7 +711,8 @@ def execute_official_model_graph(
         forecast = dependencies.get("forecast-scenarios", {})
         try:
             return workflow._run_synthesis_with_budget(
-                context, dossier, growth, skeptic, forecast, run=run
+                context, dossier, growth, skeptic, forecast, run=run,
+                frozen_context_json=frozen_inputs["context_json"],
             )
         except SynthesisContextLimitError as exc:
             return {
@@ -707,18 +736,22 @@ def execute_official_model_graph(
                 "_context_counting_mode": "provider_error_code",
             }
 
+    compilation_errors = {}
+    default_material_digest = next(stage_material_digests[spec.stage_id]
+        for spec in registry.stages if stage_inputs[spec.stage_id] is inputs)
     request_generations = request_journal.prepare(
-        registry, recovery_digest(inputs), invalidated, stage_configurations=fingerprints,
+        registry, default_material_digest, invalidated, stage_configurations=fingerprints,
         local_only=bool(getattr(workflow, "local_revalidation", False)), stage_material_digests=stage_material_digests,
         planned_requests=plan_role_requests(workflow, registry, inputs, previous,
-            stage_inputs=stage_inputs, request_materials=request_materials,
+            stage_inputs=stage_inputs, request_materials=request_materials, compilation_errors=compilation_errors,
             reused_stage_ids=tuple(spec.stage_id for spec in registry.stages
                 if spec.stage_id not in invalidated and spec.stage_id in previous
                 and previous[spec.stage_id].validation.state in {"completed_verified", "reused_verified"}
                 and previous[spec.stage_id].stage_identity == spec.identity
-                and previous[spec.stage_id].input_digest == stage_input_digest(spec,
-                    stage_material_digests.get(spec.stage_id, recovery_digest(inputs)),
-                    fingerprints[spec.stage_id], previous))))
+                and all(key in previous for key in spec.depends_on)
+                and stage_generation_matches(spec, stage_material_digests[spec.stage_id],
+                    fingerprints[spec.stage_id], previous, previous, previous[spec.stage_id].input_digest,
+                    legacy_material_identity=legacy_material_digests.get(spec.stage_id)))))
     publication = workflow.storage.bind_research_publication_stages(publication, request_generations)
 
     def validate(spec, candidate, frozen_inputs):
@@ -955,6 +988,8 @@ def execute_official_model_graph(
             stage_id=spec.stage_id, journal=request_journal)
 
     def produce(spec, frozen_inputs, dependencies):
+        if spec.stage_id in compilation_errors:
+            raise compilation_errors[spec.stage_id]
         with workflow._bind_request_journal(request_journal), request_journal.bind(spec.stage_id, request_generations[spec.stage_id]):
             return produce_unbound(spec, frozen_inputs, dependencies)
 
@@ -980,7 +1015,9 @@ def execute_official_model_graph(
         candidate_checkpoint=persist_candidate,
         candidate_wave_preparer=lambda entries: _prepare_assertion_wave(workflow, request_journal,
             request_generations, validate_candidate, entries),
-        dispatch_group=packet_dispatch_group,
+        # Assigned originals use independent lanes, even when two roles
+        # belonged to the same older, unassigned prefix family.
+        dispatch_group=lambda spec: spec.stage_id if not spec.depends_on else packet_dispatch_group(spec),
         timing_observer=request_journal.record_stage_timing,
         candidate_verifier=DurableStageVerifier(workflow.storage, run.run_id, cancel_check=workflow.cancel_check,
                                                request_generations=request_generations),

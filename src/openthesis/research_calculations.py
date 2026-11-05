@@ -85,6 +85,10 @@ def prove_calculation(claim: dict, records: list[dict]) -> CalculationProof:
     formula = FORMULAS.get(formula_name) if isinstance(formula_name, str) else None
     if formula is None or claim.get("concept") != formula_name:
         return CalculationProof("CLAIM_FORMULA_UNSUPPORTED")
+    from .financial_metric_policy import BANK_INAPPLICABLE
+    if formula_name in BANK_INAPPLICABLE and any(
+            record.get("metric_profile_id") == "bank" for record in records if isinstance(record, dict)):
+        return CalculationProof("CLAIM_CALCULATION_INDUSTRY_NOT_APPLICABLE")
     bindings = claim.get("inputs")
     if not isinstance(bindings, dict) or set(bindings) != {role for role, _ in formula.roles}:
         return CalculationProof("CLAIM_CALCULATION_INPUTS_INVALID")

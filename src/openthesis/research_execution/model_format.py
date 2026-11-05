@@ -9,7 +9,7 @@ candidate; research business validation remains with the stage executor.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import math
 from typing import Any, Callable
@@ -80,6 +80,95 @@ class ModelFormatRecovery:
     def __init__(self, journal):
         self.journal = journal
 
+    def _target_keys(self, request, proof, fields, claim_plan):
+        """Identify actual repair work, independent of healthy sibling progress.
+
+        These keys are host-owned recovery metadata, not model assertions. A
+        changed source, validator, contract, target or configured model is new
+        work; committing an unrelated target is not permission to charge again.
+        """
+        common = {"schema": "model-repair-target-v1", "input": request.input_digest,
+                  "configuration": self.journal.configuration_fingerprint}
+        if fields:
+            return {path: digest({**common, "version": FIELD_REPAIR_VERSION,
+                "contract": request.output_contract.to_dict(), "path": path,
+                "present": path in proof, "value": proof.get(path)}) for path in fields}
+        if claim_plan is not None:
+            from ..research_claim_repair import read_pointer
+            contract = request.claim_repair_contract
+            return {target.path: digest({**common, "version": claim_plan.version,
+                "validator": claim_plan.validator_version, "target": asdict(target),
+                "value": read_pointer(proof, target.path),
+                "material": contract.repair_material((target,)) if contract.repair_material else {}})
+                for target in claim_plan.targets}
+        return {}
+
+    def _attempted_targets(self, request, stage_id, configuration, keys, *, claim_repair):
+        """Read verified journal identities; never trust answer control fields.
+
+        A returned, independently journalled repair is not a new attempt just
+        because a sibling was committed. Unknown submissions are checked before
+        this method. Rejected candidates remain attempts too, not permission to
+        repeatedly submit the same work on every restart.
+        """
+        if not keys:
+            return ()
+        strategy = "model-text-claims" if claim_repair else "model-text-fields"
+        verifier = "model-claim-candidate-v2" if claim_repair else "model-field-candidate-v2"
+        anchor = format_target(stage_id, request.input_digest)
+        attempted = set()
+        with self.journal.store.connect() as db:
+            plans = db.execute("""SELECT p.* FROM recovery_plans p
+                JOIN recovery_incidents i ON i.incident_id=p.incident_id
+                WHERE i.run_id=? AND i.input_digest=? AND (i.target=? OR i.target LIKE ?)
+                AND p.outcome_json IS NOT NULL ORDER BY p.updated_at DESC""",
+                (self.journal.run_id, request.input_digest, anchor, anchor + ':work:%')).fetchall()
+            for row in plans:
+                plan = RecoveryPlan.from_dict(json.loads(row["payload_json"]))
+                if plan.plan_hash != row["plan_hash"]:
+                    raise RecoveryConflict("RECOVERY_REPAIR_HISTORY_IDENTITY_INVALID")
+                for action in plan.actions:
+                    if (action.strategy_id != strategy or action.verifier_id != verifier
+                            or action.configuration_fingerprint != configuration):
+                        continue
+                    saved = db.execute("SELECT * FROM recovery_actions WHERE plan_id=? AND action_id=?",
+                        (plan.plan_id, action.identity(plan.run_id, plan.target))).fetchone()
+                    if saved is None or not saved["response_received"]:
+                        continue
+                    decoded = RecoveryRepository._decode_saved_candidate(
+                        db, plan, action, saved, allow_rejected=True)
+                    if decoded is None:
+                        raise RecoveryConflict("RECOVERY_REPAIR_HISTORY_CANDIDATE_INVALID")
+                    payload = decoded["candidate"]
+                    host_keys = payload.get("repair_target_keys")
+                    if host_keys is None:
+                        # Older journals have no per-target key. Reconstruct
+                        # only identities actually proved by their frozen
+                        # request/contract; never invent an old source hash.
+                        original = payload.get("original_result")
+                        if not isinstance(original, dict) or digest(original) != payload.get("original_digest"):
+                            raise RecoveryConflict("RECOVERY_REPAIR_HISTORY_CANDIDATE_INVALID")
+                        if not claim_repair:
+                            fields = payload.get("repair_fields")
+                            if (payload.get("contract_digest") != digest(request.output_contract.to_dict())
+                                    or not isinstance(fields, list) or any(not isinstance(path, str) for path in fields)):
+                                continue
+                            host_keys = self._target_keys(request, original, fields, None)
+                        else:
+                            contract = request.claim_repair_contract
+                            original_plan = contract.plan(original)
+                            if original_plan is None or digest(original_plan.to_dict()) != digest(payload.get("claim_repair_plan")):
+                                continue
+                            if contract.repair_material is not None:
+                                # Its old material callback output was not
+                                # frozen in v1 receipts. Retain the candidate
+                                # for explicit review instead of a blind fee.
+                                raise RecoveryConflict("MODEL_REPAIR_HISTORY_MATERIAL_UNBOUND")
+                            host_keys = self._target_keys(request, original, (), original_plan)
+                    if isinstance(host_keys, dict):
+                        attempted.update(path for path, key in keys.items() if host_keys.get(path) == key)
+        return tuple(path for path in keys if path in attempted)
+
     def execute(self, request, invoke: Callable[[], dict], scope, *, transient: bool = False,
                 output_repair: bool = False, field_repair: bool = False, claim_repair: bool = False) -> dict:
         if sum((transient, output_repair, field_repair, claim_repair)) > 1:
@@ -117,6 +206,24 @@ class ModelFormatRecovery:
             raise ProviderError("A durable unusable response or confirmed rejection is required", code=code)
         request_id = original["request_id"]
         configuration = digest({"configured_model": journal.configuration_fingerprint})
+        target_keys = self._target_keys(request, proof, fields, claim_plan)
+        blocked_targets = self._attempted_targets(request, stage_id, configuration, target_keys,
+            claim_repair=claim_repair) if field_repair or claim_repair else ()
+        original_targets = tuple(target_keys)
+        if blocked_targets:
+            fields = tuple(path for path in fields if path not in blocked_targets)
+            if claim_plan is not None:
+                claim_plan = replace(claim_plan, targets=tuple(
+                    item for item in claim_plan.targets if item.path not in blocked_targets))
+            if not fields and (claim_plan is None or not claim_plan.targets):
+                result = deepcopy(proof)
+                key = "_claim_repair" if claim_repair else "_field_repair"
+                previous = result.get(key)
+                result[key] = {**(previous if isinstance(previous, dict) else {}),
+                    "state": "pending", "code": "MODEL_REPAIR_TARGETS_REMAIN",
+                    "targets": list(blocked_targets), "deduplicated_targets": list(blocked_targets)}
+                return result
+            target_keys = {path: key for path, key in target_keys.items() if path not in blocked_targets}
         provider_id = journal.configuration_fingerprint
         authorization = AuthorizationScope(providers=(provider_id,), configuration_fingerprints=(configuration,))
         target = format_target(stage_id, request.input_digest)
@@ -136,6 +243,8 @@ class ModelFormatRecovery:
         preconditions = ((claim_plan.version, digest(proof), digest(claim_plan.to_dict())) if claim_repair else
                          (FIELD_REPAIR_VERSION, digest(proof), contract_digest, *fields) if field_repair else
                          (OUTPUT_REPAIR_VERSION, digest(proof)) if output_repair else ())
+        if target_keys:
+            preconditions = (*preconditions, digest(target_keys))
         if candidate_repair:
             # A bounded incident owns one concrete repair state, not all
             # future gaps in this stage. New target/content is new work; the
@@ -173,6 +282,8 @@ class ModelFormatRecovery:
             identity["repair_fields"] = list(fields)
         if claim_repair:
             identity["claim_repair_plan"] = claim_plan.to_dict()
+        if target_keys:
+            identity["repair_target_keys"] = target_keys
 
         transport_contexts = []
 
@@ -196,7 +307,8 @@ class ModelFormatRecovery:
                     transport_contexts.append(dict(journal.transport_context()))
                     context.coordinator.repository.model_call_observed(plan, context.action_id, context.token,
                         journal.clock(), {"response_received": False, "model_call": transport_contexts[-1]})
-                    result = invoke()
+                    result = (invoke(target_fields=fields) if blocked_targets and field_repair else
+                              invoke(target_plan=claim_plan) if blocked_targets and claim_repair else invoke())
             except TimeoutError as error:
                 # Intent exists and the wire outcome is not observed. Never
                 # turn a timeout into proof that the provider did no work.
@@ -311,10 +423,13 @@ class ModelFormatRecovery:
                 delta = target_merge(value["result"])
                 result = delta.candidate
                 key = "_claim_repair" if claim_repair else "_field_repair"
-                if delta.unresolved_targets:
+                remaining_targets = tuple(path for path in original_targets
+                    if path in blocked_targets or path in delta.unresolved_targets)
+                if remaining_targets:
                     result[key] = {"state": "pending", "code": "MODEL_REPAIR_TARGETS_REMAIN",
-                        "targets": list(delta.unresolved_targets),
+                        "targets": list(remaining_targets),
                         "accepted_targets": list(delta.accepted_patches),
+                        **({"deduplicated_targets": list(blocked_targets)} if blocked_targets else {}),
                         "ignored_extensions": list(delta.ignored_extensions),
                         "issues": list(delta.issues)}
                 else:

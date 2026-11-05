@@ -360,8 +360,12 @@ def _verification_batches(queries, provider):
     """
     from .research_execution.input_budget import input_measurement
     from .research_execution.model import provider_context_capability, provider_declares_context_capability
-    effective = provider.for_output_budget(32_000) if callable(getattr(provider, "for_output_budget", None)) else provider
-    limit = provider_context_capability(effective).available_input_tokens if provider_declares_context_capability(effective) else None
+    def current_capacity(count):
+        output = min(32_000, 1024 + 384 * count)
+        current = provider.for_output_budget(output) if callable(getattr(provider, "for_output_budget", None)) else provider
+        capability = provider_context_capability(current)
+        return current, capability, capability.available_input_tokens if capability.context_is_declared else None
+    effective, _, _ = current_capacity(1)
     # Source-connected components keep related assertions adjacent. Several
     # complete groups may share one bounded verdict request: a separate wire
     # for every disjoint footnote needlessly multiplies cold starts.
@@ -379,8 +383,11 @@ def _verification_batches(queries, provider):
     base = input_measurement(effective, _MODEL_PROTOCOL, '{"protocol":"' + VERSION + '","sources":{},"assertions":[]}')["tokens"]
 
     def exact_batches(items):
-        measured = input_measurement(effective, _MODEL_PROTOCOL, _verification_prompt(items))
-        if limit is not None and measured["tokens"] > limit and len(items) > 1:
+        current, capacity, limit = current_capacity(len(items))
+        measured = input_measurement(current, _MODEL_PROTOCOL, _verification_prompt(items))
+        overflow = (limit is not None and measured["tokens"] > limit or capacity.explicit_max_input_bytes is not None
+                    and measured["input_bytes"] > capacity.explicit_max_input_bytes)
+        if overflow and len(items) > 1:
             middle = len(items) // 2
             yield from exact_batches(items[:middle])
             yield from exact_batches(items[middle:])
@@ -402,6 +409,7 @@ def _verification_batches(queries, provider):
             query_size = input_measurement(effective, "", json.dumps(wire_query, ensure_ascii=False, separators=(",", ":")))["tokens"]
             # Short verdict output planning, with room for exact source spans.
             output_estimate = 1024 + 384 * (len(batch) + 1)
+            _, _, limit = current_capacity(len(batch) + 1)
             if batch and ((limit is not None and estimate + additions + query_size > limit * .95)
                           or output_estimate > 32_000):
                 yield from exact_batches(batch)
@@ -492,8 +500,8 @@ def validate_with_assertions(validate: Callable[[], Any], *, stage_id: str, jour
                 effective = (provider.for_output_budget(request.max_output_tokens)
                              if callable(getattr(provider, "for_output_budget", None)) else provider)
                 capability = provider_context_capability(effective)
-                capacity = {"declared": provider_declares_context_capability(effective),
-                    "available_input_tokens": capability.available_input_tokens,
+                capacity = {"declared": capability.context_is_declared,
+                    "available_input_tokens": capability.available_input_tokens if capability.context_is_declared else None,
                     "reserved_output_tokens": capability.reserved_output_tokens,
                     "counting": input_measurement(effective, request.system_prompt, request.user_prompt)}
                 candidate = journal.saved_candidate(request, stage_id) if journal is not None else None

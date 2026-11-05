@@ -196,6 +196,7 @@ def standard_model_registry() -> StageRegistry:
         optional_dependencies=spec.depends_on,
         required_capabilities=("company_identity", *requirements.get(spec.stage_id, ())),
         any_capabilities=("quantitative_facts", "sourced_financial_observations") if spec.stage_id == "financial-analyst" else
+            (*material, "sourced_financial_observations") if spec.stage_id == "accounting-risk-analyst" else
             ("sourced_disclosures",) if spec.stage_id in qualitative else
             material if spec.stage_id in {"accounting-risk-analyst", "forecast-scenarios", "final-synthesis"} else ())
         for spec in specs)

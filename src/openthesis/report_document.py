@@ -18,6 +18,7 @@ from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from .i18n import EN, ZH_HANT, normalize_language
+from .financial_metric_policy import apply_metric_policy, metric_profile, metric_applicable, bank_metric_notice
 from .financials import (
     cash_conversion_definition,
     format_cash_conversion,
@@ -941,6 +942,10 @@ def _financial_nodes(
     metrics = content.get("metrics")
     if not isinstance(metrics, list):
         return (), ()
+    profile_id = metric_profile(content.get("company"))
+    metrics = apply_metric_policy(metrics, profile_id=profile_id)
+    is_bank = profile_id == "bank" or any(
+        isinstance(row, dict) and not metric_applicable(row, "free_cash_flow") for row in metrics)
     period_diagnostics: list[str] = []
     metric_periods: dict[int, Any] = {}
     valid_metrics: list[dict[str, Any]] = []
@@ -1054,7 +1059,11 @@ def _financial_nodes(
         ]
         if rows and len(headers) > 1 else []
     )
+    if is_bank:
+        nodes.insert(0, ReportNode("quote", bank_metric_notice(language)))
     raw_interim = content.get("interim_metrics")
+    if isinstance(raw_interim, list):
+        raw_interim = apply_metric_policy(raw_interim, profile_id=profile_id)
     interim: list[dict[str, Any]] = []
     interim_periods: dict[int, Any] = {}
     if isinstance(raw_interim, list):
@@ -1124,8 +1133,8 @@ def _financial_nodes(
     ]
     if latest is not None:
         detail_items: list[tuple[str, str, bool]] = [
-            (("Cash conversion" if english else "現金利潤轉化率" if traditional else "现金利润转化率"), format_cash_conversion(latest, language), "cash_conversion_status" in latest),
-            (("Definition" if english else "計算口徑" if traditional else "计算口径"), cash_conversion_definition(latest, language), "cash_conversion_status" in latest),
+            (("Cash conversion" if english else "現金利潤轉化率" if traditional else "现金利润转化率"), format_cash_conversion(latest, language), metric_applicable(latest, "cash_conversion") and "cash_conversion_status" in latest),
+            (("Definition" if english else "計算口徑" if traditional else "计算口径"), cash_conversion_definition(latest, language), metric_applicable(latest, "cash_conversion") and "cash_conversion_status" in latest),
             (("Gross margin" if english else "毛利率"), format_percent(latest.get("gross_margin")), latest.get("gross_margin") is not None),
             (("Net income growth" if english else "淨利潤增長" if traditional else "净利润增长"), format_growth(latest.get("net_income_growth"), latest.get("net_income_growth_status"), language), latest.get("net_income_growth") is not None or latest.get("net_income_growth_status") is not None),
             (("Operating cash-flow growth" if english else "經營現金流增長" if traditional else "经营现金流增长"), format_growth(latest.get("operating_cash_flow_growth"), latest.get("operating_cash_flow_growth_status"), language), latest.get("operating_cash_flow_growth") is not None or latest.get("operating_cash_flow_growth_status") is not None),
@@ -1133,7 +1142,7 @@ def _financial_nodes(
         visible_details = [(label, value) for label, value, visible in detail_items if visible]
         if visible_details:
             nodes.extend((
-                ReportNode("heading", "Growth and quality metrics" if english else "增長與品質指標" if traditional else "增长与质量指标", level=3),
+                ReportNode("heading", ("Growth metrics" if english else "增長指標" if traditional else "增长指标") if is_bank else ("Growth and quality metrics" if english else "增長與品質指標" if traditional else "增长与质量指标"), level=3),
                 *(ReportNode("list_item", f"**{label}:** {value}" if english else f"**{label}：** {value}") for label, value in visible_details),
             ))
         tensions = [
@@ -1180,7 +1189,7 @@ def _financial_nodes(
                     f"{year} 财年收入增长缺少 {previous_year} 财年已验证收入"
                 )
         for metric in metrics[:5]:
-            if not isinstance(metric, dict) or not metric.get("free_cash_flow_gap"):
+            if not isinstance(metric, dict) or not metric_applicable(metric, "free_cash_flow") or not metric.get("free_cash_flow_gap"):
                 continue
             year = metric_periods[id(metric)].year
             period = f"FY{year}" if english else f"{year} 財年" if traditional else f"{year} 财年"
@@ -2105,6 +2114,14 @@ def assemble_report_document(
     if isinstance(final, dict):
         final_content = final.get("content") if isinstance(final.get("content"), dict) else {}
         mode = str(final_content.get("mode") or "")
+        if mode in {"staged-fallback", "synthesis-incomplete"}:
+            from .reporting import staged_compilation_notice
+            notice = staged_compilation_notice(final_content.get("report"), locale)
+            if notice:
+                add_section("local-compilation-status", notice["title"],
+                    tuple(ReportNode("paragraph", notice[key]) for key in ("summary", "retry")),
+                    role="notice", materiality="non_material", is_substantive=False,
+                    diagnostic_code="MODEL_REQUEST_COMPILATION_FAILED")
         if mode == "financial-refresh":
             add_section(
                 "financial-refresh-status",
@@ -2412,11 +2429,19 @@ def assemble_report_document(
                         )
                 proven_nodes.extend(annotated)
             for note_group in note_groups.values():
-                reason_label = (
+                if note_group["reason"] == "CONTENT_MIXED_ASSUMPTION_PENDING":
+                    reason_label = (
+                        "The projection is an assumption; historical amounts in the same item still need source verification."
+                        if locale == EN else
+                        "預測部分是假設；同一項中的歷史數字仍待核對來源。"
+                        if locale == ZH_HANT else
+                        "预测部分是假设；同一项中的历史数字仍待核对来源。")
+                else:
+                    reason_label = (
                     f"Reason: {note_group['reason']}"
                     if locale == EN else
                     f"原因：{note_group['reason']}"
-                )
+                    )
                 proven_nodes.append(ReportNode(
                     "verification_note",
                     reason_label,

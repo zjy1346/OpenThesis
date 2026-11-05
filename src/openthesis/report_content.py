@@ -11,7 +11,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
 
-from .research_section_validation import SECTION_PROOF_VERSION, content_digest, proven_content_nodes
+from .research_section_validation import (SECTION_PROOF_VERSION, DISPLAY_PENDING_PROOF_VERSIONS,
+    content_digest, proven_content_nodes, section_node_id)
 
 
 CONTENT_ROLES = frozenset({
@@ -588,9 +589,7 @@ def _replay_saved_assertion_proofs(nodes, artifacts, evidence_records):
                 judgments = [deepcopy(proofs[query['assertion_id']]) for query in queries]
                 node.update(role='verified_analysis', validation_state='verified', issue_code='',
                             assertion_results=judgments, assertions_sha256=content_digest(judgments))
-                identity = {key: node[key] for key in ('source_path', 'body_sha256', 'evidence_ids', 'role',
-                    'validator_version', 'context_sha256', 'depends_on', 'assertions_sha256')}
-                node['node_id'] = 'node:' + content_digest(identity)
+                node['node_id'] = section_node_id(node)
         result.append(node)
     return tuple(result)
 
@@ -669,7 +668,7 @@ def trusted_node_is_substantive(node: dict[str, Any]) -> bool:
         return node.get("validation_state") == "labelled"
     return (node.get("role") in {"analysis", "verified_analysis"} and node.get("validation_state") == "verified"
             or node.get("role") == "analysis" and node.get("validation_state") == "partial"
-            and node.get("validator_version") == SECTION_PROOF_VERSION
+            and node.get("validator_version") in DISPLAY_PENDING_PROOF_VERSIONS
             and node.get("display_eligible") is True)
 
 

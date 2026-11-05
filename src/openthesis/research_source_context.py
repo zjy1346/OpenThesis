@@ -10,13 +10,16 @@ from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from typing import Any
 import re
+import json
 
 from .research_assertions import source_identity
 from .resilience.contracts import digest
 
 
-SOURCE_CONTEXT_VERSION = "research-source-context-v2-question-repair"
+SOURCE_CONTEXT_VERSION = "research-source-context-v3-original-repair"
 _REPAIR_USE_CLASSES = ["repair_mapping", "model_analysis_labelled"]
+_TARGET_KEYS = ("concept", "fact_id", "evidence_id", "company_cik", "accession_number",
+                "period_end", "fiscal_period", "scope", "source_hash", "source_page")
 
 
 def _value(item: Any, key: str, default: Any = None) -> Any:
@@ -45,10 +48,38 @@ def _sequence(value: Any) -> list[Any]:
 def _target_matches(observation: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
     """Match only explicit stable target identities; never infer by value."""
 
-    keys = ("concept", "fact_id", "evidence_id", "company_cik", "accession_number",
-            "period_end", "fiscal_period", "scope", "source_hash")
-    supplied = [key for key in keys if target.get(key) not in (None, "")]
+    supplied = [key for key in _TARGET_KEYS if target.get(key) not in (None, "")]
     return bool(supplied) and all(observation.get(key) == target.get(key) for key in supplied)
+
+
+def _matching_observations(observations, targets):
+    """Index complete target predicates by field shape, without changing their union."""
+    by_shape = {}
+    fallback = []
+    for target in targets:
+        if not isinstance(target, Mapping):
+            continue
+        fields = tuple(key for key in _TARGET_KEYS if target.get(key) not in (None, ""))
+        if not fields:
+            continue
+        values = tuple(target[key] for key in fields)
+        try:
+            by_shape.setdefault(fields, set()).add(values)
+        except TypeError:
+            fallback.append(target)
+    for row in observations:
+        matched = False
+        for fields, allowed in by_shape.items():
+            try:
+                if tuple(row.get(field) for field in fields) in allowed:
+                    matched = True
+                    break
+            except TypeError:
+                # A malformed unhashable row cannot match these hashable
+                # target values; unhashable predicates use exact equality.
+                continue
+        if matched or any(_target_matches(row, target) for target in fallback):
+            yield row
 
 
 def _repair_catalog_item(observation: Mapping[str, Any]) -> dict[str, Any]:
@@ -78,7 +109,7 @@ def _normalise_repair_observation(item: Any) -> dict[str, Any] | None:
     return value
 
 
-def source_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
+def source_context(context: Mapping[str, Any] | None, *, include_repair_audit: bool = True) -> dict[str, Any]:
     """Build separate source, fact, repair, and issue channels.
 
     ``facts`` is the only accepted-fact input.  Evidence records are converted
@@ -110,17 +141,13 @@ def source_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
     observations = [
         observation for item in _sequence(payload.get("repair_observations"))
         if (observation := _normalise_repair_observation(item)) is not None
-    ]
+    ] if include_repair_audit else []
     issues = [deepcopy(item) for item in _sequence(payload.get("issues"))]
     targets = [
         dict(item) for item in _sequence(payload.get("repair_targets"))
         if isinstance(item, Mapping)
     ]
-    selected = [
-        deepcopy(observation)
-        for observation in observations
-        if targets and any(_target_matches(observation, target) for target in targets)
-    ]
+    selected = [deepcopy(observation) for observation in _matching_observations(observations, targets)]
     return {
         "contract_version": SOURCE_CONTEXT_VERSION,
         "accepted_facts": facts,
@@ -204,6 +231,22 @@ def repair_observations_from_canonical(canonical: Any) -> list[dict[str, Any]]:
             raw_value = lineage.get("raw_value", "")
         else:
             raw_value = fact.get("raw_value", "")
+        context_ids = set(fact.get("classification_evidence_ids", ()) or ())
+        if isinstance(lineage, Mapping):
+            context_ids.update(lineage.get("unit_evidence_ids", ()) or ())
+        # Preserve independently bound titles/units as original context. These
+        # are not currency/period defaults, and a neighbour is not a proof of
+        # applicability until the ordinary compiler checks the mapping.
+        source_context_rows = []
+        for ref in evidence_by_id.values():
+            if (not source_hash or _value(ref, "content_hash") != source_hash
+                    or not any(_value(ref, "document_id") == binding["document_id"]
+                               for binding in original_bindings)):
+                continue
+            ref_id = str(_value(ref, "evidence_id", ""))
+            same_page = _value(ref, "locator") == f"page:{fact.get('source_page')}"
+            if ref_id in context_ids or (same_page and ref_id.startswith(("unit:", "statement:"))):
+                source_context_rows.append(_as_dict(ref))
         observation = {
             "fact_id": fact_id,
             "evidence_id": f"fact:{fact_id}",
@@ -225,6 +268,9 @@ def repair_observations_from_canonical(canonical: Any) -> list[dict[str, Any]]:
             "source_page": fact.get("source_page"),
             "source_bbox": deepcopy(fact.get("source_bbox")),
             "raw_text": fact.get("raw_text", ""),
+            "source_column": fact.get("source_column", ""),
+            "statement": fact.get("statement", ""),
+            "original_context": source_context_rows,
             "raw_value": raw_value,
             "candidate_value": record.get("candidate_value", record.get("value", fact.get("value"))),
             "normalization_lineage": lineage,
@@ -240,6 +286,56 @@ def repair_observations_from_canonical(canonical: Any) -> list[dict[str, Any]]:
             "verification_state": "unresolved",
         }
         projected.append(observation)
+    # An unrecognized number/label may never have become a FinancialFact at
+    # all. Preserve original numeric table rows independently of that success.
+    # These are reader materials only; proposals are reread from the PDF before
+    # the financial compiler can adopt anything.
+    represented = {(item.get("accession_number"), item.get("source_page"), item.get("raw_text"))
+        for item in (*[_as_dict(row) or {} for row in research], *projected)}
+    for ref in evidence_by_id.values():
+        if not str(_value(ref, "evidence_id", "")).startswith("table-structure:"):
+            continue
+        owner = next((filing for filing in filings
+            if _value(filing, "document_id") == _value(ref, "document_id")
+            and _value(filing, "content_hash") == _value(ref, "content_hash")
+            and _value(filing, "source_url") == _value(ref, "source_url")
+            and re.fullmatch(r"[0-9a-fA-F]{64}", str(_value(ref, "content_hash", "")))), None)
+        page_match = re.fullmatch(r"page:([1-9]\d*)", str(_value(ref, "locator", "")))
+        if owner is None or page_match is None:
+            continue
+        try:
+            table = json.loads(_value(ref, "excerpt", ""))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(table, dict) or not isinstance(table.get("rows"), list):
+            continue
+        page = int(page_match[1])
+        for row in table["rows"]:
+            if not isinstance(row, dict) or not isinstance(row.get("cells"), list):
+                continue
+            cells = row["cells"]
+            if any(not isinstance(cell, dict) or not isinstance(cell.get("text"), str) for cell in cells):
+                continue
+            raw = " ".join(cell["text"] for cell in cells).strip()
+            identity = (_value(owner, "accession_number"), page, raw)
+            if len(cells) < 2 or not re.search(r"\d", raw) or identity in represented:
+                continue
+            represented.add(identity)
+            observation = {"company_cik": _value(owner, "company_cik"),
+                "accession_number": _value(owner, "accession_number"),
+                "source_document": _value(owner, "primary_document", ""),
+                "source_hash": _value(ref, "content_hash"), "source_page": page,
+                "source_url": _value(ref, "source_url"), "source_bbox": deepcopy(row.get("bbox")),
+                "raw_text": raw, "currency": "unknown", "period_end": "",
+                "unit_provenance": "unknown", "concept": "unknown", "scope": "unknown",
+                "source_binding": "bound", "original_context": [_as_dict(ref)],
+                "source_bindings": [{"evidence_id": _value(ref, "evidence_id"),
+                    "document_id": _value(ref, "document_id"), "document_sha256": _value(ref, "content_hash"),
+                    "page": page, "bbox": deepcopy(row.get("bbox"))}],
+                "issue_codes": ["original_row_not_compiled"], "allowed_uses": list(_REPAIR_USE_CLASSES),
+                "financial_admission": False, "verification_state": "unresolved"}
+            observation["evidence_id"] = "original-row:" + digest(observation)
+            projected.append(observation)
     return projected
 
 
@@ -250,16 +346,13 @@ def route_repair_observations(
 
     if not isinstance(observations, (list, tuple)):
         observations = ()
-    normalized = [
-        item for raw in observations
-        if (item := _normalise_repair_observation(raw)) is not None
-    ]
-    target_list = [item for item in targets if isinstance(item, Mapping)]
-    selected = [
-        deepcopy(item) for item in normalized
-        if target_list and any(_target_matches(item, target) for target in target_list)
-    ]
-    return selected, [_repair_catalog_item(item) for item in normalized]
+    rows = [item for item in observations if isinstance(item, Mapping) or callable(getattr(item, "to_dict", None))]
+    rows = [item if isinstance(item, Mapping) else item.to_dict() for item in rows]
+    rows = [item for item in rows if isinstance(item, Mapping)]
+    # Catalog construction never copies page/row bodies. Only the exact
+    # matched records are hydrated into role-specific repair material.
+    selected = [_normalise_repair_observation(item) for item in _matching_observations(rows, targets)]
+    return selected, [_repair_catalog_item(item) for item in rows]
 
 
 def observation_source_record(observation: Mapping[str, Any]) -> dict[str, Any] | None:

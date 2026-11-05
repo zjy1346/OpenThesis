@@ -91,6 +91,8 @@ class ModelRequestJournal:
         self._automatic_deadline = None
         self._automatic_limit_seconds = None
         self.adaptive_resume = False
+        from .request_diagnostics import PrefixObservations
+        self._prefix_observations = PrefixObservations()
 
     def prepare(self, registry, material_digest: str, invalidated: tuple[str, ...] = (), *,
                 stage_configurations: dict[str, str] | None = None,
@@ -185,6 +187,12 @@ class ModelRequestJournal:
     def note_preparation(self, queue_seconds, material_seconds):
         self._local.queue_seconds = queue_seconds
         self._local.material_seconds = material_seconds
+        self._local.scheduler_dispatch = None
+
+    def note_scheduler_dispatch(self, snapshot):
+        self._local.scheduler_dispatch = {"at_epoch": self.clock(), "active": snapshot.active,
+            "limit": snapshot.limit, "waiting": snapshot.waiting,
+            "cooldown_remaining_seconds": snapshot.cooldown_remaining_seconds}
 
     def note_queued_work(self, purpose, input_estimate, output_limit):
         # Queue/time exhaustion can precede wire preparation, including the
@@ -261,6 +269,22 @@ class ModelRequestJournal:
             "material_preparation_seconds": getattr(self._local, "material_seconds", None),
             "sent_at_epoch": self.clock(),
             "wire_state": "send_intent_recorded", "usage": None, **prefix_metadata}
+        from .request_diagnostics import message_accounting, capacity_accounting
+        diagnostic["final_message_ledger"] = message_accounting(system_prompt, user_prompt, measured)
+        diagnostic["capacity"] = capacity_accounting(provider, capability)
+        diagnostic["prefix_comparison"] = self._prefix_observations.observe(
+            getattr(config, "public_id", self.configuration_fingerprint), system_prompt, user_prompt)
+        # Look up the frozen forecast separately: an actual request is not the
+        # hypothetical dependency estimate used before its upstream stages ran.
+        with self.store.connect() as db:
+            plan_row = db.execute("SELECT plan_json FROM model_run_call_plans WHERE run_id=?", (self.run_id,)).fetchone()
+            plan = json.loads(plan_row[0]) if plan_row else {}
+            matches = [item for item in plan.get("request_plan", ()) if item.get("stage_id") == context["stage_id"]
+                       and item.get("purpose") == purpose]
+            diagnostic["planned_request"] = matches[0] if len(matches) == 1 else None
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='research_jobs' AND type='table'").fetchone():
+                job = db.execute("SELECT job_id FROM research_jobs WHERE run_id=? ORDER BY created_at DESC LIMIT 1", (self.run_id,)).fetchone()
+                diagnostic["job_id"] = job[0] if job else None
         self._local.wire_started = time.monotonic()
         self._local.pending_work = {"purpose": purpose, "input_estimate": measured["tokens"],
             "output_limit": capability.reserved_output_tokens}
@@ -276,6 +300,10 @@ class ModelRequestJournal:
             item.get("assertion_id") for item in semantic.get("assertions", ()) if isinstance(item, dict)]
         material = {key: semantic[key] for key in ("research_context", "material_registry", "common_core",
             "source_package", "late_evidence", "sources", "repair_material", "material") if key in semantic}
+        reading = semantic.get("reading_assignment")
+        current_state = reading.get("current_research_state") if isinstance(reading, dict) else None
+        if current_state is not None:
+            material["current_research_state"] = current_state
         claims = [{"path": item.get("path"), "original_claim": item.get("original_claim")}
             for item in semantic.get("targets", ()) if isinstance(item, dict) and "original_claim" in item]
         def content_only(value):
@@ -289,7 +317,16 @@ class ModelRequestJournal:
             "targets": targets or [context["stage_id"]],
             "source_version": digest(material) if material else digest(user_prompt),
             "completed_digest": digest(content_only(claims or semantic.get("prior_artifacts", {}))),
-            "strategy": "source-bound:" + purpose}
+            "strategy": "source-bound:" + purpose + ":" + digest({key: semantic.get(key) for key in
+                ("agent", "agent_role", "task_instructions", "output_schema", "claim_contract")})}
+        # A user-selected model/corrected physical capacity is genuine new
+        # work. Generation IDs and elapsed time are deliberately NOT included.
+        # Without this binding the adaptive no-progress guard suppresses an
+        # explicitly requested new-model synthesis before provider dispatch.
+        work["execution_route"] = getattr(config, "public_id", self.configuration_fingerprint)
+        work["capacity_revision"] = digest({"context": getattr(provider, "context_window_tokens", None),
+            "physical_bytes": capability.explicit_max_input_bytes,
+            "output_reserve": capability.reserved_output_tokens})
         if self.manual_authorization_id:
             # Only the existing explicit retry grant can authorize repeating
             # unchanged semantic work. A timestamp/attempt ID cannot do so.
@@ -328,6 +365,7 @@ class ModelRequestJournal:
             if row is None:
                 return
             diagnostic = json.loads(row["diagnostics_json"])
+            diagnostic["scheduler_dispatch"] = getattr(self._local, "scheduler_dispatch", None)
             code = getattr(error, "code", "")
             status = getattr(error, "http_status", None) if error is not None else metadata.get("http_status")
             elapsed = max(0, time.monotonic() - getattr(self._local, "wire_started", time.monotonic()))
@@ -353,6 +391,18 @@ class ModelRequestJournal:
             actual_input = diagnostic["usage"]["input_tokens"]
             budget = metadata.get("output_budget_tokens")
             diagnostic["applied_output_budget_tokens"] = budget if type(budget) is int and budget > 0 else None
+            cached = diagnostic["usage"]["cache_read_input_tokens"]
+            actual = diagnostic["usage"]["input_tokens"]
+            valid_cache = type(cached) is int and type(actual) is int and 0 <= cached <= actual
+            diagnostic["supplier_input_cache"] = {"cached_input_tokens": cached if valid_cache else None,
+                "uncached_input_tokens": actual - cached if valid_cache else None,
+                "hit_ratio": cached / actual if valid_cache and actual else None,
+                "source": "supplier_usage" if valid_cache else "unknown"}
+            diagnostic["error_origin"] = ("provider_context_rejection" if code == "MODEL_CONTEXT_CAPACITY" and status in {400, 422}
+                else "request_body_size" if code == "MODEL_REQUEST_BODY_TOO_LARGE" or status == 413
+                else "authentication" if status in {401, 403} else "rate_limit" if status == 429
+                else "output_exhausted" if metadata.get("finish_reason") in {"length", "max_tokens", "max_output_tokens"}
+                else "provider_error_code" if code == "MODEL_CONTEXT_CAPACITY" else "transport_or_local" if error else None)
             if actual_input:
                 diagnostic["observed_bytes_per_input_token"] = diagnostic["input_bytes"] / actual_input
             for key in ("model_id", "configured_model_id", "provider_id", "endpoint_host", "finish_reason",

@@ -17,6 +17,17 @@ _PARTITIONS = {
 
 
 def repair_context(prompt, fields):
+    from .reference_aliases import RequestReferenceError
+    from .request_planning import RequestCompilationError
+    from .request_diagnostics import compilation_diagnostic
+    try:
+        return _repair_context(prompt, fields)
+    except RequestReferenceError as error:
+        raise RequestCompilationError(compilation_diagnostic(error, "local-section-repair", prompt,
+            {"target_fields": list(fields)})) from error
+
+
+def _repair_context(prompt, fields):
     try:
         original = json.loads(prompt)
     except (TypeError, ValueError):
@@ -25,31 +36,13 @@ def repair_context(prompt, fields):
         raise ValueError("MODEL_REPAIR_DEPENDENCY_BOUNDARY_UNKNOWN")
     if not isinstance(original, dict):
         raise ValueError("MODEL_REPAIR_DEPENDENCY_BOUNDARY_UNKNOWN")
-    from .source_compiler import expand_record_tables
-    original = expand_record_tables(original)
     # Repairs are independent requests. Expand path aliases against this full
     # frozen input *before* selecting partitions, so a removed sibling cannot
     # strand references into a previous request or the relocated common core.
-    def expand_paths(value, resolving=()):
-        if isinstance(value, dict):
-            if set(value) == {"request_path_ref"}:
-                path = value["request_path_ref"]
-                if not isinstance(path, list) or len(resolving) >= 32 or tuple(path) in resolving:
-                    raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED")
-                target = original
-                try:
-                    for component in path:
-                        target = target[component]
-                except (KeyError, IndexError, TypeError):
-                    raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED") from None
-                return expand_paths(target, (*resolving, tuple(path)))
-            return {key: expand_paths(child, resolving) for key, child in value.items()}
-        if isinstance(value, list):
-            return [expand_paths(child, resolving) for child in value]
-        return deepcopy(value)
-    original = expand_paths(original)
+    from .reference_aliases import _expand_request_paths
+    original = _expand_request_paths(original)
     context = deepcopy(original.get("research_context", {}))
-    selected = {"risk_disclosures", "other_disclosures"}
+    selected = {"risk_disclosures", "audit_disclosures", "other_disclosures"}
     known = all(field in _PARTITIONS for field in fields)
     if known:
         selected.update(*( _PARTITIONS[field] for field in fields))
@@ -69,14 +62,20 @@ def repair_context(prompt, fields):
     result.update({"research_context": context, "target_fields": list(fields),
         "dependency_scope": "named_fields_and_risk_counterevidence" if known else "expanded_role_material_unknown_field_dependencies",
         "acceptance": "Return only target patches; preserve source identity, period, units and opposing evidence. Unknown facts stay unknown."})
-    if not known or any(field in {"scenarios", "growth_opportunities", "opportunities"} for field in fields):
-        result["prior_artifacts"] = deepcopy(original.get("prior_artifacts", {}))
+    if not known or any(field in {"scenarios", "growth_opportunities", "opportunities"} for field in fields) or original.get("sectional_delivery"):
+        from .analysis_references import section_dependencies
+        result["prior_artifacts"] = section_dependencies(original.get("prior_artifacts", {}), fields)
         result["dependency_scope"] += ":cross_stage_findings_retained"
     # Include only reachable interned text. No dangling references or implicit
     # lookup into the preceding request's prompt/cache are permitted.
     registry = original.get("material_registry", {})
     references = set()
+    visited = set()
     def visit(value):
+        if isinstance(value, (dict, list)):
+            if id(value) in visited:
+                return
+            visited.add(id(value))
         if isinstance(value, dict):
             if isinstance(value.get("material_ref"), str):
                 references.add(value["material_ref"])
@@ -89,24 +88,17 @@ def repair_context(prompt, fields):
     if references - set(registry):
         raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED")
     result["material_registry"] = {key: deepcopy(registry[key]) for key in sorted(references)}
-    def resolve_path(path):
-        value = result
-        try:
-            for component in path:
-                value = value[component]
-        except (KeyError, IndexError, TypeError):
-            raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED") from None
-        return value
+    checked = set()
     def check(value):
+        if isinstance(value, (dict, list)):
+            if id(value) in checked:
+                return
+            checked.add(id(value))
         if isinstance(value, dict):
             if "finding_ref" in value:
                 finding = result.get("prior_artifacts", {}).get("findings_registry", {}).get(value["finding_ref"])
                 if not isinstance(finding, dict) or not isinstance(finding.get("text"), str):
                     raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED")
-            if "request_path_ref" in value:
-                if not isinstance(value["request_path_ref"], list):
-                    raise ValueError("MODEL_REPAIR_SOURCE_REFERENCE_UNRESOLVED")
-                resolve_path(value["request_path_ref"])
             for child in value.values():
                 check(child)
         elif isinstance(value, list):
@@ -124,4 +116,9 @@ def repair_context(prompt, fields):
         context["evidence_partitions"][key] = compact_record_table(records)
     if "record_table_contract" in original:
         result["record_table_contract"] = original["record_table_contract"]
+    from ..research_materials import intern_request_values
+    result = intern_request_values(result)
+    # Validate the NEW request layout with the shared addressing semantics;
+    # send its compact representation, not this local expanded audit graph.
+    _expand_request_paths(result)
     return result

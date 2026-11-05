@@ -37,7 +37,6 @@ def mapping_reference(mapping, filing, allowed_pages):
     """Capture an untrusted hint under the already approved page manifest."""
     if (not isinstance(mapping, dict) or set(mapping) != _KEYS
             or mapping.get("concept") not in STATEMENT_FOR
-            or mapping["concept"] == "reported_roe"
             or type(mapping.get("original_page")) is not int
             or mapping["original_page"] not in allowed_pages
             or any(not isinstance(mapping.get(key), str) or not mapping[key].strip()
@@ -79,9 +78,9 @@ def _reread_worker(subject, filing, refs, original_rules):
     import pdfplumber
     from .financial_ingestion import (
         FinancialIngestionEngine, _manifest_for, _manifest_from_observed_pages,
-        _labels_for_rules, _label_compact, _positioned_pdf_rows, _row_label_source_text,
+        _labels_for_rules, _label_compact, _positioned_pdf_rows, _row_label_source_text, _merge_visual_rows,
     )
-    from .financial_sources.document_units import discover_document_units
+    from .financial_sources.pdf_document_units import _document_context_worker
     from .financial_statutory_currency import bind_statutory_presentation
 
     diagnostics, mappings = [], []
@@ -97,12 +96,20 @@ def _reread_worker(subject, filing, refs, original_rules):
     if FinancialIngestionEngine._file_sha256(filing.local_path) != filing.content_hash:
         return CandidateBatch(filing, diagnostics=("CELL_REPAIR_SOURCE_CHANGED",))
     candidates, evidence = [], []
+    # Already inside the killable cell-reader worker: reuse the ordinary
+    # complete-document native prepass inline instead of extracting every
+    # page again with the much slower positioned parser. No pages/units are
+    # omitted; pdfplumber below is reserved for the actual selected cells.
+    try:
+        document_context = _document_context_worker(filing.local_path)
+    except Exception:
+        document_context = _document_context_worker(filing.local_path, True)
+    texts = document_context.page_texts
     with pdfplumber.open(filing.local_path) as pdf:
-        texts = tuple(page.extract_text() or "" for page in pdf.pages)
         manifest = _manifest_from_observed_pages(_manifest_for(filing), filing, texts)
         if not manifest.period_end or manifest.period_end != filing.period_end:
             return CandidateBatch(filing, diagnostics=("CELL_REPAIR_PERIOD_UNRESOLVED",))
-        document_units = bind_statutory_presentation(discover_document_units(texts), texts, subject, filing)
+        document_units = bind_statutory_presentation(document_context.units, texts, subject, filing)
         label_registry = _labels_for_rules(original_rules)
         selected_by_page = {}
         for mapping, ref in mappings:
@@ -112,7 +119,12 @@ def _reread_worker(subject, filing, refs, original_rules):
                 continue
             rows = _positioned_pdf_rows(pdf.pages[page - 1].extract_words(
                 keep_blank_chars=False, use_text_flow=False) or [])
-            matches = [row for row in rows if _text(row.text) == _text(mapping["row_quote"])]
+            # Use the same host-owned logical-row geometry as extraction.
+            # A model hint cannot invent a join: matching happens under the
+            # original rules, before its document-local alias is introduced.
+            logical = [*rows, *(_merge_visual_rows(rows, index, original_rules) for index in range(len(rows)))]
+            unique = {(row.bbox, row.text): row for row in logical}
+            matches = [row for row in unique.values() if _text(row.text) == _text(mapping["row_quote"])]
             label = _label_compact(mapping["label"])
             if (len(matches) != 1 or not label
                     or label != _label_compact(_row_label_source_text(matches[0]))):
@@ -175,6 +187,8 @@ def _reread_worker(subject, filing, refs, original_rules):
                 candidates.append(FactCandidate(fact, tuple(by_id[key] for key in fact_row_evidence_ids(fact)
                     if key in by_id), CELL_REPAIR_VERSION))
                 evidence.extend((*reread_refs, proposal, proof))
+    if FinancialIngestionEngine._file_sha256(filing.local_path) != filing.content_hash:
+        return CandidateBatch(filing, diagnostics=("CELL_REPAIR_SOURCE_CHANGED",))
     return CandidateBatch(filing, tuple(candidates), tuple({ref.evidence_id: ref for ref in evidence}.values()),
         tuple(dict.fromkeys(diagnostics)))
 

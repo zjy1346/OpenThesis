@@ -16,6 +16,9 @@ ROOT_METADATA_FIELDS = frozenset({
     "generation_id", "model", "model_id", "provider_id", "usage", "billing", "billing_info",
     "metadata", "diagnostics", "receipt", "response_metadata", "structured_output_valid",
     "analysis_refs", "analysis_registry", "analysis_reference_contract",
+    # A recovery instruction is durable candidate metadata, not a business
+    # conclusion or a numerical fact to render in the final report.
+    "financial_repairs",
 })
 
 

@@ -151,6 +151,11 @@ class FinancialAdmission:
             research_as_of=research_as_of,
             parsing_observations=parsing_observations,
         )
+        from .financial_metric_policy import apply_metric_policy, metric_profile
+        industry_profile = metric_profile(subject)
+        profile = replace(profile,
+            metrics=tuple(apply_metric_policy(list(profile.metrics), profile_id=industry_profile)),
+            interim_metrics=tuple(apply_metric_policy(list(profile.interim_metrics), profile_id=industry_profile)))
         profile = replace(profile, disclosure_facts=tuple(
             getattr(canonical, "supplemental_facts", ()) or ()),
             repair_observations=tuple(repair_observations_from_canonical(canonical)),

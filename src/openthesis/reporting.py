@@ -179,6 +179,22 @@ def _locale_text(language: str, simplified: str, traditional: str, english: str)
     return simplified
 
 
+def staged_compilation_notice(report: object, language: str) -> dict[str, str] | None:
+    if not isinstance(report, dict) or report.get("cross_section_synthesis_status") != "not_completed_local_compilation":
+        return None
+    return {
+        "title": _locale_text(language, "本地研究请求需要修复", "本機研究請求需要修復", "Local research request needs repair"),
+        "summary": _locale_text(language,
+            "受影响阶段的材料引用未通过本地编译；该请求未发送给模型，不是财报校验失败或模型容量不足。已完成的独立阶段仍已保留。",
+            "受影響階段的材料引用未通過本機編譯；該請求未傳送給模型，不是財報驗證失敗或模型容量不足。已完成的獨立階段仍已保留。",
+            "Material references in an affected stage failed local compilation. This request was not sent to a model; it is not a financial-validation or model-capacity failure. Completed independent stages remain saved."),
+        "retry": _locale_text(language,
+            "请导出本地诊断并修复请求结构；之后仅继续受影响阶段。不要重新下载财报或反复发起模型请求。",
+            "請匯出本機診斷並修復請求結構；之後僅繼續受影響階段。不要重新下載財報或反覆發起模型請求。",
+            "Export local diagnostics and repair the request structure, then resume only affected stages. Do not re-download filings or repeatedly submit model requests."),
+    }
+
+
 def staged_context_capacity_notice(
     report: object,
     language: str,

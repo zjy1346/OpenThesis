@@ -12,6 +12,7 @@ from ..domain import EvidenceRef, FinancialFact, ResearchArtifact, ResearchRun, 
 from ..financial_contracts import CompilationPolicy
 from ..financial_pipeline import FinancialResearchSnapshot
 from ..financials import deterministic_summary
+from ..financial_metric_policy import metric_profile, metric_policy_identity
 from ..financial_evidence import build_fact_evidence
 from ..resilience.contracts import digest
 from .reports import artifacts_for_report_projection
@@ -54,6 +55,7 @@ class FinancialArtifactRefresher:
         if not (profile.metrics or profile.interim_metrics):
             return ()
         metrics, interim = list(profile.metrics), list(profile.interim_metrics)
+        metric_policy = metric_policy_identity(metric_profile(company))
         quality = {"status": profile.status.value, "rejected_periods": list(profile.rejected_periods),
             "period_continuity": list(profile.period_continuity), "period_coverage": dict(profile.period_coverage)}
         summary = {
@@ -63,6 +65,7 @@ class FinancialArtifactRefresher:
             "markdown": deterministic_summary(company.name, metrics, str(payload.get("report_language", "zh-CN")),
                 company.reporting_currency),
             "metrics": metrics, "interim_metrics": interim,
+            **({"metric_policy": metric_policy} if metric_policy else {}),
             "evidence": build_fact_evidence([*profile.fact_dicts,
                 *(fact.to_dict() for fact in profile.disclosure_facts)],
                 source_records=tuple(ref.to_dict() for ref in profile.source_evidence)), "currency": company.reporting_currency,
@@ -81,7 +84,9 @@ class FinancialArtifactRefresher:
         old_snapshot = payload.get('data_snapshot', {})
         old_semantics = old_snapshot.get('financial_semantics_sha256', '') if isinstance(old_snapshot, dict) else ''
         prior_stale = bool((base or {}).get('content', {}).get('financial_refresh', {}).get('qualitative_snapshot_stale'))
-        qualitative_stale = bool(analysis_exists and (prior_stale or old_semantics != financial_semantics_digest(profile.fact_dicts)))
+        policy_changed = bool(metric_policy and old_snapshot.get("financial_metric_policy") != metric_policy)
+        qualitative_stale = bool(analysis_exists and (prior_stale or policy_changed
+            or old_semantics != financial_semantics_digest(profile.fact_dicts)))
         overlay = {"mode": "financial-refresh-overlay",
             "base_report_artifact_id": str(base["artifact_id"]) if base else "",
             "financial_refresh": {"updated_at": now, "fact_count": len(profile.fact_dicts),
@@ -96,6 +101,7 @@ class FinancialArtifactRefresher:
         ]
         from ..storage import DERIVED_PIPELINE_CONTRACT
         payload["data_snapshot"] = {**dict(payload.get("data_snapshot", {})), "captured_at": now,
+            **({"financial_metric_policy": metric_policy} if metric_policy else {}),
             "financial_facts_sha256": digest(list(profile.fact_dicts)),
             "financial_semantics_sha256": financial_semantics_digest(profile.fact_dicts),
             "financial_fact_count": len(profile.fact_dicts),

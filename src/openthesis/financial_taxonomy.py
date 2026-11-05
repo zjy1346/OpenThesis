@@ -42,6 +42,7 @@ FINANCIAL_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
         "归属于母公司股东的净利润", "归属于母公司所有者的净利润",
         "归属于上市公司股东的净利润", "歸屬於母公司股東的淨利潤",
         "本公司权益持有人应占盈利", "本公司股东应占溢利",
+        "本行股东的净利润", "归属于本行股东的净利润",
         "net income attributable to owners", "net income attributable to shareholders",
         "net profit attributable to shareholders of the parent company",
         "net income attributable to alibaba group holding limited",
@@ -50,7 +51,7 @@ FINANCIAL_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
         "equity holders of the company", "owners of the company",
     ),
     "minority_interest_profit": (
-        "少数股东损益", "少數股東損益", "少数股东净利润", "非控股权益应占利润",
+        "少数股东损益", "少數股東損益", "少数股东净利润", "少数股东的净利润", "非控股权益应占利润",
         "net income attributable to non-controlling interests",
         "profit attributable to non-controlling interests", "non-controlling interests",
         "noncontrolling interests", "minority interests",
@@ -252,11 +253,12 @@ def profit_row_concept(label: object, attribution: object = "") -> str | None:
     )
     if attributed and any(token in normalized for token in ("ordinaryshareholder", "普通股股东")):
         return "ordinary_shareholder_net_income"
-    if any(token in normalized for token in ("少数股东损益", "少数股东净利润")):
+    if any(token in normalized for token in ("少数股东损益", "少数股东净利润", "少数股东的净利润")):
         return "minority_interest_profit"
     if (attributed or ownership_context) and any(token in normalized for token in ("noncontrollinginterest", "minorityinterest", "非控股")):
         return "minority_interest_profit"
-    if (attributed or ownership_context) and any(token in normalized for token in ("母公司", "上市公司股东", "本公司", "owners", "equityholder", "shareholder", "alibabagroup")):
+    if ((attributed or ownership_context) and any(token in normalized for token in ("母公司", "上市公司股东", "本公司", "本行股东", "owners", "equityholder", "shareholder", "alibabagroup"))
+            or normalized == "本行股东的净利润"):
         return "parent_net_income"
     if not attributed and any(normalized.startswith(normalize_financial_label(item)) for item in FINANCIAL_LABEL_ALIASES["net_income"]):
         return "net_income"

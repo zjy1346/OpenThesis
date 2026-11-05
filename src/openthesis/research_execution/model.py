@@ -63,15 +63,19 @@ class ProviderContextCapability:
     reserved_repair_tokens: int = 2_048
     explicit_max_input_bytes: int | None = None
     bytes_per_token: float = 1.0
+    context_is_declared: bool = False
 
     @property
     def available_input_tokens(self) -> int:
-        return max(1, self.max_input_tokens - self.reserved_output_tokens - self.reserved_repair_tokens)
+        # A repair is an independent request, not a second output occupying
+        # every generation's context. Reserve only this physical call's output.
+        return max(0, self.max_input_tokens - self.reserved_output_tokens)
 
     @property
     def max_input_bytes(self) -> int:
         if self.explicit_max_input_bytes is not None:
-            return max(1, int(self.explicit_max_input_bytes))
+            physical = max(1, int(self.explicit_max_input_bytes))
+            return min(physical, max(1, int(self.available_input_tokens * self.bytes_per_token))) if self.context_is_declared else physical
         return max(1, int(self.available_input_tokens * self.bytes_per_token))
 
 
@@ -113,8 +117,9 @@ def provider_context_capability(provider: Any) -> ProviderContextCapability:
     ratio = getattr(provider, "input_bytes_per_token", 1.0)
     if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio <= 0:
         ratio = 1.0
+    declared_tokens = any(_positive_integer(getattr(provider, name, None)) for name in ("context_window_tokens", "max_input_tokens"))
     return ProviderContextCapability(tokens, *reserves,
-                                     explicit if _positive_integer(explicit) else None, float(ratio))
+                                     explicit if _positive_integer(explicit) else None, float(ratio), declared_tokens)
 
 
 def provider_declares_context_capability(provider: Any) -> bool:
@@ -134,9 +139,11 @@ class ModelStageRequest:
     purpose: str = "generation"
     max_output_tokens: int | None = None
     reference_bindings: tuple[tuple[str, str], ...] = ()
+    input_limit_kind: str = "explicit_bytes"
 
     def __post_init__(self) -> None:
-        if (self.purpose not in {"generation", "semantic_verification", "material_coverage", "section_delivery"}
+        if (self.input_limit_kind not in {"explicit_bytes", "planning_estimate"}
+                or self.purpose not in {"generation", "semantic_verification", "material_coverage", "section_delivery"}
                 or not isinstance(self.stage_id, str) or not self.stage_id.strip()
                 or not isinstance(self.system_prompt, str)
                 or not isinstance(self.user_prompt, str)
@@ -212,16 +219,21 @@ class ModelStageExecutor:
         if request.max_output_tokens is not None and callable(getattr(budget_provider, "for_output_budget", None)):
             budget_provider = budget_provider.for_output_budget(request.max_output_tokens)
         capability = provider_context_capability(budget_provider)
-        input_exceeded = request.max_input_bytes is not None and request.input_bytes > request.max_input_bytes
-        if measurement["exact"] and provider_declares_context_capability(self.provider):
-            input_exceeded = measurement["tokens"] > capability.available_input_tokens
-            if capability.explicit_max_input_bytes is not None:
-                input_exceeded = input_exceeded or request.input_bytes > capability.explicit_max_input_bytes
+        def exceeds_input(prompt):
+            counted = measurement if prompt == request.user_prompt else input_measurement(
+                budget_provider, request.system_prompt, prompt)
+            size = counted["input_bytes"]
+            physical = capability.explicit_max_input_bytes
+            return ((request.input_limit_kind == "explicit_bytes" and request.max_input_bytes is not None and size > request.max_input_bytes)
+                or physical is not None and size > physical
+                or counted["exact"] and capability.context_is_declared and counted["tokens"] > capability.available_input_tokens)
+        input_exceeded = exceeds_input(request.user_prompt)
         if input_exceeded:
             raise SynthesisContextLimitError(
                 [{"name": request.stage_id, "bytes": request.input_bytes}],
                 request.max_input_bytes or capability.max_input_bytes, required_bytes=request.input_bytes,
-                counting_mode=measurement["method"],
+                counting_mode=("explicit_physical_bytes" if request.input_limit_kind == "explicit_bytes"
+                               or capability.explicit_max_input_bytes is not None else measurement["method"]),
             )
         result: dict[str, Any] | None = None
         error: BaseException | None = None
@@ -292,6 +304,9 @@ class ModelStageExecutor:
                                         dispatch = getattr(self.request_journal, "before_dispatch", None)
                                         if callable(dispatch):
                                             dispatch()
+                                        note_dispatch = getattr(self.request_journal, "note_scheduler_dispatch", None)
+                                        if callable(note_dispatch):
+                                            note_dispatch(self.scheduler.snapshot())
                                     if format_compensation or output_repair or field_patch or claim_plan is not None:
                                         response = provider.generate_once(
                                             request.system_prompt,
@@ -372,11 +387,12 @@ class ModelStageExecutor:
                                 repair_bytes = (len(request.system_prompt.encode("utf-8"))
                                     + len(field_repair_prompt(request.user_prompt, request.output_contract,
                                                             fields).encode("utf-8")))
-                                if request.max_input_bytes is not None and repair_bytes > request.max_input_bytes:
+                                if exceeds_input(field_repair_prompt(request.user_prompt, request.output_contract, fields)):
                                     raise ProviderError("Complete field repair needs a larger model context",
                                                         code="MODEL_FIELD_REPAIR_CONTEXT_REQUIRED")
                                 candidate = self.request_journal.recover_fields(request,
-                                    lambda: scheduled_call(request.json_mode, field_patch=fields), request_scope)
+                                    lambda *, target_fields=fields: scheduled_call(
+                                        request.json_mode, field_patch=target_fields), request_scope)
                             except Exception as repair_error:
                                 candidate = {**candidate, "_field_repair": {
                                     "state": "pending", "code": _repair_failure_code(repair_error), "targets": list(fields)}}
@@ -390,9 +406,10 @@ class ModelStageExecutor:
                                     and callable(getattr(self.provider, "generate_once", None))):
                                 repair_prompt = request.claim_repair_contract.prompt(request.user_prompt, candidate, claim_plan)
                                 repair_bytes = len(request.system_prompt.encode("utf-8")) + len(repair_prompt.encode("utf-8"))
-                                if request.max_input_bytes is None or repair_bytes <= request.max_input_bytes:
+                                if not exceeds_input(repair_prompt):
                                     candidate = self.request_journal.recover_claims(request,
-                                        lambda: scheduled_call(request.json_mode, claim_plan=claim_plan), request_scope)
+                                        lambda *, target_plan=claim_plan: scheduled_call(
+                                            request.json_mode, claim_plan=target_plan), request_scope)
                                 else:
                                     candidate = {**candidate, "_claim_repair": {
                                         "state": "pending", "code": "MODEL_CLAIM_REPAIR_CONTEXT_REQUIRED",

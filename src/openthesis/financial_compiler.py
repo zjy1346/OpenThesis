@@ -391,7 +391,17 @@ class FinancialFactCompiler:
                     continue
                 # Same-value candidates are independently auditable, but one
                 # canonical fact is resolved to prevent last-write-wins drift.
-                chosen.append(sorted(defensible, key=lambda option: (option.extractor, option.fact.fact_id))[0])
+                # A continuation may repeat the same cell. Prefer its first
+                # physical occurrence within the same extractor instead of an
+                # opaque fact hash, which can change with row geometry. This
+                # runs only after all source/identity/value checks above; it
+                # must never resolve a genuine numeric or semantic conflict.
+                chosen.append(min(defensible, key=lambda option: (
+                    option.extractor,
+                    option.fact.source_page is None,
+                    option.fact.source_page if option.fact.source_page is not None else 0,
+                    option.fact.fact_id,
+                )))
 
             group_facts = [item.fact for item in chosen]
             refs: dict[str, EvidenceRef] = {

@@ -18,6 +18,7 @@ import type {
   ProviderConnectionSummary,
   ProviderDefinition,
   ResearchJob,
+  ResearchTaskList,
   StructureRuntimeStatus,
   ResearchReport,
   RecoveryStageTarget,
@@ -66,10 +67,17 @@ async function request<M extends BackendMethod>(
 }
 
 const DEFERRED_METHODS = new Set<BackendMethod>([
-  "app.bootstrap", "research.get_report", "research.financial_diagnostics", "research.retry_synthesis", "research.retry_model_stages",
-  "research.retry_growth", "research.retry_stage", "research.revalidate_saved", "research.refresh_financial_report",
-  "research.retry_financials", "research.rebuild_financials", "research.market_snapshot", "company.search", "ot.suggest", "packs.install",
+  "app.bootstrap", "research.get_report", "research.financial_diagnostics",
+  "research.market_snapshot", "company.search", "ot.suggest", "packs.install",
 ]);
+
+async function enqueueRequest<M extends BackendMethod>(method: M, params: BackendParams[M]): Promise<BackendResponse<M>> {
+  const payload = { ...params, client_request_id: (params as { client_request_id?: string }).client_request_id ?? crypto.randomUUID() };
+  // Only the cheap atomic enqueue is repeated. The durable idempotency key
+  // prevents a lost IPC acknowledgement creating a second research/call plan.
+  try { return await request(method, payload); }
+  catch { return request(method, payload); }
+}
 
 export function bootstrapBackend(minimal = false): Promise<BootstrapResult> {
   return request("app.bootstrap", minimal ? { minimal: true } : {});
@@ -310,7 +318,7 @@ export async function installResearchPack(file: File): Promise<ResearchPackSumma
 }
 
 export function startResearch(research: ResearchRequest = { mode: "demo" }): Promise<ResearchJob> {
-  return request("research.start", research);
+  return enqueueRequest("research.start", research);
 }
 
 export function deleteResearchRun(runId: string): Promise<{ run_id: string; deleted: boolean }> {
@@ -320,16 +328,16 @@ export function deleteResearchRun(runId: string): Promise<{ run_id: string; dele
 export function retryResearchSynthesis(
   runId: string,
   model?: ModelSelection,
-): Promise<ResearchReport> {
-  return request("research.retry_synthesis", { run_id: runId, ...(model ? { model } : {}) });
+): Promise<ResearchJob> {
+  return enqueueRequest("research.retry_synthesis", { run_id: runId, ...(model ? { model } : {}) });
 }
 
 export function retryResearchModelStages(
   runId: string,
   model?: ModelSelection,
   budgetOnly = false,
-): Promise<ResearchReport> {
-  return request("research.retry_model_stages", {
+): Promise<ResearchJob> {
+  return enqueueRequest("research.retry_model_stages", {
     run_id: runId,
     ...(model ? { model } : {}),
     ...(budgetOnly ? { budget_only: true } : {}),
@@ -370,8 +378,8 @@ export function getResearchCallHistory(
 export function retryResearchGrowth(
   runId: string,
   model: ModelSelection,
-): Promise<ResearchReport> {
-  return request("research.retry_growth", { run_id: runId, model });
+): Promise<ResearchJob> {
+  return enqueueRequest("research.retry_growth", { run_id: runId, model });
 }
 
 export function retryResearchStage(
@@ -380,8 +388,8 @@ export function retryResearchStage(
   model: ModelSelection,
   planHash: string,
   confirmNewAttempt = false,
-): Promise<ResearchReport> {
-  return request("research.retry_stage", {
+): Promise<ResearchJob> {
+  return enqueueRequest("research.retry_stage", {
     run_id: runId,
     target,
     model,
@@ -390,31 +398,31 @@ export function retryResearchStage(
   });
 }
 
-export function revalidateSavedResearch(runId: string): Promise<ResearchReport> {
-  return request("research.revalidate_saved", { run_id: runId });
+export function revalidateSavedResearch(runId: string): Promise<ResearchJob> {
+  return enqueueRequest("research.revalidate_saved", { run_id: runId });
 }
 
-export function retryResearchFinancials(runId: string): Promise<ResearchReport> {
-  return request("research.retry_financials", { run_id: runId });
+export function retryResearchFinancials(runId: string): Promise<ResearchJob> {
+  return enqueueRequest("research.retry_financials", { run_id: runId });
 }
 
 export function refreshFinancialReport(
   runId: string,
   language?: ResearchReport["report_language"],
-): Promise<ResearchReport> {
-  return request("research.refresh_financial_report", { run_id: runId, language });
+): Promise<ResearchJob> {
+  return enqueueRequest("research.refresh_financial_report", { run_id: runId, language });
 }
 
 export function startResearchFinancialRetry(runId: string): Promise<ResearchJob> {
-  return request("research.start_financial_retry", { run_id: runId });
+  return enqueueRequest("research.start_financial_retry", { run_id: runId });
 }
 
-export function rebuildResearchFinancials(runId: string): Promise<ResearchReport> {
-  return request("research.rebuild_financials", { run_id: runId, confirmed: true });
+export function rebuildResearchFinancials(runId: string): Promise<ResearchJob> {
+  return enqueueRequest("research.rebuild_financials", { run_id: runId, confirmed: true });
 }
 
 export function startResearchFinancialRebuild(runId: string): Promise<ResearchJob> {
-  return request("research.start_financial_rebuild", { run_id: runId, confirmed: true });
+  return enqueueRequest("research.start_financial_rebuild", { run_id: runId, confirmed: true });
 }
 
 export function getResearchStatus(jobId: string): Promise<ResearchJob> {
@@ -429,8 +437,28 @@ export function cancelModelCall(jobId: string, requestId: string, attemptId: str
   return request("research.cancel_model_call", { job_id: jobId, request_id: requestId, attempt_id: attemptId });
 }
 
-export function decideVisionUpload(jobId: string, approved: boolean): Promise<ResearchJob> {
-  return request("research.vision_decision", { job_id: jobId, approved });
+export function decideVisionUpload(jobId: string, approved: boolean, expectedRevision?: number, planId?: string): Promise<ResearchJob> {
+  return request("research.vision_decision", { job_id: jobId, approved, expected_revision: expectedRevision, plan_id: planId });
+}
+
+export function listResearchTasks(options: BackendParams["research.jobs.list"] = {}): Promise<ResearchTaskList> {
+  return request("research.jobs.list", options);
+}
+export function resumeResearchTask(jobId: string, expectedRevision: number, model?: ModelReference, useCurrentVisionSettings = false): Promise<ResearchJob> {
+  return request("research.jobs.resume", { job_id: jobId, expected_revision: expectedRevision, model, use_current_vision_settings: useCurrentVisionSettings });
+}
+export function archiveResearchTask(jobId: string, expectedRevision: number): Promise<{ job_id: string; archived: boolean }> {
+  return request("research.jobs.archive", { job_id: jobId, expected_revision: expectedRevision });
+}
+export function continueResearchQueue(): Promise<ResearchTaskList> {
+  return request("research.queue.continue", {});
+}
+export function shutdownResearchQueue() { return request("research.queue.shutdown", {}); }
+export function listenForWindowClose(onClose: () => void) {
+  return listen("openthesis-close-requested", onClose);
+}
+export function finishWindowClose(action: "minimize" | "exit"): Promise<void> {
+  return invoke("finish_window_close", { action });
 }
 
 export function exportResearchReport(report: ResearchReport): Promise<boolean> {

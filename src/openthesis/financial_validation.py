@@ -16,7 +16,7 @@ from .financial_contracts import (
     FinancialValidation,
     SourceComponentObservation,
     ValidationStatus,
-    exact_decimal_arithmetic,
+    exact_decimal_arithmetic, source_numeric_token,
     fact_row_evidence_ids,
     missing_profile_concepts,
 )
@@ -53,7 +53,7 @@ _COVERAGE_WARNING_ISSUES = frozenset({
 })
 
 def _parse_number(text: str) -> float | None:
-    cleaned = text.strip().replace("−", "-").replace("％", "%")
+    cleaned = source_numeric_token(text).replace("％", "%")
     is_percent = cleaned.endswith("%")
     if is_percent:
         cleaned = cleaned[:-1].strip()
@@ -78,7 +78,7 @@ def _source_row_contains_label(label: str, text: str) -> bool:
     # Strip only numeric tokens from the bound, verbatim evidence row before
     # matching its label. The row/page/box binding remains independently checked.
     normalized = _label_compact(label)
-    return bool(normalized and normalized in _label_compact(_NUM.sub("", text)))
+    return bool(normalized and normalized in _label_compact(_NUM.sub("", source_numeric_token(text))))
 
 
 def _statement_source_issue(
@@ -155,7 +155,7 @@ def _profit_before_tax_row_issue(
     displayed_value = float(fact.value) / float(fact.unit_scale)
     row_values = (
         _parse_number(match.group())
-        for match in _NUM.finditer(fact.raw_text.replace("−", "-"))
+        for match in _NUM.finditer(source_numeric_token(fact.raw_text))
     )
     if fact.normalization_lineage is None and not any(
         value is not None
@@ -286,7 +286,7 @@ class FinancialValidator:
                     ):
                         return "normalization_source_row_binding_mismatch"
                     observed = set()
-                    for match in _NUM.finditer(row_ref.excerpt.replace("−", "-")):
+                    for match in _NUM.finditer(source_numeric_token(row_ref.excerpt)):
                         token = match.group().replace(",", "").replace(" ", "")
                         if token.startswith("(") and token.endswith(")"):
                             token = "-" + token[1:-1]
@@ -299,7 +299,7 @@ class FinancialValidator:
                             yield node
 
                     for leaf in source_leaves(lineage):
-                        raw_token = leaf.raw_value.strip().replace("−", "-").replace(",", "")
+                        raw_token = source_numeric_token(leaf.raw_value).replace(",", "")
                         if raw_token.startswith("(") and raw_token.endswith(")"):
                             raw_token = "-" + raw_token[1:-1].strip()
                         if Decimal(raw_token) not in observed:
@@ -678,14 +678,14 @@ class FinancialValidator:
             amount_state = "unknown"
             if (lineage is not None and row is not None and not lineage.inputs
                     and isinstance(lineage.raw_value, str)):
-                raw_token = lineage.raw_value.strip().replace("−", "-").replace(",", "")
+                raw_token = source_numeric_token(lineage.raw_value).replace(",", "")
                 if raw_token.startswith("(") and raw_token.endswith(")"):
                     raw_token = "-" + raw_token[1:-1].strip()
                 try:
                     row_values = {
                         Decimal(match.group().replace("−", "-").replace(",", "").replace(" ", "").strip("()"))
                         * (-1 if match.group().strip().startswith("(") else 1)
-                        for match in _NUM.finditer(row.excerpt)
+                        for match in _NUM.finditer(source_numeric_token(row.excerpt))
                     }
                     amount_state = "observed" if Decimal(raw_token) in row_values else "conflict"
                 except (InvalidOperation, ValueError):

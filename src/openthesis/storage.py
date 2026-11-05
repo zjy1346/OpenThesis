@@ -39,8 +39,8 @@ if TYPE_CHECKING:
     from .research_continuity import StageAttempt
 
 
-SCHEMA_VERSION = 20
-STARTUP_MIGRATION = "startup-read-models-v20-r7"
+SCHEMA_VERSION = 21
+STARTUP_MIGRATION = "startup-read-models-v21-r1"
 
 
 class StorageSchemaError(RuntimeError):
@@ -581,6 +581,20 @@ class Storage:
                     stage TEXT NOT NULL,
                     snapshot_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    operation_type TEXT NOT NULL DEFAULT 'research',
+                    client_request_id TEXT NOT NULL DEFAULT '',
+                    request_hash TEXT NOT NULL DEFAULT '',
+                    queue_sequence INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    started_at TEXT,
+                    finished_at TEXT,
+                    request_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    snapshot_schema_version INTEGER NOT NULL DEFAULT 0,
+                    execution_owner TEXT NOT NULL DEFAULT '',
+                    lease_updated_at TEXT,
+                    blocked_reason TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    revision INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(run_id) REFERENCES research_runs(run_id)
                 );
 
@@ -733,7 +747,36 @@ class Storage:
                 "supersedes_json": "TEXT NOT NULL DEFAULT '[]'",
             })
             self._ensure_columns(db, "research_stage_attempts", {"action_id": "TEXT NOT NULL DEFAULT ''"})
-            self._ensure_columns(db, "research_jobs", {"revision": "INTEGER NOT NULL DEFAULT 0"})
+            self._ensure_columns(db, "research_jobs", {
+                "operation_type": "TEXT NOT NULL DEFAULT 'research'",
+                "client_request_id": "TEXT NOT NULL DEFAULT ''",
+                "request_hash": "TEXT NOT NULL DEFAULT ''",
+                "queue_sequence": "INTEGER NOT NULL DEFAULT 0",
+                "created_at": "TEXT NOT NULL DEFAULT ''",
+                "started_at": "TEXT",
+                "finished_at": "TEXT",
+                "request_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+                "snapshot_schema_version": "INTEGER NOT NULL DEFAULT 0",
+                "execution_owner": "TEXT NOT NULL DEFAULT ''",
+                "lease_updated_at": "TEXT",
+                "blocked_reason": "TEXT NOT NULL DEFAULT ''",
+                "archived": "INTEGER NOT NULL DEFAULT 0",
+                "revision": "INTEGER NOT NULL DEFAULT 0",
+            })
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_research_job_client_request "
+                "ON research_jobs(client_request_id) WHERE client_request_id <> ''"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_research_job_execution_slot "
+                "ON research_jobs((1)) WHERE execution_owner <> ''"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('research_jobs_revision', '0')"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES('research_queue_paused', 'false')"
+            )
             db.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -2527,7 +2570,11 @@ class Storage:
         completed_at = utc_now_iso()
         with self.connect() as db:
             rows = db.execute(
-                "SELECT run_id, payload_json FROM research_runs WHERE status = ?",
+                """SELECT r.run_id, r.payload_json FROM research_runs r WHERE r.status = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM research_jobs j
+                        WHERE j.run_id=r.run_id AND j.snapshot_schema_version=1
+                    )""",
                 (RunStatus.RUNNING.value,),
             ).fetchall()
             for row in rows:
@@ -2555,7 +2602,9 @@ class Storage:
                     ),
                 )
                 job_rows = db.execute(
-                    "SELECT job_id, snapshot_json FROM research_jobs WHERE run_id = ? AND state IN ('queued', 'running', 'cancelling')",
+                    """SELECT job_id, snapshot_json, revision FROM research_jobs
+                        WHERE run_id = ? AND snapshot_schema_version=0
+                        AND state IN ('queued', 'running', 'cancelling')""",
                     (row["run_id"],),
                 ).fetchall()
                 for job_row in job_rows:
@@ -2567,10 +2616,13 @@ class Storage:
                         "state": "completed", "stage": "partial", "percent": 100,
                         "message": reason, "error_code": "PROCESS_INTERRUPTED",
                     })
+                    revision = max(int(job_row["revision"] or 0), int(snapshot.get("revision", 0) or 0)) + 1
+                    snapshot["revision"] = revision
                     db.execute(
-                        "UPDATE research_jobs SET state = 'completed', stage = 'partial', snapshot_json = ?, updated_at = ? WHERE job_id = ?",
-                        (json.dumps(snapshot, ensure_ascii=False), completed_at, job_row["job_id"]),
+                        "UPDATE research_jobs SET state='completed',stage='partial',snapshot_json=?,updated_at=?,revision=? WHERE job_id=?",
+                        (json.dumps(snapshot, ensure_ascii=False), completed_at, revision, job_row["job_id"]),
                     )
+                    self._bump_research_jobs_revision_db(db)
         return len(rows)
 
     @staticmethod
@@ -3170,44 +3222,610 @@ class Storage:
             call["call_plan"] = call_plan
         return list(calls.values())
 
+    @staticmethod
+    def _bump_research_jobs_revision_db(db: sqlite3.Connection) -> int:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='research_jobs_revision'"
+        ).fetchone()
+        revision = int(row["value"]) + 1 if row is not None else 1
+        db.execute(
+            "INSERT INTO settings(key,value) VALUES('research_jobs_revision',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(revision),),
+        )
+        return revision
+
+    @staticmethod
+    def _research_jobs_revision_db(db: sqlite3.Connection) -> int:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key='research_jobs_revision'"
+        ).fetchone()
+        try:
+            return max(0, int(row["value"])) if row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _validate_research_request_snapshot(value: Any) -> str:
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                for key, child in item.items():
+                    normalized = re.sub(r"[^a-z]", "", str(key).casefold())
+                    public_consent = (normalized == "authorization" and isinstance(child, Mapping)
+                        and set(child) <= {"confirmed_at", "policy_version", "scope", "valid"}
+                        and child.get("scope") in {"failed_financial_statement_pages", "financial_failed_pages"}
+                        and type(child.get("valid")) is bool)
+                    if normalized in {"apikey", "authorization", "secret", "password"} and child and not public_consent:
+                        raise ValueError("RESEARCH_REQUEST_SNAPSHOT_SECRET")
+                    visit(child)
+            elif isinstance(item, (list, tuple)):
+                for child in item:
+                    visit(child)
+
+        if not isinstance(value, dict):
+            raise ValueError("RESEARCH_REQUEST_SNAPSHOT_INVALID")
+        visit(value)
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("RESEARCH_REQUEST_SNAPSHOT_INVALID") from exc
+
+    @staticmethod
+    def _research_job_snapshot(row: sqlite3.Row) -> dict[str, Any] | None:
+        try:
+            snapshot = json.loads(row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        return snapshot
+
+    @classmethod
+    def _research_job_record_from_row(cls, row: sqlite3.Row) -> dict[str, Any] | None:
+        snapshot = cls._research_job_snapshot(row)
+        if snapshot is None:
+            return None
+        try:
+            request_snapshot = json.loads(row["request_snapshot_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            request_snapshot = {}
+        if not isinstance(request_snapshot, dict):
+            request_snapshot = {}
+        # Old installations stored the revision only inside snapshot_json.
+        revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0))
+        return {
+            **snapshot,
+            "revision": revision,
+            "operation_type": str(row["operation_type"] or "research"),
+            "client_request_id": str(row["client_request_id"] or ""),
+            "request_hash": str(row["request_hash"] or ""),
+            "queue_sequence": int(row["queue_sequence"] or 0),
+            "created_at": str(row["created_at"] or row["updated_at"] or ""),
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "request_snapshot": request_snapshot,
+            "snapshot_schema_version": int(row["snapshot_schema_version"] or 0),
+            "execution_owner": str(row["execution_owner"] or ""),
+            "lease_updated_at": row["lease_updated_at"],
+            "blocked_reason": str(row["blocked_reason"] or ""),
+            "archived": bool(row["archived"]),
+        }
+
+    @staticmethod
+    def _public_research_job_state(state: Any, execution_owner: Any) -> tuple[str, bool]:
+        state = str(state or "")
+        draining = bool(str(execution_owner or "")) and state in {
+            "completed", "failed", "cancelled", "waiting_input", "interrupted",
+        }
+        if not draining:
+            return state, False
+        return ("cancelling" if state == "cancelled" else "running"), True
+
+    @staticmethod
+    def _public_research_job_state_sql(alias: str = "") -> str:
+        prefix = f"{alias}." if alias else ""
+        state = f"{prefix}state"
+        owner = f"{prefix}execution_owner"
+        return (
+            f"CASE WHEN {owner}<>'' AND {state} IN "
+            "('completed','failed','cancelled','waiting_input','interrupted') "
+            f"THEN CASE WHEN {state}='cancelled' THEN 'cancelling' ELSE 'running' END "
+            f"ELSE {state} END"
+        )
+
+    @classmethod
+    def _public_research_job_from_row(cls, row: sqlite3.Row) -> dict[str, Any] | None:
+        record = cls._research_job_record_from_row(row)
+        if record is None:
+            return None
+        for private_key in ("request_snapshot", "client_request_id", "request_hash",
+                            "execution_owner", "lease_updated_at"):
+            record.pop(private_key, None)
+        state, execution_draining = cls._public_research_job_state(row["state"], row["execution_owner"])
+        record["state"] = state
+        if execution_draining:
+            record["execution_draining"] = True
+            record.update(
+                attempt_complete=False,
+                research_complete=False,
+                action_required=False,
+                vision_approval_pending=False,
+            )
+        else:
+            record.pop("execution_draining", None)
+        return record
+
+    def enqueue_research_job(
+        self,
+        snapshot: dict[str, Any],
+        request_snapshot: dict[str, Any],
+        *,
+        client_request_id: str,
+        request_hash: str,
+        run: ResearchRun | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(snapshot, dict) or not snapshot.get("job_id") or not snapshot.get("run_id"):
+            raise ValueError("RESEARCH_JOB_SNAPSHOT_INVALID")
+        request_json = self._validate_research_request_snapshot(request_snapshot)
+        job_id, run_id = str(snapshot["job_id"]), str(snapshot["run_id"])
+        client_request_id, request_hash = str(client_request_id or ""), str(request_hash or "")
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if client_request_id:
+                existing = db.execute(
+                    "SELECT * FROM research_jobs WHERE client_request_id=?", (client_request_id,)
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["request_hash"] or "") != request_hash:
+                        raise ValueError("RESEARCH_REQUEST_ID_CONFLICT")
+                    record = self._public_research_job_from_row(existing)
+                    if record is None:
+                        raise ValueError("RESEARCH_JOB_SNAPSHOT_INVALID")
+                    return record
+
+            existing_run = db.execute(
+                "SELECT 1 FROM research_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if run is not None:
+                if run.run_id != run_id:
+                    raise ValueError("RESEARCH_RUN_ID_MISMATCH")
+                if existing_run is not None:
+                    raise ValueError("RESEARCH_RUN_ALREADY_EXISTS")
+                if db.execute("SELECT 1 FROM companies WHERE cik=?", (run.company.cik,)).fetchone() is None:
+                    raise ValueError("RESEARCH_RUN_COMPANY_NOT_FOUND")
+                payload = run.to_dict()
+                payload["status"] = RunStatus.CREATED.value
+                payload["completed_at"] = None
+                db.execute(
+                    "INSERT INTO research_runs(run_id,company_cik,payload_json,status,started_at,completed_at) "
+                    "VALUES(?,?,?,?,?,NULL)",
+                    (run_id, run.company.cik, json.dumps(payload, ensure_ascii=False),
+                     RunStatus.CREATED.value, run.started_at),
+                )
+            elif existing_run is None:
+                raise ValueError("RESEARCH_RUN_NOT_FOUND")
+
+            clean_snapshot = dict(snapshot)
+            clean_snapshot.update({"job_id": job_id, "run_id": run_id, "state": "queued"})
+            revision = max(0, int(clean_snapshot.get("revision", 0) or 0))
+            clean_snapshot["revision"] = revision
+            queue_sequence = int(db.execute(
+                "SELECT COALESCE(MAX(queue_sequence),0)+1 FROM research_jobs"
+            ).fetchone()[0])
+            operation_type = str(clean_snapshot.get("operation_type") or "research")[:128]
+            db.execute(
+                """INSERT INTO research_jobs(
+                    job_id,run_id,state,stage,snapshot_json,updated_at,operation_type,
+                    client_request_id,request_hash,queue_sequence,created_at,request_snapshot_json,
+                    snapshot_schema_version,revision
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+                (job_id, run_id, "queued", str(clean_snapshot.get("stage", "preparing"))[:128],
+                 json.dumps(clean_snapshot, ensure_ascii=False, allow_nan=False), now, operation_type,
+                 client_request_id, request_hash, queue_sequence, now, request_json, revision),
+            )
+            self._bump_research_jobs_revision_db(db)
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            record = self._public_research_job_from_row(row)
+            if record is None:
+                raise ValueError("RESEARCH_JOB_SNAPSHOT_INVALID")
+            return record
+
     def save_research_job(self, snapshot: dict[str, Any]) -> None:
         run_id = str(snapshot.get("run_id") or "")
-        if not run_id:
+        job_id = str(snapshot.get("job_id") or "")
+        if not run_id or not job_id:
             return
+        encoded = json.dumps(snapshot, ensure_ascii=False, allow_nan=False)
+        now = utc_now_iso()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM research_runs WHERE run_id = ?", (run_id,)).fetchone() is None:
                 return
-            db.execute(
-                """
-                INSERT INTO research_jobs(job_id, run_id, state, stage, snapshot_json, updated_at, revision)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    state=excluded.state,
-                    stage=excluded.stage,
-                    snapshot_json=excluded.snapshot_json,
-                    updated_at=excluded.updated_at,
-                    revision=excluded.revision
-                WHERE excluded.revision >= research_jobs.revision
-                """,
-                (
-                    str(snapshot["job_id"]), run_id, str(snapshot.get("state", "queued")),
-                    str(snapshot.get("stage", "preparing")),
-                    json.dumps(snapshot, ensure_ascii=False), utc_now_iso(), int(snapshot.get("revision", 0)),
-                ),
-            )
+            existing = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if existing is None:
+                revision = max(0, int(snapshot.get("revision", 0) or 0))
+                state = str(snapshot.get("state", "queued"))
+                operation_type = str(snapshot.get("operation_type") or "research")[:128]
+                started_at = now if state == "running" else None
+                finished_at = now if state in {"completed", "failed", "cancelled"} else None
+                db.execute(
+                    """INSERT INTO research_jobs(
+                        job_id,run_id,state,stage,snapshot_json,updated_at,operation_type,
+                        created_at,started_at,finished_at,revision
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (job_id, run_id, state, str(snapshot.get("stage", "preparing"))[:128], encoded,
+                     now, operation_type, now, started_at, finished_at, revision),
+                )
+            else:
+                if str(existing["run_id"]) != run_id:
+                    raise ValueError("RESEARCH_JOB_RUN_MISMATCH")
+                current_revision = max(
+                    int(existing["revision"] or 0),
+                    int((self._research_job_snapshot(existing) or {}).get("revision", 0) or 0),
+                )
+                incoming_revision = int(snapshot.get("revision", current_revision) or 0)
+                if incoming_revision < current_revision:
+                    return
+                state = str(snapshot.get("state", existing["state"]))
+                operation_type = str(snapshot.get("operation_type") or existing["operation_type"] or "research")[:128]
+                started_at = existing["started_at"] or (now if state == "running" else None)
+                finished_at = existing["finished_at"] or (now if state in {"completed", "failed", "cancelled"} else None)
+                # The snapshot writer owns progress fields only. Durable queue
+                # metadata (including the execution lease) remains authoritative.
+                db.execute(
+                    """UPDATE research_jobs SET state=?,stage=?,snapshot_json=?,updated_at=?,
+                        operation_type=?,started_at=?,finished_at=?,revision=?,blocked_reason=? WHERE job_id=?""",
+                    (state, str(snapshot.get("stage", existing["stage"]))[:128], encoded, now,
+                     operation_type, started_at, finished_at, incoming_revision,
+                     str(snapshot.get("blocked_reason", existing["blocked_reason"]) or "")[:128], job_id),
+                )
+            self._bump_research_jobs_revision_db(db)
 
     def get_research_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            row = db.execute(
-                "SELECT snapshot_json FROM research_jobs WHERE job_id = ?", (job_id,)
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return self._public_research_job_from_row(row) if row is not None else None
+
+    def get_research_job_record(self, job_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return self._research_job_record_from_row(row) if row is not None else None
+
+    def cancel_waiting_research_job(self, job_id: str) -> dict[str, Any] | None:
+        """Cancel before claim (or after unwind); a claimant wins atomically."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError("research job not found")
+            if row["execution_owner"] or row["state"] not in {"queued", "waiting_input", "interrupted"}:
+                return None
+            snapshot = self._research_job_snapshot(row) or {}
+            revision = int(row["revision"] or 0) + 1
+            snapshot.update(state="cancelled", stage="cancelled", cancel_requested=True,
+                            revision=revision, vision_approval_pending=False, blocked_reason="")
+            db.execute("""UPDATE research_jobs SET state='cancelled',stage='cancelled',snapshot_json=?,
+                revision=?,finished_at=?,updated_at=?,blocked_reason='' WHERE job_id=?""",
+                (json.dumps(snapshot, ensure_ascii=False, allow_nan=False), revision, utc_now_iso(), utc_now_iso(), job_id))
+            if row["operation_type"] == "research":
+                run = db.execute("SELECT payload_json,status FROM research_runs WHERE run_id=?", (row["run_id"],)).fetchone()
+                if run is not None and run["status"] == RunStatus.CREATED.value:
+                    payload = json.loads(run["payload_json"])
+                    payload.update(status=RunStatus.CANCELLED.value, completed_at=utc_now_iso())
+                    db.execute("UPDATE research_runs SET payload_json=?,status=?,completed_at=? WHERE run_id=?",
+                        (json.dumps(payload, ensure_ascii=False), RunStatus.CANCELLED.value, payload["completed_at"], row["run_id"]))
+            self._bump_research_jobs_revision_db(db)
+            updated = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            return self._public_research_job_from_row(updated)
+
+    def claim_next_research_job(self, owner: str) -> dict[str, Any] | None:
+        owner = str(owner or "").strip()
+        if not owner:
+            raise ValueError("RESEARCH_EXECUTION_OWNER_REQUIRED")
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            paused = db.execute(
+                "SELECT value FROM settings WHERE key='research_queue_paused'"
             ).fetchone()
-        if row is None:
-            return None
-        try:
-            value = json.loads(row["snapshot_json"])
-        except (TypeError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
+            if paused is not None and str(paused["value"]).casefold() == "true":
+                return None
+            if db.execute("SELECT 1 FROM research_jobs WHERE execution_owner<>'' LIMIT 1").fetchone():
+                return None
+            row = db.execute(
+                """SELECT * FROM research_jobs WHERE snapshot_schema_version=1
+                    AND archived=0 AND state='queued'
+                    AND lower(operation_type) NOT LIKE '%install%'
+                    ORDER BY queue_sequence,created_at,job_id LIMIT 1"""
+            ).fetchone()
+            if row is None:
+                return None
+            snapshot = self._research_job_snapshot(row) or {}
+            revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0)) + 1
+            snapshot.update({"state": "running", "revision": revision})
+            db.execute(
+                """UPDATE research_jobs SET state='running',snapshot_json=?,revision=?,
+                    execution_owner=?,lease_updated_at=?,started_at=COALESCE(started_at,?),
+                    updated_at=? WHERE job_id=?""",
+                (json.dumps(snapshot, ensure_ascii=False, allow_nan=False), revision,
+                 owner, now, now, now, row["job_id"]),
+            )
+            self._bump_research_jobs_revision_db(db)
+            claimed = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (row["job_id"],)).fetchone()
+            return self._research_job_record_from_row(claimed)
+
+    def release_research_job(self, job_id: str, owner: str) -> bool:
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None or not owner or str(row["execution_owner"] or "") != owner:
+                return False
+            state = str(row["state"])
+            snapshot = self._research_job_snapshot(row) or {}
+            revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0)) + 1
+            blocked_reason = str(row["blocked_reason"] or "")
+            if state in {"running", "cancelling"}:
+                state, blocked_reason = "interrupted", "EXECUTION_INTERRUPTED"
+                snapshot.update({"state": state, "blocked_reason": blocked_reason})
+            snapshot["revision"] = revision
+            db.execute(
+                """UPDATE research_jobs SET state=?,snapshot_json=?,revision=?,execution_owner='',
+                    lease_updated_at=NULL,blocked_reason=?,updated_at=? WHERE job_id=?""",
+                (state, json.dumps(snapshot, ensure_ascii=False, allow_nan=False), revision,
+                 blocked_reason, now, job_id),
+            )
+            self._bump_research_jobs_revision_db(db)
+            return True
+
+    def requeue_research_job(
+        self, job_id: str, expected_revision: int, *, request_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        request_json = self._validate_research_request_snapshot(request_snapshot) if request_snapshot is not None else None
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise ValueError("RESEARCH_TASK_NOT_FOUND")
+            snapshot = self._research_job_snapshot(row) or {}
+            revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0))
+            if revision != int(expected_revision):
+                raise ValueError("RESEARCH_TASK_REVISION_CONFLICT")
+            if (int(row["snapshot_schema_version"] or 0) != 1 or row["execution_owner"]
+                    or row["state"] not in {"waiting_input", "interrupted"}):
+                raise ValueError("RESEARCH_TASK_NOT_REQUEUEABLE")
+            queue_sequence = int(db.execute(
+                "SELECT COALESCE(MAX(queue_sequence),0)+1 FROM research_jobs"
+            ).fetchone()[0])
+            next_revision = revision + 1
+            snapshot.update({"state": "queued", "revision": next_revision,
+                             "blocked_reason": "", "cancel_requested": False,
+                             "error_code": None, "action_required": False,
+                             "vision_approval_pending": False, "vision_approval": None,
+                             "vision_upload_preview": None})
+            if request_snapshot is not None:
+                reference = (request_snapshot.get("model") if row["operation_type"] == "research"
+                             else request_snapshot.get("parameters", {}).get("model"))
+                if isinstance(reference, dict):
+                    snapshot["model"] = str(reference.get("configured_model_id") or "")
+            assignments = "state='queued',stage=?,snapshot_json=?,updated_at=?,revision=?,queue_sequence=?,blocked_reason=''"
+            params: list[Any] = [str(snapshot.get("stage", row["stage"]))[:128],
+                                 json.dumps(snapshot, ensure_ascii=False, allow_nan=False), now,
+                                 next_revision, queue_sequence]
+            if request_json is not None:
+                assignments += ",request_snapshot_json=?"
+                params.append(request_json)
+            params.append(job_id)
+            db.execute(f"UPDATE research_jobs SET {assignments} WHERE job_id=?", params)
+            self._bump_research_jobs_revision_db(db)
+            updated = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            record = self._research_job_record_from_row(updated)
+            if record is None:
+                raise ValueError("RESEARCH_JOB_SNAPSHOT_INVALID")
+            return record
+
+    def recover_research_jobs(self, live_owners: set[str]) -> dict[str, Any]:
+        live_owners = {str(owner) for owner in live_owners if str(owner)}
+        now = utc_now_iso()
+        interrupted_ids: list[str] = []
+        released_ids: list[str] = []
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT * FROM research_jobs ORDER BY queue_sequence,created_at,job_id").fetchall()
+            for row in rows:
+                owner = str(row["execution_owner"] or "")
+                state = str(row["state"])
+                schema_version = int(row["snapshot_schema_version"] or 0)
+                if owner and owner in live_owners:
+                    continue
+                legacy_pending = schema_version == 0 and state in {"queued", "running", "cancelling"}
+                stale_owned = bool(owner)
+                if not (legacy_pending or stale_owned):
+                    continue
+                snapshot = self._research_job_snapshot(row) or {}
+                revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0)) + 1
+                next_state, blocked_reason = state, str(row["blocked_reason"] or "")
+                if legacy_pending:
+                    next_state, blocked_reason = "interrupted", "LEGACY_REQUEST_UNAVAILABLE"
+                elif state in {"running", "cancelling"}:
+                    next_state, blocked_reason = "interrupted", "EXECUTION_INTERRUPTED"
+                if next_state != state:
+                    interrupted_ids.append(str(row["job_id"]))
+                if owner:
+                    released_ids.append(str(row["job_id"]))
+                snapshot.update({"state": next_state, "revision": revision})
+                if blocked_reason:
+                    snapshot["blocked_reason"] = blocked_reason
+                db.execute(
+                    """UPDATE research_jobs SET state=?,snapshot_json=?,revision=?,execution_owner='',
+                        lease_updated_at=NULL,blocked_reason=?,updated_at=? WHERE job_id=?""",
+                    (next_state, json.dumps(snapshot, ensure_ascii=False, allow_nan=False), revision,
+                     blocked_reason, now, row["job_id"]),
+                )
+                self._bump_research_jobs_revision_db(db)
+            remaining_live_owner = db.execute(
+                "SELECT 1 FROM research_jobs WHERE execution_owner<>'' LIMIT 1"
+            ).fetchone() is not None
+            pending = db.execute(
+                """SELECT 1 FROM research_jobs WHERE archived=0
+                    AND lower(operation_type) NOT LIKE '%install%'
+                    AND state IN ('queued','interrupted','waiting_input') LIMIT 1"""
+            ).fetchone() is not None
+            current_setting = db.execute(
+                "SELECT value FROM settings WHERE key='research_queue_paused'"
+            ).fetchone()
+            paused = bool(current_setting and str(current_setting["value"]).casefold() == "true")
+            if pending and not remaining_live_owner and not paused:
+                db.execute("UPDATE settings SET value='true' WHERE key='research_queue_paused'")
+                self._bump_research_jobs_revision_db(db)
+                paused = True
+            owners = sorted({str(r[0]) for r in db.execute(
+                "SELECT execution_owner FROM research_jobs WHERE execution_owner<>''"
+            ).fetchall()})
+            return {"interrupted_job_ids": interrupted_ids, "released_job_ids": released_ids,
+                    "queue_paused": paused, "live_owners": owners}
+
+    def set_research_queue_paused(self, paused: bool) -> None:
+        value = "true" if paused else "false"
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM settings WHERE key='research_queue_paused'").fetchone()
+            if row is None or str(row["value"]).casefold() != value:
+                db.execute(
+                    "INSERT INTO settings(key,value) VALUES('research_queue_paused',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (value,)
+                )
+                self._bump_research_jobs_revision_db(db)
+
+    def research_queue_owners(self) -> list[str]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT execution_owner FROM research_jobs WHERE execution_owner<>'' ORDER BY execution_owner"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def list_research_jobs(
+        self, *, limit: int = 50, offset: int = 0, states=None,
+        since_revision: int | None = None, include_archived: bool = False,
+    ) -> dict[str, Any]:
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 100:
+            raise ValueError("RESEARCH_TASK_LIMIT_INVALID")
+        if isinstance(offset, bool) or int(offset) < 0:
+            raise ValueError("RESEARCH_TASK_OFFSET_INVALID")
+        limit, offset = int(limit), int(offset)
+        state_values = None if states is None else {str(value) for value in states}
+        with self.connect() as db:
+            db.execute("BEGIN")
+            revision = self._research_jobs_revision_db(db)
+            paused_row = db.execute("SELECT value FROM settings WHERE key='research_queue_paused'").fetchone()
+            paused = bool(paused_row and str(paused_row["value"]).casefold() == "true")
+            count_state_sql = self._public_research_job_state_sql()
+            count_rows = db.execute(
+                f"""SELECT {count_state_sql} AS projected_state,COUNT(*) AS count FROM research_jobs
+                    WHERE archived=0 AND lower(operation_type) NOT LIKE '%install%'
+                    GROUP BY {count_state_sql}"""
+            ).fetchall()
+            counts = {state: 0 for state in ("running", "queued", "waiting_input", "interrupted", "cancelling")}
+            for row in count_rows:
+                if row["projected_state"] in counts:
+                    counts[row["projected_state"]] = int(row["count"])
+            not_modified = since_revision is not None and int(since_revision) == revision
+            if not_modified:
+                return {"items": [], "revision": revision, "not_modified": True, "counts": counts,
+                        "queue_paused": paused, "has_more": False, "next_offset": None}
+            archived_clause = "" if include_archived else "AND j.archived=0"
+            state_clause, params = "", []
+            list_state_sql = self._public_research_job_state_sql("j")
+            if state_values is not None:
+                if not state_values:
+                    return {"items": [], "revision": revision, "not_modified": False, "counts": counts,
+                            "queue_paused": paused, "has_more": False, "next_offset": None}
+                state_clause = f"AND {list_state_sql} IN (" + ",".join("?" for _ in state_values) + ")"
+                params.extend(sorted(state_values))
+            rows = db.execute(
+                f"""SELECT j.*, {list_state_sql} AS public_state,
+                    c.ticker AS company_ticker,c.name AS company_name,
+                    CASE WHEN j.state='queued' THEN (
+                        SELECT COUNT(*) FROM research_jobs q WHERE q.archived=0 AND q.state='queued'
+                          AND lower(q.operation_type) NOT LIKE '%install%' AND q.queue_sequence<j.queue_sequence
+                    ) END AS queue_before,
+                    (SELECT COUNT(*) FROM research_jobs x WHERE x.execution_owner<>'') AS active_slots
+                    FROM research_jobs j JOIN research_runs r ON r.run_id=j.run_id
+                    JOIN companies c ON c.cik=r.company_cik
+                    WHERE lower(j.operation_type) NOT LIKE '%install%' {archived_clause} {state_clause}
+                    ORDER BY CASE public_state WHEN 'running' THEN 0 WHEN 'cancelling' THEN 0
+                        WHEN 'queued' THEN 1 WHEN 'waiting_input' THEN 2 WHEN 'interrupted' THEN 3 ELSE 4 END,
+                        CASE WHEN j.state='queued' THEN j.queue_sequence END,
+                        COALESCE(j.created_at,j.updated_at) DESC,j.job_id
+                    LIMIT ? OFFSET ?""",
+                (*params, limit + 1, offset),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items: list[dict[str, Any]] = []
+        summary_keys = ("job_id", "run_id", "state", "stage", "percent", "message", "revision",
+                        "error_code", "cancel_requested", "company", "model", "elapsed_seconds", "action_required")
+        for row in rows:
+            snapshot = self._research_job_snapshot(row) or {}
+            item = {key: snapshot[key] for key in summary_keys if key in snapshot}
+            public_state, execution_draining = self._public_research_job_state(
+                row["state"], row["execution_owner"])
+            item["state"] = public_state
+            item.update({"operation_type": str(row["operation_type"] or "research"),
+                         "queue_sequence": int(row["queue_sequence"] or 0),
+                         "created_at": str(row["created_at"] or row["updated_at"] or ""),
+                         "updated_at": str(row["updated_at"] or ""), "started_at": row["started_at"],
+                         "finished_at": row["finished_at"], "blocked_reason": str(row["blocked_reason"] or ""),
+                         "archived": bool(row["archived"]), "company_ticker": str(row["company_ticker"] or ""),
+                         "company_name": str(row["company_name"] or "")})
+            item.setdefault("company", {"ticker": item["company_ticker"], "name": item["company_name"]})
+            item.setdefault("model", "")
+            item.setdefault("elapsed_seconds", 0)
+            if execution_draining:
+                item["execution_draining"] = True
+                item["action_required"] = False
+            else:
+                item["action_required"] = row["state"] in {"waiting_input", "interrupted"}
+            if row["state"] == "queued":
+                before = int(row["queue_before"] or 0)
+                item["queue_position"] = before + 1
+                item["ahead_count"] = before + int(row["active_slots"] or 0)
+            else:
+                item["queue_position"] = None
+                item["ahead_count"] = None
+            if isinstance(item.get("message"), str):
+                item["message"] = item["message"][:500]
+            if isinstance(item.get("stage"), str):
+                item["stage"] = item["stage"][:128]
+            items.append(item)
+        return {"items": items, "revision": revision, "not_modified": False, "counts": counts,
+                "queue_paused": paused, "has_more": has_more,
+                "next_offset": offset + len(items) if has_more else None}
+
+    def archive_research_job(self, job_id: str, expected_revision: int) -> bool:
+        now = utc_now_iso()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM research_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None:
+                raise ValueError("RESEARCH_TASK_NOT_FOUND")
+            snapshot = self._research_job_snapshot(row) or {}
+            revision = max(int(row["revision"] or 0), int(snapshot.get("revision", 0) or 0))
+            if revision != int(expected_revision):
+                raise ValueError("RESEARCH_TASK_REVISION_CONFLICT")
+            if (row["execution_owner"] or row["state"] not in {"completed", "failed", "cancelled"}):
+                raise ValueError("RESEARCH_TASK_ACTIVE")
+            next_revision = revision + 1
+            snapshot["revision"] = next_revision
+            db.execute(
+                "UPDATE research_jobs SET archived=1,revision=?,snapshot_json=?,updated_at=? WHERE job_id=?",
+                (next_revision, json.dumps(snapshot, ensure_ascii=False, allow_nan=False), now, job_id),
+            )
+            self._bump_research_jobs_revision_db(db)
+            return True
 
     def continuity_snapshot(self, run_id: str) -> dict[str, Any]:
         with self.connect() as db:
@@ -3400,12 +4018,20 @@ class Storage:
         """Delete one finished research record without deleting shared company data."""
 
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT status FROM research_runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
             if row is None:
                 return False
+            if db.execute(
+                """SELECT 1 FROM research_jobs WHERE run_id=? AND snapshot_schema_version=1
+                    AND (state IN ('queued','running','cancelling','waiting_input','interrupted')
+                         OR execution_owner<>'') LIMIT 1""",
+                (run_id,),
+            ).fetchone() is not None:
+                raise ValueError("RESEARCH_RUN_HAS_ACTIVE_TASKS")
             if row["status"] in {RunStatus.CREATED.value, RunStatus.RUNNING.value}:
                 raise ValueError("an active research run cannot be deleted")
             db.execute(
@@ -3418,7 +4044,12 @@ class Storage:
             )
             db.execute("DELETE FROM artifacts WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM financial_recovery_cases WHERE run_id = ?", (run_id,))
+            deleted_jobs = int(db.execute(
+                "SELECT COUNT(*) FROM research_jobs WHERE run_id=?", (run_id,)
+            ).fetchone()[0])
             db.execute("DELETE FROM research_jobs WHERE run_id = ?", (run_id,))
+            for _ in range(deleted_jobs):
+                self._bump_research_jobs_revision_db(db)
             db.execute("DELETE FROM research_stage_attempts WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM latest_report_revisions WHERE run_id = ?", (run_id,))
             db.execute("DELETE FROM report_revision_contexts WHERE revision_id IN "

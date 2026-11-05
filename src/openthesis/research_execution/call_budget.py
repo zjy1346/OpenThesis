@@ -114,7 +114,8 @@ def plan_status(db, run_id):
     used_input = sum(row["input_actual"] if row["input_actual"] is not None else row["input_estimate"] for row in prior)
     used_output = sum(row["output_actual"] if row["output_actual"] is not None else row["output_limit"] for row in prior)
     limits = plan.get("user_envelope", {})
-    elapsed = max(0, time.time() - plan["started_at"]) if "started_at" in plan else None
+    effective_now = min(time.time(), plan.get("execution_paused_at", time.time()))
+    elapsed = max(0, effective_now - plan["started_at"]) if "started_at" in plan else None
     remaining = lambda key, used: max(0, plan[key] - used) if plan.get(key) is not None else None
     forecast = plan.get("initial_forecast", plan.get("forecast", plan.get("workload_bounds", {})))
     exceeded = [key for key, used in (("max_calls", len(prior)), ("max_input_estimate", used_input),
@@ -343,7 +344,8 @@ def reserve(db, run_id, context, *, purpose, input_estimate, output_limit, trigg
         # Semantic identity intentionally excludes generation, attempt, clock,
         # prompt revision and trigger wording. Only changed work can proceed.
         work = {key: context["work_item"].get(key) for key in (
-            "obligation", "targets", "source_version", "completed_digest", "strategy")}
+            "obligation", "targets", "source_version", "completed_digest", "strategy",
+            "execution_route", "capacity_revision")}
         work["targets"] = sorted(set(work.get("targets") or [stage]))
         identity = hashlib.sha256(canonical_json([stage, purpose, work]).encode()).hexdigest()
         previous = db.execute("""SELECT r.state FROM model_work_items w JOIN model_call_reservations r

@@ -293,6 +293,11 @@ def repairable_fields(candidate: Any, contract: ModelOutputContract | None) -> t
         # Missing raw section keys here do not justify a paid regeneration.
         # Invalid IDs remain pending at that gate, never verified by this flag.
         return ()
+    if isinstance(candidate.get("material_requests"), list) and candidate["material_requests"]:
+        # The host first supplies the concrete missing sources, then validates
+        # the completed candidate. Missing raw fields cannot justify asking
+        # the same model to invent them without the requested material.
+        return ()
     meta = candidate.get("_response_meta")
     if isinstance(meta, dict):
         reason = meta.get("finish_reason")

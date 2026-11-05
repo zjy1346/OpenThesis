@@ -157,6 +157,8 @@ class ResearchRecoveryPlanner:
             if isinstance(content, dict) and content.get("mode") == "synthesis-incomplete":
                 diagnostics = content.get("diagnostics")
                 diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+                if diagnostics.get("processing_phase") == "request_compilation":
+                    return "MODEL_REQUEST_COMPILATION_FAILED"
                 provider_code = str(diagnostics.get("provider_error_code") or "")
                 if provider_code:
                     return provider_code[:80]

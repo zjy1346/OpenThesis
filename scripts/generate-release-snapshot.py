@@ -53,14 +53,15 @@ def included(name: str) -> bool:
 
 def entry(path: Path, name: str) -> dict[str, object]:
     info = path.lstat()
-    link = path.is_symlink()
+    link = path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+    directory_link = link and path.is_dir()
     return {
         "path": name,
-        "type": "symlink" if link else "file",
+        "type": "directory_symlink" if directory_link else "symlink" if link else "file",
         "mode": oct(stat.S_IMODE(info.st_mode)),
         "symlink_target": os.readlink(path) if link else None,
         "bytes": info.st_size,
-        "sha256": hashlib.file_digest(path.open("rb"), "sha256").hexdigest(),
+        "sha256": None if directory_link else hashlib.file_digest(path.open("rb"), "sha256").hexdigest(),
     }
 
 
@@ -146,11 +147,21 @@ def main() -> None:
             continue
         for current, dirs, files in os.walk(base):
             current_path = Path(current)
-            dirs[:] = sorted(
-                directory
-                for directory in dirs
-                if included((current_path / directory).relative_to(root).as_posix())
-            )
+            selected_dirs = []
+            for directory in sorted(dirs):
+                path = current_path / directory
+                relative = path.relative_to(root).as_posix()
+                if not included(relative):
+                    continue
+                if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                    # A non-followed dependency-directory link is still an
+                    # input. Record it before excluding recursive traversal;
+                    # backing files under the selected trees retain their own
+                    # ordinary sorted content entries.
+                    rows.append(entry(path, relative))
+                else:
+                    selected_dirs.append(directory)
+            dirs[:] = selected_dirs
             for filename in sorted(files):
                 path = current_path / filename
                 relative = path.relative_to(root).as_posix()

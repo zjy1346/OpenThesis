@@ -23,6 +23,7 @@ import type {
   ResearchBudgetPreview,
   AdaptiveResearchRunEnvelope,
   ResearchRequest,
+  ResearchTaskSummary,
 } from "../../types";
 import { parseVisionFallbackPolicy, visionFallbackSelectionFromPolicy } from "../../types";
 
@@ -184,13 +185,15 @@ function buildRunEnvelope(
   };
 }
 
-export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisionSettings, onSavePreferences, onStart }: {
+export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisionSettings, onSavePreferences, onStart, activeResearchTasks = [], onOpenTask }: {
   bootstrap: BootstrapResult;
   copy: ResearchCopy;
   onOpenModelCenter: () => void;
   onOpenVisionSettings?: () => void;
   onSavePreferences: (value: Partial<Preferences>) => Promise<Preferences>;
   onStart: (request: ResearchRequest) => Promise<void>;
+  activeResearchTasks?: ResearchTaskSummary[];
+  onOpenTask?: (id: string) => void;
 }) {
   const parallelHintId = useId();
   const [profile, setProfile] = useState(bootstrap.preferences.sec_contact_profile || "personal");
@@ -205,6 +208,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [searchError, setSearchError] = useState("");
   const [copiedDiagnosticId, setCopiedDiagnosticId] = useState("");
   const [launching, setLaunching] = useState(false);
+  const [duplicateTask, setDuplicateTask] = useState<ResearchTaskSummary | null>(null);
   const searchSequence = useRef(0);
   const searchTimeout = useRef<number | undefined>(undefined);
   const clearSearchTimeout = () => {
@@ -398,12 +402,17 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     }
   };
 
-  const launch = async () => {
+  const launch = async (createAnother = false) => {
     if (launching) return;
     if (!selected || (requiresSecIdentity && !email.includes("@"))) {
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
     }
+    const existing = activeResearchTasks.find((task) => ["queued", "running", "cancelling", "waiting_input", "interrupted"].includes(task.state)
+      && (task.company.security_id && selected.security_id ? task.company.security_id === selected.security_id
+        : task.company.ticker === selected.ticker));
+    if (existing && !createAnother) { setDuplicateTask(existing); return; }
+    setDuplicateTask(null);
     const primary = modelReference(primaryModelId, "primary");
     if (!primary) {
       setSearchError(modelLoadError || copy.modelsEmpty);
@@ -463,6 +472,13 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
         } } : {}),
         ...(visionFallback ? { vision_fallback: visionFallback } : {}),
       });
+      // Keep shared research/model choices, but require a deliberate company
+      // selection for the next submission instead of reusing the old identity.
+      setSelected(null);
+      setQuery("");
+      setSearchResponse(null);
+      setMarketPreview(null);
+      setMarketCap(""); setMarketPrice(""); setMarketAsOf("");
     } catch (reason) {
       const errorCode = reason instanceof Error ? reason.message.split(/[\s:]/, 1)[0] : "";
       setSearchError(errorCode ? searchErrorMessage(errorCode, copy, copy.launchFailed ?? copy.coreUnavailable) : (copy.launchFailed ?? copy.coreUnavailable));
@@ -732,6 +748,11 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
             <label>{copy.discountRate}<input inputMode="decimal" value={discountRate} onChange={(event) => setDiscountRate(event.target.value)} /></label>
             <label>{copy.terminalGrowth}<input inputMode="decimal" value={terminalGrowth} onChange={(event) => setTerminalGrowth(event.target.value)} /></label>
           </div></details>
+          {duplicateTask && <div className="task-duplicate-notice" role="status">
+            <p>{bootstrap.preferences.ui_language === "en" ? "This company already has an active task." : bootstrap.preferences.ui_language === "zh-Hant" ? "這家公司已有進行中的任務。" : "这家公司已有进行中的任务。"}</p>
+            {onOpenTask && <button type="button" onClick={() => onOpenTask(duplicateTask.job_id)}>{bootstrap.preferences.ui_language === "en" ? "View existing task" : bootstrap.preferences.ui_language === "zh-Hant" ? "檢視現有任務" : "查看现有任务"}</button>}
+            <button type="button" disabled={launching} onClick={() => void launch(true)}>{bootstrap.preferences.ui_language === "en" ? "Create another research" : bootstrap.preferences.ui_language === "zh-Hant" ? "仍建立新研究" : "仍创建新研究"}</button>
+          </div>}
           <button className="primary-button launch-button" type="button" disabled={!selected || launching} onClick={() => void launch()}>{launching ? (copy.launchingResearch ?? copy.searching) : selected ? copy.launchResearch : copy.chooseCompany}</button>
         </section>
       </div>

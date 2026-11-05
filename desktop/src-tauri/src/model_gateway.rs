@@ -576,6 +576,27 @@ impl ModelGateway {
         }
         Ok(())
     }
+    fn validate_configuration(&self, configured_model_id: &str) -> Result<GatewayGenerateResult, GatewayError> {
+        // Queue admission checks local metadata and the vault only. It must
+        // not probe a provider, reserve an attempt, or populate billing usage.
+        let model = self.center.configured_model_runtime(configured_model_id)
+            .map_err(GatewayError::configuration)?;
+        self.check_model_version(&model)?;
+        if !model.connection_enabled || !model.model_enabled {
+            return Err(GatewayError::new("MODEL_DISABLED", "The frozen model or connection is disabled.", false));
+        }
+        let connection = self.center.connection_runtime(&model.connection_id)
+            .map_err(GatewayError::configuration)?;
+        if connection.configuration_version != model.connection_configuration_version
+            || connection.credential_version != model.credential_version {
+            return Err(GatewayError::new("MODEL_CONFIGURATION_CHANGED", "Connection changed before dispatch.", false));
+        }
+        if connection.status == "unauthorized" {
+            return Err(GatewayError::new("MODEL_CONNECTION_AUTH_PAUSED", "Update or explicitly test this connection in Model Center.", false));
+        }
+        let _credential = self.center.credential_for_connection(&connection).map_err(GatewayError::configuration)?;
+        Ok(self.result(&model, r#"{"configuration_valid":true}"#.into(), None))
+    }
     fn as_probe(&self) -> Self {
         let mut probe=self.clone(); probe.probe=true; probe.max_output_tokens=Some(64);
         probe.probe_parent=format!("probe:{}:{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d|d.as_nanos()).unwrap_or_default());
@@ -1811,6 +1832,7 @@ pub fn run_model_gateway_stdio() -> i32 {
     let wire_contract = match request.as_ref().map(|value| value.operation.as_str()) {
         Ok("generate") => "text-single-request-v1",
         Ok("vision") => "vision-single-request-v1",
+        Ok("validate_configuration") => "configuration-validation-v1",
         _ => "",
     };
     let response = match request.and_then(|request| run_cli_request_with_events(request, events.clone())) {
@@ -1902,6 +1924,7 @@ fn run_cli_request_with_events(request: GatewayCliRequest, events: Option<Arc<Ga
     let required_contract = match request.operation.as_str() {
         "generate" => "text-single-request-v1",
         "vision" => "vision-single-request-v1",
+        "validate_configuration" => "configuration-validation-v1",
         _ => "",
     };
     if required_contract.is_empty() || request.wire_contract != required_contract {
@@ -1932,6 +1955,7 @@ fn run_cli_request_with_events(request: GatewayCliRequest, events: Option<Arc<Ga
     gateway.events = events;
     gateway.expected_configuration_version = request.expected_configuration_version;
     match request.operation.as_str() {
+        "validate_configuration" => gateway.validate_configuration(&request.configured_model_id),
         "generate" => gateway.generate_once(
             &request.configured_model_id,
             &request.system_prompt,
@@ -2121,6 +2145,23 @@ mod tests {
         center.save_connection(SaveConnectionInput{transport:None,connection_id:"custom-local".into(),provider_id:"custom".into(),display_name:"Unknown".into(),region:"custom".into(),endpoint:"http://127.0.0.1:9".into(),enabled:true,protocol:Some("chat_completions".into()),capability_profile:Some(Default::default())}).unwrap();
         let error=ModelGateway::new(center).generate_once(&id,"system","source",true).unwrap_err();
         assert_eq!(error.code,"MODEL_OUTPUT_BUDGET_POLICY_REQUIRED"); assert_eq!(error.delivery_state.as_deref(),Some("not_sent"));
+    }
+    #[test]
+    fn queued_configuration_validation_330_never_opens_an_http_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (center, id) = configured_custom(endpoint, None);
+        let version = center.configured_model_runtime(&id).unwrap().configuration_version;
+        let mut gateway = ModelGateway::new(center);
+        gateway.expected_configuration_version = Some(version);
+        let result = gateway.validate_configuration(&id).unwrap();
+        assert_eq!(result.content, r#"{"configuration_valid":true}"#);
+        assert!(result.meta.input_tokens.is_none());
+        assert!(listener.accept().is_err(), "local validation must not probe or generate");
+        gateway.expected_configuration_version = Some(version + 1);
+        assert_eq!(gateway.validate_configuration(&id).unwrap_err().code, "MODEL_CONFIGURATION_CHANGED");
+        assert!(listener.accept().is_err());
     }
     use crate::credentials::InMemoryVault;
     use crate::model_center::{SaveConfiguredModelInput, SaveConnectionInput};

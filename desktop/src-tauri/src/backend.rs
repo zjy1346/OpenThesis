@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,9 +27,17 @@ const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct BackendState {
     process: Arc<Mutex<Option<BackendProcess>>>,
     initialization: Arc<Mutex<InitializationState>>,
+    close_approved: Arc<AtomicBool>,
 }
 
 impl BackendState {
+    pub(crate) fn guard_window_close(&self) -> bool {
+        if self.close_approved.load(Ordering::SeqCst) { return false; }
+        // Never block the native event loop behind a backend RPC.
+        self.process.try_lock().map(|process| process.is_some()).unwrap_or(true)
+    }
+
+    fn approve_close(&self) { self.close_approved.store(true, Ordering::SeqCst); }
     fn begin_initialization(&self) -> Instant {
         let started_at = Instant::now();
         if let Ok(mut state) = self.initialization.lock() {
@@ -92,6 +100,33 @@ impl BackendState {
                 total_units: None,
             },
         }
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn finish_window_close(app: AppHandle, state: State<'_, BackendState>, action: String) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or("WINDOW_UNAVAILABLE")?;
+    match action.as_str() {
+        "minimize" => window.minimize().map_err(|_| "WINDOW_MINIMIZE_FAILED".into()),
+        "exit" => {
+            if state.guard_window_close() {
+                let app_worker = app.clone();
+                let worker_state = state.inner().clone();
+                let saved = run_backend_blocking(move || backend_request_blocking(app_worker, worker_state,
+                    "research.queue.shutdown".into(), json!({}))).await??;
+                if saved.get("safe_to_exit").and_then(Value::as_bool) != Some(true) {
+                    return Err("RESEARCH_TASKS_STILL_STOPPING".into());
+                }
+            }
+            state.approve_close();
+            window.close().map_err(|_| {
+                // A failed native close must not waive the guard for later
+                // research submitted while this same window remains open.
+                state.close_approved.store(false, Ordering::SeqCst);
+                "WINDOW_CLOSE_FAILED".into()
+            })
+        },
+        _ => Err("WINDOW_ACTION_INVALID".into()),
     }
 }
 
@@ -381,6 +416,14 @@ fn safe_rpc_failure(error: &Value) -> String {
             | (Some(-32010), Some("MODEL_BUDGET_GAP_CHANGED"))
             | (Some(-32010), Some("CORE_OPERATION_BUSY"))
             | (Some(-32010), Some("CORE_OPERATION_EXPIRED"))
+            | (Some(-32602), Some("RESEARCH_REQUEST_ID_CONFLICT"))
+            | (Some(-32602), Some("RESEARCH_REQUEST_ID_INVALID"))
+            | (Some(-32602), Some("RESEARCH_TASK_REVISION_CONFLICT"))
+            | (Some(-32602), Some("RESEARCH_TASK_NOT_REQUEUEABLE"))
+            | (Some(-32602), Some("RESEARCH_RUN_HAS_ACTIVE_TASKS"))
+            | (Some(-32602), Some("RESEARCH_TASKS_STILL_STOPPING"))
+            | (Some(-32602), Some("VISION_TASK_APPROVAL_CONFLICT"))
+            | (Some(-32602), Some("VISION_POLICY_CHANGED"))
     ) {
         return message.unwrap().to_string();
     }
@@ -770,6 +813,32 @@ mod tests {
             assert_eq!(
                 super::safe_rpc_failure(&serde_json::json!({"code": code, "message": message})),
                 message
+            );
+        }
+        let task_actionable_codes = [
+            "RESEARCH_REQUEST_ID_CONFLICT",
+            "RESEARCH_REQUEST_ID_INVALID",
+            "RESEARCH_TASK_REVISION_CONFLICT",
+            "RESEARCH_TASK_NOT_REQUEUEABLE",
+            "RESEARCH_RUN_HAS_ACTIVE_TASKS",
+            "RESEARCH_TASKS_STILL_STOPPING",
+            "VISION_TASK_APPROVAL_CONFLICT",
+            "VISION_POLICY_CHANGED",
+        ];
+        for message in task_actionable_codes {
+            assert_eq!(
+                super::safe_rpc_failure(&serde_json::json!({"code": -32602, "message": message})),
+                message
+            );
+            assert_eq!(
+                super::safe_rpc_failure(&serde_json::json!({"code": -32603, "message": message})),
+                "research core request failed (-32603)"
+            );
+        }
+        for message in ["SERVER_OPERATION_FAILED", "RESEARCH_TASKS_STILL_STOPPING_EXTRA"] {
+            assert_eq!(
+                super::safe_rpc_failure(&serde_json::json!({"code": -32602, "message": message})),
+                "research core request failed (-32602)"
             );
         }
         assert_eq!(

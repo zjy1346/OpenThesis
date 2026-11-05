@@ -9,6 +9,7 @@ from typing import Any
 
 from .i18n import EN, ZH_HANT, normalize_language
 from .financial_comparatives import comparative_amounts_agree, comparison_binding
+from .financial_metric_policy import metric_applicable, bank_metric_notice
 
 
 _ANNUAL_PERIODS = frozenset({"", "FY", "CY", "ANNUAL"})
@@ -1688,6 +1689,8 @@ def deterministic_summary(
     if any(row.get("parent_net_income") is not None for row in metrics):
         columns.append(("parent_net_income", "Profit attributable to owners", "歸母淨利潤" if traditional else "归母净利润"))
     columns.append(("operating_cash_flow", "Operating cash flow", "經營現金流" if traditional else "经营现金流"))
+    if not metric_applicable(metrics[0], "free_cash_flow") and any(row.get("capital_expenditure") is not None for row in metrics):
+        columns.append(("capital_expenditure", "Capital expenditure (reported scope)", "資本開支（披露口徑）" if traditional else "资本开支（披露口径）"))
     if has_free_cash_flow:
         columns.append(("free_cash_flow", "Free cash flow", "\u81ea\u7531\u73fe\u91d1\u6d41" if traditional else "\u81ea\u7531\u73b0\u91d1\u6d41"))
     labels = [column[1] if english else column[2] for column in columns]
@@ -1699,7 +1702,7 @@ def deterministic_summary(
             value = row.get(key)
             if key == "year":
                 values.append(str(metric_periods[id(row)].year))
-            elif key in {"revenue", "net_income", "parent_net_income", "operating_cash_flow", "free_cash_flow"}:
+            elif key in {"revenue", "net_income", "parent_net_income", "operating_cash_flow", "capital_expenditure", "free_cash_flow"}:
                 values.append(format_money(value, currency))
             elif key.endswith("_growth"):
                 values.append(format_growth(value, row.get(f"{key}_status"), language))
@@ -1708,6 +1711,9 @@ def deterministic_summary(
         lines.append("| " + " | ".join(values) + " |")
 
     latest = metrics[0]
+    cash_applicable = metric_applicable(latest, "cash_conversion")
+    if not cash_applicable:
+        lines.extend(["", "> " + bank_metric_notice(language), ""])
     metric_details = (
         [
             ("Gross margin", "毛利率", "毛利率", format_percent(latest.get("gross_margin"))),
@@ -1722,7 +1728,9 @@ def deterministic_summary(
         if item[3] != "—" or item[0] == "Gross margin" and latest.get("gross_margin") is not None
     ]
     if visible_details:
-        lines.extend(["", "## " + ("Growth and Quality Metrics" if english else "成長與品質指標" if traditional else "增长与质量指标"), ""])
+        growth_heading = (("Growth Metrics" if english else "成長指標" if traditional else "增长指标")
+                          if not cash_applicable else ("Growth and Quality Metrics" if english else "成長與品質指標" if traditional else "增长与质量指标"))
+        lines.extend(["", "## " + growth_heading, ""])
         for en_label, hant_label, zh_label, value in visible_details:
             label = en_label if english else hant_label if traditional else zh_label
             lines.append(f"- {label}: {value}" if english else f"- {label}：{value}")
@@ -1733,8 +1741,8 @@ def deterministic_summary(
             "",
             "## Latest Fiscal-Year Deterministic Metrics",
             "",
-            f"- Cash conversion: {cash_conversion_text}",
-            f"- Definition: {cash_conversion_formula}",
+            *([f"- Cash conversion: {cash_conversion_text}",
+               f"- Definition: {cash_conversion_formula}"] if cash_applicable else []),
             f"- Debt to assets: {format_percent(latest.get('debt_to_assets'))}",
             f"- Return on equity: {_format_roe(latest, 'en')}",
             "",
@@ -1743,8 +1751,8 @@ def deterministic_summary(
     elif traditional:
         lines.extend([
             "", "## \u6700\u65b0\u8ca1\u5e74\u78ba\u5b9a\u6027\u6307\u6a19", "",
-            f"- \u73fe\u91d1\u5229\u6f64\u8f49\u5316\u7387：{cash_conversion_text}",
-            f"- \u8a08\u7b97\u65b9\u5f0f：{cash_conversion_formula}",
+            *([f"- \u73fe\u91d1\u5229\u6f64\u8f49\u5316\u7387：{cash_conversion_text}",
+               f"- \u8a08\u7b97\u65b9\u5f0f：{cash_conversion_formula}"] if cash_applicable else []),
             f"- \u8cc7\u7522\u8ca0\u50b5\u7387：{format_percent(latest.get('debt_to_assets'))}",
             f"- \u6de8\u8cc7\u7522\u5831\u916c\u7387：{_format_roe(latest, 'zh-Hant')}", "",
             "> \u9019\u4e9b\u6307\u6a19\u50c5\u4f5c\u70ba\u7814\u7a76\u8f38\u5165\uff0c\u4e0d\u69cb\u6210\u6295\u8cc7\u5efa\u8b70\u3002",
@@ -1754,8 +1762,8 @@ def deterministic_summary(
             "",
             "## 最新财年确定性指标",
             "",
-            f"- 现金利润转化率：{cash_conversion_text}",
-            f"- 计算方式：{cash_conversion_formula}",
+            *([f"- 现金利润转化率：{cash_conversion_text}",
+               f"- 计算方式：{cash_conversion_formula}"] if cash_applicable else []),
             f"- 资产负债率：{format_percent(latest.get('debt_to_assets'))}",
             f"- 净资产收益率：{_format_roe(latest, 'zh-CN')}",
             "",
