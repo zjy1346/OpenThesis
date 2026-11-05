@@ -16,6 +16,8 @@ from ..disclosure_coverage import DisclosureCoverage, DisclosureCoveragePlanner
 from ..domain import Company, FinancialFact, ResearchRun
 from ..financial_sources.disclosures import cached_filing_evidence, financial_evidence_record
 from ..financial_disclosure_bindings import bind_compiled_disclosures
+from ..financial_compiler import CoveragePlanner
+from ..financial_contracts import STATEMENT_FOR
 from ..market_capabilities import DEFAULT_MARKET_CAPABILITIES
 from ..market_snapshot import ReverseDcfPolicy
 from ..providers import ModelConfig
@@ -35,7 +37,7 @@ class ResearchPreparationUnavailable(RuntimeError):
         super().__init__(code)
 
 
-def financial_scope_gaps(facts, filings) -> tuple[dict[str, Any], ...]:
+def financial_scope_gaps(facts, filings, subject: Company | None = None) -> tuple[dict[str, Any], ...]:
     """Major table absence in the latest required annual/interim periods.
 
     This is a paid-research scope question, not an all-files quality gate.
@@ -49,6 +51,9 @@ def financial_scope_gaps(facts, filings) -> tuple[dict[str, Any], ...]:
     table_concepts = {"income_statement": {"revenue", "net_income", "parent_net_income", "operating_income"},
                       "balance_sheet": {"assets", "equity", "total_equity", "liabilities"},
                       "cash_flow": {"operating_cash_flow", "capital_expenditure"}}
+    if subject is not None:
+        required_tables = {STATEMENT_FOR[name] for name in CoveragePlanner().plan(subject).required_concepts}
+        table_concepts = {table:members for table,members in table_concepts.items() if table in required_tables}
     gaps = []
     for target in targets:
         concepts = {fact.get("concept") for fact in facts if fact.get("end_date") == target.period_end
@@ -230,7 +235,7 @@ class NewResearchPreparer:
                         or (prepared.recovery_outcome.diagnostic_code if prepared.recovery_outcome else "")
                         or "FILING_DATA_QUALITY_FAILED", outcome=prepared.recovery_outcome)
                 profile, capabilities = admitted.profile, admitted.capability_map
-                scope_gaps = financial_scope_gaps(facts, filings)
+                scope_gaps = financial_scope_gaps(facts, filings, subject)
                 download_errors = {}
                 for item in prepared.errors:
                     parts = str(item).split(":", 2)

@@ -16,6 +16,14 @@ describe("platform-neutral backend contract", () => {
       "research.get_report",
       "research.call_history",
       "research.extend_budget",
+      "research.jobs.list",
+      "research.jobs.resume",
+      "research.jobs.archive",
+      "research.cancel",
+      "research.cancel_model_call",
+      "research.vision_decision",
+      "research.queue.continue",
+      "research.queue.shutdown",
       "settings.update",
     ]));
   });

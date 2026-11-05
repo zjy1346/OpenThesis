@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { captureMarketSnapshot, getResearchBudgetPreview, listConfiguredModels, searchCompanies } from "../../backend";
 import { COPY } from "../../i18n";
-import type { BootstrapResult } from "../../types";
+import type { BootstrapResult, ResearchTaskSummary } from "../../types";
 import { NewResearchView } from "./NewResearchView";
 
 vi.mock("../../backend", () => ({
@@ -387,6 +387,65 @@ describe("NewResearch configured models", () => {
     fireEvent.click(candidate!);
     fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
     await waitFor(() => expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ company: expect.objectContaining({ identity_state: "cached_verified" }) })));
+  });
+
+  it("deduplicates an active company task and offers a direct task link before explicit duplicate creation", async () => {
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+      companies: [{ cik: "700", ticker: "0700", name: "Tencent Holdings", exchange: "SEHK", market: "HK", security_id: "HK:700", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    const activeTask: ResearchTaskSummary = {
+      job_id: "existing-company-task", run_id: "run-existing", state: "queued", revision: 3,
+      operation_type: "research", company: { name: "Tencent Holdings", ticker: "0700", security_id: "HK:700" },
+      model: "primary-model", stage: "preparing", message: "Queued", elapsed_seconds: 0,
+      queue_position: 1, ahead_count: 0, created_at: "2026-10-28T10:00:00Z",
+    };
+    const onOpenTask = vi.fn();
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()}
+      onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart}
+      activeResearchTasks={[activeTask]} onOpenTask={onOpenTask} />);
+
+    fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+    fireEvent.click((await screen.findByText("Tencent Holdings")).closest("button")!);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+
+    expect(await screen.findByText("This company already has an active task.")).toBeVisible();
+    expect(onStart).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "View existing task" }));
+    expect(onOpenTask).toHaveBeenCalledExactlyOnceWith("existing-company-task");
+
+    fireEvent.click(screen.getByRole("button", { name: "Create another research" }));
+    await waitFor(() => expect(onStart).toHaveBeenCalledOnce());
+    expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ company: expect.objectContaining({ ticker: "0700" }) }));
+  });
+
+  it("clears the company after successful submission but preserves shared model selection", async () => {
+    const otherModel = { ...configuredModels[0], configured_model_id: "alternate-model", connection_id: "alternate-connection", model_id: "alternate", alias: "Alternate" };
+    vi.mocked(listConfiguredModels).mockResolvedValue([...configuredModels, otherModel]);
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+      companies: [{ cik: "700", ticker: "0700", name: "Tencent Holdings", exchange: "SEHK", market: "HK", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<NewResearchView bootstrap={bootstrap} copy={COPY.en} onOpenModelCenter={vi.fn()}
+      onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+
+    const modelSelect = await screen.findByRole("combobox", { name: COPY.en.primaryModel });
+    fireEvent.change(modelSelect, { target: { value: "alternate-model" } });
+    fireEvent.change(screen.getByRole("textbox", { name: COPY.en.companySearch }), { target: { value: "Tencent" } });
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.searchAction }));
+    fireEvent.click((await screen.findByText("Tencent Holdings")).closest("button")!);
+    fireEvent.click(screen.getByRole("button", { name: COPY.en.launchResearch }));
+
+    await waitFor(() => expect(onStart).toHaveBeenCalledOnce());
+    expect(onStart.mock.calls[0][0].model).toMatchObject({ configured_model_id: "alternate-model", connection_id: "alternate-connection" });
+    expect(screen.getByRole("textbox", { name: COPY.en.companySearch })).toHaveValue("");
+    expect(modelSelect).toHaveValue("alternate-model");
+    expect(screen.getByRole("button", { name: COPY.en.chooseCompany })).toBeDisabled();
   });
 
   it("keeps launch failures in the form instead of leaving an unhandled rejection", async () => {

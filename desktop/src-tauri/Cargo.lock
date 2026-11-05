@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "openthesis-desktop"
-version = "3.2.6"
+version = "3.3.3"
 dependencies = [
  "base64 0.22.1",
  "httpdate",

@@ -25,10 +25,8 @@ from .storage import StorageCorruptionError
 
 
 DEFERRED_METHODS = frozenset({
-    "research.get_report", "research.financial_diagnostics", "research.pdf_runtime", "research.diagnostics", "research.budget_preview", "research.retry_synthesis",
-    "research.retry_model_stages", "research.retry_growth", "research.retry_stage",
-    "research.revalidate_saved", "research.refresh_financial_report", "research.retry_financials",
-    "research.rebuild_financials", "research.market_snapshot", "company.search", "ot.suggest", "packs.install", "app.bootstrap",
+    "research.get_report", "research.financial_diagnostics", "research.pdf_runtime", "research.diagnostics", "research.budget_preview",
+    "research.market_snapshot", "company.search", "ot.suggest", "packs.install", "app.bootstrap",
 })
 
 
@@ -73,7 +71,12 @@ class JsonLineServer:
             if str(exc) == "STORAGE_HEALTH_RECOVERY_REQUIRED":
                 return _error(request_id, -32040, "STORAGE_HEALTH_RECOVERY_REQUIRED")
             return _error(request_id, -32603, "internal error")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            if str(exc) in {"RESEARCH_REQUEST_ID_CONFLICT", "RESEARCH_REQUEST_ID_INVALID",
+                    "RESEARCH_TASK_REVISION_CONFLICT", "RESEARCH_TASK_NOT_REQUEUEABLE",
+                    "RESEARCH_RUN_HAS_ACTIVE_TASKS", "RESEARCH_TASKS_STILL_STOPPING",
+                    "VISION_TASK_APPROVAL_CONFLICT", "VISION_POLICY_CHANGED"}:
+                return _error(request_id, -32602, str(exc))
             return _error(request_id, -32602, "invalid parameters")
         except KeyError as exc:
             message = exc.args[0] if exc.args else "resource not found"
@@ -100,6 +103,8 @@ class JsonLineServer:
         params = request.get("params", {})
         if not isinstance(method, str) or not isinstance(params, dict):
             raise ValueError("invalid request")
+        client_identity = ({"client_request_id": params["client_request_id"]}
+                           if "client_request_id" in params else {})
 
         if (self._storage_recovery_required()
                 and method not in {"system.hello", "rpc.result", "research.cancel", "research.cancel_model_call"}):
@@ -252,6 +257,26 @@ class JsonLineServer:
                     else self.service.financial_diagnostics(run_id))
         if method == "research.start":
             return self.service.start_research(params)
+        if method == "research.jobs.list":
+            allowed = {"limit", "offset", "states", "since_revision"}
+            if set(params) - allowed or ("states" in params and not isinstance(params["states"], list)):
+                raise ValueError("invalid task list parameters")
+            return self.service.list_research_tasks(**params)
+        if method == "research.queue.continue":
+            return self.service.continue_research_queue()
+        if method == "research.queue.shutdown":
+            return self.service.shutdown_research_tasks()
+        if method in {"research.jobs.resume", "research.jobs.archive"}:
+            job_id, revision = params.get("job_id"), params.get("expected_revision")
+            if not isinstance(job_id, str) or not job_id or type(revision) is not int or revision < 0:
+                raise ValueError("task identity and revision required")
+            if method == "research.jobs.archive":
+                return self.service.archive_research_task(job_id, revision)
+            model = params.get("model")
+            current_vision = params.get("use_current_vision_settings", False)
+            if model is not None and not isinstance(model, dict) or type(current_vision) is not bool:
+                raise ValueError("invalid task resume")
+            return self.service.resume_research_task(job_id, revision, model=model, use_current_vision_settings=current_vision)
         if method == "research.market_snapshot":
             company = params.get("company")
             if not isinstance(company, dict):
@@ -264,7 +289,7 @@ class JsonLineServer:
                 raise ValueError("run_id is required")
             if model is not None and not isinstance(model, dict):
                 raise ValueError("model must be an object")
-            return self.service.retry_research_synthesis(run_id, model)
+            return self.service.retry_research_synthesis(run_id, model, **client_identity)
         if method == "research.retry_model_stages":
             run_id = params.get("run_id")
             model = params.get("model")
@@ -272,18 +297,18 @@ class JsonLineServer:
                 raise ValueError("run_id is required")
             if model is not None and not isinstance(model, dict):
                 raise ValueError("model must be an object")
-            return self.service.retry_research_model_stages(run_id, model, budget_only=params.get("budget_only", False))
+            return self.service.retry_research_model_stages(run_id, model, budget_only=params.get("budget_only", False), **client_identity)
         if method == "research.revalidate_saved":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
-            return self.service.revalidate_saved_research(run_id)
+            return self.service.revalidate_saved_research(run_id, **client_identity)
         if method == "research.retry_growth":
             run_id = params.get("run_id")
             model = params.get("model")
             if not isinstance(run_id, str) or not run_id or not isinstance(model, dict):
                 raise ValueError("run_id and model are required")
-            return self.service.retry_research_growth(run_id, model)
+            return self.service.retry_research_growth(run_id, model, **client_identity)
         if method == "research.retry_stage":
             run_id = params.get("run_id")
             target = params.get("target")
@@ -302,13 +327,13 @@ class JsonLineServer:
                 raise ValueError("confirm_new_attempt must be a boolean")
             if confirm_new_attempt:
                 return self.service.retry_research_stage(run_id, target, model, plan_hash,
-                                                        confirm_new_attempt=True)
-            return self.service.retry_research_stage(run_id, target, model, plan_hash)
+                                                        confirm_new_attempt=True, **client_identity)
+            return self.service.retry_research_stage(run_id, target, model, plan_hash, **client_identity)
         if method == "research.retry_financials":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
-            return self.service.retry_financials(run_id)
+            return self.service.retry_financials(run_id, **client_identity)
         if method == "research.refresh_financial_report":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
@@ -316,32 +341,33 @@ class JsonLineServer:
             language = params.get("language")
             if language is not None and not isinstance(language, str):
                 raise ValueError("language must be a string")
-            return self.service.refresh_financial_report(run_id, language=language)
+            return self.service.refresh_financial_report(run_id, language=language, **client_identity)
         if method == "research.start_financial_retry":
             run_id = params.get("run_id")
             if not isinstance(run_id, str) or not run_id:
                 raise ValueError("run_id is required")
-            return self.service.start_financial_retry(run_id)
+            return self.service.start_financial_retry(run_id, **client_identity)
         if method == "research.rebuild_financials":
             run_id = params.get("run_id")
             confirmed = params.get("confirmed")
             if not isinstance(run_id, str) or not run_id or not isinstance(confirmed, bool):
                 raise ValueError("run_id and confirmed are required")
-            return self.service.rebuild_financials(run_id, confirmed=confirmed)
+            return self.service.rebuild_financials(run_id, confirmed=confirmed, **client_identity)
         if method == "research.start_financial_rebuild":
             run_id = params.get("run_id")
             confirmed = params.get("confirmed")
             if not isinstance(run_id, str) or not run_id or not isinstance(confirmed, bool):
                 raise ValueError("run_id and confirmed are required")
             return self.service.start_financial_retry(
-                run_id, force=True, confirmed=confirmed
+                run_id, force=True, confirmed=confirmed, **client_identity
             )
         if method == "research.vision_decision":
             job_id = params.get("job_id")
             approved = params.get("approved")
             if not isinstance(job_id, str) or not job_id or not isinstance(approved, bool):
                 raise ValueError("job_id and approved are required")
-            return self.service.vision_decision(job_id, approved)
+            approval_identity = {key: params[key] for key in ("expected_revision", "plan_id") if key in params}
+            return self.service.vision_decision(job_id, approved, **approval_identity)
         if method == "research.cancel_model_call":
             values = [params.get(key) for key in ("job_id", "request_id", "attempt_id")]
             if any(not isinstance(value, str) or not value or len(value) > 256 for value in values):

@@ -1510,3 +1510,25 @@ button { color: inherit; }
   .model-picker-footer > button { flex: 1 1 auto; }
   .model-picker-manual { grid-template-columns: minmax(0,1fr); }
 }
+
+/* Research task navigation does not own the report-reading layout. */
+.rail-actions .icon-button { position: relative; }
+.task-rail-count { position: absolute; top: 1px; right: 1px; min-width: 16px; padding: 1px 3px; border-radius: 9px; font-size: 9px; line-height: 13px; color: white; background: var(--accent, #27684b); font-variant-numeric: tabular-nums; }
+.task-nav-counts { display: block; margin-top: 3px; font-size: 10px; line-height: 1.4; color: var(--ink-muted); white-space: normal; }
+.task-submission-notice, .task-notifications > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border: 1px solid #d5e4db; border-radius: 12px; background: #f3f9f5; color: #325343; font-size: 12px; }
+.task-submission-notice { margin-bottom: 10px; }
+.task-submission-notice > span, .task-notifications span { flex: 1 1 180px; }
+.task-submission-notice button, .task-notifications button { min-height: 32px; padding: 4px 8px; border: 1px solid #cbdcd0; border-radius: 8px; background: white; color: inherit; cursor: pointer; }
+.task-notifications { display: grid; gap: 6px; margin-bottom: 10px; }
+.task-drawer-host { position: fixed; top: 12px; right: 12px; bottom: 12px; width: min(760px, calc(100vw - 96px)); z-index: 70; transition: transform 180ms cubic-bezier(.23,1,.32,1), opacity 150ms ease-out; }
+@starting-style { .task-drawer-host { transform: translateX(16px); opacity: 0; } }
+.task-page { height: calc(100dvh - 180px); min-height: 230px; }
+.task-close-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 18px; background: rgba(20,30,24,.35); }
+.task-close-dialog { width: min(560px, 100%); max-height: calc(100dvh - 36px); overflow: auto; padding: 24px; border-radius: 18px; background: white; box-shadow: 0 18px 60px #12221b25; }
+.task-close-dialog h2 { margin: 0 0 12px; font-size: 20px; }
+.task-close-dialog p { line-height: 1.7; color: #63736a; }
+.task-duplicate-notice { margin-top: 12px; padding: 12px; border-radius: 10px; background: #fffaf0; border: 1px solid #e6d9bb; }
+.task-duplicate-notice button { margin-right: 8px; min-height: 36px; }
+[data-skip-motion="true"] .task-drawer-host { transition: none; }
+@media (prefers-reduced-motion: reduce) { .task-drawer-host { transform: none; transition: none; } @starting-style { .task-drawer-host { transform: none; opacity: 1; } } }
+@media (max-height: 650px) { .task-page { height: calc(100dvh - 132px); } .task-drawer-host { top: 8px; bottom: 8px; } }

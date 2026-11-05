@@ -17,8 +17,10 @@ from .research_claim_dedup import deduplicate_claims
 from .research_assertions import current_assertions, independent_sentences
 
 
-SECTION_PROOF_VERSION = "evidence-bound-sections-v10-local-retention"
-_ASSERTION_PROOF_VERSIONS = {SECTION_PROOF_VERSION, "evidence-bound-sections-v9-analysis-presentation", "evidence-bound-sections-v8-assertions"}
+SECTION_PROOF_VERSION = "evidence-bound-sections-v11-purpose-bound"
+DISPLAY_PENDING_PROOF_VERSIONS = frozenset({SECTION_PROOF_VERSION, "evidence-bound-sections-v10-local-retention"})
+_ASSERTION_PROOF_VERSIONS = {*DISPLAY_PENDING_PROOF_VERSIONS,
+    "evidence-bound-sections-v9-analysis-presentation", "evidence-bound-sections-v8-assertions"}
 _READABLE_PROOF_VERSIONS = {*_ASSERTION_PROOF_VERSIONS, "evidence-bound-sections-v7-source-dependencies", "evidence-bound-sections-v6-role-quantities"}
 _VERIFIED = frozenset({"numeric_verified", "text_supported"})
 _REFERENCES = frozenset({"evidence_ids", "source_evidence_ids", "supporting_evidence_ids", "contradicting_evidence_ids",
@@ -81,8 +83,44 @@ def _labelled_nonfactual_text(text: str, kind: str) -> bool:
             for clause in clauses if clause.strip())
     if _HISTORICAL.search(text):
         return False
-    clauses = re.split(r"[。；;!?！？]|(?<!\d)[,，]|(?<!\d)\.(?!\d)", text)
+    clauses = re.split(r"[。；;!?！？]|(?<!\d)[,，]|(?<!\d)\.(?!\d)|\b(?:but|however|whereas)\b|但是|然而|但", text, flags=re.I)
     return all(not _REPORTED_NUMBER.search(clause) or _HYPOTHETICAL.search(clause) for clause in clauses)
+
+
+def _node_use(role: str) -> dict[str, Any]:
+    return {"validation_state": "partial" if role == "analysis" else
+            "labelled" if role in {"assumption", "question", "methodology"} else "verified",
+            "display_eligible": True, "calculation_eligible": role == "fact_table"}
+
+
+def section_node_id(node: Mapping[str, Any]) -> str:
+    fields = ["source_path", "body_sha256", "evidence_ids", "role", "validator_version", "context_sha256"]
+    version = node.get("validator_version")
+    if version in _ASSERTION_PROOF_VERSIONS | {"evidence-bound-sections-v7-source-dependencies"}:
+        fields.append("depends_on")
+    if version in _ASSERTION_PROOF_VERSIONS:
+        fields.append("assertions_sha256")
+    if version == SECTION_PROOF_VERSION:
+        fields.extend(_node_use(node.get("role")))
+        if "purpose_spans" in node:
+            fields.append("purpose_spans")
+    return "node:" + content_digest({key: node.get(key) for key in fields})
+
+
+def _mixed_purpose_spans(text: str, kind: str) -> list[dict[str, Any]]:
+    if kind not in {"assumption", "forecast", "scenario"}:
+        return []
+    spans = []
+    boundary = re.compile(r"[。；;!?！？]|(?<!\d)[,，]|(?<!\d)\.(?!\d)|\b(?:but|however|whereas)\b|但是|然而|但", re.I)
+    start = 0
+    for end, next_start in [*((m.start(), m.end()) for m in boundary.finditer(text)), (len(text), len(text))]:
+        clause = text[start:end]
+        if _REPORTED_NUMBER.search(clause):
+            spans.append({"start": start, "end": end,
+                          "state": "declared_assumption" if _labelled_nonfactual_text(clause, kind)
+                              else "pending_source_verification"})
+        start = next_start
+    return spans if len({span["state"] for span in spans}) == 2 else []
 
 
 def content_digest(value: Any) -> str:
@@ -131,8 +169,14 @@ def proven_content_nodes(report: Mapping[str, Any], audit: Any) -> tuple[dict[st
             if not assertions_valid:
                 continue
             identity["assertions_sha256"] = node["assertions_sha256"]
+        use = _node_use(identity["role"])
+        if node["validator_version"] == SECTION_PROOF_VERSION:
+            if any(node.get(key) is not value if isinstance(value, bool) else node.get(key) != value
+                   for key, value in use.items()):
+                continue
+            identity.update(use)
         try:
-            identity_valid = node.get("node_id") == "node:" + content_digest(identity)
+            identity_valid = node.get("node_id") == section_node_id(node)
         except (TypeError, ValueError):
             identity_valid = False
         if not identity_valid:
@@ -147,7 +191,9 @@ def proven_content_nodes(report: Mapping[str, Any], audit: Any) -> tuple[dict[st
                 continue
         except (TypeError, ValueError):
             continue
-        result.append(deepcopy(node))
+        # Historical audit envelopes did not hash these flags. Re-derive them
+        # from the bound role instead of letting stale flags upgrade content.
+        result.append({**deepcopy(node), **use})
     return tuple(result)
 
 
@@ -224,7 +270,7 @@ def project_supported_sections(
             return False
 
     def accept(path: str, value: Any, refs: list[str], claims: list[dict], role: str,
-               *, issue_code: str = "") -> None:
+               *, issue_code: str = "", purpose_spans=None) -> None:
         # Freeze presentation ancestry as non-substantive metadata. Flattening
         # trusted leaves must not lose opportunity/scenario names or combine
         # different list items. Titles never become evidence for this body.
@@ -257,13 +303,14 @@ def project_supported_sections(
             role = "source_quote"
             identity["role"] = role
         identity["assertions_sha256"] = content_digest(assertions)
-        atoms.append({**identity, "node_id": "node:" + content_digest(identity),
+        identity.update(_node_use(role))
+        if purpose_spans:
+            identity["purpose_spans"] = purpose_spans
+        atoms.append({**identity, "node_id": section_node_id(identity),
                       "section_id": path.split(".")[0].split("[")[0],
                       "body": deepcopy(value), "context": context, "claim_ids": sorted({claim["claim_id"] for claim in claims
                           if isinstance(claim.get("claim_id"), str)}),
                       "assertion_results": assertions,
-                      "validation_state": "partial" if role == "analysis" else "verified" if role != "assumption" else "labelled",
-                      "display_eligible": True, "calculation_eligible": role == "fact_table",
                       "issue_code": issue_code})
 
     def checked_claims(value: Any, path: str) -> list[dict[str, Any]]:
@@ -317,7 +364,9 @@ def project_supported_sections(
                 if states.get(index) == "numeric_verified":
                     numeric_verified_indices.add(len(collected) + len(valid) - 1)
             elif (isinstance(claim, dict) and states.get(index) == "reference_only"
-                  and str(claim.get("kind", "")).casefold() in _NONFACTUAL):
+                  and (kind := str(claim.get("kind", "")).casefold()) in _NONFACTUAL
+                  and any(isinstance(claim.get(field), str) and _labelled_nonfactual_text(claim[field], kind)
+                          for field in ("text", "conclusion", "argument"))):
                 valid.append(deepcopy(claim))
                 assumptions.append(f"{path}[{index}]")
             elif isinstance(claim, dict) and states.get(index) != "contradicted":
@@ -511,14 +560,14 @@ def project_supported_sections(
             return projected if projected else _ABSENT
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):
             text = str(value).strip()
-            if declared_assumption and isinstance(value, (int, float)):
+            if not factual and declared_assumption and isinstance(value, (int, float)):
                 # A numeric assumption is explicitly typed by its containing
                 # forecast/scenario and `assumptions` field. It is labelled,
                 # never admitted as a reported fact or engine calculation.
                 assumptions.append(path)
                 accept(path, value, inherited, owned, "assumption")
                 return deepcopy(value)
-            if nonfactual and _labelled_nonfactual_text(text, nonfactual):
+            if not factual and nonfactual and _labelled_nonfactual_text(text, nonfactual):
                 assumptions.append(path)
                 role = "question" if nonfactual in {"question", "unresolved"} else "methodology" if nonfactual in {"method", "methodology"} else "assumption"
                 accept(path, value, inherited, owned, role)
@@ -591,7 +640,10 @@ def project_supported_sections(
                         return _ABSENT
             if text:
                 pending.append({"path": path, "reason": "assertion_pending_verification"})
-                accept(path, value, refs, owned, "analysis", issue_code="CONTENT_PENDING_VERIFICATION")
+                mixed = _mixed_purpose_spans(value, nonfactual) if not factual and isinstance(value, str) else []
+                accept(path, value, refs, owned, "analysis",
+                    issue_code="CONTENT_MIXED_ASSUMPTION_PENDING" if mixed else "CONTENT_PENDING_VERIFICATION",
+                    purpose_spans=mixed)
                 return deepcopy(value)
             return _ABSENT
         reject(path, "not_analysis")

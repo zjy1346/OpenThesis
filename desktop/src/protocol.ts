@@ -12,6 +12,7 @@ import type {
   OtValidationResult,
   Preferences,
   ResearchJob,
+  ResearchTaskList,
   StructureRuntimeStatus,
   ResearchPackSummary,
   ResearchReport,
@@ -66,6 +67,11 @@ export const BACKEND_METHODS = [
   "research.cancel",
   "research.cancel_model_call",
   "research.vision_decision",
+  "research.jobs.list",
+  "research.jobs.resume",
+  "research.jobs.archive",
+  "research.queue.continue",
+  "research.queue.shutdown",
 ] as const;
 
 export type BackendMethod = typeof BACKEND_METHODS[number];
@@ -98,6 +104,11 @@ export type BackendParams = {
   "rpc.result": { job_id: string };
   "research.financial_diagnostics": { run_id: string };
   "research.start": ResearchRequest;
+  "research.jobs.list": { limit?: number; offset?: number; since_revision?: number; states?: string[] };
+  "research.jobs.resume": { job_id: string; expected_revision: number; model?: ModelReference; use_current_vision_settings?: boolean };
+  "research.jobs.archive": { job_id: string; expected_revision: number };
+  "research.queue.continue": EmptyParams;
+  "research.queue.shutdown": EmptyParams;
   "research.market_snapshot": { company: Company; valuation?: ResearchRequest["valuation"] };
   "research.retry_growth": { run_id: string; model: ModelSelection };
   "research.retry_stage": { run_id: string; target: string; model?: ModelSelection; plan_hash: string; confirm_new_attempt?: boolean };
@@ -114,7 +125,7 @@ export type BackendParams = {
   "research.status": { job_id: string };
   "research.cancel": { job_id: string };
   "research.cancel_model_call": { job_id: string; request_id: string; attempt_id: string };
-  "research.vision_decision": { job_id: string; approved: boolean };
+  "research.vision_decision": { job_id: string; approved: boolean; expected_revision?: number; plan_id?: string };
 };
 
 export type BackendResult = {
@@ -140,20 +151,25 @@ export type BackendResult = {
   "research.financial_diagnostics": FinancialDiagnostics;
   "research.start": ResearchJob;
   "research.market_snapshot": MarketSnapshotPreview;
-  "research.retry_growth": ResearchReport;
-  "research.retry_stage": ResearchReport;
-  "research.revalidate_saved": ResearchReport;
-  "research.retry_model_stages": ResearchReport;
-  "research.retry_financials": ResearchReport;
-  "research.refresh_financial_report": ResearchReport;
+  "research.retry_growth": ResearchJob;
+  "research.retry_stage": ResearchJob;
+  "research.revalidate_saved": ResearchJob;
+  "research.retry_model_stages": ResearchJob;
+  "research.retry_financials": ResearchJob;
+  "research.refresh_financial_report": ResearchJob;
   "research.start_financial_retry": ResearchJob;
   "research.start_financial_rebuild": ResearchJob;
-  "research.rebuild_financials": ResearchReport;
-  "research.retry_synthesis": ResearchReport;
+  "research.rebuild_financials": ResearchJob;
+  "research.retry_synthesis": ResearchJob;
   "research.status": ResearchJob;
   "research.cancel": ResearchJob;
   "research.cancel_model_call": ResearchJob;
   "research.vision_decision": ResearchJob;
+  "research.jobs.list": ResearchTaskList;
+  "research.jobs.resume": ResearchJob;
+  "research.jobs.archive": { job_id: string; archived: boolean };
+  "research.queue.continue": ResearchTaskList;
+  "research.queue.shutdown": { queue_paused: boolean; safe_to_exit: boolean; progress_preserved: boolean; remote_billing_stopped: boolean };
 };
 
 export type BackendRequest<M extends BackendMethod = BackendMethod> = {

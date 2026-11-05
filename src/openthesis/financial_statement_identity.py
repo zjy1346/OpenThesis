@@ -3,10 +3,58 @@ from __future__ import annotations
 
 import re
 import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .financial_taxonomy import normalize_financial_label
+
+
+STATEMENT_MAPPING_VERSION = "statement-scope-dates-v5-cache-context"
+
+
+def statement_mapping_affected(facts=(), evidence=()) -> bool:
+    """Select legacy source observations needing local semantic replay.
+
+    This is cache invalidation only, never an admission rule. Retained raw
+    table observations catch even titles whose numeric rows were all lost.
+    Geometry/original bytes remain reusable and are not removed.
+    """
+    def get(item, key, default=""):
+        return item.get(key, default) if isinstance(item, dict) else getattr(item, key, default)
+    for fact in facts:
+        label = normalize_financial_label(get(fact, "reported_concept"))
+        if "本行股东" in label or "少数股东的净利润" in label:
+            return True
+        if (get(fact, "statement") == "balance_sheet"
+                and re.fullmatch(r"\s*(?:19|20)\d{2}\s*年\s*", str(get(fact, "source_column") or ""))):
+            return True
+    for ref in evidence:
+        if not str(get(ref, "evidence_id")).startswith("table-structure:"):
+            continue
+        try:
+            table = json.loads(get(ref, "excerpt"))
+            for row in table.get("rows", ()):
+                text = " ".join(str(cell.get("text", "")) for cell in row.get("cells", ()))
+                compact = normalize_financial_label(text)
+                if re.search(r"[０-９][０-９，．]*[，．][０-９]|（\s*[０-９]", text):
+                    return True
+                if re.search(r"未经审计|未經審計|未经审核|未經審核|财务比率|財務比率", compact):
+                    return True
+                if "本行股东" in compact or "少数股东的净利润" in compact:
+                    return True
+                if "本集团" in compact and "本行" in compact:
+                    return True
+                if re.fullmatch(r"(?:公司|本行)(?:资产负债表|利润表|现金流量表)(?:续)?", compact):
+                    return True
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return False
+
+
+def needs_statement_remap(payload) -> bool:
+    return (payload.get("statement_mapping_version") != STATEMENT_MAPPING_VERSION
+        and statement_mapping_affected(payload.get("facts", ()), payload.get("evidence", ())))
 
 
 STATEMENT_TITLE_MARKERS = {
@@ -144,10 +192,17 @@ def find_statement_headings(
                 if marker_at < 0:
                     continue
                 prefix = folded[:marker_at].strip()
+                # These are formal report qualifiers, not narrative text.
+                # Strip only an anchored sequence; arbitrary words before a
+                # statement title remain ineligible (including TOC entries).
+                prefix = re.sub(
+                    r"^(?:(?:未经审计|未經審計|未经审核|未經審核|简明|簡明|中期|期中|"
+                    r"unaudited\b|condensed\b|interim\b)[\s()（）]*)+", "", prefix,
+                ).strip()
                 if prefix and not re.fullmatch(
                     r"(?:20\d{2}\s+annual\s+report)?", prefix,
                 ) and prefix not in {
-                    "母公司", "parent", "parent company", "company only", "company-only", "separate",
+                    "母公司", "公司", "本行", "parent", "parent company", "company only", "company-only", "separate",
                     *(alias.casefold().strip() for alias in parent_aliases),
                 }:
                     continue

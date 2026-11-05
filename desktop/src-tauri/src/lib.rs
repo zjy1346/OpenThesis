@@ -12,7 +12,7 @@ pub use model_gateway::run_model_gateway_stdio;
 
 use base64::Engine as _;
 use std::path::Path;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 
@@ -272,7 +272,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(backend::BackendState::default())
         .manage(model_center::ModelCenterState::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.state::<backend::BackendState>().guard_window_close() {
+                    api.prevent_close();
+                    let _ = window.emit("openthesis-close-requested", ());
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            backend::finish_window_close,
             backend::backend_request,
             backend::backend_initialization_status,
             model_center::model_center_list_providers,

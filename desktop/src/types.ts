@@ -390,6 +390,7 @@ export function visionFallbackSelectionFromPolicy(
 }
 
 export type ResearchRequest = {
+  client_request_id?: string;
   allow_partial_research?: boolean;
   mode: "demo" | "company";
   company?: Company;
@@ -823,11 +824,53 @@ export type ModelCallHistoryPage = {
   next_cursor: string | null;
 };
 
+export type ResearchTaskState = "queued" | "running" | "waiting_input" | "interrupted" | "cancelling" | "completed" | "failed" | "cancelled";
+
+export type ResearchTaskSummary = {
+  job_id: string;
+  run_id: string;
+  state: ResearchTaskState;
+  revision: number;
+  operation_type: string;
+  company: { name: string; ticker: string; security_id?: string };
+  model: string;
+  stage: string;
+  message: string;
+  elapsed_seconds: number;
+  queue_position?: number;
+  ahead_count?: number;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  blocked_reason?: string;
+  action_required?: boolean;
+};
+
+export type ResearchTaskCounts = Record<"running" | "queued" | "waiting_input" | "interrupted" | "cancelling", number>;
+export type ResearchTaskList = {
+  items: ResearchTaskSummary[];
+  revision: number;
+  not_modified: boolean;
+  counts: ResearchTaskCounts;
+  queue_paused: boolean;
+  has_more: boolean;
+  next_offset: number | null;
+};
+
 export type ResearchJob = {
   revision?: number;
   status_revision?: string;
   job_id: string;
-  state: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+  state: ResearchTaskState;
+  operation_type?: string;
+  company?: ResearchTaskSummary["company"];
+  model?: string;
+  queue_position?: number;
+  ahead_count?: number;
+  created_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  blocked_reason?: string;
   message: string;
   percent: number;
   run_id: string | null;
@@ -838,6 +881,7 @@ export type ResearchJob = {
   completed_agents?: number;
   total_agents?: number;
   cancel_requested?: boolean;
+  execution_draining?: boolean;
   elapsed_seconds?: number;
   engine_active_seconds?: number;
   external_wait_seconds?: number;
@@ -901,6 +945,12 @@ export type ResearchJob = {
   vision_approval_pending?: boolean;
   vision_approval?: boolean | null;
   operation_result?: FinancialRetryResult | null;
+  recovery_outcome?: {
+    state: string;
+    diagnostic_code: string;
+    next_actions: string[];
+    [key: string]: unknown;
+  } | null;
   attempt_complete?: boolean;
   research_complete?: boolean;
   action_required?: boolean;

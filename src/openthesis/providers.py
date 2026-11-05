@@ -204,6 +204,10 @@ def _parse_model_json(text: str) -> dict[str, Any]:
 class RustModelGatewayProvider:
     """Use the Tauri executable's bounded gateway mode; Python never receives API keys."""
 
+    # Actual Rust final text-content transport limit, not a guessed model
+    # context. Unknown models may use this full boundary without a 128K veto.
+    max_input_bytes = 7 * 1024 * 1024
+
     def __init__(
         self,
         config: ModelConfig,
@@ -295,6 +299,34 @@ class RustModelGatewayProvider:
         )
         return "连接成功" if result else "接口响应为空"
 
+    def validate_configuration(self) -> None:
+        """Local gateway/vault check, never a provider connection test."""
+        path = self._validated_gateway_path()
+        request = {"operation": "validate_configuration", "wire_contract": "configuration-validation-v1",
+                   "configured_model_id": self.config.configured_model_id,
+                   "expected_configuration_version": self.config.configuration_version,
+                   "system_prompt": "", "user_prompt": ""}
+        options = {"input": json.dumps(request).encode("utf-8"), "stdout": subprocess.PIPE,
+                   "stderr": subprocess.DEVNULL, "check": False, "timeout": 15}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            result = subprocess.run([str(path), "--model-gateway"], **options)
+            response = json.loads(result.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise ProviderError("Local configuration check unavailable", code="MODEL_GATEWAY_CONFIGURATION_ERROR") from exc
+        if result.returncode != 0 or response.get("wire_contract") != "configuration-validation-v1":
+            raise ProviderError("Configuration check protocol mismatch", code="MODEL_GATEWAY_CONFIGURATION_ERROR")
+        if response.get("ok") is not True:
+            code = str((response.get("error") or {}).get("code", "MODEL_CONFIGURATION_ERROR"))
+            raise ProviderError("Frozen model configuration is unavailable", code=code)
+        try:
+            valid = json.loads(response["result"]["content"]).get("configuration_valid") is True
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise ProviderError("Configuration check result invalid", code="MODEL_GATEWAY_CONFIGURATION_ERROR")
+
     def generate(
         self,
         system_prompt: str,
@@ -371,6 +403,7 @@ class RustModelGatewayProvider:
             raise ProviderError(
                 "模型请求超过网关大小限制。",
                 code="MODEL_REQUEST_BODY_TOO_LARGE",
+                not_sent=True,
             )
         timeout_seconds = max(5, min(600, int(self.config.timeout_seconds))) + 20
         if self._request_deadline is not None:

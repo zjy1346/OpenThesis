@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .financial_metric_policy import metric_applicable
+
 import html
 from typing import Any
 
@@ -567,12 +569,12 @@ def _financial_section(
         (
             _pick(language, "现金利润转化率", "Cash conversion"),
             format_cash_conversion(latest, language),
-            "cash_conversion_status" in latest,
+            metric_applicable(latest, "cash_conversion") and "cash_conversion_status" in latest,
         ),
         (
             _pick(language, "计算口径", "Definition"),
             cash_conversion_definition(latest, language),
-            "cash_conversion_status" in latest,
+            metric_applicable(latest, "cash_conversion") and "cash_conversion_status" in latest,
         ),
         (
             _pick(language, "毛利率", "Gross margin"),

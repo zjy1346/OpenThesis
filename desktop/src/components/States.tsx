@@ -171,7 +171,7 @@ export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, 
   );
 }
 
-export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN", onCancel, onVisionDecision, onCancelCall, loadCallHistory }: {
+export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN", onCancel, onVisionDecision, onCancelCall, loadCallHistory, showCancel = true }: {
   job: ResearchJob;
   cancelLabel?: string;
   language?: string;
@@ -199,6 +199,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   onVisionDecision?: (approved: boolean) => void;
   onCancelCall?: (requestId: string, attemptId: string) => void;
   loadCallHistory?: (runId: string, stageId: string, after?: string, limit?: number) => Promise<ModelCallHistoryPage>;
+  showCancel?: boolean;
 }) {
   const copy = labels ?? {
     cancel: cancelLabel ?? "Cancel research",
@@ -234,6 +235,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
       : { preparation: "资料准备", research: "模型研究" };
   const agentStates = job.agent_states ?? {};
   const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
+  const executionClockRunning = job.state === "running" || job.state === "cancelling";
   const [elapsed, setElapsed] = useState(backendElapsed);
   const elapsedAnchor = useRef({
     jobId: job.job_id,
@@ -242,17 +244,23 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   });
   useEffect(() => {
     const now = Date.now();
+    if (!executionClockRunning) {
+      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+      setElapsed(backendElapsed);
+      return;
+    }
     const anchor = elapsedAnchor.current;
     const estimated = anchor.seconds + Math.max(0, Math.floor((now - anchor.observedAt) / 1_000));
     if (anchor.jobId !== job.job_id || backendElapsed > estimated) {
       elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
     }
     setElapsed((current) => Math.max(current, backendElapsed));
-  }, [backendElapsed, job.job_id]);
+  }, [backendElapsed, job.job_id, executionClockRunning]);
   useEffect(() => {
     const now = Date.now();
     elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
     setElapsed(backendElapsed);
+    if (!executionClockRunning) return;
     const update = () => {
       const anchor = elapsedAnchor.current;
       const actual = anchor.seconds + Math.max(0, Math.floor((Date.now() - anchor.observedAt) / 1_000));
@@ -264,8 +272,10 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", update);
     };
-  }, [job.job_id]);
-  const stage = job.state === "cancelling" ? "cancelling" : job.stage;
+  }, [job.job_id, executionClockRunning]);
+  const stage = job.execution_draining && job.state !== "cancelling"
+    ? "task-finalizing"
+    : job.state === "running" ? job.stage : job.state;
   const stageCopy = progressStageCopy(language, stage);
   const stageDetail = progressStageDetail(
     language,
@@ -402,6 +412,10 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
           <div className="research-stage-copy" aria-live="polite">
             <strong>{stageCopy.title}</strong>
             <span>“{stageCopy.note}”</span>
+            {job.state !== "running" && job.stage && job.stage !== stage && <small>
+              {language === "en" ? "Latest stage:" : language === "zh-Hant" ? "最近階段：" : "最近阶段："}{" "}
+              <span>{progressStageCopy(language, job.stage).title}</span>
+            </small>}
             {stageDetail && <small>{stageDetail}</small>}
             {filingStates.length > 0 && <small>
               {filingCountLabel} {formatCount(completedFilingCount)} / {formatCount(filingStates.length)}
@@ -418,7 +432,8 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
           </div>
         </div>
         <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
-        <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>
+        {executionClockRunning && !job.execution_draining && job.state !== "cancelling" && !job.vision_approval_pending
+          && <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>}
         {remaining && <div className="research-remaining" aria-label={remainingLabel}>
           <span>{remainingLabel}</span>
           <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
@@ -426,9 +441,9 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
         {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
         {showEstimating && <small className="research-remaining">{estimatingCopy}</small>}
       </div>
-      <button className="research-progress-cancel" type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
+      {showCancel && <button className="research-progress-cancel" type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
         {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
-      </button>
+      </button>}
       {job.vision_approval_pending && job.vision_upload_preview && <div className="vision-approval-card" role="dialog" aria-label={copy.visionApprovalTitle ?? "Vision upload approval"}>
         <strong>{copy.visionApprovalTitle ?? "Vision upload approval"}</strong>
         <span>{copy.visionApprovalProvider ?? "Provider"}: {job.vision_upload_preview.provider}</span><span>{copy.visionApprovalDocument ?? "Document"}: {job.vision_upload_preview.source_document || "—"}</span>

@@ -18,11 +18,12 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Literal, Sequence
 
 from .domain import EvidenceRef, FinancialFact
 from .financial_contracts import ROE_ROW_MAPPING_VERSION
 from .financial_taxonomy import FINANCIAL_MAPPING_VERSION, cost_row_mentions
+from .financial_statement_identity import STATEMENT_MAPPING_VERSION, needs_statement_remap
 
 
 CHECKPOINT_SCHEMA_VERSION = "financial-window-checkpoint-v1"
@@ -115,12 +116,32 @@ class WindowCheckpoint:
             "schema_version": self.key.schema_version,
             "roe_row_mapping_version": ROE_ROW_MAPPING_VERSION,
             "financial_mapping_version": FINANCIAL_MAPPING_VERSION,
+            "statement_mapping_version": STATEMENT_MAPPING_VERSION,
             "key": asdict(self.key),
             "window": asdict(self.window),
             "facts": [fact.to_dict() for fact in self.facts],
             "evidence": [item.to_dict() for item in self.evidence],
             "context": dict(self.context or {}),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class WindowIncompleteProgress:
+    """Durable child progress for a parent that is not yet complete.
+
+    These checkpoints are deliberately separate from the function's normal
+    completed-window return value. Consumers may report progress or use the
+    records to resume, but must not treat them as a complete parent window.
+    """
+
+    parent: PdfWindow
+    completed_children: tuple[WindowCheckpoint, ...]
+    state: Literal["cancelled", "scheduling_slice", "incomplete"]
+    error_type: str
+
+
+class _SchedulingSliceEnded(RuntimeError):
+    """The cooperative work slice ended; this is not a user cancellation."""
 
 
 class WindowCheckpointStore:
@@ -212,6 +233,7 @@ class WindowCheckpointStore:
             "schema_version": EXHAUSTED_SCHEMA_VERSION,
             "roe_row_mapping_version": ROE_ROW_MAPPING_VERSION,
             "financial_mapping_version": FINANCIAL_MAPPING_VERSION,
+            "statement_mapping_version": STATEMENT_MAPPING_VERSION,
             "key_digest": key.digest,
             "input_fingerprint": input_fingerprint or key.digest,
             "reason": str(reason)[:240],
@@ -278,6 +300,18 @@ class WindowCheckpointStore:
                                              separators=(",", ":")).encode("utf-8")
                         if (envelope.get("sha256") == hashlib.sha256(encoded).hexdigest()
                                 and prior.get("key") == asdict(key) and _needs_cost_remap(prior)):
+                            return None
+                    except (OSError, TypeError, ValueError, KeyError):
+                        continue
+            if payload.get("statement_mapping_version") != STATEMENT_MAPPING_VERSION:
+                for path in self.directory.glob(f"{key.digest}-[0-9]*.json"):
+                    try:
+                        envelope = json.loads(path.read_text(encoding="utf-8"))
+                        prior = envelope["payload"]
+                        encoded = json.dumps(prior, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":")).encode("utf-8")
+                        if (envelope.get("sha256") == hashlib.sha256(encoded).hexdigest()
+                                and prior.get("key") == asdict(key) and needs_statement_remap(prior)):
                             return None
                     except (OSError, TypeError, ValueError, KeyError):
                         continue
@@ -363,6 +397,8 @@ class WindowCheckpointStore:
             if _needs_roe_remap(payload):
                 return None
             if _needs_cost_remap(payload):
+                return None
+            if needs_statement_remap(payload):
                 return None
             evidence = tuple(self._decode_evidence(item) for item in payload.get("evidence", ()))
             context = payload.get("context", {})
@@ -486,6 +522,7 @@ def run_checkpointed_windows(
     adaptive: bool = False,
     independent_pages: bool = False,
     work_identity: dict | None = None,
+    on_incomplete_progress: Callable[[WindowIncompleteProgress], None] | None = None,
 ) -> tuple[WindowCheckpoint, ...]:
     """Resume successful windows and retry only failed windows deterministically.
 
@@ -568,7 +605,7 @@ def run_checkpointed_windows(
             try:
                 remaining = deadline - time.monotonic() if deadline is not None else None
                 if remaining is not None and remaining <= 0:
-                    raise CancelledError("scheduling slice ended")
+                    raise _SchedulingSliceEnded("scheduling slice ended")
                 limit = timeout_seconds if scheduling_slice or remaining is None else (
                     min(timeout_seconds, remaining) if timeout_seconds is not None else remaining)
                 facts, evidence, next_context = _invoke_worker(worker, window, limit, context, cancel_check)
@@ -593,7 +630,7 @@ def run_checkpointed_windows(
             next_context = dict(context)
             for pages in (window.pages[:middle], window.pages[middle:]):
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise CancelledError("scheduling slice ended")
+                    raise _SchedulingSliceEnded("scheduling slice ended")
                 # Stable child identities independent of traversal/window count.
                 material = f"{window.index}|{','.join(map(str, pages))}"
                 index = 1_000_000_000 + int(hashlib.sha256(material.encode()).hexdigest()[:16], 16)
@@ -661,6 +698,10 @@ def run_checkpointed_windows(
                     # Retrying the same denied host operation cannot repair a
                     # document. Leave it resumable after the host is restored.
                     break
+                if isinstance(exc, (CancelledError, _SchedulingSliceEnded)):
+                    # Neither user cancellation nor a cooperative slice end
+                    # is a parser failure eligible for an unchanged retry.
+                    break
                 from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
                 if getattr(exc, 'code', '') in PDF_RUNTIME_FAILURE_CODES:
                     break
@@ -673,13 +714,28 @@ def run_checkpointed_windows(
                     )
                     break
         if last_error is not None:
-            results.extend(partial_children[partial_start:])
-            if partial_children[partial_start:]:
-                current_context = dict(partial_children[-1].context or {})
+            partial = tuple(partial_children[partial_start:])
+            if on_incomplete_progress is not None:
+                state: Literal["cancelled", "scheduling_slice", "incomplete"]
+                if isinstance(last_error, CancelledError):
+                    state = "cancelled"
+                elif isinstance(last_error, _SchedulingSliceEnded):
+                    state = "scheduling_slice"
+                else:
+                    state = "incomplete"
+                on_incomplete_progress(WindowIncompleteProgress(
+                    window, partial, state, type(last_error).__name__,
+                ))
             if on_failure is not None:
                 on_failure(window, last_error)
             emit_progress("failed")
-            if independent_pages and not isinstance(last_error, (WorkerIsolationUnavailable, CancelledError)):
+            if isinstance(last_error, (CancelledError, _SchedulingSliceEnded)):
+                # Keep cached children resumable, but never return them as a
+                # complete parent or advance later context-dependent work.
+                emit_progress("cancelled" if isinstance(last_error, CancelledError)
+                              else "budget_exhausted_resumable")
+                break
+            if independent_pages and not isinstance(last_error, WorkerIsolationUnavailable):
                 from .financial_source_errors import PDF_RUNTIME_FAILURE_CODES
                 if getattr(last_error, "code", "") not in PDF_RUNTIME_FAILURE_CODES:
                     # A missing page cannot donate its header to a suffix.

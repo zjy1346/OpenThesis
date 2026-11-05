@@ -19,14 +19,26 @@ class RoleRequestMaterials:
     output_schema: str | None = None
 
 
+class RequestCompilationError(ValueError):
+    code = "MODEL_REQUEST_COMPILATION_FAILED"
+    processing_phase = "request_compilation"
+    retryable = False
+    not_sent = True
+    response_received = False
+
+    def __init__(self, diagnostic):
+        super().__init__(self.code)
+        self.compilation_diagnostic = diagnostic
+
+
 def plan_role_requests(workflow, registry, inputs, saved=None, *, reused_stage_ids=(),
-                       stage_inputs=None, request_materials=None):
+                       stage_inputs=None, request_materials=None, compilation_errors=None):
     # This uses the same request builder as dispatch. Source text remains
     # complete; local estimates never masquerade as provider billed tokens.
     from ..research import _agent_prompt_bundle, _agent_role, _deduplicated_stage_context
     from ..research_assertions import _verification_prompt, _MODEL_PROTOCOL, source_identity, source_text
-    from .source_compiler import packet_materials, compact_record_table
-    from .executor import dependency_findings
+    from .source_compiler import frozen_packet_materials, compact_record_table
+    from .executor import dependency_request_values
     rows = []
     saved = saved or {}
     packets = {}
@@ -36,12 +48,7 @@ def plan_role_requests(workflow, registry, inputs, saved=None, *, reused_stage_i
         levels[spec.stage_id] = max((levels[key] + 1 for key in spec.depends_on), default=0)
     for spec in registry.stages:
         frozen_inputs = (stage_inputs or {}).get(spec.stage_id, inputs)
-        dependencies = {key: dependency_findings(saved[key].validation.trusted_output)
-                        for key in spec.depends_on if key in saved}
-        if spec.optional_dependencies:
-            dependencies["_dependency_gaps"] = [{"stage_id": key,
-                "state": saved[key].validation.state, "issue_codes": list(saved[key].validation.issues)}
-                for key in spec.optional_dependencies if key in saved and not saved[key].validation.passed]
+        dependencies = dependency_request_values(spec, saved)
         packets[spec.stage_id] = (request_materials(spec, frozen_inputs, dependencies) if request_materials else
             RoleRequestMaterials(spec.stage_id, frozen_inputs["context_json"], dependencies,
                                  spec.role, spec.output_contract or None))
@@ -58,9 +65,17 @@ def plan_role_requests(workflow, registry, inputs, saved=None, *, reused_stage_i
             continue
         packet = packets[spec.stage_id]
         context_json, _ = _deduplicated_stage_context(packet.context_json, packet.agent_id)
-        system, user = _agent_prompt_bundle(packet.agent_id, workflow.pack.prompt(spec.prompt_path),
-            workflow.report_language, context_json, packet.prior_artifacts,
-            role_id=packet.role_id, output_schema=packet.output_schema)
+        try:
+            system, user = _agent_prompt_bundle(packet.agent_id, workflow.pack.prompt(spec.prompt_path),
+                workflow.report_language, context_json, packet.prior_artifacts,
+                role_id=packet.role_id, output_schema=packet.output_schema)
+        except RequestCompilationError as error:
+            if compilation_errors is None:
+                raise
+            compilation_errors[spec.stage_id] = error
+            # A failed local compile forecasts no physical model request.
+            # Dispatch records its needs-action result without calling a model.
+            continue
         provider = workflow._stage_budget_provider(packet.agent_id)
         measured = input_measurement(provider, system, user)
         # Future dependency bodies do not exist yet. Explicit output allowances
@@ -70,7 +85,8 @@ def plan_role_requests(workflow, registry, inputs, saved=None, *, reused_stage_i
             "compiled_input_estimate": measured["tokens"], "input_counting_method": measured["method"],
             "input_bytes": measured["input_bytes"], "pending_dependency_output_estimate": dependency_estimate,
             "output_limit": output_limits[spec.stage_id]})
-        material = packet_materials(json.loads(context_json), _agent_role(packet.agent_id, packet.role_id))
+        material = frozen_packet_materials(context_json, _agent_role(packet.agent_id, packet.role_id),
+            reading_lane=packet.prior_artifacts.get("source_research_lane"))
         identities = {}
         all_identities = {}
         for records in material.get("evidence_partitions", {}).values():
@@ -130,7 +146,7 @@ def plan_role_requests(workflow, registry, inputs, saved=None, *, reused_stage_i
         source_query = [{"assertion_id": "planning-only", "sources": forecast_sources}]
         verification = input_measurement(provider, _MODEL_PROTOCOL, _verification_prompt(source_query))
         capability = provider_context_capability(provider)
-        batch_estimate = max(1, math.ceil(verification["tokens"] / max(1, capability.available_input_tokens * .85))) if provider_declares_context_capability(provider) else 1
+        batch_estimate = max(1, math.ceil(verification["tokens"] / max(1, capability.available_input_tokens * .85))) if capability.context_is_declared else 1
         batch_estimate = max(batch_estimate, math.ceil((1024 + expected_assertions * 384) / 32_000))
         for index in range(batch_estimate):
             rows.append({"stage_id": group["stage_id"], "purpose": "semantic_verification", "wave_index": wave,

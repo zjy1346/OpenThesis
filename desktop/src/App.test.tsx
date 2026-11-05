@@ -1,11 +1,11 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import {
   bootstrapBackend,
+  captureMarketSnapshot,
   exportResearchDiagnostics,
-  exportResearchReport,
   extendResearchBudget,
   installResearchPack,
   getModelDirectory,
@@ -17,19 +17,24 @@ import {
   getResearchReport,
   getResearchDiagnostics,
   getResearchStatus,
+  cancelResearch,
+  listResearchTasks,
+  listenForWindowClose,
+  finishWindowClose,
   startResearch,
   updatePreferences,
 } from "./backend";
+import type { MarketSnapshotPreview } from "./types";
 
 vi.mock("./backend", () => ({
   bootstrapBackend: vi.fn(),
+  captureMarketSnapshot: vi.fn(),
   deleteResearchRun: vi.fn(),
   getResearchReport: vi.fn(),
   getThesis: vi.fn(),
   listTheses: vi.fn(),
   saveThesis: vi.fn(),
   updatePreferences: vi.fn(),
-  exportResearchReport: vi.fn(),
   getResearchDiagnostics: vi.fn(),
   exportResearchDiagnostics: vi.fn(),
   installResearchPack: vi.fn(),
@@ -41,14 +46,47 @@ vi.mock("./backend", () => ({
   searchCompanies: vi.fn(),
   startResearch: vi.fn(),
   getResearchStatus: vi.fn(),
+  listResearchTasks: vi.fn(),
+  archiveResearchTask: vi.fn(),
+  cancelModelCall: vi.fn(),
+  continueResearchQueue: vi.fn(),
+  decideVisionUpload: vi.fn(),
+  resumeResearchTask: vi.fn(),
+  listenForWindowClose: vi.fn(),
+  finishWindowClose: vi.fn(),
   cancelResearch: vi.fn(),
   extendResearchBudget: vi.fn(),
   getResearchCallHistory: vi.fn(),
 }));
 
+const verifiedMarketSnapshot = {
+  status: "VERIFIED",
+  price: 225.12,
+  market_cap: 3_400_000_000_000,
+  quote_currency: "USD",
+  as_of: "2026-10-31",
+  provider: "test-provider",
+} satisfies MarketSnapshotPreview;
+
+const unavailableMarketSnapshot = {
+  status: "UNAVAILABLE",
+  error_code: "QUOTE_UNAVAILABLE",
+} satisfies MarketSnapshotPreview;
+
 describe("report-first workbench", () => {
   beforeEach(() => {
+    vi.useRealTimers();
+    vi.clearAllTimers();
     vi.clearAllMocks();
+    vi.mocked(captureMarketSnapshot).mockReset();
+    vi.mocked(captureMarketSnapshot).mockResolvedValue(unavailableMarketSnapshot);
+    vi.mocked(listResearchTasks).mockResolvedValue({
+      items: [], revision: 0, not_modified: false,
+      counts: { running: 0, queued: 0, waiting_input: 0, interrupted: 0, cancelling: 0 },
+      queue_paused: false, has_more: false, next_offset: null,
+    });
+    vi.mocked(listenForWindowClose).mockResolvedValue(() => {});
+    vi.mocked(finishWindowClose).mockResolvedValue(undefined);
     vi.mocked(getModelDirectory).mockResolvedValue({ source: "https://models.dev/api.json", retrieved_at: "2026-10-22", license: "MIT", models: [] });
     vi.mocked(listModelProviders).mockResolvedValue([]);
     vi.mocked(listProviderConnections).mockResolvedValue([]);
@@ -118,27 +156,112 @@ describe("report-first workbench", () => {
     });
   });
 
+  afterEach(() => {
+    cleanup();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("shows a verified market snapshot when the backend returns a valid quote", async () => {
+    vi.mocked(captureMarketSnapshot).mockResolvedValue(verifiedMarketSnapshot);
+    render(<App />);
+
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    await screen.findByLabelText("Search ticker or company name");
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "AAPL" }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+
+    expect(captureMarketSnapshot).toHaveBeenCalledWith(expect.objectContaining({ ticker: "AAPL" }));
+    expect(screen.getByTestId("market-snapshot-preview")).toHaveTextContent("Market snapshot verified · 2026-10-31 · USD");
+  });
+
+  it("shows unavailable market data without making it available for valuation", async () => {
+    vi.mocked(captureMarketSnapshot).mockResolvedValue(unavailableMarketSnapshot);
+    render(<App />);
+
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    await screen.findByLabelText("Search ticker or company name");
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "AAPL" }));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+
+    expect(captureMarketSnapshot).toHaveBeenCalledWith(expect.objectContaining({ ticker: "AAPL" }));
+    expect(screen.getByTestId("market-snapshot-preview")).toHaveTextContent("Market data unavailable; excluded from valuation");
+    expect(screen.getByText("The quote source is unavailable. Retry later.")).toBeVisible();
+  });
+
+  it("cancels a pending market snapshot request when the research view unmounts", async () => {
+    const view = render(<App />);
+
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    await screen.findByLabelText("Search ticker or company name");
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "AAPL" }));
+    expect(captureMarketSnapshot).not.toHaveBeenCalled();
+
+    view.unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+
+    expect(captureMarketSnapshot).not.toHaveBeenCalled();
+  });
+
   it("offers research diagnostics for a running job as soon as a run id exists", async () => {
-    vi.mocked(startResearch).mockResolvedValue({
-      job_id: "job-diagnostics", state: "running", message: "Working", percent: 5, run_id: "run-diagnostics",
-      model_calls: [],
-    });
+    const job = {
+      job_id: "job-diagnostics", state: "running" as const, message: "Working", percent: 5, run_id: "run-diagnostics",
+      revision: 1, operation_type: "research", company: { name: "Demo", ticker: "DEMO" }, model: "model:test",
+      stage: "preparing", elapsed_seconds: 2, model_calls: [],
+    };
+    vi.mocked(startResearch).mockResolvedValue(job);
+    vi.mocked(getResearchStatus).mockResolvedValue(job);
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    fireEvent.click(await screen.findByTitle("Research tasks"));
     expect(await screen.findByRole("button", { name: "Export research diagnostics (cost and time)" })).toBeVisible();
     expect(getResearchDiagnostics).not.toHaveBeenCalled();
   });
 
+  it("keeps background work observable while navigating without showing global progress", async () => {
+    const active = {
+      job_id: "navigation-task", run_id: "navigation-run", state: "running" as const,
+      message: "Working", percent: 31, revision: 2, operation_type: "research",
+      company: { name: "Background Company", ticker: "BG" }, model: "frozen-model",
+      stage: "filing-parse", elapsed_seconds: 8, model_calls: [],
+    };
+    vi.mocked(startResearch).mockResolvedValue(active);
+    vi.mocked(getResearchStatus).mockResolvedValue(active);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    expect(await screen.findByText("Research submitted")).toBeVisible();
+    for (const name of ["Research history", "Settings", "Model Center", "Research workspace"]) {
+      fireEvent.click(screen.getByRole("button", { name }));
+      expect(screen.queryByRole("button", { name: "Cancel task" })).not.toBeInTheDocument();
+      expect(screen.getByTitle("Research tasks")).toBeVisible();
+    }
+    fireEvent.click(screen.getByTitle("Research tasks"));
+    expect(await screen.findByRole("heading", { name: "Background Company" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Cancel task" })).toBeVisible();
+    expect(startResearch).toHaveBeenCalledTimes(1);
+    expect(cancelResearch).not.toHaveBeenCalled();
+  });
+
   it("shows concrete current-run budget gaps without approving them automatically", async () => {
-    vi.mocked(startResearch).mockResolvedValue({
-      job_id: "job-budget", state: "running", message: "Working", percent: 35, run_id: "run-budget",
+    const job = {
+      job_id: "job-budget", state: "running" as const, message: "Working", percent: 35, run_id: "run-budget",
+      revision: 1, operation_type: "research", company: { name: "Demo", ticker: "DEMO" }, model: "model:test",
+      stage: "growth-opportunities", elapsed_seconds: 12,
       call_plan: { plan_digest: "digest-1", max_calls: 2, max_input_estimate: 8_000, max_output_tokens: 20_000,
         pending_budget_gaps: [{ gap_id: "gap-growth", stage_id: "growth-opportunities", purpose: "generation", input_estimate: 1_234,
           output_limit: 4_096, diagnostic_code: "MODEL_RUN_CALL_BUDGET_EXHAUSTED" }] },
-    });
+    };
+    vi.mocked(startResearch).mockResolvedValue(job);
+    vi.mocked(getResearchStatus).mockResolvedValue(job);
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    fireEvent.click(await screen.findByTitle("Research tasks"));
 
     expect(await screen.findByText("Growth opportunities · Generation")).toBeInTheDocument();
     expect(screen.getByText("1,234 input tokens (estimate) · 4,096 output tokens (limit)")).toBeInTheDocument();
@@ -304,66 +427,51 @@ describe("report-first workbench", () => {
     expect(screen.getByLabelText("Listing market").closest(".market-source-row")).not.toBeNull();
   });
 
-  it("shows classified no-filing actions without exposing technical errors", async () => {
-    vi.mocked(startResearch).mockResolvedValue({
-      job_id: "job-no-filings",
-      state: "queued",
-      message: "",
-      percent: 0,
-      run_id: null,
-    });
-    vi.mocked(getResearchStatus).mockResolvedValue({
-      job_id: "job-no-filings",
-      state: "failed",
+  it("shows no-filing recovery guidance on a failed task and opens only its official disclosure link", async () => {
+    const job = {
+      job_id: "job-no-filings", state: "failed" as const,
       message: "The official disclosure platform does not currently provide a usable financial report for this company.",
-      percent: 5,
-      run_id: null,
-      error_code: "NO_FILINGS_AVAILABLE",
-      market: "CN_A",
+      percent: 5, run_id: null, revision: 2, operation_type: "research",
+      company: { name: "Demo Company", ticker: "DEMO" }, model: "model:test", stage: "filing-discovery",
+      error_code: "NO_FILINGS_AVAILABLE", market: "CN_A" as const,
       disclosure_url: "https://www.cninfo.com.cn/new/index",
-    });
+    };
+    vi.mocked(startResearch).mockResolvedValue(job);
+    vi.mocked(getResearchStatus).mockResolvedValue(job);
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
-
-    expect(await screen.findByText(/does not currently provide a usable financial report/, {}, { timeout: 2000 })).toBeVisible();
-    expect(screen.queryByText(/NoneType/)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Try fetching again" })).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "Open official disclosure platform" }));
+    expect(await screen.findByText("Demo Company · Failed")).toBeVisible();
+    expect(getResearchReport).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    expect(await screen.findByText(/no usable official financial reports/i)).toBeVisible();
+    expect(screen.getByText(/Diagnostic code: NO_FILINGS_AVAILABLE/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Continue task" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open official disclosure page" }));
     expect(openExternalUrl).toHaveBeenCalledWith("https://www.cninfo.com.cn/new/index");
   });
 
-  it("requires the explicit available-material action for every partial-research retry", async () => {
-    let nextJob = 0;
-    vi.mocked(startResearch).mockImplementation(async () => {
-      nextJob += 1;
-      return { job_id: `job-scope-${nextJob}`, state: "queued", message: "", percent: 0, run_id: null };
-    });
-    vi.mocked(getResearchStatus).mockImplementation(async (jobId) => ({
-      job_id: jobId,
-      state: "failed",
-      message: "Available filing material needs explicit confirmation before research can continue.",
-      percent: 5,
-      run_id: null,
-      error_code: "FILING_RESEARCH_SCOPE_CONFIRMATION_REQUIRED",
-    }));
+  it("does not treat a completed task attempt with incomplete research as a complete report", async () => {
+    const incomplete = {
+      job_id: "job-incomplete", state: "completed" as const, message: "Financial data needs review before research can be considered complete.",
+      percent: 100, run_id: "run-incomplete", revision: 2, operation_type: "financial-rebuild",
+      company: { name: "New Company", ticker: "NEW" }, model: "model:test", stage: "filing-validation",
+      attempt_complete: true, research_complete: false, action_required: true, error_code: "FILING_DATA_QUALITY_FAILED",
+      recovery_outcome: { state: "needs_action", diagnostic_code: "FINANCIAL_DATA_QUALITY_FAILED", next_actions: ["open_report_recovery"] },
+    };
+    vi.mocked(startResearch).mockResolvedValue({ ...incomplete, state: "queued", revision: 1, message: "Accepted" });
+    vi.mocked(getResearchStatus).mockResolvedValue(incomplete);
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
-    await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 });
 
-    fireEvent.click(screen.getByRole("button", { name: "Try fetching again" }));
-    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(2));
-    expect(startResearch).toHaveBeenNthCalledWith(2, { mode: "demo" });
-
-    fireEvent.click(await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 }));
-    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(3));
-    expect(startResearch).toHaveBeenNthCalledWith(3, { mode: "demo", allow_partial_research: true });
-
-    await screen.findByRole("button", { name: "Research available material only" }, { timeout: 3_000 });
-    fireEvent.click(screen.getByRole("button", { name: "Try fetching again" }));
-    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(4));
-    expect(startResearch).toHaveBeenNthCalledWith(4, { mode: "demo" });
+    expect(await screen.findByText("Research submitted")).toBeVisible();
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    expect(await screen.findByText(/this task attempt has ended/i)).toBeVisible();
+    expect(await screen.findByText(/the research is not complete/i)).toBeVisible();
+    expect(screen.getByText(/Diagnostic code: FINANCIAL_DATA_QUALITY_FAILED/)).toBeVisible();
+    expect(getResearchReport).not.toHaveBeenCalled();
+    expect(screen.queryByText(/research completed successfully/i)).not.toBeInTheDocument();
   });
 
   it("saves interface and report languages independently", async () => {
@@ -391,66 +499,90 @@ describe("report-first workbench", () => {
     }));
   });
 
-  it("loads the report when a research job completes", async () => {
-    vi.mocked(startResearch).mockResolvedValue({
+  it("keeps the selected report readable until the user opens a completion notification", async () => {
+    const existingRun = {
+      run_id: "run-existing", ticker: "OLD", company_name: "Previously Selected Company", status: "completed",
+      started_at: "2026-10-20T00:00:00Z", completed_at: "2026-10-20T00:01:00Z", report_language: "en" as const,
+      exchange: "NYSE", market: "US" as const,
+    };
+    vi.mocked(bootstrapBackend).mockResolvedValue({
+      contract_version: "2", app_version: "3.3.0", capabilities: [], interrupted_runs: 0,
+      preferences: { ui_language: "en", report_language: "en", ui_language_mode: "manual", sidebar_collapsed: "true", parallel_agents: "false" },
+      recent_runs: [existingRun], common_companies: [], research_packs: [],
+    });
+    const existingReport = {
+      run_id: existingRun.run_id, ticker: existingRun.ticker, company_name: existingRun.company_name,
+      status: "partial" as const, report_language: "en" as const, markdown: "# Previously Selected Report\n\nVerified existing evidence.", html: "<h1>Previously Selected Report</h1><p>Verified existing evidence.</p>",
+      report_contract_version: "1", report_input_generation: "gen-existing", is_substantive: true,
+      visible_sections: [{ section_id: "executive_summary", title: "Executive summary", source_artifact_ids: ["artifact-existing"], verification_state: "partial", is_substantive: true }],
+      report_read_state: "partial" as const,
+    };
+    const completedReport = {
+      run_id: "run-new", ticker: "NEW", company_name: "New Company",
+      status: "partial" as const, report_language: "en" as const, markdown: "# New Verified Report\n\nVerified new evidence.", html: "<h1>New Verified Report</h1><p>Verified new evidence.</p>",
+      report_contract_version: "1", report_input_generation: "gen-new", is_substantive: true,
+      visible_sections: [{ section_id: "executive_summary", title: "Executive summary", source_artifact_ids: ["artifact-new"], verification_state: "partial", is_substantive: true }],
+      report_read_state: "partial" as const,
+    };
+    vi.mocked(getResearchReport).mockImplementation(async (runId) => runId === "run-existing" ? existingReport : completedReport);
+    const accepted = {
       job_id: "job-1",
-      state: "queued",
-      message: "",
+      state: "queued" as const,
+      message: "Accepted",
       percent: 0,
-      run_id: null,
-    });
-    vi.mocked(getResearchStatus).mockResolvedValue({
-      job_id: "job-1",
-      state: "completed",
-      message: "Done",
-      percent: 100,
-      run_id: "run-1",
-    });
-    vi.mocked(getResearchReport).mockResolvedValue({
-      run_id: "run-1",
-      ticker: "DEMO",
-      company_name: "Synthetic Demo",
-      status: "partial",
-      report_language: "zh-CN",
-      markdown: "# Completed report",
-      html: "<!doctype html><h1>Completed report</h1>",
-      retryable_synthesis: true,
-    });
+      run_id: "run-new",
+      revision: 1,
+      ahead_count: 2,
+      operation_type: "research",
+      company: { name: "New Company", ticker: "NEW" },
+      model: "model:test",
+      stage: "preparing",
+      elapsed_seconds: 0,
+      created_at: "2026-10-28T12:00:00Z",
+    };
+    const completed = { ...accepted, state: "completed" as const, message: "Research attempt finished.", revision: 2, percent: 100, stage: "synthesis", attempt_complete: true, research_complete: false, action_required: true };
+    vi.mocked(startResearch).mockResolvedValue(accepted);
+    vi.mocked(getResearchStatus).mockResolvedValue(completed);
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+      companies: [{ cik: "CN_A:NEW", ticker: "NEW", name: "New Company", exchange: "SSE", market: "CN_A", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    vi.mocked(updatePreferences).mockImplementation(async (value) => ({
+      ui_language: "en", report_language: "en", sidebar_collapsed: "true", parallel_agents: "false", research_market: "CN_A",
+      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)])),
+    }));
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
+    expect(await screen.findByRole("heading", { name: "Previously Selected Report" })).toBeVisible();
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    fireEvent.change(screen.getByLabelText("Listing market"), { target: { value: "CN_A" } });
+    fireEvent.change(screen.getByLabelText("Search ticker or company name"), { target: { value: "NEW" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search companies" }));
+    const candidate = (await screen.findByText("New Company")).closest("button");
+    expect(candidate).not.toBeNull();
+    fireEvent.click(candidate!);
+    fireEvent.click(screen.getAllByRole("button", { name: "Start research" }).at(-1)!);
 
-    expect(await screen.findByRole("heading", { name: "Synthetic Demo" }, { timeout: 2000 })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Completed report" })).toBeVisible();
-    expect(screen.getByRole("article")).toHaveAttribute("data-report-status", "partial");
-    expect(screen.getByText(/Partial report:/)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Regenerate synthesized report" })).toHaveTextContent("Regenerate synthesized report");
-    expect(screen.queryByLabelText("Elapsed research time")).not.toBeInTheDocument();
-    expect(screen.queryByText(/OpenThesis is taking a few minutes/)).not.toBeInTheDocument();
+    expect(await screen.findByText("Added to queue · 2 ahead")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Research workspace" }));
+    expect(screen.getByRole("heading", { name: "Previously Selected Report" })).toBeVisible();
+    expect(getResearchReport).toHaveBeenCalledTimes(1);
+    expect(getResearchReport).toHaveBeenCalledWith("run-existing", "en");
 
-    const reportDocument = screen.getByRole("article");
-    fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
-    expect(reportDocument).toHaveStyle({ "--report-scale": "1.1" });
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    expect(await screen.findByText("New Company · Completed")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Previously Selected Report" })).toBeVisible();
+    expect(getResearchReport).toHaveBeenCalledTimes(1);
+    const notification = screen.getAllByRole("region", { name: "Research tasks" })
+      .find((region) => within(region).queryByText("New Company · Completed"));
+    expect(notification).toBeDefined();
+    fireEvent.click(within(notification!).getByRole("button", { name: "View research report" }));
 
-    fireEvent.click(screen.getByRole("button", { name: "Show technical details" }));
-    await waitFor(() => {
-      expect(getResearchReport).toHaveBeenLastCalledWith("run-1", "zh-CN", true);
-    });
-    expect(screen.getByRole("button", { name: "Hide technical details" })).toHaveAttribute("aria-pressed", "true");
-
-    fireEvent.click(screen.getByRole("button", { name: "Enter focus mode" }));
-    expect(reportDocument).toHaveAttribute("data-focus", "focused");
-    fireEvent.click(screen.getByRole("button", { name: "Exit focus mode" }));
-    await waitFor(() => expect(reportDocument).not.toHaveAttribute("data-focus"));
-
-    fireEvent.keyDown(window, { key: "F11" });
-    expect(reportDocument).toHaveAttribute("data-focus", "focused");
-    expect(reportDocument).toHaveAttribute("data-focus-motion", "skip");
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(reportDocument).not.toHaveAttribute("data-focus");
-
-    fireEvent.click(screen.getByRole("button", { name: "Export report" }));
-    await waitFor(() => expect(exportResearchReport).toHaveBeenCalled());
+    expect(await screen.findByRole("heading", { name: "New Verified Report" })).toBeVisible();
+    expect(screen.getByText("Verified new evidence.")).toBeVisible();
+    expect(getResearchReport).toHaveBeenLastCalledWith("run-new", "en");
+    expect(cancelResearch).not.toHaveBeenCalled();
   });
 
   it("shows only configured tested models and no credential fields in research", async () => {
@@ -497,18 +629,44 @@ describe("report-first workbench", () => {
     await waitFor(() => expect(bootstrapBackend).toHaveBeenCalledTimes(initialBootstrapCalls + 1));
   });
 
-  it("keeps the last research request session-only for retry", async () => {
-    vi.mocked(startResearch).mockRejectedValue(new Error("temporary provider failure"));
+  it("reuses the same idempotency key when a company-task acknowledgement is retried", async () => {
+    vi.mocked(startResearch)
+      .mockRejectedValueOnce(new Error("temporary provider failure"))
+      .mockResolvedValueOnce({
+        job_id: "job-retry", state: "queued", message: "Accepted", percent: 0, run_id: "run-retry",
+        revision: 1, operation_type: "research", company: { name: "Retry Company", ticker: "RETRY" },
+        model: "primary-model", stage: "preparing", elapsed_seconds: 0, ahead_count: 0,
+      });
+    vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
+      contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
+      companies: [{ cik: "CN_A:RETRY", ticker: "RETRY", name: "Retry Company", exchange: "SSE", market: "CN_A", identity_state: "official_verified" }],
+      diagnostics: [],
+    }));
+    vi.mocked(updatePreferences).mockImplementation(async (value) => ({
+      ui_language: "en", report_language: "en", sidebar_collapsed: "true", parallel_agents: "false", research_market: "CN_A",
+      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [key, String(item)])),
+    }));
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Run again" }));
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    fireEvent.change(screen.getByLabelText("Listing market"), { target: { value: "CN_A" } });
+    fireEvent.change(screen.getByLabelText("Search ticker or company name"), { target: { value: "RETRY" } });
+    fireEvent.click(screen.getByRole("button", { name: "Search companies" }));
+    fireEvent.click((await screen.findByText("Retry Company")).closest("button")!);
+    const launchButton = () => screen.getAllByRole("button", { name: "Start research" }).at(-1)!;
+    fireEvent.click(launchButton());
+    await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(1));
+    expect(launchButton()).toBeEnabled();
+    fireEvent.click(launchButton());
 
     await waitFor(() => expect(startResearch).toHaveBeenCalledTimes(2));
-    expect(startResearch).toHaveBeenLastCalledWith({ mode: "demo" });
-    expect(updatePreferences).not.toHaveBeenCalledWith(
-      expect.objectContaining({ api_key: expect.anything() }),
-    );
+    const firstRequest = vi.mocked(startResearch).mock.calls[0]?.[0];
+    const secondRequest = vi.mocked(startResearch).mock.calls[1]?.[0];
+    if (!firstRequest || !secondRequest) throw new Error("Both idempotent submissions must be recorded");
+    expect(firstRequest).toMatchObject({ mode: "company", company: { ticker: "RETRY" }, client_request_id: expect.any(String) });
+    expect(secondRequest).toMatchObject({ mode: "company", company: { ticker: "RETRY" }, client_request_id: firstRequest.client_request_id });
+    expect(JSON.stringify([firstRequest, secondRequest])).not.toMatch(/api_key|base_url|preset_id/i);
+    expect(await screen.findByText("Research submitted")).toBeVisible();
   });
 
   it("shows architecture diagnostics in the About view", async () => {

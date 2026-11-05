@@ -65,7 +65,7 @@ from .financial_contracts import (
     FinancialValidation, PDF_PARSER_VERSION as _PDF_PARSER_VERSION,
     ROE_ROW_MAPPING_VERSION as _ROE_ROW_MAPPING_VERSION,
     QuantityKind, SourceAmount, STATEMENT_FOR as _STATEMENT_FOR, ValidationStatus,
-    exact_decimal_arithmetic,
+    exact_decimal_arithmetic, source_numeric_token,
 )
 from .financial_profile import (
     FinancialProfile, _fact_period_identity, _validation_group_role,
@@ -83,6 +83,7 @@ _SOURCE_DISCLOSURE_VERSION = DISCLOSURE_VERSION + "/" + NOTE_DISCLOSURE_VERSION
 from .disclosure_identity import DisclosureIdentityResolver, _title_report_year
 from .financial_compatibility import FinancialRulesSnapshot
 from .financial_statement_identity import STATEMENT_TITLE_MARKERS, classify_statement_title, is_narrative_title_tail, statement_title_evidence_id
+from .financial_statement_identity import STATEMENT_MAPPING_VERSION, needs_statement_remap, statement_mapping_affected
 from .financial_taxonomy import (
     FINANCIAL_LABEL_ALIASES, FINANCIAL_MAPPING_VERSION, cost_row_alias_conflicts,
     cost_row_concept, cost_row_mentions,
@@ -231,6 +232,24 @@ def _ratio_unit_source(row, cell, table_rows, *, summary=False):
     if summary:
         declarations.extend(item.text for item in table_rows[:12]
             if re.search(r"(?:单位|unit)\s*[:：]", item.text, re.I))
+        # Summary tables can switch from money, to per-share amounts, to a
+        # separately labelled ratio block. A growth-column '%' is not a unit
+        # for ROE. Only the nearest preceding explicit ratio subsection owns
+        # these rows, and a new unit subsection terminates its applicability.
+        for prior in sorted((item for item in table_rows if item.top < row.top),
+                            key=lambda item: item.top, reverse=True):
+            if any(_parse_number(item.text) is not None for item in prior.cells):
+                continue
+            text = prior.text.strip()
+            caption = re.sub(r"[\s()（）]", "", text)
+            if re.fullmatch(
+                r"(?:(?:财务|財務|financial))?(?:比率|比例|ratios?)[%％]"
+                r"(?:年化|annualized|annualised)?", caption, re.I,
+            ):
+                declarations.append(text)
+                break
+            if re.search(r"每股|per\s+share|人民币|人民幣|单位\s*[:：]|單位\s*[:：]|units?\s*:", text, re.I):
+                break
     for text in declarations:
         if any(marker in text for marker in ("%", "％", "百分比")):
             return "explicit_percent", Decimal("0.01"), text
@@ -547,7 +566,19 @@ _LABELS: dict[str, tuple[str, ...]] = {
         "noncontrolling interests", "non-controlling interests", "minority interests",
         "少数股东权益", "少數股東權益", "非控股权益", "非控股權益",
     ),
-    "reported_roe": ("加权平均净资产收益率", "weighted average return on equity"),
+    "reported_roe": ("加权平均净资产收益率", "加權平均淨資產收益率", "weighted average return on equity"),
+    # Keep the disclosed after-nonrecurring ROE as a distinct concept.  These
+    # labels are used by the PDF prepass to retain standalone metrics pages;
+    # parsing still binds the value to its own row/cell and never derives it
+    # from ordinary ROE.
+    "reported_roe_excluding_nonrecurring": (
+        "扣除非经常性损益后的加权平均净资产收益率",
+        "扣除非经常性损益后加权平均净资产收益率",
+        "扣除非經常性損益後的加權平均淨資產收益率",
+        "扣除非經常性損益後加權平均淨資產收益率",
+        "weighted average return on equity excluding non-recurring items",
+        "weighted average return on equity excluding nonrecurring items",
+    ),
     "profit_before_tax": FINANCIAL_LABEL_ALIASES["profit_before_tax"],
     "profit_after_tax": ("净利润", "profit after tax", "net profit"),
     "operating_income": FINANCIAL_LABEL_ALIASES["operating_income"],
@@ -977,7 +1008,7 @@ def _period_start(manifest: FilingManifest) -> str | None:
 
 
 def _parse_number(text: str) -> float | None:
-    cleaned = text.strip().replace("−", "-").replace("％", "%")
+    cleaned = source_numeric_token(text).replace("％", "%")
     is_percent = cleaned.endswith("%")
     if is_percent:
         cleaned = cleaned[:-1].strip()
@@ -1201,9 +1232,39 @@ def _period_header_cells(cells: Sequence[PdfCellAST]) -> tuple[PdfCellAST, ...]:
     return tuple(result)
 
 
+def _vertical_date_header_cells(rows: Sequence[PdfRowAST], index: int) -> tuple[PdfCellAST, ...]:
+    """Join only a literal year and its adjacent, horizontally bound month/day.
+
+    Annual bank statements print ``2025年`` above ``12月31日``. Dropping
+    the second line makes an instant comparative period unknown; borrowing a
+    nearby date from the title or another column is not a safe substitute.
+    """
+    result = []
+    row = rows[index]
+    for cell in _period_header_cells(row.cells):
+        year = re.fullmatch(r"\s*((?:19|20)\d{2})\s*年\s*", cell.text)
+        if year is None or index + 1 >= len(rows):
+            result.append(cell)
+            continue
+        below = rows[index + 1]
+        tails = [part for part in below.cells
+            if 0 <= part.top - cell.bottom <= 12
+            and min(cell.x1, part.x1) > max(cell.x0, part.x0)
+            and re.fullmatch(r"\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*", part.text)]
+        if len(tails) == 1:
+            tail = tails[0]
+            literal = cell.text.strip() + tail.text.strip()
+            if _period_header_bounds(literal)[1]:
+                result.append(PdfCellAST(literal, min(cell.x0, tail.x0), cell.top,
+                    max(cell.x1, tail.x1), tail.bottom))
+                continue
+        result.append(cell)
+    return tuple(result)
+
+
 def _period_columns(
     rows: Sequence[PdfRowAST], preferred_currency: str = "", rules: FinancialRulesSnapshot | None = None,
-    *, source_page: int | None = None,
+    *, source_page: int | None = None, scope: str = "",
 ) -> tuple[_PeriodColumn, ...]:
     """Choose visual year columns before any one-year title/date row."""
     dual: list[tuple[int, float]] | None = None
@@ -1220,6 +1281,21 @@ def _period_columns(
         'current': {'本期发生额', '本期金额', '本期', '本年', '本年发生额', '期末余额', 'currentperiod', 'currentyear'},
         'prior': {'上期发生额', '上期金额', '上期', '上年', '上年发生额', '期初余额', '上年年末余额', 'previousperiod', 'previousyear'},
     }
+    # Two period pairs can belong to different entities on the same table.
+    # Bind the header axis before deduplicating years. Neither axis order nor
+    # a repeated year is authority to relabel a bank-only value as a group.
+    scope_interval = None
+    scope_aliases = {"本集团": "consolidated", "集团": "consolidated", "thegroup": "consolidated",
+        "本行": "parent", "本公司": "parent", "thebank": "parent", "thecompany": "parent"}
+    if scope:
+        for axis_row in rows[:12]:
+            axes = [(scope_aliases[normalize_financial_label(cell.text)], (cell.x0+cell.x1)/2)
+                for cell in axis_row.cells if normalize_financial_label(cell.text) in scope_aliases]
+            if len(axes) == 2 and {role for role, _ in axes} == {"consolidated", "parent"}:
+                axes.sort(key=lambda item: item[1])
+                boundary = (axes[0][1] + axes[1][1])/2
+                scope_interval = (-float("inf"), boundary) if axes[0][0] == scope else (boundary, float("inf"))
+                break
     for row_index, row in enumerate(rows):
         if _is_narrative_date_header(row.text):
             continue
@@ -1234,7 +1310,9 @@ def _period_columns(
                     unit_cells.append(((cell.x0 + cell.x1) / 2, currency, cell))
         by_year: dict[int, tuple[int, float, str]] = {}
         row_period_bounds: dict[int, tuple[str, str, str]] = {}
-        for cell in _period_header_cells(row.cells):
+        for cell in _vertical_date_header_cells(rows, row_index):
+            if scope_interval is not None and not scope_interval[0] <= (cell.x0+cell.x1)/2 <= scope_interval[1]:
+                continue
             period_bounds = _period_header_bounds(cell.text)
             effective_year = _effective_period_year(cell.text)
             if effective_year is not None:
@@ -1365,6 +1443,8 @@ def _period_columns(
     for index, (year, center) in enumerate(candidates):
         left = (centers[index - 1] + center) / 2 if index else center - 90
         right = (center + centers[index + 1]) / 2 if index + 1 < len(centers) else center + 90
+        if scope_interval is not None:
+            left, right = max(left, scope_interval[0]), min(right, scope_interval[1])
         currency = ""
         unit_cell = None
         value_center = center
@@ -1414,6 +1494,18 @@ def _summary_roe_period_columns(
         return ()
     if current_year <= 1 or not manifest.fiscal_period or not _period_start(manifest):
         return ()
+
+    # A summary page may contain an instant balance sheet followed by a
+    # separate performance block. The latter's explicit duration headers own
+    # ROE, not the first pair of dates elsewhere on this page. Callers pass
+    # only rows preceding this ratio, so a later table cannot relabel it.
+    for index in range(len(rows) - 1, -1, -1):
+        periods = [_period_header_bounds(cell.text) for cell in rows[index].cells]
+        intervals = [period for period in periods if period[0] and period[1]]
+        if len({period[:2] for period in intervals}) >= 2:
+            columns = _period_columns(rows[index:])
+            if len(columns) >= 2:
+                return columns
 
     headers: dict[str, list[PdfCellAST]] = {"current": [], "prior": [], "change": []}
     for row in rows[:12]:
@@ -1632,7 +1724,7 @@ def _parse_decimal(text: str) -> tuple[Decimal, bool] | None:
     The returned Decimal is the displayed number; percent scaling is retained
     separately so the caller can place it in a source lineage.
     """
-    cleaned = str(text or "").strip().replace("−", "-").replace("％", "%")
+    cleaned = source_numeric_token(str(text or "")).replace("％", "%")
     is_percent = cleaned.endswith("%")
     if is_percent:
         cleaned = cleaned[:-1].strip()
@@ -1653,11 +1745,13 @@ def _parse_decimal(text: str) -> tuple[Decimal, bool] | None:
 
 
 def _raw_decimal_token(text: str) -> str:
-    cleaned = str(text or "").strip().replace("−", "-").replace("％", "%")
-    if cleaned.endswith("%"):
-        cleaned = cleaned[:-1].strip()
-    match = _NUM.fullmatch(cleaned)
-    return match.group() if match else ""
+    # Preserve the observed glyphs in the proof. Canonical typography is only
+    # used to decide whether this exact token can be parsed, never to rewrite
+    # the bound original or guess a digit/decimal separator.
+    raw = str(text or "").strip()
+    if raw.endswith(("%", "％")):
+        raw = raw[:-1].strip()
+    return raw if _NUM.fullmatch(source_numeric_token(raw)) else ""
 
 
 def _row_title_context(row: PdfRowAST, rules: FinancialRulesSnapshot | None = None) -> tuple[str, str] | None:
@@ -1770,7 +1864,7 @@ def _continuation_compatible(context: PdfTableContext, rows: Sequence[PdfRowAST]
     """Require a labelled target row and a value in a known period column."""
     if not rows:
         return False
-    periods = context.periods or _period_columns(rows, rules=rules)
+    periods = context.periods or _period_columns(rows, rules=rules, scope=context.scope)
     if not periods:
         return False
     for index in range(len(rows)):
@@ -1961,7 +2055,7 @@ def _page_sections(
                 local_unit_excerpt or section_text, rules)
             section_scale = local_scale if section_explicit else 1.0
             section_currency = local_currency or default_currency
-            periods = _period_columns(section_rows, default_currency, rules, source_page=page_number)
+            periods = _period_columns(section_rows, default_currency, rules, source_page=page_number, scope=scope)
             title_text = section_rows[0].text.casefold() if section_rows else ""
             continuation_title = bool(re.search(
                 r"续|continued|continuation|cont[\s.'’_-]*d", title_text
@@ -2043,7 +2137,7 @@ def _page_sections(
     ):
         inherited_scale = previous.multiplier if not explicit else scale
         inherited_currency = currency or previous.currency or default_currency
-        inherited_periods = previous.periods or _period_columns(rows_tuple, default_currency, rules, source_page=page_number)
+        inherited_periods = previous.periods or _period_columns(rows_tuple, default_currency, rules, source_page=page_number, scope=previous.scope)
         inherited_unit_provenance = "explicit" if explicit else "inherited"
         continuation_unit_excerpt = unit_excerpt or previous.unit_evidence
         continuation_unit_page = unit_page or previous.unit_evidence_page
@@ -2607,6 +2701,58 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
             for variant in variants for cell in variant.cells
         )
         candidate_has_values = any(_parse_number(cell.text) is not None for cell in candidate.cells)
+        exact_labels = _exact_label_keys(rules)
+        short_registered_completion = (
+            len(_label_compact(candidate_label)) <= 12
+            and not _known_label(current_label, rules)
+            and _known_label(combined_label, rules)
+        )
+        roe_completion = bool(
+            "收益率" not in _label_compact(current_label)
+            and re.search(r"归属于|扣除非经常性损益", _label_compact(current_label))
+            and re.fullmatch(r"的?加权平均净资产收益率(?:[%％()（）0-9])*",
+                             _label_compact(candidate_label))
+        )
+        conjunction_completion = bool(
+            current_has_values and not candidate_has_values
+            and _label_compact(current_label).endswith("and")
+            and 0 < len(_label_compact(candidate_label)) <= 60
+            and not _known_label(candidate_label, rules)
+        )
+        ownership_completion = bool(
+            current_has_values and not candidate_has_values
+            and _label_compact(current_label).endswith(("attributable", "attributableto"))
+            and equity_row_concept(combined_label) == "equity"
+        )
+        if (current_has_values and candidate_label and not candidate_has_values
+                and not (wrapped_completion or sign_annotation or short_registered_completion
+                         or roe_completion or conjunction_completion or ownership_completion)):
+            # Unknown complete labels also introduce independent rows. A
+            # valued average-ROE row must not consume the following weighted
+            # ROE/ex-nonrecurring prefix merely because it is not an alias.
+            break
+        if (candidate_label and _label_compact(current_label) in exact_labels
+                and _label_compact(candidate_label) in exact_labels
+                and _label_compact(combined_label) not in exact_labels):
+            # Separate complete labels remain separate even when both labels
+            # precede a third, values-only line (revenue -> interest income).
+            break
+        if (candidate_has_values and candidate_label and _known_label(candidate_label, rules)
+                and _label_compact(combined_label) not in exact_labels
+                and not roe_completion and not sign_annotation):
+            # A trailing fragment of the preceding subtotal (e.g. "operating
+            # activities") cannot acquire the next complete OCF row. Without
+            # this boundary, marking wrapped tails as consumed would hide the
+            # real, independently labelled numeric row from extraction.
+            break
+        if (current_has_values and candidate_label and not candidate_has_values
+                and _label_compact(current_label) in _exact_label_keys(rules)
+                and not wrapped_completion and not sign_annotation and not conjunction_completion):
+            # A complete valued total cannot acquire a different meaning by
+            # swallowing the next valueless section title (e.g. liabilities
+            # followed by "shareholders' equity"). Wrapped fragments are
+            # still handled by explicit completion/sign rules above.
+            break
         if candidate_has_values and candidate_label:
             # An ownership allocation leaf with its own values is a new row,
             # even when the preceding parent label is still a valueless
@@ -2654,7 +2800,7 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
         # item, even when concatenating both labels still contains a known
         # alias.  Incomplete wrapped tails (for example ``率``) remain
         # mergeable because they are not independently recognized labels.
-        if current_has_values and candidate_label and _known_label(candidate_label, rules):
+        if current_has_values and candidate_label and _known_label(candidate_label, rules) and not roe_completion:
             break
         if candidate_label and current_label and _known_label(candidate_label, rules) and (
             "现金流" in current_label
@@ -2693,12 +2839,14 @@ def _merge_visual_rows(rows: Sequence[PdfRowAST], start: int, rules: FinancialRu
 
 def _is_summary_page(page_text: str, rows: Sequence[PdfRowAST], rules: FinancialRulesSnapshot | None = None) -> bool:
     """Detect the metrics page even when PDF text wraps its labels."""
-    compact = re.sub(r"\s+", "", page_text).casefold()
+    compact = _label_compact(page_text)
     labels = _labels_for_rules(rules)
-    if any(label.casefold() in compact for label in labels["reported_roe"]):
+    roe_labels = (*labels["reported_roe"], *labels["reported_roe_excluding_nonrecurring"])
+    if any(_label_compact(label) in compact for label in roe_labels):
         return True
     return any(
-        any(label.casefold() in _row_label_text(_merge_visual_rows(rows, index, rules)).casefold() for label in labels["reported_roe"])
+        any(_label_compact(label) in _label_compact(_row_label_text(_merge_visual_rows(rows, index, rules)))
+            for label in roe_labels)
         for index in range(len(rows))
     )
 
@@ -4467,6 +4615,7 @@ def _candidate_pages_from_text(
             if owner == statement and concept != "reported_roe")
         for statement in ("income_statement", "balance_sheet", "cash_flow")
     }
+    roe_labels = (*labels["reported_roe"], *labels["reported_roe_excluding_nonrecurring"])
     for page_number, text in enumerate(page_texts, 1):
         page_record = catalog_pages[page_number - 1] if catalog_pages and page_number <= len(catalog_pages) else {}
         compact = re.sub(r"\s+", "", text).casefold()
@@ -4476,7 +4625,7 @@ def _candidate_pages_from_text(
             summary_pages.add(page_number)
         if scoped_units.note_text_for_page(page_number) is not None:
             summary_pages.add(page_number)
-        if any(label.casefold() in compact for label in labels["reported_roe"]):
+        if any(_label_compact(label) in _label_compact(compact) for label in roe_labels):
             # ROE is commonly disclosed in a standalone performance table
             # outside the three formal statements. Keep the exact page in
             # the bounded coordinate pass without widening its continuation
@@ -4959,6 +5108,7 @@ class FinancialIngestionEngine:
         self._parse_cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._parse_cache_memory: dict[str, tuple[list[FinancialFact], list[EvidenceRef]]] = {}
         self._parse_cache_mapping_versions: dict[str, str] = {}
+        self._parse_cache_statement_versions: dict[str, str] = {}
         self._max_workers = max(1, min(3, int(max_workers)))
         self._parse_timeout_seconds = max(0.1, float(parse_timeout_seconds))
         self._batch_timeout_seconds = max(0.1, min(280.0, float(batch_timeout_seconds)))
@@ -5032,6 +5182,7 @@ class FinancialIngestionEngine:
                 _PDF_TAXONOMY_VERSION,
                 _PDF_CACHE_POLICY_VERSION,
                 _SOURCE_DISCLOSURE_VERSION,
+                STATEMENT_MAPPING_VERSION,
                 self._compatibility_rules.semantic_fingerprint(),
                 profile,
                 policy,
@@ -5058,10 +5209,16 @@ class FinancialIngestionEngine:
             if (cached_memory is not None and _cost_mapping_recompile_needed(
                     cached_memory[0], self._parse_cache_mapping_versions.get(key), cached_memory[1])):
                 pending.add(filing.accession_number)
+            if (cached_memory is not None
+                    and self._parse_cache_statement_versions.get(key) != STATEMENT_MAPPING_VERSION
+                    and statement_mapping_affected(*cached_memory)):
+                pending.add(filing.accession_number)
             if self._parse_cache_dir is None:
                 continue
             try:
                 payload = json.loads((self._parse_cache_dir / f"{key}.json").read_text(encoding="utf-8"))
+                if needs_statement_remap(payload):
+                    pending.add(filing.accession_number)
                 if (payload.get("parser_version") == _PDF_PARSER_VERSION
                     and payload.get("roe_row_mapping_version") != _ROE_ROW_MAPPING_VERSION
                     and any(isinstance(item, dict) and item.get("concept") in {
@@ -5081,6 +5238,9 @@ class FinancialIngestionEngine:
     ) -> tuple[list[FinancialFact], list[EvidenceRef]] | None:
         cached = self._parse_cache_memory.get(key)
         if cached is not None:
+            if (self._parse_cache_statement_versions.get(key) != STATEMENT_MAPPING_VERSION
+                    and statement_mapping_affected(*cached)):
+                return None
             if _cost_mapping_recompile_needed(
                 cached[0], self._parse_cache_mapping_versions.get(key), cached[1],
             ):
@@ -5091,6 +5251,8 @@ class FinancialIngestionEngine:
         cache_path = self._parse_cache_dir / f"{key}.json"
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if needs_statement_remap(payload):
+                return None
             # The digest key prevents ordinary v3/v4 collisions, while this
             # payload marker protects against a stale or manually copied
             # payload being placed under a current key.  Cached facts must be
@@ -5132,6 +5294,7 @@ class FinancialIngestionEngine:
             return None
         self._parse_cache_memory[key] = (facts, refs)
         self._parse_cache_mapping_versions[key] = str(payload.get("financial_mapping_version", ""))
+        self._parse_cache_statement_versions[key] = str(payload.get("statement_mapping_version", ""))
         return ([replace(item) for item in facts], [replace(item) for item in refs])
 
     def _store_parse_cache(
@@ -5150,6 +5313,7 @@ class FinancialIngestionEngine:
         safe_refs = [replace(item) for item in refs]
         self._parse_cache_memory[key] = (safe_facts, safe_refs)
         self._parse_cache_mapping_versions[key] = FINANCIAL_MAPPING_VERSION
+        self._parse_cache_statement_versions[key] = STATEMENT_MAPPING_VERSION
         if self._parse_cache_dir is None:
             return
         payload = json.dumps(
@@ -5158,6 +5322,7 @@ class FinancialIngestionEngine:
                 "disclosure_version": _SOURCE_DISCLOSURE_VERSION,
                 "roe_row_mapping_version": _ROE_ROW_MAPPING_VERSION,
                 "financial_mapping_version": FINANCIAL_MAPPING_VERSION,
+                "statement_mapping_version": STATEMENT_MAPPING_VERSION,
                 "facts": [item.to_dict() for item in safe_facts],
                 "evidence": [item.to_dict() for item in safe_refs],
                 "document_execution": {document_id: self._document_execution[document_id]
@@ -5359,6 +5524,12 @@ class FinancialIngestionEngine:
                         manifest.revision,
                         manifest.source_url,
                         _SOURCE_DISCLOSURE_VERSION,
+                        # A formerly unrecognized title can yield a successful
+                        # zero-fact window. Its empty output cannot reveal that
+                        # it depends on old statement semantics. Version the
+                        # namespace, including continuation context, instead
+                        # of inferring that dependency from extracted facts.
+                        STATEMENT_MAPPING_VERSION,
                     )
                 ).encode("utf-8")
             ).hexdigest(),
@@ -5399,6 +5570,20 @@ class FinancialIngestionEngine:
 
         window_failures: list[str] = []
         failed_pages: set[int] = set()
+        observation["partial_window_progress"] = []
+
+        def window_incomplete_progress(item):
+            # Keep child artifacts visible for resume diagnostics only. They
+            # are not exposed to the financial compiler until their parent
+            # window completes and the ordinary verification path runs.
+            observation["partial_window_progress"].append({
+                "parent_pages": list(item.parent.pages),
+                "completed_child_pages": [
+                    list(child.window.pages) for child in item.completed_children
+                ],
+                "state": item.state,
+                "error_type": item.error_type,
+            })
 
         def window_failed(_window, error):
             failed_pages.update(_window.pages)
@@ -5435,6 +5620,7 @@ class FinancialIngestionEngine:
                     'statements': sorted({kind for text in document_context.page_texts
                         if (kind := (_statement_context(text, self._compatibility_rules) or ('', ''))[0])}),
                     'missing_concepts': [], 'input_artifact_hash': actual_hash},
+                on_incomplete_progress=window_incomplete_progress,
             )
         observation["work_progress"] = store.work_progress(key)
         observation["checkpoint_write_elapsed_seconds"] = round(store.write_elapsed_seconds, 4)
@@ -5877,7 +6063,7 @@ class FinancialIngestionEngine:
                     normalization_refs.append(EvidenceRef(f"table-structure:{table_id}", filing.document_id,
                         filing.source_url, "Positioned table / unvalidated observation", f"page:{page_number}",
                         structure, filing.filed_at, filing.content_hash))
-                    columns = context.periods or _period_columns(table.rows, rules=rules, source_page=page_number)
+                    columns = context.periods or _period_columns(table.rows, rules=rules, source_page=page_number, scope=scope)
                     if section.summary and not columns:
                         columns = _summary_roe_period_columns(table.rows, manifest)
                     if manifest.fiscal_period in {'FY', 'CY', 'ANNUAL'}:
@@ -5957,10 +6143,23 @@ class FinancialIngestionEngine:
                     equity_totals = _equity_group_total_rows(
                         table.rows, columns, int(manifest.period_end[:4])
                     ) if statement == "balance_sheet" and not summary_page else {}
+                    consumed_visual_rows = set()
                     for row_index, row in enumerate(table.rows):
+                        if row.bbox in consumed_visual_rows:
+                            continue
+                        if summary_page:
+                            columns = _summary_roe_period_columns(table.rows[:row_index], manifest) or columns
                         if revision_boundary is not None and row_index >= revision_boundary:
                             continue
                         merged_row = _merge_visual_rows(table.rows, row_index, rules)
+                        if merged_row.cells != row.cells:
+                            # The tail of one wrapped source row is not a new
+                            # generic ROE/net-income row. Re-emitting it would
+                            # drop its "excluding nonrecurring"/ownership
+                            # prefix and create a false independent fact.
+                            for tail in table.rows[row_index + 1:row_index + 3]:
+                                if tail.cells and all(cell in merged_row.cells for cell in tail.cells):
+                                    consumed_visual_rows.add(tail.bbox)
                         if row.bbox in equity_totals:
                             merged_row = equity_totals[row.bbox]
                         compact = _row_label_text(merged_row)
@@ -6072,6 +6271,15 @@ class FinancialIngestionEngine:
                             compact = _row_label_text(merged_row)
                         allocation_concept = capital_allocation_payment_concept(compact)
                         for concept, labels in section_labels.items():
+                            if concept == "reported_roe_excluding_nonrecurring":
+                                # This distinct concept is represented by the
+                                # same printed base label as ordinary ROE and
+                                # is classified from the row's explicit
+                                # non-recurring-loss qualifier below. Its
+                                # aliases are prepass/recognition hints only;
+                                # parsing a second fact here would bypass the
+                                # ordinary ROE ratio/period binding contract.
+                                continue
                             if concept in {"interest_revenue", "finance_interest_income"} and concept != interest_concept:
                                 continue
                             if concept == "capital_expenditure" and has_distinct_capital_payment_label(compact):
@@ -6200,10 +6408,18 @@ class FinancialIngestionEngine:
                                 numbered_prefix = bool(re.fullmatch(
                                     r"[一二三四五六七八九十百千万亿零〇0-9]+", prefix
                                 ))
+                                roe_prefix = concept == "reported_roe" and re.fullmatch(
+                                    r"(?:(?:年化后|年化|扣除非经常性损益后|扣除非经常性损益的|扣除非经常性损益))*"
+                                    r"(?:归属于(?:本行|本公司|母公司)?(?:普通股股东|股东)的?)?", prefix,
+                                ) is not None
+                                roe_prefix = roe_prefix or bool(concept == "reported_roe" and prefix == "的"
+                                    and re.search(r"归属于(?:本行|本公司|母公司)?(?:普通股股东|股东)的加权平均净资产收益率",
+                                                  _label_compact(compact)))
                                 if (
                                     prefix
                                     and any("\u4e00" <= char <= "\u9fff" for char in prefix[-1:])
                                     and not numbered_prefix
+                                    and not roe_prefix
                                     and not (prefix == "其中" and (
                                         concept == "revenue" or (
                                             concept in {"cost_of_revenue", "total_operating_cost"}
@@ -6285,7 +6501,7 @@ class FinancialIngestionEngine:
                             ) else None
                             fact_concept = concept
                             if concept == "reported_roe" and (
-                                "扣除非经常性损益后" in compact
+                                "扣除非经常性损益" in compact
                                 or "excludingnonrecurring" in _label_compact(compact)
                             ):
                                 fact_concept = "reported_roe_excluding_nonrecurring"

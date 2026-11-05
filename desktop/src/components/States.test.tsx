@@ -163,6 +163,92 @@ describe("ResearchProgress", () => {
     vi.useRealTimers();
   });
 
+  it.each(["queued", "waiting_input", "interrupted", "completed", "failed", "cancelled"] as const)("does not advance the execution clock for %s tasks", (state) => {
+    vi.useFakeTimers();
+    const view = render(<ResearchProgress language="en"
+      job={{ job_id: "paused-clock", run_id: null, state, stage: "filing-parse", message: "", percent: 20, elapsed_seconds: 4 }}
+      onCancel={vi.fn()} />);
+    try {
+      act(() => { vi.advanceTimersByTime(10_000); document.dispatchEvent(new Event("visibilitychange")); });
+      expect(screen.getByLabelText("Elapsed research time")).toHaveTextContent("00:04");
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("excludes input-wait time when the same task resumes", () => {
+    vi.useFakeTimers();
+    const base = { job_id: "resume-clock", run_id: null, stage: "filing-parse", message: "", percent: 20, elapsed_seconds: 4 };
+    const view = render(<ResearchProgress language="en" job={{ ...base, state: "running" }} onCancel={vi.fn()} />);
+    try {
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(screen.getByLabelText("Elapsed research time")).toHaveTextContent("00:06");
+      view.rerender(<ResearchProgress language="en" job={{ ...base, state: "waiting_input", elapsed_seconds: 6 }} onCancel={vi.fn()} />);
+      act(() => vi.advanceTimersByTime(600_000));
+      expect(screen.getByLabelText("Elapsed research time")).toHaveTextContent("00:06");
+      view.rerender(<ResearchProgress language="en" job={{ ...base, state: "running", elapsed_seconds: 6 }} onCancel={vi.fn()} />);
+      act(() => vi.advanceTimersByTime(2_000));
+      expect(screen.getByLabelText("Elapsed research time")).toHaveTextContent("00:08");
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["queued", "Waiting for an execution slot…"],
+    ["waiting_input", "Waiting for your decision…"],
+    ["interrupted", "Task interrupted; progress saved"],
+    ["completed", "Task processing finished"],
+    ["failed", "Task processing failed"],
+    ["cancelled", "Task cancelled"],
+  ] as const)("shows the %s lifecycle without a misleading active-stage title or waiting quotes", (state, title) => {
+    const view = render(<ResearchProgress language="en"
+      job={{ job_id: "lifecycle-copy", run_id: null, state, stage: "filing-parse", message: "", percent: 31, elapsed_seconds: 4 }}
+      onCancel={vi.fn()} />);
+    expect(screen.getByText(title)).toBeInTheDocument();
+    expect(view.container.querySelector(".research-stage-copy strong")).toHaveTextContent(title);
+    expect(screen.getByText("Latest stage:")).toBeInTheDocument();
+    expect(screen.getByText("Reading financial statements…")).toBeInTheDocument();
+    expect(view.container.querySelector(".research-waiting-copy")).toBeNull();
+  });
+
+  it("shows task finalizing instead of a completed stage while execution is draining", () => {
+    const job = {
+      job_id: "draining-completed-stage",
+      run_id: null,
+      state: "running" as const,
+      stage: "completed",
+      message: "",
+      percent: 100,
+      elapsed_seconds: 30,
+      execution_draining: true,
+    };
+    const view = render(<ResearchProgress language="en" job={job} onCancel={vi.fn()} />);
+
+    expect(screen.getByText("Saving task progress…")).toBeInTheDocument();
+    expect(screen.queryByText("Task processing finished")).not.toBeInTheDocument();
+    expect(view.container.querySelector(".research-waiting-copy")).toBeNull();
+  });
+
+  it("keeps the cancellation lifecycle during execution draining", () => {
+    const view = render(<ResearchProgress language="en" job={{
+      job_id: "draining-cancellation",
+      run_id: null,
+      state: "cancelling",
+      stage: "completed",
+      message: "",
+      percent: 100,
+      elapsed_seconds: 30,
+      execution_draining: true,
+    }} onCancel={vi.fn()} />);
+
+    expect(screen.getByText("Stopping the research safely…")).toBeInTheDocument();
+    expect(screen.queryByText("Saving task progress…")).not.toBeInTheDocument();
+    expect(view.container.querySelector(".research-waiting-copy")).toBeNull();
+  });
+
   it("uses actual elapsed time after a background-tab pause", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-16T00:00:00Z"));

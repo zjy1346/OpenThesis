@@ -23,33 +23,120 @@ class StageExecutionCancelled(RuntimeError):
     pass
 
 
-def dependency_findings(value: Any) -> Any:
+def dependency_findings(value: Any, _memo=None, *, legacy_order=False) -> Any:
     """The actual downstream input, excluding host proof/prompt history.
 
     Proof records stay in their stage checkpoint. Including their changing
     local audit hashes in producer input makes identical business findings
     look new and repeats already completed calls after local revalidation.
     """
-    if isinstance(value, dict):
-        return {key: dependency_findings(child) for key, child in value.items()
+    memo = {} if _memo is None else _memo
+    if isinstance(value, (dict, list, tuple)):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        result = {} if isinstance(value, dict) else []
+        memo[marker] = result
+        if isinstance(value, dict):
+            result.update({key: dependency_findings(child, memo, legacy_order=legacy_order) for key, child in value.items()
                 if (not str(key).startswith("_") or key == "_verification_state")
-                and key not in {"trusted_channels", "prior_artifacts", "raw_response", "prompt", "journal"}}
-    if isinstance(value, (list, tuple)):
-        return [dependency_findings(child) for child in value]
+                and key not in {"trusted_channels", "prior_artifacts", "raw_response", "prompt", "journal"}})
+            audit = value.get("_section_validation")
+            if isinstance(audit, dict):
+                # Stable per-leaf trust is actual producer input, unlike
+                # local proof hashes/timings. Retain its meaning without
+                # copying the entire changing checkpoint into each request.
+                fields = {"path", "section_id", "validation_state", "role", "evidence_ids",
+                          "display_eligible", "calculation_eligible", "display_state"}
+                nodes = [{key: dependency_findings(child, memo, legacy_order=legacy_order)
+                          for key, child in node.items() if key in fields}
+                         for node in audit.get("nodes", ()) if isinstance(node, dict)]
+                if not legacy_order:
+                    # SQLite canonical JSON sorts object keys. That may change
+                    # validator traversal order, not the proof at a given path.
+                    nodes.sort(key=lambda node: (str(node.get("path", "")), digest(node)))
+                result["_section_validation"] = {"schema": audit.get("schema"), "nodes": nodes}
+            if type(value.get("_verified_claim_count")) is int:
+                result["_verified_claim_count"] = value["_verified_claim_count"]
+        else:
+            result.extend(dependency_findings(child, memo, legacy_order=legacy_order) for child in value)
+        return result
     return deepcopy(value)
+
+
+def dependency_request_values(spec: StageSpec, dependencies: Mapping[str, "StageResult"], *, legacy_order=False) -> dict:
+    values = {key: dependency_findings(dependencies[key].validation.trusted_output, legacy_order=legacy_order)
+              for key in spec.depends_on if key in dependencies}
+    if spec.optional_dependencies:
+        values["_dependency_gaps"] = [{"stage_id": key, "state": dependencies[key].validation.state,
+            "issue_codes": list(dependencies[key].validation.issues) if legacy_order
+                else sorted(set(dependencies[key].validation.issues))}
+            for key in spec.optional_dependencies if key in dependencies and not dependencies[key].validation.passed]
+    return values
+
+
+def stage_input_components(spec: StageSpec, input_identity: str, fingerprint: str,
+                           dependencies: Mapping[str, "StageResult"], *, legacy=False) -> dict:
+    """Separate model-visible inputs from verifier history.
+
+    Optional dependency gaps and in-body trust flags are deliberately part of
+    the input: these can be seen by the producer. Outer validation status and
+    issue codes for required dependencies do not enter its request.
+    """
+    values = dependency_request_values(spec, dependencies, legacy_order=legacy)
+    result = {"input": input_identity, "stage": spec.identity, "execution_fingerprint": fingerprint,
+              "dependencies": {key: {"stage_identity": dependencies[key].stage_identity,
+                                    "trusted_output_sha256": digest(values[key])}
+                               for key in spec.depends_on}}
+    if legacy:
+        for key, record in result["dependencies"].items():
+            record.update(validation_state=dependencies[key].validation.state,
+                          issue_codes=dependencies[key].validation.issues)
+    elif values.get("_dependency_gaps"):
+        result["visible_dependency_gaps_sha256"] = digest(values["_dependency_gaps"])
+    return result
 
 
 def stage_input_digest(spec: StageSpec, input_identity: str, fingerprint: str,
                        dependencies: Mapping[str, "StageResult"]) -> str:
-    """One input identity for both planning and executing persisted stages."""
-    return digest({"input": input_identity, "stage": spec.identity,
-                   "execution_fingerprint": fingerprint,
-                   "dependencies": {
-                       key: {"stage_identity": dependencies[key].stage_identity,
-                             "validation_state": dependencies[key].validation.state,
-                             "issue_codes": dependencies[key].validation.issues,
-                             "trusted_output_sha256": digest(dependency_findings(dependencies[key].validation.trusted_output))}
-                       for key in spec.depends_on}})
+    return digest(stage_input_components(spec, input_identity, fingerprint, dependencies))
+
+
+def stage_generation_matches(spec: StageSpec, input_identity: str, fingerprint: str,
+                             saved: Mapping[str, "StageResult"], current: Mapping[str, "StageResult"],
+                             previous_digest: str, expected: str | None = None, *,
+                             legacy_material_identity: str | None = None) -> bool:
+    if expected is None:
+        expected = stage_input_digest(spec, input_identity, fingerprint, current)
+    if previous_digest == expected:
+        return True
+    # A pre-3.3.3 checkpoint is usable only when the exact old digest is
+    # reproducible and every current model-visible dependency still matches.
+    if not all(key in saved for key in spec.depends_on):
+        return False
+    return (previous_digest == digest(stage_input_components(spec,
+                legacy_material_identity or input_identity, fingerprint, saved, legacy=True))
+            and expected == stage_input_digest(spec, input_identity, fingerprint, saved))
+
+
+def stage_material_identities(registry: StageRegistry, inputs: dict, scoped_inputs: Mapping[str, dict], *,
+                              legacy=False) -> dict[str, str]:
+    identities = {}
+    result = {}
+    for spec in registry.stages:
+        value = scoped_inputs.get(spec.stage_id, inputs)
+        key = id(value)
+        if key not in identities:
+            # These host inputs select rendering and verification policy,
+            # not generation. The output/report language remains visible.
+            if legacy and callable(getattr(value.get("context_json"), "legacy_text", None)):
+                legacy_value = {**value, "context_json": value["context_json"].legacy_text()}
+            else:
+                legacy_value = value
+            identities[key] = digest(legacy_value if legacy else {k: v for k, v in value.items()
+                if k not in {"research_verification_contract", "ui_language"}})
+        result[spec.stage_id] = identities[key]
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,8 +237,7 @@ class StageExecutor:
         if (set(scoped_inputs) - {spec.stage_id for spec in registry.stages}
                 or any(not isinstance(value, dict) for value in scoped_inputs.values())):
             raise ValueError("STAGE_INPUT_SCOPE_INVALID")
-        input_identities = {spec.stage_id: digest(scoped_inputs.get(spec.stage_id, frozen_inputs))
-                            for spec in registry.stages}
+        input_identities = stage_material_identities(registry, frozen_inputs, scoped_inputs)
         selected = set(registry.ancestors(targets)) if targets is not None else {spec.stage_id for spec in registry.stages}
         invalid = set(registry.descendants(invalidated)) if propagate_invalidation else set(invalidated)
         for stage_id in invalid:
@@ -160,6 +246,7 @@ class StageExecutor:
         wave_candidates = {}
         results: dict[str, StageResult] = {}
         saved = dict(previous or {})
+        legacy_inputs = stage_material_identities(registry, frozen_inputs, scoped_inputs, legacy=True) if saved else {}
         local_candidates = dict(revalidation_candidates or {})
         if execution_fingerprints is None and invalidated:
             for spec in registry.stages:
@@ -167,8 +254,9 @@ class StageExecutor:
                 if (spec.stage_id not in invalid and prior is not None
                         and prior.execution_fingerprint and prior.stage_identity == spec.identity
                         and all(key in saved for key in spec.depends_on)
-                        and prior.input_digest == stage_input_digest(
-                            spec, input_identities[spec.stage_id], prior.execution_fingerprint, saved)):
+                        and stage_generation_matches(spec, input_identities[spec.stage_id],
+                            prior.execution_fingerprint, saved, saved, prior.input_digest,
+                            legacy_material_identity=legacy_inputs.get(spec.stage_id))):
                     fingerprints[spec.stage_id] = prior.execution_fingerprint
         executor = ThreadPoolExecutor(max_workers=max_workers)
         pending = {}
@@ -345,6 +433,8 @@ class StageExecutor:
                     capabilities = set(scoped_inputs.get(spec.stage_id, frozen_inputs).get("capabilities", ()))
                     missing_capabilities = list(spec.missing_capabilities(capabilities))
                     stage_input = expected(spec)
+                    timeline.setdefault(spec.stage_id, {"depends_on": list(spec.depends_on),
+                        "ready_at_epoch": time.time()})
                     if bad_dependencies or missing_capabilities:
                         result = StageResult(spec.stage_id, spec.identity, stage_input, {},
                                              StageValidation(False, state="needs_action", issues=tuple(
@@ -362,7 +452,9 @@ class StageExecutor:
                             and (previous_result.usable or previous_result.has_candidate)
                             and previous_result.stage_identity == spec.identity
                             and previous_result.execution_fingerprint == fingerprints.get(spec.stage_id, execution_fingerprint)
-                            and previous_result.input_digest == stage_input
+                            and stage_generation_matches(spec, input_identities[spec.stage_id],
+                                previous_result.execution_fingerprint, saved, results, previous_result.input_digest,
+                                stage_input, legacy_material_identity=legacy_inputs.get(spec.stage_id))
                             and previous_result.candidate_digest == digest(previous_result.candidate)):
                         # Revalidate at the same seam; a persisted success bit
                         # alone is not proof of current semantic compatibility.
@@ -380,7 +472,9 @@ class StageExecutor:
                     if (local_candidate is not None and local_candidate.has_candidate
                             and (local_only or spec.stage_id not in invalid
                                  and local_candidate.stage_identity == spec.identity
-                                 and local_candidate.input_digest == stage_input
+                                 and stage_generation_matches(spec, input_identities[spec.stage_id],
+                                     local_candidate.execution_fingerprint, saved, results, local_candidate.input_digest,
+                                     stage_input, legacy_material_identity=legacy_inputs.get(spec.stage_id))
                                  and local_candidate.execution_fingerprint == fingerprints.get(
                                      spec.stage_id, execution_fingerprint))):
                         if (local_candidate.stage_id != spec.stage_id or
@@ -422,14 +516,33 @@ class StageExecutor:
                     if packet and packet not in attempted_packets and packet in cold_leads:
                         continue
                     self.progress(spec.stage_id, "queued")
-                    timeline[spec.stage_id] = {"depends_on": list(spec.depends_on), "queued_at_epoch": time.time(), "_queued": time.monotonic()}
-                    dependencies = {key: dependency_findings(results[key].validation.trusted_output) for key in spec.depends_on}
-                    if spec.optional_dependencies:
-                        dependencies["_dependency_gaps"] = [{"stage_id": key,
-                            "state": results[key].validation.state,
-                            "issue_codes": list(results[key].validation.issues)}
-                            for key in spec.optional_dependencies
-                            if not results[key].validation.passed]
+                    timeline[spec.stage_id].update(queued_at_epoch=time.time(), _queued=time.monotonic(),
+                                                   dispatch_group=packet, executor_workers=max_workers)
+                    if previous_result is not None and all(key in saved for key in spec.depends_on):
+                        old = stage_input_components(spec, input_identities[spec.stage_id],
+                            previous_result.execution_fingerprint, saved)
+                        new = stage_input_components(spec, input_identities[spec.stage_id],
+                            fingerprints.get(spec.stage_id, execution_fingerprint), results)
+                        changed = [key for key in spec.depends_on if old["dependencies"][key] != new["dependencies"][key]]
+                        before = dependency_request_values(spec, saved)
+                        after = dependency_request_values(spec, results)
+                        timeline[spec.stage_id]["generation_change"] = {
+                            "previous_identity_matches_current_material": digest(old) == previous_result.input_digest,
+                            "changed_dependencies": changed,
+                            # Only host-known structural fields, not generated
+                            # field names/values or source bodies, are exported.
+                            "changed_dependency_categories": {key: {
+                                "proof": before[key].get("_section_validation") != after[key].get("_section_validation"),
+                                "verification_state": before[key].get("_verification_state") != after[key].get("_verification_state"),
+                                "claims": before[key].get("claims") != after[key].get("claims"),
+                                "body": {k: v for k, v in before[key].items() if not k.startswith("_") and k != "claims"}
+                                    != {k: v for k, v in after[key].items() if not k.startswith("_") and k != "claims"},
+                            } for key in changed},
+                            "visible_gaps_changed": old.get("visible_dependency_gaps_sha256") != new.get("visible_dependency_gaps_sha256"),
+                            "model_changed": old["execution_fingerprint"] != new["execution_fingerprint"],
+                            "explicitly_invalidated": spec.stage_id in invalid,
+                        }
+                    dependencies = dependency_request_values(spec, results)
                     future = executor.submit(produce, spec, stage_input, dependencies)
                     pending[future] = (spec, stage_input)
                     if packet and packet not in attempted_packets:
@@ -497,8 +610,14 @@ class StageExecutor:
                                 if type(value) is int and value >= 0:
                                     diagnostic[field_name] = value
                         phase = getattr(exc, "processing_phase", "")
-                        if phase in {"candidate_storage", "response_identity", "response_parsing"}:
+                        if phase in {"candidate_storage", "response_identity", "response_parsing", "request_compilation"}:
                             diagnostic["processing_phase"] = phase
+                        if phase == "request_compilation" and code == "MODEL_REQUEST_COMPILATION_FAILED":
+                            from .request_diagnostics import safe_compilation_diagnostic
+                            compilation = safe_compilation_diagnostic(getattr(exc, "compilation_diagnostic", None))
+                            if compilation is not None:
+                                diagnostic["request_compilation"] = {**compilation, "stage_id": spec.stage_id}
+                                diagnostic["not_sent"] = True
                         path = getattr(exc, "content_path", "")
                         if path in {"$", "$.receipt.metadata.configured_model_id", "$.receipt.metadata.connection_id"}:
                             diagnostic["content_path"] = path

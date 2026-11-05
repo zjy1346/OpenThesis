@@ -71,15 +71,24 @@ def restore_saved_references(response, input_digest):
     return ModelResponse(decode_references(response, dict(pairs)), response.receipt, response.diagnostics)
 
 
-def reference_aliases(context_json: str) -> dict[str, str]:
+def reference_aliases(context_json: str, *, stable=None) -> dict[str, str]:
     """Return sorted request aliases for original frozen evidence and fact IDs.
 
     The returned names only shorten typed IDs. They do not establish that a
     candidate is a verified fact or authorize use of an unsupplied source.
     """
-    context = json.loads(context_json)
+    from .source_compiler import FrozenSourceContext, read_source_context
+    context = read_source_context(context_json)
+    if isinstance(context_json, FrozenSourceContext):
+        return dict(context_json.once(("reference-aliases", stable), lambda: _aliases(context, stable)))
+    return _aliases(context, stable)
+
+
+def _aliases(context, stable):
     if not isinstance(context, dict):
         return {}
+    if stable is None:
+        stable = bool(context.get("source_reader_stages"))
     evidence = context.get("evidence")
     facts = context.get("facts")
     if not isinstance(evidence, list):
@@ -96,6 +105,31 @@ def reference_aliases(context_json: str) -> dict[str, str]:
         for fact in facts
         if isinstance(fact, dict) and isinstance(fact.get("fact_id"), str) and fact["fact_id"]
     }
+    if stable:
+        # An unrelated new source cannot renumber a fixed reading group's
+        # aliases and destroy its prefix. This is an identity codec, not trust.
+        from ..research_materials import TOPIC_PARTITION, usable_disclosure
+        groups = {name: index for index, name in enumerate(("quantitative_facts", "business_disclosures",
+            "mda_disclosures", "risk_disclosures", "audit_disclosures", "other_disclosures"), 1)}
+        grouped = {}
+        for record in evidence:
+            original = record.get("evidence_id") if isinstance(record, dict) else None
+            if original not in evidence_ids:
+                continue
+            topic = str(record.get("topic") or str(record.get("title", "")).split(" · ")[-1])
+            bucket = groups[TOPIC_PARTITION.get(topic, "other_disclosures")] if usable_disclosure(record) else 1
+            grouped[original] = min(grouped.get(original, bucket), bucket)
+        aliases = {}
+        for bucket in groups.values():
+            for index, original in enumerate(sorted(key for key in evidence_ids if grouped.get(key) == bucket)):
+                digits = str(index)
+                # Group + length + ordinal is injective, compact and stable
+                # when another group changes. Long ordinals use a distinct
+                # escape, not an overflowing fixed-width counter.
+                suffix = f"{len(digits)}{digits}" if len(digits) < 10 else f"0{len(digits)}0{digits}"
+                aliases[f"@E{bucket}{suffix}"] = original
+        aliases.update({f"@F{index}": original for index, original in enumerate(sorted(fact_ids))})
+        return aliases
     aliases = {f"@E{index}": original for index, original in enumerate(sorted(evidence_ids))}
     aliases.update({f"@F{index}": original for index, original in enumerate(sorted(fact_ids))})
     return aliases
@@ -223,41 +257,163 @@ def decode_references(value: Any, bindings: Mapping[str, str]) -> Any:
     return _transform(value, evidence, facts, decoding=True)
 
 
-def _expand_request_paths(value: Any) -> Any:
-    """Expand same-request path aliases or reject cycles/unresolvable paths."""
-    from .source_compiler import expand_record_tables
+class RequestReferenceError(ValueError):
+    """A local codec failure, never a supplier rejection or a fact verdict."""
 
-    root = expand_record_tables(value)
+    code = "MODEL_SOURCE_REFERENCE_PATH_INVALID"
 
-    def resolve_path(path: Any) -> Any:
-        if not isinstance(path, list):
-            raise ValueError("MODEL_SOURCE_REFERENCE_PATH_INVALID")
-        target = root
+    def __init__(self, kind, path=(), *, at=()):
+        super().__init__(self.code)
+        self.kind = kind
+        self.path = list(path) if isinstance(path, (list, tuple)) else []
+        self.at = list(at)
+        self.reference_location = None
+
+
+class RequestPathResolver:
+    """One addressing implementation for bindings, repairs and prior findings.
+
+    Path memo caches completed lookups; active paths and active containers
+    identify actual cycles. The graph memo preserves shared acyclic objects.
+    The existing reference-hop protection also applies to cached lookups.
+    """
+
+    def __init__(self, value):
+        from .source_compiler import expand_record_tables
+        self.root = expand_record_tables(value)
+        self.paths = {}
+        self.active_paths = set()
+        self.memo = {}
+        self.active_nodes = set()
+
+    def _dereference(self, node):
+        if isinstance(node, dict) and set(node) == {"request_path_ref"}:
+            target, hops = self._locate(node["request_path_ref"])
+            if hops + 1 > _MAX_PATH_DEPTH:
+                raise RequestReferenceError("reference_hop_limit", node["request_path_ref"])
+            return target, hops + 1
+        return node, 0
+
+    def _locate(self, path):
+        if not isinstance(path, list) or any(type(part) not in (str, int) for part in path):
+            raise RequestReferenceError("invalid_path_type", path)
+        identity = tuple(path)
+        if identity in self.active_paths:
+            raise RequestReferenceError("reference_cycle", path)
+        if identity in self.paths:
+            return self.paths[identity]
+        self.active_paths.add(identity)
         try:
-            for component in path:
+            target, hops = self.root, 0
+            for index, component in enumerate(path):
+                target, used = self._dereference(target)
+                hops += used
+                if hops > _MAX_PATH_DEPTH:
+                    raise RequestReferenceError("reference_hop_limit", path, at=path[:index])
+                if isinstance(target, dict):
+                    if type(component) is not str or component not in target:
+                        raise RequestReferenceError("missing_object_key", path, at=path[:index + 1])
+                elif isinstance(target, list):
+                    if type(component) is not int or component < 0 or component >= len(target):
+                        raise RequestReferenceError("invalid_array_index", path, at=path[:index + 1])
+                else:
+                    raise RequestReferenceError("non_container", path, at=path[:index])
                 target = target[component]
-        except (IndexError, KeyError, TypeError):
-            raise ValueError("MODEL_SOURCE_REFERENCE_PATH_INVALID") from None
-        return target
+            target, used = self._dereference(target)
+            hops += used
+            if hops > _MAX_PATH_DEPTH:
+                raise RequestReferenceError("reference_hop_limit", path)
+            self.paths[identity] = (target, hops)
+            return target, hops
+        finally:
+            self.active_paths.remove(identity)
 
-    def walk(node: Any, path_stack: tuple[tuple[Any, ...], ...] = ()) -> Any:
-        if isinstance(node, dict):
-            if set(node) == {"request_path_ref"}:
+    def target(self, path):
+        return self._walk(self._locate(path)[0], path)
+
+    def _walk(self, node, path=()):
+        if not isinstance(node, (dict, list)):
+            return node
+        marker = id(node)
+        if marker in self.active_nodes:
+            raise RequestReferenceError("container_reference_cycle", path)
+        if marker in self.memo:
+            return self.memo[marker]
+        self.active_nodes.add(marker)
+        try:
+            if isinstance(node, dict) and set(node) == {"request_path_ref"}:
+                target, _hops = self._dereference(node)
+                result = self._walk(target, node["request_path_ref"])
+            elif isinstance(node, dict):
+                result = {key: self._walk(child, (*path, key)) for key, child in node.items()}
+            else:
+                result = [self._walk(child, (*path, index)) for index, child in enumerate(node)]
+            self.memo[marker] = result
+            return result
+        except RequestReferenceError as error:
+            if error.reference_location is None:
+                error.reference_location = list(path)
+            raise
+        finally:
+            self.active_nodes.remove(marker)
+
+    def expand(self):
+        return self._walk(self.root)
+
+
+def _expand_request_paths(value: Any) -> Any:
+    """Validate/expand locally without serializing the expanded graph to wire."""
+    try:
+        return RequestPathResolver(value).expand()
+    except RecursionError:
+        raise RequestReferenceError("structural_resource_limit") from None
+
+
+def resolve_request_path(value: Any, path: list) -> Any:
+    """Locate a current-request value with the same table/reference semantics."""
+    try:
+        return RequestPathResolver(value).target(path)
+    except RecursionError:
+        raise RequestReferenceError("structural_resource_limit", path) from None
+
+
+def relocate_request_paths(value, relocations):
+    """Rewrite the longest moved prefix, including paths outside source lanes.
+
+    Relocations are simultaneous, not repeatedly applied substitutions. Only
+    typed path objects change; source text, record values and order do not.
+    """
+    moves = sorted(relocations, key=lambda pair: len(pair[0]), reverse=True)
+    memo, active = {}, set()
+    def visit(node):
+        if not isinstance(node, (dict, list)):
+            return node
+        marker = id(node)
+        if marker in active:
+            raise RequestReferenceError("container_cycle")
+        if marker in memo:
+            return memo[marker]
+        active.add(marker)
+        try:
+            if isinstance(node, dict) and set(node) == {"request_path_ref"}:
                 path = node["request_path_ref"]
-                if (not isinstance(path, list)
-                        or any(not isinstance(component, (str, int)) or isinstance(component, bool)
-                               for component in path)):
-                    raise ValueError("MODEL_SOURCE_REFERENCE_PATH_INVALID")
-                identity = tuple(path)
-                if identity in path_stack or len(path_stack) >= _MAX_PATH_DEPTH:
-                    raise ValueError("MODEL_SOURCE_REFERENCE_PATH_INVALID")
-                return walk(resolve_path(path), (*path_stack, identity))
-            return {key: walk(child, path_stack) for key, child in node.items()}
-        if isinstance(node, list):
-            return [walk(child, path_stack) for child in node]
-        return deepcopy(node)
-
-    return walk(root)
+                if not isinstance(path, list) or any(type(part) not in (str, int) for part in path):
+                    raise RequestReferenceError("invalid_path_type", path)
+                replacement = path
+                for old, new in moves:
+                    if tuple(path[:len(old)]) == tuple(old):
+                        replacement = [*new, *path[len(old):]]
+                        break
+                result = {"request_path_ref": list(replacement)}
+            elif isinstance(node, dict):
+                result = {key: visit(child) for key, child in node.items()}
+            else:
+                result = [visit(child) for child in node]
+            memo[marker] = result
+            return result
+        finally:
+            active.remove(marker)
+    return visit(value)
 
 
 def _physical_body(value: Any, material_registry: Mapping[str, Any]) -> bool:
@@ -301,7 +457,12 @@ def supplied_bindings(encoded_prompt: str | dict[str, Any], all_bindings: Mappin
         values = value if isinstance(value, list) else [value]
         return [item for item in values if isinstance(item, str)]
 
+    collected = set()
     def collect(node: Any) -> None:
+        if isinstance(node, (dict, list)):
+            if id(node) in collected:
+                return
+            collected.add(id(node))
         if isinstance(node, dict):
             evidence_ids = aliases(node.get("evidence_id"))
             accepted_refs = aliases(node.get("accepted_fact_ref"))
@@ -319,7 +480,12 @@ def supplied_bindings(encoded_prompt: str | dict[str, Any], all_bindings: Mappin
 
     # First gather all complete facts so an evidence record can safely refer
     # forward to one elsewhere in this same request.
+    collected_facts = set()
     def collect_facts(node: Any) -> None:
+        if isinstance(node, (dict, list)):
+            if id(node) in collected_facts:
+                return
+            collected_facts.add(id(node))
         if isinstance(node, dict):
             fact_ids = aliases(node.get("fact_id"))
             if (node.get("value") is not None and isinstance(node.get("concept"), str)

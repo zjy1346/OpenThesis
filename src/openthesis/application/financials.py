@@ -14,10 +14,11 @@ import uuid
 
 from ..domain import Company, EvidenceRef, FilingDocument, FinancialFact
 from ..financial_admission import FinancialResearchView, ReadinessLevel
-from ..financial_contracts import CompilationPolicy, GapStageKind
+from ..financial_contracts import CompilationPolicy, GapStageKind, missing_profile_concepts, STATEMENT_FOR
 from ..financial_compiler import CoveragePlanner, concepts_cover_profile
 from ..financial_pipeline import FinancialResearchSnapshot, disclosed_reporting_currency
 from ..financial_taxonomy import FINANCIAL_MAPPING_VERSION, cost_row_mentions
+from ..financial_statement_identity import STATEMENT_MAPPING_VERSION, statement_mapping_affected
 from ..market_financials import FinancialValidation, ValidationStatus
 from ..financial_contracts import FinancialGroupValidation
 from ..financial_recovery import FinancialRecoveryController
@@ -29,6 +30,7 @@ from ..resilience.contracts import RecoveryLimits
 
 
 _FINANCIAL_MAPPING_GENERATION_MARKER = f"financial-mapping:{FINANCIAL_MAPPING_VERSION}"
+_STATEMENT_MAPPING_GENERATION_MARKER = f"statement-mapping:{STATEMENT_MAPPING_VERSION}"
 
 
 def _publication_fact_key(fact):
@@ -48,7 +50,42 @@ def _publication_fact_key(fact):
 def _financial_mapping_generation_id() -> str:
     """Persist the local semantic-mapping dependency with each active head."""
 
-    return f"{uuid.uuid4().hex}:{_FINANCIAL_MAPPING_GENERATION_MARKER}"
+    return f"{uuid.uuid4().hex}:{_STATEMENT_MAPPING_GENERATION_MARKER}:{_FINANCIAL_MAPPING_GENERATION_MARKER}"
+
+
+def validation_recovery_details(subject, filing, dataset):
+    """A concrete source-bound work order, not permission to bypass validation."""
+    groups = [group for group in dataset.validations if tuple(group.identity[:4]) == (
+        filing.accession_number, filing.period_end, filing.fiscal_period, "consolidated")]
+    covered = {fact.concept for group in groups for fact in group.accepted}
+    missing = missing_profile_concepts(covered, CoveragePlanner().plan(subject).required_concepts)
+    rejected = [fact for group in groups for fact in group.quarantined]
+    if not missing and not rejected:
+        return None
+    fields = sorted(set(missing) | {fact.concept for fact in rejected})
+    pages = {fact.source_page for fact in rejected if type(fact.source_page) is int and fact.source_page > 0}
+    statements = {STATEMENT_FOR.get(concept) for concept in missing}
+    for ref in dataset.evidence:
+        if (ref.document_id != filing.document_id or ref.content_hash != filing.content_hash
+                or not ref.evidence_id.startswith("table-structure:") or not ref.locator.startswith("page:")):
+            continue
+        import json
+        try:
+            table = json.loads(ref.excerpt)
+            if table.get("scope") == "consolidated" and table.get("statement") in statements:
+                pages.add(int(ref.locator.split(":", 1)[1]))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    issues = sorted({issue for group in groups for issue in group.issues})
+    return {"pages": tuple(sorted(pages)), "fields": tuple(fields), "diagnostics": {
+        "period_end": filing.period_end, "fiscal_period": filing.fiscal_period,
+        "scope": "consolidated", "missing_core_fields": ",".join(sorted(missing)),
+        "unverified_fields": ",".join(sorted({fact.concept for fact in rejected})),
+        "failure_stage": "validation", "issues": ",".join(issues),
+        "previous_strategy": "positioned-original-candidates",
+        "next_strategy": "replay_saved_text_geometry_and_candidates",
+        "target_location": "source_bound_pages" if pages else "statement_location_unresolved",
+        "model_rerun": "not_automatic", "original_hash": filing.content_hash}}
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +402,18 @@ class OfficialFinancialPreparer:
                     accession_number=filing.accession_number, document_hash=filing.content_hash,
                     stage='filing-parse' if failure.stage in {'parse', 'worker', 'index'} else failure.stage,
                     error_code=failure.code, next_action=next(iter(failed_outcome.next_actions), 'repair_required_official_evidence'))
+            failed_accessions = {failure.accession_number for failure in canonical.source_failures}
+            failed_accessions.update(str(error).split(":download:", 1)[0] for error in errors if ":download:" in str(error))
+            for filing in filings:
+                if (filing.accession_number not in target_accessions or filing.accession_number in failed_accessions
+                        or not filing.local_path or not filing.content_hash):
+                    continue
+                details = validation_recovery_details(subject, filing, canonical)
+                if details is not None:
+                    self.storage.save_financial_recovery_case(run_id=request.run_id, company_cik=storage_key,
+                        accession_number=filing.accession_number, document_hash=filing.content_hash,
+                        stage="filing-validation", error_code="FILING_DATA_QUALITY_FAILED",
+                        next_action="repair_required_official_evidence", **details)
             if publication is not None and publication.get("state") != "stale_generation":
                 failed_accessions = {failure.accession_number for failure in canonical.source_failures}
                 validation_accessions = {
@@ -504,6 +553,7 @@ class OfficialFinancialPreparer:
         # its validated facts/source labels touch either cost family, reparse
         # only that accession even when its parse cache is absent or corrupt.
         pending_mappings.update(self._pending_persisted_cost_mappings(subject, filings))
+        pending_mappings.update(self._pending_persisted_statement_mappings(subject, filings))
         # Having all core fields does not prove that the remaining page plan
         # completed. Keep these sources eligible for checkpointed recovery.
         incomplete_pages = {str(item.get("accession_number", ""))
@@ -526,6 +576,26 @@ class OfficialFinancialPreparer:
                                                CoveragePlanner().plan(subject).required_concepts)
                     for group in view.canonical_dataset.validations)
         }
+
+    def _pending_persisted_statement_mappings(self, subject, filings):
+        """An old, apparently complete cohort cannot bypass corrected roles."""
+        key = subject.cik if subject.market == "US" else subject.security_id
+        snapshot = self.storage.get_financial_research_snapshot(key, include_evidence=True)
+        generations = snapshot.get("generations", {})
+        observations = (*snapshot.get("facts", ()), *snapshot.get("supplemental_facts", ()),
+            *self.storage.get_facts_audit(key))
+        evidence = snapshot.get("evidence", ())
+        pending = set()
+        for filing in filings:
+            if _STATEMENT_MAPPING_GENERATION_MARKER in str(generations.get(filing.accession_number, "")).split(":financial-mapping:")[0]:
+                continue
+            bound_refs = tuple(ref for ref in evidence if isinstance(ref, dict)
+                and ref.get("document_id") == filing.document_id and ref.get("content_hash") == filing.content_hash)
+            rows = tuple(fact for fact in observations if isinstance(fact, dict)
+                and fact.get("accession_number") == filing.accession_number)
+            if statement_mapping_affected(rows, bound_refs):
+                pending.add(filing.accession_number)
+        return pending
 
     def _pending_persisted_cost_mappings(self, subject, filings):
         key = subject.cik if subject.market == "US" else subject.security_id

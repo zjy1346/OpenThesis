@@ -224,6 +224,33 @@ def _agent_role(agent_id: str, role_id: str | None) -> str:
 
 
 def _agent_prompt_bundle(
+    agent_id: str, role_prompt: str, report_language: str, context_json: str,
+    prior_artifacts: dict[str, Any], *, role_id: str | None = None, output_schema: str | None = None,
+) -> tuple[str, str]:
+    """Compile one closed request, rebuilding only a proven cached source lane."""
+    from .research_execution.reference_aliases import RequestReferenceError
+    from .research_execution.request_diagnostics import compilation_diagnostic
+    from .research_execution.source_compiler import source_packet_cache_token, invalidate_source_packet
+    from .research_execution.request_planning import RequestCompilationError
+    token = source_packet_cache_token(context_json, _agent_role(agent_id, role_id), prior_artifacts.get("source_research_lane"))
+    rebuilt = False
+    while True:
+        try:
+            return _compile_agent_prompt_bundle(agent_id, role_prompt, report_language, context_json,
+                prior_artifacts, role_id=role_id, output_schema=output_schema)
+        except RequestReferenceError as error:
+            location = error.reference_location or error.path
+            source_lane = location[:1] in (["research_context"], ["common_core"], ["reading_assignment"])
+            if not rebuilt and source_lane and invalidate_source_packet(token):
+                # No provider has run. Recompile this one existing cache entry
+                # from the same frozen originals; never resend an invalid wire.
+                rebuilt = True
+                continue
+            raise RequestCompilationError(compilation_diagnostic(error, agent_id, context_json,
+                prior_artifacts, rebuilt=rebuilt)) from error
+
+
+def _compile_agent_prompt_bundle(
     agent_id: str,
     role_prompt: str,
     report_language: str,
@@ -244,7 +271,8 @@ def _agent_prompt_bundle(
 
     from .research_execution.source_compiler import compiled_source_package
     packet_context, packet_registry, source_packet, common_core, late_sources, reading_assignment = compiled_source_package(
-        context_json, role, _collect_evidence_ids(prior_artifacts))
+        context_json, role, _collect_evidence_ids(prior_artifacts),
+        reading_lane=prior_artifacts.get("source_research_lane"))
     compiled_sources = (packet_context, packet_registry)
     # Keep the existing material sections and list ordering (which can encode
     # source/role priority). Canonicalize mapping keys only, without dropping
@@ -278,6 +306,10 @@ def _agent_prompt_bundle(
     }
     if late_sources:
         prompt_payload["late_evidence"] = late_sources
+    prompt_payload["reading_assignment"]["request_contract"] = {
+        "optional_output": {"material_requests": [{"evidence_ids": ["concrete frozen source ID or alias"], "topic": "optional explicit disclosure topic",
+            "fields": ["the target section"], "question": "the missing source-bound question"}]},
+        "policy": "Request only necessary unseen originals, not the full library. The host supplies complete source closure and retains completed findings; unavailable evidence remains an explicit gap."}
     if role_id is not None:
         prompt_payload["agent_role"] = role
     if output_schema is not None:
@@ -297,6 +329,21 @@ def _agent_prompt_bundle(
             "Prefer analysis_refs:[{analysis_id,section}] to retain prior findings verbatim. IDs resolve only to current "
             "prior_artifacts paths; the host copies their complete bodies and performs the ordinary source/numeric checks. "
             "Do not rewrite unchanged premises just to fill sections. New conclusions and opposing views still need their own sources.")
+        prompt_payload["task_instructions"] += (
+            "\nDelivery contract: unchanged complete section-named findings will be assembled verbatim by the host. "
+            "Use analysis_refs instead of repeating them. Concentrate output on new executive judgment, thesis, "
+            "invalidation conditions, cross-section contradictions and missing arguments, with source-bound claims. "
+            "Do not shorten the necessary argument or omit contrary evidence to save tokens.")
+    # All inbound paths, including prior findings and late source records,
+    # must follow the same simultaneous source relocation contract.
+    from .research_execution.source_compiler import relocate_source_paths
+    material_delivery = prior_artifacts.get("material_request_delivery")
+    if isinstance(material_delivery, dict):
+        prompt_payload["material_request_delivery"] = deepcopy(material_delivery)
+        prompt_payload["task_instructions"] += (
+            "\nThis is a source-question continuation. Return ONLY {section_patches:{target_field:complete_answer},claims:[]}, "
+            "for the exact fields in material_request_delivery. Preserve already completed findings; do not rewrite unrelated sections. "
+            "Use the newly supplied complete originals and contrary evidence. You may request another concrete unseen source if necessary.")
     delivery = prior_artifacts.get("sectional_delivery")
     if (role == "research-synthesizer" and output_schema == "research-report-section-v1"
             and isinstance(delivery, dict)):
@@ -316,12 +363,24 @@ def _agent_prompt_bundle(
         prompt_payload["assigned_research_obligations"] = [item for item in obligation_production_plan()
             if any(path.split(".")[0] in sections for path in item["report_paths"])]
         from .research_execution.repair_context import repair_context
+        prompt_payload = relocate_source_paths(prompt_payload)
         narrowed = repair_context(json.dumps(prompt_payload, ensure_ascii=False), tuple(sections))
         prompt_payload = {**narrowed, **{key: prompt_payload[key] for key in (
             "agent", "task_instructions", "assigned_research_obligations", "sectional_delivery", "output_schema")}}
-    from .research_execution.reference_aliases import encode_references, reference_aliases
+    from .research_execution.reference_aliases import encode_references, reference_aliases, supplied_bindings, RequestReferenceError
+    prompt_payload = relocate_source_paths(prompt_payload)
+    all_bindings = reference_aliases(context_json)
+    encoded_payload = encode_references(prompt_payload, all_bindings)
+    try:
+        physical_bindings = supplied_bindings(encoded_payload, all_bindings)
+    except RequestReferenceError as error:
+        from .research_execution.request_diagnostics import request_outline
+        error.request_snapshot_sha256 = hashlib.sha256(json.dumps(encoded_payload,
+            ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+        error.request_outline = request_outline(encoded_payload)
+        raise
     user_prompt = json.dumps(
-        encode_references(prompt_payload, reference_aliases(context_json)),
+        encode_references(prompt_payload, physical_bindings),
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -360,31 +419,50 @@ class ResearchContext:
     material_issues: list[dict[str, Any]] = field(default_factory=list)
     research_as_of: str = ""
     source_reader_roles: tuple[str, ...] = ()
+    source_reader_stages: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        from .financial_metric_policy import evidence_metric_policy, apply_metric_policy, metric_profile
+        profile_id = metric_profile(self.company)
+        self.evidence = evidence_metric_policy(self.evidence, profile_id=profile_id)
+        self.metrics = apply_metric_policy(self.metrics, profile_id=profile_id)
+        self.interim_metrics = apply_metric_policy(self.interim_metrics, profile_id=profile_id)
 
     def compact_json(self) -> str:
-        return json.dumps(
-            {
+        return json.dumps(self.compact_payload(), ensure_ascii=False, separators=(",", ":"))
+
+    def compact_payload(self) -> dict[str, Any]:
+        from .financial_metric_policy import apply_metric_policy, metric_profile, METRIC_POLICY_VERSION, BANK_INAPPLICABLE
+        profile_id = metric_profile(self.company)
+        return {
                 "company": self.company.to_dict(),
                 "facts": self.facts,
-                "metrics": self.metrics,
-                "latest_interim_metrics": self.interim_metrics,
+                "metrics": apply_metric_policy(self.metrics, profile_id=profile_id),
+                "latest_interim_metrics": apply_metric_policy(self.interim_metrics, profile_id=profile_id),
+                **({"metric_policy": {"profile_id": "bank", "version": METRIC_POLICY_VERSION,
+                    "not_applicable": list(BANK_INAPPLICABLE),
+                    "instruction": "Raw OCF and CapEx are source observations, not bank distributable cash or earnings-quality tests. Do not apply OCF minus CapEx, cash conversion or earnings-cash-flow divergence as bank valuation/quality measures. Debt to assets is not a regulatory capital ratio. NIM, NPL and regulatory capital metrics require their own verified disclosures; do not infer absent bank-specific metrics."}}
+                    if profile_id == "bank" else {}),
                 "evidence": self.evidence,
                 "valuation": self.valuation,
                 "market_snapshot": self.market_snapshot,
                 "research_as_of": self.research_as_of,
                 **({"source_reader_roles": list(self.source_reader_roles)} if self.source_reader_roles else {}),
+                **({"source_reader_stages": list(self.source_reader_stages)} if self.source_reader_stages else {}),
                 "valuation_gaps": self.valuation_gaps(),
                 "repair_observations": self.repair_observations,
                 "issues": self.material_issues,
                 **({"financial_period_coverage": self.financial_period_coverage}
                    if self.financial_period_coverage else {}),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        }
 
     def valuation_gaps(self) -> dict[str, Any]:
         """Host-owned missing inputs; None is not permission to guess CapEx."""
+        from .financial_metric_policy import metric_profile
+        if metric_profile(self.company) == "bank":
+            return {"status": "not_applicable", "reasons": ["bank_industry_not_applicable"],
+                    "available_financial_inputs": [],
+                    "instruction": "Ordinary-company FCF valuation is not applicable to banks. This is not a missing-data request; do not backfill a cash-flow base. Raw OCF/CapEx remain disclosed observations."}
         latest = max((row for row in self.metrics if isinstance(row, dict)), key=lambda row: str(
             row.get("period_end") or row.get("end_date") or row.get("year") or row.get("fiscal_year") or ""), default={})
         status = str((self.valuation or {}).get("status") or "not_calculated")
@@ -426,6 +504,7 @@ class StageMaterialManifest:
             "exact_duplicates_removed": self.exact_duplicates_removed,
             "mode": self.mode,
             "partition_count": self.partition_count,
+            "coverage_basis": "host_inventory_not_actual_model_reading; see physical source_reading_coverage",
         }
 
 
@@ -434,7 +513,18 @@ def _deduplicated_stage_context(
 ) -> tuple[str, StageMaterialManifest]:
     """Remove exact repeated records while preserving every unique payload."""
 
-    context = json.loads(context_json)
+    from .research_execution.source_compiler import FrozenSourceContext, read_source_context
+    if isinstance(context_json, FrozenSourceContext):
+        def dedup():
+            return _deduplicate_source_context(context_json)
+        compact, evidence_ids, removed = context_json.once("deduplicated-sources", dedup)
+        return compact, StageMaterialManifest(stage, compact.sha256, evidence_ids, removed, mode, partition_count)
+    return _deduplicate_source_context(context_json, stage, mode=mode, partition_count=partition_count)
+
+
+def _deduplicate_source_context(context_json, stage=None, *, mode="direct", partition_count=1):
+    from .research_execution.source_compiler import FrozenSourceContext, read_source_context
+    context = read_source_context(context_json)
     evidence = context.get("evidence") if isinstance(context, dict) else None
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -452,8 +542,8 @@ def _deduplicated_stage_context(
                 continue
             seen.add(digest)
             unique.append(item)
-        context["evidence"] = unique
-    compact = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
+        if removed or len(unique) != len(evidence):
+            context = {**context, "evidence": unique}
     evidence_ids = tuple(
         dict.fromkeys(
             str(item.get("evidence_id"))
@@ -461,6 +551,9 @@ def _deduplicated_stage_context(
             if item.get("evidence_id")
         )
     )
+    if isinstance(context_json, FrozenSourceContext):
+        return (context_json if context is context_json.snapshot else FrozenSourceContext(context)), evidence_ids, removed
+    compact = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
     return compact, StageMaterialManifest(
         stage=stage,
         input_sha256=hashlib.sha256(compact.encode("utf-8")).hexdigest(),
@@ -473,6 +566,24 @@ def _deduplicated_stage_context(
 
 def _stage_input_digest(context_json: str, prior_artifacts: dict[str, Any], *,
                         role_id: str | None = None, output_schema: str | None = None) -> str:
+    from .research_execution.source_compiler import FrozenSourceContext
+    if isinstance(context_json, FrozenSourceContext):
+        # Same sorted JSON identity, streamed without re-parsing/encoding the
+        # original material at every stage.
+        payload = {"prior_artifacts": prior_artifacts}
+        if role_id is not None:
+            payload["agent_role"] = role_id
+        if output_schema is not None:
+            payload["output_schema"] = output_schema
+        value = hashlib.sha256(b"{")
+        for index, key in enumerate(sorted({"context", *payload})):
+            if index:
+                value.update(b",")
+            value.update(f'"{key}":'.encode())
+            value.update((context_json if key == "context" else json.dumps(payload[key], ensure_ascii=False,
+                sort_keys=True, separators=(",", ":"), allow_nan=False)).encode())
+        value.update(b"}")
+        return value.hexdigest()
     payload = {"context": json.loads(context_json), "prior_artifacts": prior_artifacts}
     if role_id is not None:
         payload["agent_role"] = role_id
@@ -1272,7 +1383,7 @@ def _supported_research_fields(
         if node.get("validation_state") != "partial" or not isinstance(node.get("body"), str):
             continue
         parts = [node["body"], *independent_sentences(node["body"])]
-        if any(content_digest(part) in numeric_gaps for part in parts):
+        if not node.get("purpose_spans") and any(content_digest(part) in numeric_gaps for part in parts):
             node["issue_code"] = "CONTENT_NUMERIC_PREMISE_UNVERIFIED"
     audit["local_numeric_gaps"] = list(numeric_gaps.values())
     return safe, audit
@@ -1567,7 +1678,7 @@ def _synthesis_prior_artifacts(
     }
     evidence_ids = _collect_evidence_ids(values)
     values["source_evidence_ids"] = evidence_ids
-    return _lossless_synthesis_value(values)
+    return _lossless_synthesis_value(values, _path=("prior_artifacts",))
 
 
 def _synthesis_lineage(
@@ -1897,36 +2008,39 @@ def _isolate_unknown_evidence_references(
     return visit(value), list(dict.fromkeys(isolated))
 
 
-def _lossless_synthesis_value(value: Any, _seen: set[int] | None = None) -> Any:
-    """Copy JSON-like synthesis data without lossy size-based truncation."""
-    seen = _seen if _seen is not None else set()
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        if id(value) in seen:
-            return "[cyclic synthesis value]"
-        seen.add(id(value))
-        try:
-            return [_lossless_synthesis_value(item, seen) for item in value]
-        finally:
-            seen.remove(id(value))
-    if isinstance(value, tuple):
-        return [_lossless_synthesis_value(item, seen) for item in value]
-    if isinstance(value, dict):
-        if id(value) in seen:
-            return "[cyclic synthesis value]"
-        seen.add(id(value))
-        try:
-            return {
-                str(key): _lossless_synthesis_value(item, seen)
-                for key, item in value.items()
-                if not str(key).startswith("_") and key not in {"raw_response", "prompt", "trusted_channels"}
-            }
-        finally:
-            seen.remove(id(value))
-    return value
+def _lossless_synthesis_value(value: Any, _seen: set[int] | None = None, *,
+                              _path: tuple = (), _references: bool = True) -> Any:
+    """Acyclic shared objects stay shared on the wire, not only in deepcopy.
+
+    Build each Python node once, then use the existing same-request path
+    protocol. A genuine cycle is a separate diagnostic, never a clipped
+    readable sibling. Paths are relative to this value until request binding.
+    """
+    active = set(_seen or ())
+    memo = {}
+    def copy_node(item):
+        if not isinstance(item, (dict, list, tuple)):
+            return item
+        marker = id(item)
+        if marker in active:
+            return {"synthesis_reference_error": "cyclic_object_graph"}
+        if marker in memo:
+            return memo[marker]
+        active.add(marker)
+        if isinstance(item, dict):
+            result = {str(key): copy_node(child) for key, child in item.items()
+                      if (not str(key).startswith("_") or key in {
+                          "_verification_state", "_verified_claim_count", "_section_validation"})
+                      and key not in {"raw_response", "prompt", "trusted_channels",
+                                      "stage_system_metadata", "stage_response_diagnostics"}}
+        else:
+            result = [copy_node(child) for child in item]
+        active.remove(marker)
+        memo[marker] = result
+        return result
+    from .research_materials import intern_request_values
+    copied = copy_node(value)
+    return intern_request_values(copied, path=_path) if _references else copied
 
 
 def _synthesis_repair_input(
@@ -1951,17 +2065,17 @@ def _synthesis_repair_input(
         "scenarios": forecast,
         "claims": {"dossier": dossier, "growth": growth, "counter_analysis": skeptic, "forecast": forecast},
     }
-    context = {field: _lossless_synthesis_value(stage_by_field[field])
+    context = {field: _lossless_synthesis_value(stage_by_field[field], _references=False)
                for field in fields if field in stage_by_field}
     if not context:
-        context = {"base_analyses": _lossless_synthesis_value(dossier)}
+        context = {"base_analyses": _lossless_synthesis_value(dossier, _references=False)}
     result = {
         "repair_sections": fields,
         "section_context": context,
         "repair_schema": {"type": "object", "required": ["section_patches"], "properties": {"section_patches": {"type": "object", "only": fields}}},
         "repair_instruction": "Return only {section_patches: {...}} for the listed sections. Preserve evidence IDs and do not invent evidence.",
     }
-    return result
+    return _lossless_synthesis_value(result, _path=("prior_artifacts",))
 
 
 def _section_patch_from_output(output: Any, fields: list[str]) -> dict[str, Any]:
@@ -1974,7 +2088,7 @@ def _section_patch_from_output(output: Any, fields: list[str]) -> dict[str, Any]
         for key in fields
         if isinstance(source, dict) and key in source and not str(key).startswith("_")
     }
-    return _lossless_synthesis_value(patches)
+    return _lossless_synthesis_value(patches, _references=False)
 
 
 def _response_diagnostics(payload: Any) -> dict[str, Any]:
@@ -1991,6 +2105,7 @@ def _response_diagnostics(payload: Any) -> dict[str, Any]:
         "invalid_shape",
         "provider_error",
         "context_budget_exceeded",
+        "request_compilation_failed",
     }
     parse_error_class = error if isinstance(error, str) and error in known_errors else (
         "unknown_parse_error"
@@ -2009,6 +2124,9 @@ def _response_diagnostics(payload: Any) -> dict[str, Any]:
     if parse_error_class == "provider_error":
         diagnostics["provider_error_code"] = str(payload.get("_provider_error_code") or "MODEL_ERROR")
         diagnostics["provider_retryable"] = bool(payload.get("_provider_retryable"))
+    if parse_error_class == "request_compilation_failed":
+        diagnostics.update(code="MODEL_REQUEST_COMPILATION_FAILED", processing_phase="request_compilation",
+                           not_sent=True, response_received=False)
     return diagnostics
 
 
@@ -2073,6 +2191,7 @@ class ResearchWorkflow:
         forecast: dict[str, Any],
         *,
         run: ResearchRun | None = None,
+        frozen_context_json: str | None = None,
     ) -> dict[str, Any]:
         """Produce synthesis from complete material using adaptive requests.
 
@@ -2081,14 +2200,27 @@ class ResearchWorkflow:
         an input-context refusal or certified complete because keys exist.
         """
         projected = _synthesis_prior_artifacts(dossier, growth, skeptic, forecast)
-        context_json = context.compact_json()
-        result = self._run_agent_adaptive(
-            "research-synthesizer",
-            "prompts/research-synthesizer.md",
-            context_json,
-            projected,
-            run=run,
-        )
+        context_json = frozen_context_json if frozen_context_json is not None else context.compact_json()
+        provider = self._stage_budget_provider("research-synthesizer")
+        capacity = provider_context_capability(provider)
+        from .research_execution.input_budget import input_measurement
+        prompts = _agent_prompt_bundle("research-synthesizer", self.pack.prompt("prompts/research-synthesizer.md"),
+            self.report_language, context_json, projected)
+        measured = input_measurement(provider, *prompts)
+        physical_overflow = capacity.explicit_max_input_bytes is not None and measured["input_bytes"] > capacity.explicit_max_input_bytes
+        token_overflow = measured["exact"] and capacity.context_is_declared and measured["tokens"] > capacity.available_input_tokens
+        known_window_plan = capacity.context_is_declared and measured["tokens"] > capacity.available_input_tokens
+        result = {"claims": [], "_output_incomplete": {"state": "pending",
+            "code": "MODEL_CONTEXT_SECTION_DECOMPOSITION", "trigger": "closed_section_dependencies",
+            "counting_mode": measured["method"]}}
+        if not (physical_overflow or token_overflow or known_window_plan):
+            try:
+                result = self._run_agent_adaptive("research-synthesizer", "prompts/research-synthesizer.md",
+                    context_json, projected, run=run, sectional_synthesis_owner=True)
+            except ProviderError as exc:
+                if exc.code not in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE"}:
+                    raise
+                result["_output_incomplete"]["trigger"] = "confirmed_provider_rejection_section_decomposition"
         from .research_execution.model_output import response_refused
         if response_refused(result) or result.get("_response_error") == "provider_refusal":
             return result
@@ -2097,66 +2229,181 @@ class ResearchWorkflow:
         if finish_reason in {"length", "max_tokens", "max_output_tokens"}:
             result = {**result, "_output_incomplete": {
                 "code": "MODEL_OUTPUT_BUDGET_EXHAUSTED", "state": "pending"}}
+        from .research_execution.analysis_references import resolve_references
+        result = resolve_references(result, projected, assemble_existing=True)
         if result.get("_output_incomplete"):
             result = self._recover_synthesis_output_sections(context_json, projected, result, run=run)
-        from .research_execution.analysis_references import resolve_references
-        result = resolve_references(result, projected)
+        result = resolve_references(result, projected, assemble_existing=True)
         return result
 
     def _recover_synthesis_output_sections(self, context_json: str, projected: dict[str, Any],
             original: dict[str, Any], *, run: ResearchRun | None = None) -> dict[str, Any]:
-        """One semantic work item per missing section; preserve closed content.
+        """Deliver a shared dependency closure once; refine only unfinished work."""
+        from collections import deque
+        from .research_execution.analysis_references import resolve_references
+        from .research_execution.executor import dependency_findings
+        from .research_execution.model_output import response_refused
+        from .report_readiness import section_has_substance
 
-        Missing objects are named before dispatch. An open partial object is
-        retained for inspection, not overwritten by a guessed continuation.
-        Each source-bound section is journaled separately, not squeezed into
-        one fixed whole-report output allowance. No unchanged section repeats.
-        """
         sections = list(dict.fromkeys([*(key for key in REQUIRED_REPORT_SECTIONS if key != "claims"),
             *sorted({path.split(".")[0] for item in ResearchCoverageContract.obligations
                      for path in item.paths if path.split(".")[0] != "claims"})]))
         result = deepcopy(original)
-        from .research_execution.executor import dependency_findings
-        from .report_readiness import section_has_substance
         prior_findings = dependency_findings(original)
-        issues = original.get("_output_normalization_issues", [])
-        open_paths = [item.get("path", "") for item in issues if isinstance(item, dict)
-                      and item.get("code") == "MODEL_OUTPUT_CONTAINER_INCOMPLETE"]
-        states = [{"section": section, "complete": section_has_substance(section, original.get(section))
-                   and not any(path.startswith("$." + section) for path in open_paths)} for section in sections]
-        missing = [state["section"] for state in states if not state["complete"]
-            and not any(path.startswith("$." + state["section"]) for path in open_paths)]
-        parts = []
-        for missing_section in missing:
+
+        def open_containers(candidate):
+            return {str(item.get("path") or "").removeprefix("$.").split(".")[0].split("[")[0]
+                    for item in candidate.get("_output_normalization_issues", [])
+                    if isinstance(item, dict) and item.get("code") == "MODEL_OUTPUT_CONTAINER_INCOMPLETE"}
+
+        original_open = open_containers(original)
+        states = {}
+        for section in sections:
+            obligations = [item for item in ResearchCoverageContract.obligations if section in item.paths]
+            state = {"section": section, "complete": section_has_substance(section, original.get(section))
+                     and section not in original_open, "obligations": [item.obligation_id for item in obligations]}
+            if not state["complete"] and obligations:
+                alternatives = []
+                for obligation in obligations:
+                    for path in obligation.paths:
+                        root, sep, tail = path.partition(".")
+                        value = original.get(root)
+                        if sep and root not in original_open and isinstance(value, dict) and section_has_substance(section, value.get(tail)):
+                            alternatives.append(path)
+                            break
+                if len(alternatives) == len(obligations):
+                    state.update(complete=True, covered_by=alternatives)
+            states[section] = state
+        missing = tuple(section for section, state in states.items() if not state["complete"])
+        for section in sections:
+            states[section]["reason"] = ("existing_obligation_path" if states[section].get("covered_by") else
+                "received_closed_candidate" if states[section]["complete"]
+                else "open_container" if section in original_open else "missing_substantive_content")
+        original_sha = recovery_digest(original)
+        work_id = recovery_digest({
+            "schema": "research-section-delivery-v3",
+            "context_sha256": hashlib.sha256(context_json.encode()).hexdigest(),
+            "upstream_sha256": recovery_digest(projected), "candidate_sha256": original_sha,
+            "model": self.model_config.public_id, "language": self.report_language,
+            "prompt": self.pack.prompt("prompts/research-synthesizer.md"), "targets": missing,
+        })
+        groups = deque([missing] if missing else [])
+        parts, attempts = [], []
+        route_hold = None
+        empty_length_groups = set()
+
+        def persist():
+            if run is not None:
+                self._save(run, "synthesis-section-work", "Synthesis delivery work",
+                    {"work_id": work_id, "original_candidate_sha256": original_sha,
+                     "pending_groups": list(groups), "sections": list(states.values()),
+                     "attempts": attempts, "route_hold": route_hold},
+                    agent_id="host-synthesis-delivery")
+
+        def refine(targets):
+            if len(targets) > 1:
+                middle = len(targets) // 2
+                groups.extendleft((targets[middle:], targets[:middle]))
+
+        persist()
+        while groups:
             self._check_cancelled()
+            group = groups.popleft()
+            # The existing durable request journal adopts receipts for this
+            # exact group on restart before it can issue another submission.
+            # Replay the same work order, including deterministic subdivisions,
+            # so a crash before assembling the candidate cannot re-charge it.
+            group_id = recovery_digest({"work": work_id, "sections": group})
+            attempt = {"group_id": group_id, "targets": list(group), "added": [],
+                       "reused": [section for section in sections if states[section]["complete"]]}
+            attempts.append(attempt)
             try:
-                part = self._run_agent_adaptive("research-synthesizer-missing-" + missing_section,
+                part = self._run_agent_adaptive("research-synthesizer-missing-" + group_id[:16],
                     "prompts/research-synthesizer.md", context_json,
                     {**projected, "received_synthesis_findings": prior_findings,
-                     "sectional_delivery": {"schema": "research-section-delivery-v2-targeted",
-                         "sections": [missing_section], "all_sections": sections}},
-                    run=run, role_id="research-synthesizer", output_schema="research-report-section-v1")
-                from .research_execution.model_output import response_refused
-                meta = part.get("_response_meta", {})
-                finished = (not part.get("_response_error") and not part.get("_output_incomplete")
-                    and not response_refused(part) and str(meta.get("finish_reason", "")).casefold()
-                    not in {"length", "max_tokens", "max_output_tokens"})
-                parts.append(part)
-                for state in states:
-                    section = state["section"]
-                    if section == missing_section:
-                        if part.get(section) not in (None, "", [], {}):
-                            result[section] = deepcopy(part[section])
-                        state.update(complete=finished and section_has_substance(section, part.get(section)),
-                                     candidate_sha256=recovery_digest(part))
+                     "sectional_delivery": {"schema": "research-section-delivery-v3",
+                         "sections": list(group), "all_sections": sections}},
+                    run=run, role_id="research-synthesizer", output_schema="research-report-section-v1",
+                    sectional_synthesis_owner=len(group) > 1, allow_material_questions=False)
             except (ProviderError, SynthesisContextLimitError) as exc:
-                for state in states:
-                    if state["section"] == missing_section:
-                        state["code"] = exc.code
+                attempt["code"] = exc.code
+                for section in group:
+                    states[section]["code"] = exc.code
+                if exc.code in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE"} or isinstance(exc, SynthesisContextLimitError):
+                    refine(group)
+                else:
+                    # An unreachable/refused/unknown route is not made safe by
+                    # changing the section name. Keep all remaining work open.
+                    route_hold = exc.code
+                persist()
+                if route_hold:
+                    break
+                continue
+
+            part = resolve_references(part, projected)
+            meta = part.get("_response_meta")
+            finish = str(meta.get("finish_reason") or "").casefold() if isinstance(meta, dict) else ""
+            incomplete = part.get("_output_incomplete")
+            length = (finish in {"length", "max_tokens", "max_output_tokens"}
+                or isinstance(incomplete, dict) and incomplete.get("code") == "MODEL_OUTPUT_BUDGET_EXHAUSTED")
+            refused = response_refused(part) or part.get("_response_error") == "provider_refusal"
+            open_sections = open_containers(part)
+            structurally_closed = part.get("structured_output_valid") is not False and not part.get("_response_error")
+            if length and open_sections and not refused:
+                # The normalizer located the unfinished containers. Their
+                # closed siblings are valid delivery candidates, not proof.
+                structurally_closed = True
+            part_sha = recovery_digest(part)
+            received_target = False
+            if not refused:
+                parts.append(part)
+                for section in group:
+                    body = part.get(section)
+                    if not section_has_substance(section, body):
+                        continue
+                    received_target = True
+                    closed = structurally_closed and section not in open_sections and (
+                        not length or part.get("structured_output_valid") is True or bool(open_sections))
+                    if closed or not section_has_substance(section, result.get(section)):
+                        result[section] = deepcopy(body)
+                    if closed:
+                        states[section].pop("code", None)
+                        states[section].update(complete=True, candidate_sha256=part_sha, reason="received_closed_candidate")
+                        attempt["added"].append(section)
+            unfinished = tuple(section for section in group if not states[section]["complete"])
+            if refused:
+                route_hold = "MODEL_PROVIDER_REFUSAL"
+            elif length:
+                # A strict split of the still open targets, never another
+                # identical submission or a rewrite of the closed siblings.
+                no_target_after_refinement = not received_target and any(
+                    set(group) < previous for previous in empty_length_groups)
+                if no_target_after_refinement:
+                    route_hold = "MODEL_SECTION_DELIVERY_NO_PROGRESS"
+                elif len(unfinished) > 1:
+                    refine(unfinished)
+                elif unfinished and unfinished != group:
+                    groups.appendleft(unfinished)
+                if not received_target:
+                    empty_length_groups.add(frozenset(group))
+                attempt["code"] = "MODEL_OUTPUT_BUDGET_EXHAUSTED"
+            elif part.get("_response_error") or not attempt["added"]:
+                route_hold = "MODEL_SECTION_DELIVERY_NO_PROGRESS"
+            if route_hold:
+                attempt["code"] = route_hold
+            for section in unfinished:
+                states[section]["code"] = attempt.get("code", "MODEL_SECTION_DELIVERY_INCOMPLETE")
+            persist()
+            if route_hold:
+                break
+
         result["claims"] = _collect_stage_claims(original, *parts)
-        complete = bool(missing) and bool(states) and all(item["complete"] for item in states)
-        result["_sectional_delivery"] = {"schema": "research-section-delivery-v1", "complete": complete,
-            "original_candidate_sha256": recovery_digest(original), "sections": states}
+        complete = bool(missing) and all(item["complete"] for item in states.values())
+        result["_sectional_delivery"] = {"schema": "research-section-delivery-v3", "complete": complete,
+            "original_candidate_sha256": original_sha, "work_id": work_id,
+            "sections": list(states.values()), "attempts": attempts}
+        if route_hold:
+            result["_sectional_delivery"]["route_hold"] = route_hold
         if complete:
             # This is a host-assembled candidate, not the original truncated
             # provider response. Never fabricate a supplier finish/usage receipt.
@@ -2383,6 +2630,50 @@ class ResearchWorkflow:
             self, self._production_graph_bindings(), run, context, evidence, notify, publication
         )
 
+    def _valuation_for_metrics(self, company, metrics, valuation_inputs, market_snapshot):
+        """Recompute from frozen market/assumptions, never refetch a price."""
+        from .financial_metric_policy import metric_profile
+        from .financials import fcf_sensitivity_analysis
+        valuation = None
+        industry_profile = metric_profile(company)
+        snapshot = market_snapshot or {}
+        currency = str(snapshot.get("valuation_currency") or snapshot.get("currency", ""))
+        status = str(snapshot.get("status", "UNRESOLVED" if market_snapshot else "MANUAL")).upper()
+        value = snapshot.get("equity_market_value")
+        if value is None:
+            value = (valuation_inputs or {}).get("equity_market_value", (valuation_inputs or {}).get("market_cap"))
+        if industry_profile == "bank" or company.industry_support == "financial_beta" and valuation_inputs:
+            valuation = {"status": "not_applicable", "currency": company.reporting_currency,
+                "reason": self._report_text("金融机构 Beta 暂不使用标准自由现金流反向 DCF。",
+                    "Financials Beta does not apply the standard free-cash-flow reverse DCF.")}
+        elif valuation_inputs and (not company.reporting_currency or status not in {"VERIFIED", "MANUAL"}):
+            valuation = {"status": "market_snapshot_unavailable", "currency": currency or company.reporting_currency,
+                "error_code": str(snapshot.get("error_code") or "MARKET_SNAPSHOT_UNAVAILABLE"),
+                "reason": self._report_text("行情快照存在冲突、陈旧或不可用状态；未执行权益反向 DCF。",
+                    "Reverse DCF was skipped because the market snapshot is conflicted, stale, or unavailable.")}
+        elif valuation_inputs and currency and currency != company.reporting_currency:
+            valuation = {"status": "currency_mismatch", "currency": currency,
+                "reporting_currency": company.reporting_currency,
+                "reason": self._report_text("手动市值币种与财报币种不同；未提供汇率，因此不执行反向 DCF。",
+                    "The manual market-cap currency differs from the reporting currency; reverse DCF was skipped because no FX rate was supplied.")}
+        elif valuation_inputs and _valuation_money_is_positive(value, currency=currency or company.reporting_currency):
+            money = _valuation_money(value, currency=currency or company.reporting_currency,
+                source_id=str(snapshot.get("source_id") or snapshot.get("source", "")),
+                as_of=str(snapshot.get("as_of", "")))
+            valuation = reverse_dcf_analysis(metrics, money, valuation_inputs.get("discount_rate", .10),
+                valuation_inputs.get("terminal_growth", .03), int(valuation_inputs.get("horizon_years", 5)),
+                market_as_of=str(snapshot.get("as_of", "")), currency=company.reporting_currency, require_typed=True)
+            valuation["currency"] = company.reporting_currency
+            valuation["market_snapshot"] = dict(snapshot)
+        if industry_profile != "bank" and company.industry_support != "financial_beta":
+            sensitivity = fcf_sensitivity_analysis(metrics, currency=company.reporting_currency,
+                discount_rate=(valuation_inputs or {}).get("discount_rate", .10),
+                terminal_growth=(valuation_inputs or {}).get("terminal_growth", .03),
+                horizon_years=(valuation_inputs or {}).get("horizon_years", 5))
+            valuation = {**(valuation or {"status": "missing_market_price", "currency": company.reporting_currency}),
+                "intrinsic_analysis": sensitivity}
+        return valuation
+
     def _execute_official_model_graph(
         self,
         context: ResearchContext,
@@ -2394,10 +2685,124 @@ class ResearchWorkflow:
         notify: ProgressCallback | None = None,
         stage_targets: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, StageResult], ResearchPublicationSnapshot]:
-        return execute_official_model_graph(
+        graph, publication = execute_official_model_graph(
             self, self._production_graph_bindings(), context, run, artifacts,
             publication=publication, resume_target=resume_target, notify=notify, stage_targets=stage_targets,
         )
+        # Source-only prefetch and zero-provider revalidation must never turn
+        # into a new full research request. Normal research can consume hints
+        # already returned by its financial readers without a repair API call.
+        if stage_targets is not None or getattr(self, "local_revalidation", False):
+            return graph, publication
+        from .application.model_financial_repair import repair_model_financials, MODEL_FINANCIAL_REPAIR_VERSION
+        from .financial_statement_identity import STATEMENT_MAPPING_VERSION
+        proposals = []
+        for stage_id, result in graph.items():
+            role = self.stage_registry.get(stage_id).role
+            body = result.candidate
+            if (role in {"financial-analyst", "accounting-risk-analyst"} and isinstance(body, dict)
+                    and body.get("structured_output_valid", True) is True and not body.get("_response_error")
+                    and isinstance(body.get("financial_repairs"), list)):
+                proposals.extend(body["financial_repairs"])
+        if not proposals or not context.repair_observations:
+            return graph, publication
+        # A new financial input digest must not bypass an unresolved request
+        # under the old digest. Defer this automatic cycle until the existing
+        # run's remote result has been reconciled through its normal workflow.
+        with self.storage.connect() as db:
+            unresolved = db.execute("SELECT 1 FROM model_request_journal WHERE run_id=? "
+                "AND state IN ('running','unknown') AND candidate_json IS NULL LIMIT 1", (run.run_id,)).fetchone()
+        if unresolved is not None:
+            return graph, publication
+        repair_digest = recovery_digest({"version": MODEL_FINANCIAL_REPAIR_VERSION,
+            "mapping": STATEMENT_MAPPING_VERSION, "proposals": proposals,
+            "originals": context.repair_observations})
+        if any(item.get("artifact_type") == "model-financial-repair"
+               and item.get("content", {}).get("repair_digest") == repair_digest
+               for item in self.storage.get_artifacts(run.run_id)):
+            return graph, publication
+        self._check_cancelled()
+        try:
+            repaired = repair_model_financials(self.storage, context.company, context.repair_observations,
+                proposals, expected_generations=run.data_snapshot.get("financial_generations"),
+                requested_annual_count=run.research_configuration.get("annual_history_years"),
+                cancel_check=self.cancel_check)
+        except CancelledError as exc:
+            raise ResearchCancelled(run_id=run.run_id) from exc
+        self._save(run, "model-financial-repair", self._report_text("原件纠错复核", "Original-cell repair review"),
+            {"repair_digest": repair_digest, "adopted_count": repaired.adopted_count,
+             "proposals": proposals,
+             "before_generations": dict(run.data_snapshot.get("financial_generations", {})),
+             "after_generations": dict(repaired.snapshot["generations"]) if repaired.snapshot is not None else None,
+             "diagnostics": list(repaired.diagnostics), "repair_provider_calls": 0,
+             "affected_analysis_may_require_new_requests": bool(repaired.adopted_count),
+             "policy": MODEL_FINANCIAL_REPAIR_VERSION}, agent_id="original-cell-repair")
+        if not repaired.adopted_count or repaired.view is None or repaired.snapshot is None:
+            return graph, publication
+        profile = repaired.view.profile
+        context.facts = list(repaired.view.fact_dicts)
+        context.metrics, context.interim_metrics = list(profile.metrics), list(profile.interim_metrics)
+        context.financial_period_coverage = dict(profile.period_coverage)
+        from .financial_metric_policy import metric_profile
+        if ("valuation_inputs" in run.research_configuration or context.valuation is None
+                or metric_profile(context.company) == "bank"):
+            context.valuation = self._valuation_for_metrics(context.company, context.metrics,
+                run.research_configuration.get("valuation_inputs"), context.market_snapshot)
+        else:
+            # A legacy run may lack frozen DCF assumptions. Do not silently
+            # substitute today's defaults or retain an old cash-flow result.
+            context.valuation = {"status": "financial_inputs_changed", "currency": context.company.reporting_currency,
+                "reason": self._report_text("财务原件已修复，但历史估值参数未冻结；旧估值已停用，需重新确认估值参数。",
+                    "Financial inputs were repaired but the historical valuation assumptions were not frozen; the old valuation is disabled pending confirmation.")}
+        source_records = tuple(ref.to_dict() for ref in profile.source_evidence)
+        originals = [item for item in context.evidence if item.get("kind") != "financial_fact"]
+        context.evidence = [*build_fact_evidence(context.facts, source_records=source_records), *originals]
+        # Reapply the bank tag on replacement evidence exactly as __post_init__
+        # does; new facts must not reopen industrial formulas for banks.
+        if metric_profile(context.company) == "bank":
+            for record in context.evidence:
+                if record.get("kind") == "financial_fact":
+                    record["metric_profile_id"] = "bank"
+        from .application.research_snapshot import financial_semantics_digest
+        run.data_snapshot.update({"financial_facts_sha256": recovery_digest(context.facts),
+            "financial_semantics_sha256": financial_semantics_digest(context.facts),
+            "financial_fact_count": len(context.facts),
+            "financial_fact_ids_sha256": recovery_digest(sorted(item["fact_id"] for item in context.facts)),
+            "financial_generations": dict(repaired.snapshot["generations"]),
+            "model_financial_repair": {"version": MODEL_FINANCIAL_REPAIR_VERSION,
+                "repair_digest": repair_digest, "adopted_count": repaired.adopted_count}})
+        # Bind the actual changed inputs using the same report-head CAS. Do
+        # not let a snapshot recapture erase a concurrent publisher's guard.
+        publication = self.storage.begin_research_publication(run, expected=publication)
+        self._save(run, "deterministic-financial-summary", self._report_text("确定性财务概览", "Deterministic Financial Overview"),
+            {"company": context.company.to_dict(), "metrics": context.metrics,
+             "interim_metrics": context.interim_metrics, "evidence": context.evidence,
+             "repair_observations": context.repair_observations,
+             "currency": context.company.reporting_currency,
+             "accounting_standard": context.company.accounting_standard,
+             "industry_support": context.company.industry_support,
+             **({"metric_policy": run.data_snapshot["financial_metric_policy"]}
+                if run.data_snapshot.get("financial_metric_policy") else {}),
+             "financial_generations": dict(repaired.snapshot["generations"]),
+             "market_snapshot": context.market_snapshot,
+             "financial_quality": {"status": profile.status.value,
+                 "rejected_periods": list(profile.rejected_periods),
+                 "period_continuity": list(profile.period_continuity),
+                 "period_coverage": {**context.financial_period_coverage, "research_as_of": run.data_as_of}},
+             "markdown": deterministic_summary(context.company.name, context.metrics,
+                self.report_language, context.company.reporting_currency)}, agent_id="original-cell-repair")
+        if context.valuation is not None:
+            self._save(run, "deterministic-valuation", self._report_text("反向 DCF 隐含预期", "Reverse DCF Implied Expectations"),
+                context.valuation, agent_id="valuation-engine")
+        if notify is not None:
+            notify(self._progress_text("已从原件恢复财务数据，正在更新受影响分析"), 46)
+        # Re-enter once with the new material identity. Unchanged independent
+        # source stages are reused; changed quantitative stages follow normal
+        # request journals, shared budget and cancellation. Never recurse on
+        # another suggestion or resend a request with an unknown remote result.
+        return execute_official_model_graph(self, self._production_graph_bindings(), context, run,
+            self.storage.get_artifacts(run.run_id), publication=publication,
+            resume_target="model-stages", notify=notify)
 
     def prefetch_source_stages(self, run: ResearchRun, evidence: list[dict[str, Any]]) -> None:
         """Same-run source-only stages; no final report or new lifecycle.
@@ -2518,12 +2923,15 @@ class ResearchWorkflow:
                 else "STAGE_DEPENDENCY_UNAVAILABLE"
             )
             retryable = bool(synthesis_result and synthesis_result.retryable)
+            compile_failure = error_code == "MODEL_REQUEST_COMPILATION_FAILED" or (
+                error_code == "STAGE_DEPENDENCY_UNAVAILABLE" and any(
+                    value.error_code == "MODEL_REQUEST_COMPILATION_FAILED" for value in graph.values()))
             synthesis = {
                 "claims": [],
-                "_response_error": "provider_error",
-                "_provider_error_code": error_code,
+                "_response_error": "request_compilation_failed" if compile_failure else "provider_error",
+                "_provider_error_code": "MODEL_REQUEST_COMPILATION_FAILED" if compile_failure else error_code,
                 "_provider_retryable": retryable,
-                "_context_counting_mode": "stage_not_completed",
+                "_context_counting_mode": "local_request_compilation" if compile_failure else "stage_not_completed",
             }
 
         available = {
@@ -2598,6 +3006,7 @@ class ResearchWorkflow:
                 "context_budget_exceeded": "not_completed_context_capacity",
                 "provider_error": "not_completed_provider_error",
                 "insufficient_material": "not_completed_insufficient_material",
+                "request_compilation_failed": "not_completed_local_compilation",
             }.get(response_error, "generated_pending_verification" if not response_error and report_payload
                   else "not_completed_invalid_output")
             if context_budget_exceeded:
@@ -2740,6 +3149,7 @@ class ResearchWorkflow:
             "report_language": self.report_language, "parallel_agents": self.parallel_agents,
             "research_pack_id": self.pack.pack_id, "research_pack_version": self.pack.version,
             "research_pack_content_identity": self.pack.content_hash,
+            "valuation_inputs": deepcopy(valuation_inputs),
         }
         run.market_snapshot = deepcopy(market_snapshot)
         run.data_snapshot = deepcopy(reproducibility.get("data_snapshot", {}))
@@ -2748,6 +3158,13 @@ class ResearchWorkflow:
             self._check_cancelled()
             metrics = calculate_metrics(facts)
             interim_metrics = calculate_interim_metrics(facts)
+            from .financial_metric_policy import apply_metric_policy, metric_profile, metric_policy_identity
+            industry_profile = metric_profile(company)
+            metrics = apply_metric_policy(metrics, profile_id=industry_profile)
+            interim_metrics = apply_metric_policy(interim_metrics, profile_id=industry_profile)
+            industry_metric_policy = metric_policy_identity(industry_profile)
+            if industry_metric_policy:
+                run.data_snapshot["financial_metric_policy"] = industry_metric_policy
             source_records = tuple(ref.to_dict() for ref in profile.source_evidence) if profile is not None else ()
             evidence = build_fact_evidence(facts, source_records=source_records)
             if profile is not None:
@@ -2757,79 +3174,7 @@ class ResearchWorkflow:
                 evidence.extend(record for item in profile.repair_observations
                     if (record := observation_source_record(item)) is not None)
             evidence.extend(filing_evidence or [])
-            valuation = None
-            snapshot_currency = str((market_snapshot or {}).get("valuation_currency") or (market_snapshot or {}).get("currency", ""))
-            # Explicit manual valuation inputs are a separate user-approved
-            # lane. A supplied but unclassified market snapshot is not verified.
-            snapshot_status = str((market_snapshot or {}).get("status", "UNRESOLVED" if market_snapshot else "MANUAL")).upper()
-            snapshot_value = (market_snapshot or {}).get("equity_market_value")
-            requested_value = (
-                snapshot_value
-                if snapshot_value is not None
-                else (valuation_inputs or {}).get("equity_market_value", (valuation_inputs or {}).get("market_cap"))
-            )
-            valuation_money = _valuation_money(
-                requested_value,
-                currency=snapshot_currency or company.reporting_currency,
-                source_id=str((market_snapshot or {}).get("source_id") or (market_snapshot or {}).get("source", "")),
-                as_of=str((market_snapshot or {}).get("as_of", "")),
-            )
-            if company.industry_support == "financial_beta" and valuation_inputs:
-                valuation = {
-                    "status": "not_applicable",
-                    "reason": self._report_text(
-                        "金融机构 Beta 暂不使用标准自由现金流反向 DCF。",
-                        "Financials Beta does not apply the standard free-cash-flow reverse DCF.",
-                    ),
-                    "currency": company.reporting_currency,
-                }
-            elif valuation_inputs and (not company.reporting_currency or snapshot_status not in {"VERIFIED", "MANUAL"}):
-                valuation = {
-                    "status": "market_snapshot_unavailable",
-                    "reason": self._report_text(
-                        "行情快照存在冲突、陈旧或不可用状态；未执行权益反向 DCF。",
-                        "Reverse DCF was skipped because the market snapshot is conflicted, stale, or unavailable.",
-                    ),
-                    "error_code": str((market_snapshot or {}).get("error_code") or "MARKET_SNAPSHOT_UNAVAILABLE"),
-                    "currency": snapshot_currency or company.reporting_currency,
-                }
-            elif (
-                valuation_inputs
-                and snapshot_currency
-                and snapshot_currency != company.reporting_currency
-            ):
-                valuation = {
-                    "status": "currency_mismatch",
-                    "reason": self._report_text(
-                        "手动市值币种与财报币种不同；未提供汇率，因此不执行反向 DCF。",
-                        "The manual market-cap currency differs from the reporting currency; reverse DCF was skipped because no FX rate was supplied.",
-                    ),
-                    "currency": snapshot_currency,
-                    "reporting_currency": company.reporting_currency,
-                }
-            elif valuation_inputs and _valuation_money_is_positive(
-                requested_value, currency=snapshot_currency or company.reporting_currency
-            ):
-                valuation = reverse_dcf_analysis(
-                    metrics,
-                    valuation_money,
-                    valuation_inputs.get("discount_rate", 0.10),
-                    valuation_inputs.get("terminal_growth", 0.03),
-                    int(valuation_inputs.get("horizon_years", 5)),
-                    market_as_of=str((market_snapshot or {}).get("as_of", "")),
-                    currency=company.reporting_currency,
-                    require_typed=True,
-                )
-                valuation["currency"] = company.reporting_currency
-                valuation["market_snapshot"] = dict(market_snapshot or {})
-            from .financials import fcf_sensitivity_analysis
-            if company.industry_support != "financial_beta":
-                sensitivity = fcf_sensitivity_analysis(metrics, currency=company.reporting_currency,
-                    discount_rate=(valuation_inputs or {}).get("discount_rate", .10),
-                    terminal_growth=(valuation_inputs or {}).get("terminal_growth", .03),
-                    horizon_years=(valuation_inputs or {}).get("horizon_years", 5))
-                valuation = {**(valuation or {"status": "missing_market_price", "currency": company.reporting_currency}),
-                             "intrinsic_analysis": sensitivity}
+            valuation = self._valuation_for_metrics(company, metrics, valuation_inputs, market_snapshot)
             context = ResearchContext(
                 company,
                 facts,
@@ -2864,8 +3209,10 @@ class ResearchWorkflow:
                         "market": company.market,
                         "exchange": company.exchange,
                         "industry_support": company.industry_support,
+                        "industry": company.industry,
                     },
                     "markdown": summary,
+                    **({"metric_policy": industry_metric_policy} if industry_metric_policy else {}),
                     "metrics": metrics,
                     "interim_metrics": interim_metrics,
                     "evidence": evidence,
@@ -3122,14 +3469,16 @@ class ResearchWorkflow:
         prior_artifacts: dict[str, Any], *, enforce_local_budget: bool = True,
         material_adequacy_override: dict[str, Any] | None = None,
         role_id: str | None = None, output_schema: str | None = None,
+        compiled_prompts: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         self._check_cancelled()
         executor = self._model_stage_executor()
         role = _agent_role(agent_id, role_id)
+        from .research_execution.source_compiler import read_source_context
         gate = material_adequacy_override or route_materials(
-            json.loads(context_json), role
+            read_source_context(context_json), role
         )["material_adequacy"]
-        system_prompt, user_prompt = _agent_prompt_bundle(
+        system_prompt, user_prompt = compiled_prompts or _agent_prompt_bundle(
             agent_id, self.pack.prompt(prompt_path), self.report_language,
             context_json, prior_artifacts,
             role_id=role_id, output_schema=output_schema,
@@ -3140,14 +3489,27 @@ class ResearchWorkflow:
             agent_id, system_prompt, user_prompt,
             max_input_bytes=(provider_context_capability(self._stage_budget_provider(agent_id)).max_input_bytes
                              if enforce_local_budget else None),
-            output_contract=_agent_output_contract(role, output_schema),
-            claim_repair_contract=self._claim_repair_contract(context_json) if role == "research-synthesizer" else None,
+            output_contract=None if prior_artifacts.get("material_request_delivery") else _agent_output_contract(role, output_schema),
+            claim_repair_contract=self._claim_repair_contract(context_json) if role == "research-synthesizer" and not prior_artifacts.get("material_request_delivery") else None,
             max_output_tokens=self._stage_output_budget(agent_id),
-            purpose="section_delivery" if output_schema == "research-report-section-v1" else "generation",
+            purpose="material_coverage" if prior_artifacts.get("material_request_delivery") else "section_delivery" if output_schema == "research-report-section-v1" else "generation",
             reference_bindings=tuple(sorted(bindings.items())),
+            input_limit_kind="planning_estimate",
         )
         try:
-            return executor.execute(request, material_adequacy=gate, language=self.report_language)
+            result = executor.execute(request, material_adequacy=gate, language=self.report_language)
+            # Host observation of actual input and returned candidate. Neither
+            # a reader assignment nor a model's "read all" claim is validation.
+            assignment = json.loads(user_prompt).get("reading_assignment", {}).get("reading_packet", {})
+            if isinstance(assignment, dict) and assignment.get("version") == "assigned-original-readers-v2":
+                actual = set(bindings.values())
+                assigned = assignment.get("assigned_evidence_ids", ())
+                result["_source_reading_coverage"] = {"schema": "physical-reading-coverage-v1",
+                    "lane": assignment.get("lane"), "assigned_evidence_ids": assigned,
+                    "physically_supplied_evidence_ids": sorted(actual),
+                    "missing_assigned_evidence_ids": sorted(set(assigned) - actual),
+                    "state": "candidate_received_pending_validation" if not result.get("_response_error") else "candidate_unavailable"}
+            return result
         except ModelStageCancelled:
             raise ResearchCancelled() from None
 
@@ -3186,7 +3548,8 @@ class ResearchWorkflow:
         return scope(self._stage_output_budget(agent_id)) if callable(scope) else self.provider
 
     def _claim_repair_contract(self, context_json: str) -> ClaimRepairContract:
-        context = json.loads(context_json)
+        from .research_execution.source_compiler import read_source_context
+        context = read_source_context(context_json)
         records = {item["evidence_id"]: item for item in context.get("evidence", [])
                    if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)}
 
@@ -3337,6 +3700,7 @@ class ResearchWorkflow:
 
         current = list(capsules)
         rounds = 0
+        previous_merge_size = None
         minimum_merge_size = _agent_input_size(
             agent_id, role_prompt, self.report_language, lean_context_json,
             {"coverage_ledger": compact_ledger, "coverage_capsules": []},
@@ -3353,7 +3717,7 @@ class ResearchWorkflow:
         while True:
             merge_prior = {
                 "coverage_ledger": compact_ledger,
-                "coverage_capsules": current,
+                "coverage_capsules": [{"content": item.get("content", {})} for item in current],
             }
             merge_size = _agent_input_size(
                 agent_id,
@@ -3365,11 +3729,12 @@ class ResearchWorkflow:
             )
             if merge_size <= capability.max_input_bytes:
                 return current, rounds
-            if rounds >= 6 or len(current) <= 1:
+            if previous_merge_size is not None and merge_size >= previous_merge_size:
                 raise SynthesisContextLimitError(
                     [{"name": f"{agent_id}:coverage-merge", "bytes": merge_size}],
                     capability.max_input_bytes,
                 )
+            previous_merge_size = merge_size
             packets = _partition_synthesis_context(
                 {"coverage_capsules": current},
                 capability,
@@ -3428,6 +3793,74 @@ class ResearchWorkflow:
             current = next_capsules
             rounds += 1
 
+    def _complete_material_questions(self, agent_id, prompt_path, context_json, prior_artifacts, candidate,
+            *, run=None, role_id=None, output_schema=None):
+        """Continue only source-bound questions with genuinely new originals.
+
+        This uses the same adaptive runner, journal, and validation boundary.
+        Every continuation must add a previously unsent original from this
+        frozen context. Finite source progress, not an arbitrary call quota,
+        ends the loop. No network retrieval/model memory can invent a source.
+        """
+        from .research_execution.executor import dependency_findings
+        from .research_execution.reference_aliases import reference_aliases, supplied_bindings
+        from .research_materials import TOPIC_PARTITION
+        from .research_execution.source_compiler import read_source_context
+        context = read_source_context(context_json)
+        records = {row["evidence_id"]: row for row in context.get("evidence", ()) if row.get("evidence_id")}
+        aliases = reference_aliases(context_json)
+        _, original_prompt = _agent_prompt_bundle(agent_id, self.pack.prompt(prompt_path), self.report_language,
+            context_json, prior_artifacts, role_id=role_id, output_schema=output_schema)
+        included = set(supplied_bindings(original_prompt, aliases).values())
+        routed = route_materials(context, _agent_role(agent_id, role_id))
+        result = deepcopy(candidate)
+        audit = []
+        while isinstance(result.get("material_requests"), list) and result["material_requests"]:
+            self._check_cancelled()
+            requests = [row for row in result["material_requests"] if isinstance(row, dict)]
+            required, fields = set(), set()
+            for row in requests:
+                for identity in row.get("evidence_ids", ()) if isinstance(row.get("evidence_ids"), list) else ():
+                    if isinstance(identity, str):
+                        required.add(aliases.get(identity, identity))
+                topic = row.get("topic") if isinstance(row.get("topic"), str) else None
+                topic = TOPIC_PARTITION.get(topic, topic)
+                if topic in routed["evidence_partitions"]:
+                    required.update(item["evidence_id"] for item in routed["evidence_partitions"][topic] if item.get("evidence_id"))
+                fields.update(field for field in (row["fields"] if isinstance(row.get("fields"), list) else ())
+                              if isinstance(field, str) and re.fullmatch(r"[a-z][a-z0-9_]{1,79}", field)
+                              and field not in {"raw_response", "prompt", "trusted_channels", "material_requests"})
+            new_sources = (required & set(records)) - included
+            if not new_sources or not fields:
+                audit.append({"state": "no_new_material" if not new_sources else "target_fields_required",
+                    "unavailable_evidence_ids": sorted(required - set(records))})
+                # Keep the model's concrete unresolved questions visible.
+                break
+            delivery = {"fields": sorted(fields), "evidence_ids": sorted(new_sources),
+                "questions": [row.get("question") for row in requests if isinstance(row.get("question"), str)]}
+            patch_prior = {"material_request_delivery": delivery,
+                "completed_findings": dependency_findings({key: value for key, value in result.items() if key != "material_requests"})}
+            part = self._run_agent_adaptive(agent_id, prompt_path, context_json, patch_prior, run=run,
+                role_id=role_id, output_schema=output_schema, allow_material_questions=False)
+            included.update(new_sources)
+            from .research_execution.model_output import response_refused
+            if part.get("_response_error") or response_refused(part):
+                audit.append({"state": "candidate_unavailable", "new_evidence_ids": sorted(new_sources)})
+                break
+            patches = _section_patch_from_output(part, sorted(fields))
+            if not patches:
+                audit.append({"state": "candidate_incomplete", "new_evidence_ids": sorted(new_sources), "fields": sorted(fields)})
+                break
+            for field, value in patches.items():
+                result[field] = value
+            if isinstance(part.get("claims"), list):
+                result["claims"] = _collect_stage_claims(result, {"claims": part["claims"]})
+            result["material_requests"] = deepcopy(part.get("material_requests", []))
+            audit.append({"state": "candidate_patch_received_pending_validation", "new_evidence_ids": sorted(new_sources),
+                "fields": sorted(patches)})
+        result["_material_request_coverage"] = audit
+        return result
+
     def _run_agent_adaptive(
         self,
         agent_id: str,
@@ -3437,6 +3870,8 @@ class ResearchWorkflow:
         *,
         run: ResearchRun | None = None,
         role_id: str | None = None, output_schema: str | None = None,
+        sectional_synthesis_owner: bool = False,
+        allow_material_questions: bool = True,
     ) -> dict[str, Any]:
         """Use one complete call when possible, otherwise cover every bounded partition."""
 
@@ -3459,20 +3894,14 @@ class ResearchWorkflow:
         role_prompt = self.pack.prompt(prompt_path)
         capability = provider_context_capability(self._stage_budget_provider(agent_id))
         capability_declared = _provider_declares_context_capability(self.provider)
-        input_size = _agent_input_size(
-            agent_id,
-            role_prompt,
-            self.report_language,
-            context_json,
-            prior_artifacts,
-            role_id=role_id, output_schema=output_schema,
-        )
-        fits = input_size <= capability.max_input_bytes
         from .research_execution.input_budget import input_measurement
-        measured = input_measurement(self.provider, *_agent_prompt_bundle(
+        prompts = _agent_prompt_bundle(
             agent_id, role_prompt, self.report_language, context_json, prior_artifacts,
-            role_id=role_id, output_schema=output_schema))
-        if measured["exact"] and capability_declared:
+            role_id=role_id, output_schema=output_schema)
+        measured = input_measurement(self.provider, *prompts)
+        input_size = measured["input_bytes"]
+        fits = input_size <= capability.max_input_bytes
+        if measured["exact"] and capability.context_is_declared:
             fits = measured["tokens"] <= capability.available_input_tokens
             if capability.explicit_max_input_bytes is not None:
                 fits = fits and input_size <= capability.explicit_max_input_bytes
@@ -3485,9 +3914,14 @@ class ResearchWorkflow:
                     prior_artifacts,
                     enforce_local_budget=capability_declared,
                     role_id=role_id, output_schema=output_schema,
+                    compiled_prompts=prompts,
                 )
             except ProviderError as exc:
                 if exc.code not in {"MODEL_CONTEXT_CAPACITY", "MODEL_REQUEST_BODY_TOO_LARGE"}:
+                    raise
+                if sectional_synthesis_owner and role == "research-synthesizer":
+                    # A full synthesis uses the existing named-section seam,
+                    # not another complete-library reading/summarization pass.
                     raise
                 # A confirmed rejection has no remote candidate to await. Use
                 # a smaller, complete material partition through this same
@@ -3497,9 +3931,18 @@ class ResearchWorkflow:
                     max(1_024, min(capability.max_input_bytes, input_size // 2)))
             else:
                 result["_stage_material_manifest"] = direct_manifest.to_dict()
+                if allow_material_questions and result.get("material_requests"):
+                    result = self._complete_material_questions(agent_id, prompt_path, context_json, prior_artifacts,
+                        result, run=run, role_id=role_id, output_schema=output_schema)
                 return result
 
-        routed = route_materials(json.loads(context_json), role)
+        if sectional_synthesis_owner and output_schema == "research-report-section-v1" and not fits and capability_declared:
+            raise SynthesisContextLimitError(
+                [{"name": "section_group", "bytes": input_size}], capability.max_input_bytes,
+                counting_mode=measured["method"])
+
+        from .research_execution.source_compiler import read_source_context
+        routed = route_materials(read_source_context(context_json), role)
         gate = routed["material_adequacy"]
         if gate["status"] == "insufficient":
             return insufficient_material_result(gate, self.report_language)
@@ -3629,22 +4072,16 @@ class ResearchWorkflow:
         if len(capsules) != len(packets):
             raise RuntimeError("stage material coverage is incomplete")
 
-        context = json.loads(context_json)
+        context = read_source_context(context_json)
         evidence = context.get("evidence", []) if isinstance(context, dict) else []
+        from .research_execution.source_compiler import source_evidence_closure
+        cited_sources = source_evidence_closure(context, _collect_evidence_ids([item.get("content", {}) for item in capsules]))
         registry: list[dict[str, Any]] = []
         for item in evidence:
             if not isinstance(item, dict):
                 continue
-            entry = {
-                key: item.get(key)
-                for key in ("evidence_id", "kind", "topic", "source_url", "document_id")
-                if item.get(key) not in (None, "")
-            }
-            if item.get("kind") != "financial_fact":
-                entry["raw_text"] = (
-                    "Original material was supplied to a recorded partition. The linked capsule contains model findings, not a lossless copy of that original."
-                )
-            registry.append(entry)
+            if item.get("evidence_id") in cited_sources or item.get("kind") == "financial_fact":
+                registry.append(deepcopy(item))
         lean_context = {
             key: value
             for key, value in context.items()
@@ -3673,13 +4110,8 @@ class ResearchWorkflow:
             "schema": coverage["schema"],
             "complete": coverage_complete,
             "partition_count": len(packets),
-            "covered_evidence_ids": sorted(
-                {
-                    evidence_id
-                    for item in capsules
-                    for evidence_id in item["source_evidence_ids"]
-                }
-            ),
+            "covered_original_count": len({evidence_id for item in capsules for evidence_id in item["source_evidence_ids"]}),
+            "scope": "host_partition_coverage_only; cited_originals_are_physically_supplied; no_implicit_cache_knowledge",
         }
         raw_capsules = list(capsules)
         if cached_coverage_set is not None and isinstance(
@@ -3732,7 +4164,7 @@ class ResearchWorkflow:
         compact_ledger["consolidation_rounds"] = consolidation_rounds
         merge_prior = {
             "coverage_ledger": compact_ledger,
-            "coverage_capsules": capsules,
+            "coverage_capsules": [{"content": item.get("content", {})} for item in capsules],
         }
         result = self._run_agent(
             agent_id,

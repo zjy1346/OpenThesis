@@ -8,8 +8,10 @@ import os
 from pathlib import Path
 import tempfile
 
+from ..financial_statement_identity import STATEMENT_MAPPING_VERSION
 
-CATALOG_CONTRACT = 'financial-page-catalog-v2'
+
+CATALOG_CONTRACT = 'financial-page-catalog-v4'
 
 
 def document_catalog(context, source_hash, rules_fingerprint, classify, select_candidates=None):
@@ -30,6 +32,7 @@ def document_catalog(context, source_hash, rules_fingerprint, classify, select_c
     for page in pages:
         page['candidate'] = page['page'] in selected if complete else None
     return {'contract':CATALOG_CONTRACT, 'source_hash':source_hash,
+        'statement_mapping_version':STATEMENT_MAPPING_VERSION,
         'rules_fingerprint':rules_fingerprint, 'candidate_plan_complete':complete, 'pages':pages}
 
 
@@ -42,6 +45,7 @@ def load_document_catalog(directory, source_hash, rules_fingerprint):
     except (OSError, ValueError, TypeError):
         return None
     if (catalog.get('contract') != CATALOG_CONTRACT
+            or catalog.get('statement_mapping_version') != STATEMENT_MAPPING_VERSION
             or catalog.get('source_hash') != source_hash
             or catalog.get('rules_fingerprint') != rules_fingerprint
             or not isinstance(catalog.get('pages'), list)
