@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { captureMarketSnapshot, getResearchBudgetPreview, listConfiguredModels, searchCompanies } from "../../backend";
@@ -106,6 +106,28 @@ describe("NewResearch configured models", () => {
     render(<NewResearchView bootstrap={bootstrap} copy={copy} onOpenModelCenter={vi.fn()}
       onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={vi.fn()} />);
     expect(screen.getByText(text)).toBeVisible();
+  });
+
+  it.each([
+    ["zh-CN", "在设置中调整视觉兜底。发起研究时，会保存当时的策略供本次研究使用。"],
+    ["zh-Hant", "在設定中調整視覺備援。發起研究時，會儲存當時的策略供本次研究使用。"],
+    ["en", "Manage vision fallback in Settings. Each research run keeps a snapshot of the policy in effect when it starts."],
+  ] as const)("shows the localized vision policy summary and preserves the settings action in %s", async (language, summary) => {
+    const copy = COPY[language];
+    const onOpenVisionSettings = vi.fn();
+    const onStart = vi.fn();
+    render(<NewResearchView bootstrap={{ ...bootstrap, preferences: { ...bootstrap.preferences, ui_language: language } }}
+      copy={copy} onOpenModelCenter={vi.fn()} onOpenVisionSettings={onOpenVisionSettings}
+      onSavePreferences={vi.fn().mockResolvedValue(bootstrap.preferences)} onStart={onStart} />);
+
+    await screen.findByRole("combobox", { name: copy.primaryModel });
+    const policy = within(screen.getByRole("region", { name: copy.visionSettingsTitle }));
+    expect(policy.getByText(summary)).toBeVisible();
+    expect(policy.queryByText(/The persistent visual fallback/)).not.toBeInTheDocument();
+    fireEvent.click(policy.getByRole("button", { name: copy.openVisionSettings }));
+    expect(onOpenVisionSettings).toHaveBeenCalledOnce();
+    expect(onStart).not.toHaveBeenCalled();
+    expect(getResearchBudgetPreview).not.toHaveBeenCalled();
   });
 
   it("allows explicit caps beyond the former limits and disables exact cost caps without a quote", async () => {
@@ -422,7 +444,7 @@ describe("NewResearch configured models", () => {
     expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ company: expect.objectContaining({ ticker: "0700" }) }));
   });
 
-  it("clears the company after successful submission but preserves shared model selection", async () => {
+  it("preserves the company and model draft after submission until explicitly cleared", async () => {
     const otherModel = { ...configuredModels[0], configured_model_id: "alternate-model", connection_id: "alternate-connection", model_id: "alternate", alias: "Alternate" };
     vi.mocked(listConfiguredModels).mockResolvedValue([...configuredModels, otherModel]);
     vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
@@ -443,8 +465,10 @@ describe("NewResearch configured models", () => {
 
     await waitFor(() => expect(onStart).toHaveBeenCalledOnce());
     expect(onStart.mock.calls[0][0].model).toMatchObject({ configured_model_id: "alternate-model", connection_id: "alternate-connection" });
-    expect(screen.getByRole("textbox", { name: COPY.en.companySearch })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: COPY.en.companySearch })).toHaveValue("Tencent");
     expect(modelSelect).toHaveValue("alternate-model");
+    fireEvent.click(screen.getByRole("button", { name: "Clear draft" }));
+    expect(screen.getByRole("textbox", { name: COPY.en.companySearch })).toHaveValue("");
     expect(screen.getByRole("button", { name: COPY.en.chooseCompany })).toBeDisabled();
   });
 

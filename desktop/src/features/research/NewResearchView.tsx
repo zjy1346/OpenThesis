@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { getResearchTaskCopy } from "../tasks/researchTasksCopy";
 import { Building2, ExternalLink } from "lucide-react";
 import { MarketReadiness, FxDetails } from './MarketReadiness';
 import { modelEligibility } from "../../modelEligibility";
@@ -120,10 +121,10 @@ type ResearchCopy = {
   apiKey: string;
   refreshFailed: string;
   visionMissing: string;
-  visionSettingsTitle?: string;
-  visionSettingsSummary?: string;
-  visionSettingsDisabled?: string;
-  openVisionSettings?: string;
+  visionSettingsTitle: string;
+  visionSettingsSummary: string;
+  visionSettingsDisabled: string;
+  openVisionSettings: string;
   visionMineru: string;
   visionConfiguredModel: string;
   visionApprovalEach: string;
@@ -196,6 +197,9 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   onOpenTask?: (id: string) => void;
 }) {
   const parallelHintId = useId();
+  const primaryModelPickerId = useId();
+  const budgetTitleId = useId();
+  const visionTitleId = useId();
   const [profile, setProfile] = useState(bootstrap.preferences.sec_contact_profile || "personal");
   const [email, setEmail] = useState(bootstrap.preferences.sec_contact_email || "");
   const [market, setMarket] = useState<Market>(bootstrap.preferences.research_market || "US");
@@ -208,6 +212,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [searchError, setSearchError] = useState("");
   const [copiedDiagnosticId, setCopiedDiagnosticId] = useState("");
   const [launching, setLaunching] = useState(false);
+  const launchInFlight = useRef(false);
   const [duplicateTask, setDuplicateTask] = useState<ResearchTaskSummary | null>(null);
   const searchSequence = useRef(0);
   const searchTimeout = useRef<number | undefined>(undefined);
@@ -217,9 +222,14 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       searchTimeout.current = undefined;
     }
   };
-  useEffect(() => () => {
-    searchSequence.current += 1;
-    clearSearchTimeout();
+  useEffect(() => {
+    // A hidden draft preserves its values, but an invalidated search is
+    // no longer in flight when the view becomes visible again.
+    setSearchState((state) => state === "loading" ? "idle" : state);
+    return () => {
+      searchSequence.current += 1;
+      clearSearchTimeout();
+    };
   }, []);
   const [configuredModels, setConfiguredModels] = useState<ConfiguredModelSummary[]>([]);
   const [modelLoadError, setModelLoadError] = useState("");
@@ -240,6 +250,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   const [priceQuote, setPriceQuote] = useState<Record<string, unknown> | null>(null);
   const [runBudgetPreview, setRunBudgetPreview] = useState<ResearchBudgetPreview | null>(null);
   const [runBudgetPreviewLoading, setRunBudgetPreviewLoading] = useState(false);
+  const budgetPreviewGeneration = useRef(0);
   const [runBudgetError, setRunBudgetError] = useState("");
   const [downloadFilings, setDownloadFilings] = useState(true);
   const [packId, setPackId] = useState(bootstrap.research_packs[0]?.pack_id ?? "");
@@ -403,7 +414,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
   };
 
   const launch = async (createAnother = false) => {
-    if (launching) return;
+    if (launchInFlight.current) return;
     if (!selected || (requiresSecIdentity && !email.includes("@"))) {
       setSearchError(selected ? copy.secRequired : copy.chooseCompany);
       return;
@@ -433,6 +444,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
       return;
     }
     setRunBudgetError("");
+    launchInFlight.current = true;
     setLaunching(true);
     setSearchError("");
     try {
@@ -472,19 +484,34 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
         } } : {}),
         ...(visionFallback ? { vision_fallback: visionFallback } : {}),
       });
-      // Keep shared research/model choices, but require a deliberate company
-      // selection for the next submission instead of reusing the old identity.
-      setSelected(null);
-      setQuery("");
-      setSearchResponse(null);
-      setMarketPreview(null);
-      setMarketCap(""); setMarketPrice(""); setMarketAsOf("");
     } catch (reason) {
       const errorCode = reason instanceof Error ? reason.message.split(/[\s:]/, 1)[0] : "";
       setSearchError(errorCode ? searchErrorMessage(errorCode, copy, copy.launchFailed ?? copy.coreUnavailable) : (copy.launchFailed ?? copy.coreUnavailable));
     } finally {
+      launchInFlight.current = false;
       setLaunching(false);
     }
+  };
+
+  const clearDraft = () => {
+    if (launchInFlight.current) return;
+    invalidateSearch();
+    budgetPreviewGeneration.current += 1;
+    const savedMarket = bootstrap.preferences.research_market || "US";
+    setMarket(savedMarket);
+    setProfile(bootstrap.preferences.sec_contact_profile || "personal");
+    setEmail(bootstrap.preferences.sec_contact_email || "");
+    setSelected(null); setQuery(""); setSearchResponse(null); setSearchState("idle");
+    setSearchError(""); setCopiedDiagnosticId(""); setDuplicateTask(null); setMarketPreview(null);
+    setPrimaryModelId(usableModels[0]?.configured_model_id ?? "");
+    setComparisonModelIds([]); setCompareEnabled(false);
+    setParallelAgents(bootstrap.preferences.parallel_agents === "true");
+    setPackId(packs[0]?.pack_id ?? ""); setPackMessage(""); setDownloadFilings(true);
+    setRunBudgetLimits({ max_input_tokens: "", max_output_tokens: "", max_total_tokens: "", max_calls: "", max_automatic_seconds: "", max_cost: "" });
+    setPriceQuote(null); setRunBudgetPreview(null); setRunBudgetError(""); setRunBudgetPreviewLoading(false);
+    setMarketPrice(""); setMarketCap(""); setMarketAsOf(new Date().toISOString().slice(0, 10));
+    setMarketCurrency(marketCatalog.find((item) => item.market === savedMarket)?.default_currency ?? "USD");
+    setDiscountRate("10"); setTerminalGrowth("3");
   };
 
   const previewRunBudget = async () => {
@@ -496,16 +523,18 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
     setRunBudgetError("");
     setRunBudgetPreviewLoading(true);
     setRunBudgetPreview(null);
+    const generation = ++budgetPreviewGeneration.current;
     try {
       const preview = await getResearchBudgetPreview(runEnvelope);
+      if (generation !== budgetPreviewGeneration.current) return;
       setRunBudgetPreview(preview);
       const quote = preview.price_quote;
       setPriceQuote(quote && typeof quote === "object" && !Array.isArray(quote)
         ? quote as Record<string, unknown> : null);
     } catch {
-      setRunBudgetError(copy.runBudgetPreviewFailed);
+      if (generation === budgetPreviewGeneration.current) setRunBudgetError(copy.runBudgetPreviewFailed);
     } finally {
-      setRunBudgetPreviewLoading(false);
+      if (generation === budgetPreviewGeneration.current) setRunBudgetPreviewLoading(false);
     }
   };
 
@@ -650,7 +679,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
           <span className="step-label">02</span><h3>{copy.primaryModel}</h3>
           {usableModels.length ? <>
             <ConfiguredModelPicker
-              id="primary-configured-model"
+              id={primaryModelPickerId}
               label={copy.primaryModel}
               models={usableModels}
               value={primaryModelId}
@@ -691,11 +720,11 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
           </div>
           <label className="pack-import">{copy.importPack}<input type="file" accept=".ot" onChange={(event) => void importPack(event.target.files?.[0])} /></label>
           {packMessage && <p className="pack-message" role="status">{packMessage}</p>}
-          <section className="run-budget-settings" aria-labelledby="run-budget-title">
-            <h4 id="run-budget-title">{copy.runBudgetTitle}</h4>
+          <section className="run-budget-settings" aria-labelledby={budgetTitleId}>
+            <h4 id={budgetTitleId}>{copy.runBudgetTitle}</h4>
             <p className="field-caption" data-testid="run-budget-adaptive">{copy.runBudgetAdaptive}</p>
             <p className="field-caption">{copy.runBudgetAdaptiveSummary}</p>
-            <details className="run-budget-optional-limits">
+            <details className="setup-disclosure run-budget-optional-limits">
               <summary>{copy.runBudgetOptionalLimits}</summary>
               <p className="field-caption">{copy.runBudgetOptionalHint}</p>
               <div className="run-budget-limits">
@@ -713,7 +742,7 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
               </div>
             </details>
             <p className="field-caption" data-testid="run-budget-disclaimer">{copy.runBudgetDisclaimer}</p>
-            <div className="run-budget-preview-row">
+            <div className="action-row run-budget-preview-row">
               <button className="secondary-button" type="button" disabled={runBudgetPreviewLoading || !buildRunEnvelope(runBudgetLimits, priceQuote)} onClick={() => void previewRunBudget()}>
                 {runBudgetPreviewLoading ? copy.runBudgetPreviewing : copy.runBudgetPreview}
               </button>
@@ -726,21 +755,22 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
             </div>
             {runBudgetError && <p className="inline-error" role="alert">{runBudgetError}</p>}
           </section>
-          <section className="vision-policy-summary" data-testid="vision-policy-summary">
-            <h4>{copy.visionSettingsTitle ?? "Vision fallback"}</h4>
-            <p className="field-caption">{copy.visionSettingsSummary ?? "The persistent visual fallback is managed in Settings and snapshotted for this research run."}</p>
-            <p className="provider-hint">{visionPolicy.enabled && visionFallback
-              ? `${visionPolicy.provider === "mineru_flash"
-                ? (copy.visionMineru ?? "MinerU Flash")
-                : (usableModels.find((item) => item.configured_model_id === visionPolicy.model?.configured_model_id)?.alias
-                  ?? copy.visionConfiguredModel
-                  ?? "Configured vision model")} · ${visionPolicy.approval_mode === "review_each_plan"
-                    ? copy.visionApprovalEach
-                    : copy.visionApprovalResearch}`
-              : visionPolicy.enabled ? copy.visionMissing : (copy.visionSettingsDisabled ?? "Vision fallback is disabled")}</p>
-            {onOpenVisionSettings && <button className="secondary-button" type="button" onClick={onOpenVisionSettings}>{copy.openVisionSettings ?? "Open vision settings"}</button>}
+          <section className="action-row vision-policy-summary" data-testid="vision-policy-summary" aria-labelledby={visionTitleId}>
+            <div className="vision-policy-copy">
+              <h4 id={visionTitleId}>{copy.visionSettingsTitle}</h4>
+              <p className="field-caption">{copy.visionSettingsSummary}</p>
+              <p className="provider-hint">{visionPolicy.enabled && visionFallback
+                ? `${visionPolicy.provider === "mineru_flash"
+                  ? copy.visionMineru
+                  : usableModels.find((item) => item.configured_model_id === visionPolicy.model?.configured_model_id)?.alias
+                    ?? copy.visionConfiguredModel} · ${visionPolicy.approval_mode === "review_each_plan"
+                      ? copy.visionApprovalEach
+                      : copy.visionApprovalResearch}`
+                : visionPolicy.enabled ? copy.visionMissing : copy.visionSettingsDisabled}</p>
+            </div>
+            {onOpenVisionSettings && <button className="secondary-button" type="button" onClick={onOpenVisionSettings}>{copy.openVisionSettings}</button>}
           </section>
-          <details className="advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
+          <details className="setup-disclosure advanced-settings"><summary>{copy.advancedValuation}</summary><p className="field-caption">{copy.manualDataHint}</p><div className="field-grid three-column">
             <label>{copy.manualPrice}<input inputMode="decimal" value={marketPrice} onChange={(event) => setMarketPrice(event.target.value)} /></label>
             <label>{copy.manualCurrency}<select value={marketCurrency} onChange={(event) => setMarketCurrency(event.target.value)}>{[marketProfile?.default_currency, selected?.listing_currency, selected?.reporting_currency, "USD", "CNY", "HKD"].filter((item, index, all): item is string => Boolean(item) && all.indexOf(item) === index).map((currency) => <option key={currency} value={currency}>{currency}</option>)}</select></label>
             <label>{copy.manualAsOf}<input type="date" value={marketAsOf} onChange={(event) => setMarketAsOf(event.target.value)} /></label>
@@ -750,10 +780,18 @@ export function NewResearchView({ bootstrap, copy, onOpenModelCenter, onOpenVisi
           </div></details>
           {duplicateTask && <div className="task-duplicate-notice" role="status">
             <p>{bootstrap.preferences.ui_language === "en" ? "This company already has an active task." : bootstrap.preferences.ui_language === "zh-Hant" ? "這家公司已有進行中的任務。" : "这家公司已有进行中的任务。"}</p>
-            {onOpenTask && <button type="button" onClick={() => onOpenTask(duplicateTask.job_id)}>{bootstrap.preferences.ui_language === "en" ? "View existing task" : bootstrap.preferences.ui_language === "zh-Hant" ? "檢視現有任務" : "查看现有任务"}</button>}
-            <button type="button" disabled={launching} onClick={() => void launch(true)}>{bootstrap.preferences.ui_language === "en" ? "Create another research" : bootstrap.preferences.ui_language === "zh-Hant" ? "仍建立新研究" : "仍创建新研究"}</button>
+            <div className="action-row">
+              {onOpenTask && <button className="secondary-button" type="button" onClick={() => onOpenTask(duplicateTask.job_id)}>{bootstrap.preferences.ui_language === "en" ? "View existing task" : bootstrap.preferences.ui_language === "zh-Hant" ? "檢視現有任務" : "查看现有任务"}</button>}
+              <button className="secondary-button" type="button" disabled={launching} onClick={() => void launch(true)}>{bootstrap.preferences.ui_language === "en" ? "Create another research" : bootstrap.preferences.ui_language === "zh-Hant" ? "仍建立新研究" : "仍创建新研究"}</button>
+            </div>
           </div>}
-          <button className="primary-button launch-button" type="button" disabled={!selected || launching} onClick={() => void launch()}>{launching ? (copy.launchingResearch ?? copy.searching) : selected ? copy.launchResearch : copy.chooseCompany}</button>
+          <div className="action-row research-draft-actions">
+            <button className="secondary-button" type="button" disabled={launching} onClick={clearDraft}>
+              {getResearchTaskCopy(bootstrap.preferences.ui_language).clearDraft}
+            </button>
+            <button className="primary-button" type="button" disabled={!selected || launching} aria-busy={launching}
+              onClick={() => void launch()}>{launching ? (copy.launchingResearch ?? copy.searching) : selected ? copy.launchResearch : copy.chooseCompany}</button>
+          </div>
         </section>
       </div>
     </div>

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenThesis",
-  "version": "3.3.3",
+  "version": "3.4.0",
   "identifier": "org.openthesis.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -15,8 +15,8 @@
         "title": "OpenThesis",
         "width": 1180,
         "height": 680,
-        "minWidth": 980,
-        "minHeight": 680,
+        "minWidth": 740,
+        "minHeight": 380,
         "resizable": true,
         "fullscreen": false,
         "center": true

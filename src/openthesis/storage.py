@@ -3483,10 +3483,30 @@ class Storage:
                 )
             self._bump_research_jobs_revision_db(db)
 
+    @staticmethod
+    def _research_task_result_access(row: sqlite3.Row, public_state: str) -> str:
+        # This is access to persisted results, not report readiness or quality.
+        # Both joins use primary keys; no report bodies are read by polling.
+        if not row["run_status"]:
+            return "none"
+        if row["result_revision_id"]:
+            return "saved"
+        if public_state in {"waiting_input", "interrupted", "completed", "failed", "cancelled"}:
+            return "recovery"
+        return "none"
+
     def get_research_job(self, job_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM research_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        return self._public_research_job_from_row(row) if row is not None else None
+            row = db.execute(
+                """SELECT j.*, r.status AS run_status, lr.revision_id AS result_revision_id
+                   FROM research_jobs j LEFT JOIN research_runs r ON r.run_id=j.run_id
+                   LEFT JOIN latest_report_revisions lr ON lr.run_id=r.run_id WHERE j.job_id=?""",
+                (job_id,),
+            ).fetchone()
+        job = self._public_research_job_from_row(row) if row is not None else None
+        if job is not None:
+            job["result_access"] = self._research_task_result_access(row, job["state"])
+        return job
 
     def get_research_job_record(self, job_id: str) -> dict[str, Any] | None:
         with self.connect() as db:
@@ -3747,6 +3767,7 @@ class Storage:
                 params.extend(sorted(state_values))
             rows = db.execute(
                 f"""SELECT j.*, {list_state_sql} AS public_state,
+                    r.status AS run_status, lr.revision_id AS result_revision_id,
                     c.ticker AS company_ticker,c.name AS company_name,
                     CASE WHEN j.state='queued' THEN (
                         SELECT COUNT(*) FROM research_jobs q WHERE q.archived=0 AND q.state='queued'
@@ -3755,6 +3776,7 @@ class Storage:
                     (SELECT COUNT(*) FROM research_jobs x WHERE x.execution_owner<>'') AS active_slots
                     FROM research_jobs j JOIN research_runs r ON r.run_id=j.run_id
                     JOIN companies c ON c.cik=r.company_cik
+                    LEFT JOIN latest_report_revisions lr ON lr.run_id=r.run_id
                     WHERE lower(j.operation_type) NOT LIKE '%install%' {archived_clause} {state_clause}
                     ORDER BY CASE public_state WHEN 'running' THEN 0 WHEN 'cancelling' THEN 0
                         WHEN 'queued' THEN 1 WHEN 'waiting_input' THEN 2 WHEN 'interrupted' THEN 3 ELSE 4 END,
@@ -3774,6 +3796,11 @@ class Storage:
             public_state, execution_draining = self._public_research_job_state(
                 row["state"], row["execution_owner"])
             item["state"] = public_state
+            item["result_access"] = self._research_task_result_access(row, public_state)
+            item["research_complete"] = (
+                public_state == "completed" and item["result_access"] == "saved"
+                and row["run_status"] == "completed" and snapshot.get("research_complete") is True
+            )
             item.update({"operation_type": str(row["operation_type"] or "research"),
                          "queue_sequence": int(row["queue_sequence"] or 0),
                          "created_at": str(row["created_at"] or row["updated_at"] or ""),

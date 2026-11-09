@@ -2541,6 +2541,7 @@ class AppService:
                 call["call_plan"] = snapshot["call_plan"]
         warning = (snapshot["call_plan"] or {}).get("time_warning") is True
         snapshot["status_revision"] = f"{snapshot.get('revision', 0)}:{progress['revision']}:w{int(warning)}"
+        snapshot["result_access"] = (durable or {}).get("result_access", "none")
         if durable and durable.get("execution_draining"):
             durable_state = durable.get("state")
             snapshot.update(

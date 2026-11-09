@@ -18,13 +18,14 @@ import {
   getResearchDiagnostics,
   getResearchStatus,
   cancelResearch,
+  decideVisionUpload,
   listResearchTasks,
   listenForWindowClose,
   finishWindowClose,
   startResearch,
   updatePreferences,
 } from "./backend";
-import type { MarketSnapshotPreview } from "./types";
+import type { MarketSnapshotPreview, ResearchJob, ResearchTaskList, ResearchTaskSummary } from "./types";
 
 vi.mock("./backend", () => ({
   bootstrapBackend: vi.fn(),
@@ -72,6 +73,17 @@ const unavailableMarketSnapshot = {
   status: "UNAVAILABLE",
   error_code: "QUOTE_UNAVAILABLE",
 } satisfies MarketSnapshotPreview;
+
+function taskRow(id: string, state: ResearchTaskSummary["state"], revision = 1): ResearchTaskSummary {
+  return { job_id: id, run_id: `run-${id}`, state, revision, company: { name: `Company ${id}`, ticker: id.toUpperCase() },
+    operation_type: "research", model: "Local fixture", message: "", stage: "filing-parse", elapsed_seconds: 12,
+    created_at: "2026-11-08T00:00:00Z" };
+}
+
+function taskPage(items: ResearchTaskSummary[], revision = 1, more?: number): ResearchTaskList {
+  return { items, revision, counts: { running: 0, queued: 0, waiting_input: 0, interrupted: 0, cancelling: 0 },
+    queue_paused: false, not_modified: false, has_more: more !== undefined, next_offset: more ?? null };
+}
 
 describe("report-first workbench", () => {
   beforeEach(() => {
@@ -162,6 +174,88 @@ describe("report-first workbench", () => {
     vi.useRealTimers();
   });
 
+  it("opens the full research task center directly from the sidebar", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    expect(screen.getByRole("heading", { level: 1, name: "Research tasks" })).toBeVisible();
+    expect(screen.queryByRole("dialog", { name: "Research tasks" })).not.toBeInTheDocument();
+  });
+
+  it("keeps a draft across ordinary navigation and clears it only on explicit request", async () => {
+    render(<App />);
+    fireEvent.click((await screen.findAllByRole("button", { name: "Start research" }))[0]);
+    fireEvent.change(await screen.findByLabelText("Search ticker or company name"), { target: { value: "draft ticker" } });
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Settings" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Start research" }));
+    expect(screen.getByLabelText("Search ticker or company name")).toHaveValue("draft ticker");
+    fireEvent.click(screen.getByRole("button", { name: "Clear draft" }));
+    expect(screen.getByLabelText("Search ticker or company name")).toHaveValue("");
+    expect(startResearch).not.toHaveBeenCalled();
+  });
+
+  it("uses server-filtered pages and discards a late result from the previous filter", async () => {
+    let resolveOld!: (page: ResearchTaskList) => void;
+    vi.mocked(listResearchTasks).mockImplementation((options = {}) => {
+      if (options.states?.includes("running")) return new Promise((resolve) => { resolveOld = resolve; });
+      if (options.states?.includes("completed")) return Promise.resolve(options.offset
+        ? taskPage([taskRow("older-finished", "completed")])
+        : taskPage([taskRow("finished", "completed")], 1, 50));
+      return Promise.resolve(taskPage([taskRow("head", "running")]));
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    await waitFor(() => expect(resolveOld).toBeTypeOf("function"));
+    fireEvent.click(within(screen.getByRole("group", { name: "Filter tasks" })).getByRole("button", { name: "Ended" }));
+    expect(await screen.findByRole("button", { name: /^Company finished/ })).toBeVisible();
+    await act(async () => resolveOld(taskPage([taskRow("late-active", "running")], 9)));
+    expect(screen.queryByRole("button", { name: /^Company late-active/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+    expect(await screen.findByRole("button", { name: /^Company older-finished/ })).toBeVisible();
+    expect(screen.queryByRole("button", { name: /^Company finished/ })).not.toBeInTheDocument();
+    expect(listResearchTasks).toHaveBeenCalledWith({ limit: 50, offset: 50, states: ["completed", "failed", "cancelled"] });
+    fireEvent.click(screen.getByRole("button", { name: "Previous page" }));
+    expect(await screen.findByRole("button", { name: /^Company finished/ })).toBeVisible();
+    expect(startResearch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale approval after switching jobs and refreshes a conflicting approval without repeating it", async () => {
+    const a = taskRow("vision-a", "waiting_input", 3);
+    const b = taskRow("vision-b", "waiting_input", 4);
+    let resolveA!: (job: ResearchJob) => void;
+    let rejectDecision!: (reason: Error) => void;
+    let currentB = b;
+    const visionJob = (row: ResearchTaskSummary): ResearchJob => ({
+      ...row, percent: 28, vision_approval_pending: true,
+      vision_upload_preview: { provider: "offline fixture", plan_id: `plan-${row.job_id}-${row.revision}`,
+        pages: [row.revision], total_bytes: 2048, source_document: `${row.job_id}-${row.revision}.pdf` },
+    });
+    vi.mocked(listResearchTasks).mockImplementation(async (options) => options?.states && !options.states.includes("waiting_input")
+      ? taskPage([]) : taskPage([a, currentB], currentB.revision));
+    vi.mocked(getResearchStatus).mockImplementation((id) => id === a.job_id
+      ? new Promise((resolve) => { resolveA = resolve; }) : Promise.resolve(visionJob(currentB)));
+    vi.mocked(decideVisionUpload).mockImplementation(() => new Promise((_, reject) => { rejectDecision = reject; }));
+    render(<App />);
+    fireEvent.click(await screen.findByTitle("Research tasks"));
+    fireEvent.click(within(screen.getByRole("group", { name: "Filter tasks" })).getByRole("button", { name: /Needs attention/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^Company vision-a/ }));
+    await waitFor(() => expect(resolveA).toBeTypeOf("function"));
+    fireEvent.click(screen.getByRole("button", { name: /^Company vision-b/ }));
+    const approve = await screen.findByRole("button", { name: "Approve upload" });
+    await act(async () => resolveA(visionJob(a)));
+    expect(screen.queryByText(/vision-a-3\.pdf/)).not.toBeInTheDocument();
+    expect(screen.getByText(/vision-b-4\.pdf/)).toBeVisible();
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    expect(decideVisionUpload).toHaveBeenCalledExactlyOnceWith(b.job_id, true, 4, "plan-vision-b-4");
+    expect(approve).toBeDisabled();
+    currentB = { ...b, revision: 5 };
+    await act(async () => rejectDecision(new Error("RESEARCH_TASK_REVISION_CONFLICT")));
+    expect(await screen.findByText(/task changed\. Review/)).toBeVisible();
+    expect(await screen.findByText(/vision-b-5\.pdf/)).toBeVisible();
+    expect(decideVisionUpload).toHaveBeenCalledTimes(1);
+  });
+
   it("shows a verified market snapshot when the backend returns a valid quote", async () => {
     vi.mocked(captureMarketSnapshot).mockResolvedValue(verifiedMarketSnapshot);
     render(<App />);
@@ -219,6 +313,7 @@ describe("report-first workbench", () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Run synthetic demo research" }));
     fireEvent.click(await screen.findByTitle("Research tasks"));
+    fireEvent.click(await screen.findByRole("tab", { name: "Diagnostics" }));
     expect(await screen.findByRole("button", { name: "Export research diagnostics (cost and time)" })).toBeVisible();
     expect(getResearchDiagnostics).not.toHaveBeenCalled();
   });
@@ -249,9 +344,9 @@ describe("report-first workbench", () => {
 
   it("shows concrete current-run budget gaps without approving them automatically", async () => {
     const job = {
-      job_id: "job-budget", state: "running" as const, message: "Working", percent: 35, run_id: "run-budget",
+      job_id: "job-budget", state: "waiting_input" as const, message: "Waiting", percent: 35, run_id: "run-budget",
       revision: 1, operation_type: "research", company: { name: "Demo", ticker: "DEMO" }, model: "model:test",
-      stage: "growth-opportunities", elapsed_seconds: 12,
+      stage: "growth-opportunities", elapsed_seconds: 12, blocked_reason: "MODEL_RUN_PLAN_REQUIRES_APPROVAL",
       call_plan: { plan_digest: "digest-1", max_calls: 2, max_input_estimate: 8_000, max_output_tokens: 20_000,
         pending_budget_gaps: [{ gap_id: "gap-growth", stage_id: "growth-opportunities", purpose: "generation", input_estimate: 1_234,
           output_limit: 4_096, diagnostic_code: "MODEL_RUN_CALL_BUDGET_EXHAUSTED" }] },
@@ -445,7 +540,9 @@ describe("report-first workbench", () => {
     expect(getResearchReport).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByTitle("Research tasks"));
     expect(await screen.findByText(/no usable official financial reports/i)).toBeVisible();
-    expect(screen.getByText(/Diagnostic code: NO_FILINGS_AVAILABLE/)).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "Diagnostics" }));
+    fireEvent.click(screen.getByText("Diagnostic code", { selector: "summary" }));
+    expect(screen.getByText("NO_FILINGS_AVAILABLE")).toBeVisible();
     expect(screen.queryByRole("button", { name: "Continue task" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Open official disclosure page" }));
     expect(openExternalUrl).toHaveBeenCalledWith("https://www.cninfo.com.cn/new/index");
@@ -456,7 +553,7 @@ describe("report-first workbench", () => {
       job_id: "job-incomplete", state: "completed" as const, message: "Financial data needs review before research can be considered complete.",
       percent: 100, run_id: "run-incomplete", revision: 2, operation_type: "financial-rebuild",
       company: { name: "New Company", ticker: "NEW" }, model: "model:test", stage: "filing-validation",
-      attempt_complete: true, research_complete: false, action_required: true, error_code: "FILING_DATA_QUALITY_FAILED",
+      attempt_complete: true, research_complete: false, result_access: "saved" as const, action_required: true, error_code: "FILING_DATA_QUALITY_FAILED",
       recovery_outcome: { state: "needs_action", diagnostic_code: "FINANCIAL_DATA_QUALITY_FAILED", next_actions: ["open_report_recovery"] },
     };
     vi.mocked(startResearch).mockResolvedValue({ ...incomplete, state: "queued", revision: 1, message: "Accepted" });
@@ -467,9 +564,11 @@ describe("report-first workbench", () => {
 
     expect(await screen.findByText("Research submitted")).toBeVisible();
     fireEvent.click(await screen.findByTitle("Research tasks"));
-    expect(await screen.findByText(/this task attempt has ended/i)).toBeVisible();
-    expect(await screen.findByText(/the research is not complete/i)).toBeVisible();
-    expect(screen.getByText(/Diagnostic code: FINANCIAL_DATA_QUALITY_FAILED/)).toBeVisible();
+    expect(await within(screen.getByRole("region", { name: "Task details" })).findByRole("button", { name: "View saved research" })).toBeVisible();
+    expect(await screen.findByText(/financial data does not yet meet the research requirements/i)).toBeVisible();
+    fireEvent.click(screen.getByRole("tab", { name: "Diagnostics" }));
+    fireEvent.click(screen.getByText("Diagnostic code", { selector: "summary" }));
+    expect(screen.getByText("FINANCIAL_DATA_QUALITY_FAILED")).toBeVisible();
     expect(getResearchReport).not.toHaveBeenCalled();
     expect(screen.queryByText(/research completed successfully/i)).not.toBeInTheDocument();
   });
@@ -540,8 +639,11 @@ describe("report-first workbench", () => {
       elapsed_seconds: 0,
       created_at: "2026-10-28T12:00:00Z",
     };
-    const completed = { ...accepted, state: "completed" as const, message: "Research attempt finished.", revision: 2, percent: 100, stage: "synthesis", attempt_complete: true, research_complete: false, action_required: true };
-    vi.mocked(startResearch).mockResolvedValue(accepted);
+    const completed = { ...accepted, state: "completed" as const, message: "Research attempt finished.", revision: 2, percent: 100, stage: "synthesis", attempt_complete: true, research_complete: false, result_access: "saved" as const, action_required: true };
+    let submitted = false;
+    vi.mocked(startResearch).mockImplementation(async () => { submitted = true; return accepted; });
+    vi.mocked(listResearchTasks).mockImplementation(async (options) =>
+      submitted && (!options?.states || options.states.includes("completed")) ? taskPage([completed], 2) : taskPage([]));
     vi.mocked(getResearchStatus).mockResolvedValue(completed);
     vi.mocked(searchCompanies).mockImplementation(async (query, market, requestId) => ({
       contract: "openthesis.company-search.v2", request_id: requestId, query, market, state: "ready",
@@ -570,14 +672,24 @@ describe("report-first workbench", () => {
     expect(getResearchReport).toHaveBeenCalledTimes(1);
     expect(getResearchReport).toHaveBeenCalledWith("run-existing", "en");
 
+    const stage = screen.getByRole("heading", { name: "Previously Selected Report" }).closest<HTMLElement>(".report-stage")!;
+    stage.scrollTop = 290;
+    fireEvent.scroll(stage);
+    const quick = screen.getByRole("button", { name: /^Task summary/ });
+    fireEvent.click(quick);
+    expect(screen.getByRole("dialog", { name: "Task summary" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Overview" })).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(quick).toHaveFocus();
+    expect(stage.scrollTop).toBe(290);
     fireEvent.click(await screen.findByTitle("Research tasks"));
-    expect(await screen.findByText("New Company · Completed")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Return to report" }));
+    expect(stage.scrollTop).toBe(290);
+    expect(await screen.findByText("New Company · Partial result")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Previously Selected Report" })).toBeVisible();
     expect(getResearchReport).toHaveBeenCalledTimes(1);
-    const notification = screen.getAllByRole("region", { name: "Research tasks" })
-      .find((region) => within(region).queryByText("New Company · Completed"));
-    expect(notification).toBeDefined();
-    fireEvent.click(within(notification!).getByRole("button", { name: "View research report" }));
+    const notification = screen.getByRole("region", { name: "Task notifications" });
+    fireEvent.click(within(notification).getByRole("button", { name: "View saved research" }));
 
     expect(await screen.findByRole("heading", { name: "New Verified Report" })).toBeVisible();
     expect(screen.getByText("Verified new evidence.")).toBeVisible();
@@ -677,6 +789,28 @@ describe("report-first workbench", () => {
     expect(screen.getByRole("heading", { name: "About OpenThesis", level: 1 })).toBeVisible();
     expect(screen.getByText("2.0.0")).toBeVisible();
     expect(screen.getByText("JSON-RPC 2")).toBeVisible();
+  });
+
+  it("keeps the close prompt's return and minimize actions distinct", async () => {
+    let requestClose!: () => void;
+    vi.mocked(listenForWindowClose).mockImplementation(async (onClose) => {
+      requestClose = onClose;
+      return () => {};
+    });
+    const active = taskPage([taskRow("active", "running")]);
+    vi.mocked(listResearchTasks).mockResolvedValue({ ...active, counts: { ...active.counts, running: 1 } });
+    render(<App />);
+    await screen.findByTitle("Research tasks");
+    await act(async () => requestClose());
+    const close = () => screen.getByRole("dialog", { name: "Keep research running?" });
+    fireEvent.click(within(close()).getByRole("button", { name: "Back to app" }));
+    expect(screen.queryByRole("dialog", { name: "Keep research running?" })).not.toBeInTheDocument();
+    expect(finishWindowClose).not.toHaveBeenCalled();
+
+    await act(async () => requestClose());
+    fireEvent.click(within(close()).getByRole("button", { name: "Minimize and continue" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Keep research running?" })).not.toBeInTheDocument());
+    expect(finishWindowClose).toHaveBeenCalledExactlyOnceWith("minimize");
   });
 
   it("imports a declarative research pack without native path access", async () => {

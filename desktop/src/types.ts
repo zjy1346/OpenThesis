@@ -825,6 +825,7 @@ export type ModelCallHistoryPage = {
 };
 
 export type ResearchTaskState = "queued" | "running" | "waiting_input" | "interrupted" | "cancelling" | "completed" | "failed" | "cancelled";
+export type ResearchResultAccess = "none" | "saved" | "recovery";
 
 export type ResearchTaskSummary = {
   job_id: string;
@@ -837,13 +838,16 @@ export type ResearchTaskSummary = {
   stage: string;
   message: string;
   elapsed_seconds: number;
-  queue_position?: number;
-  ahead_count?: number;
+  queue_position?: number | null;
+  ahead_count?: number | null;
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;
   blocked_reason?: string;
   action_required?: boolean;
+  execution_draining?: boolean;
+  research_complete?: boolean;
+  result_access?: ResearchResultAccess;
 };
 
 export type ResearchTaskCounts = Record<"running" | "queued" | "waiting_input" | "interrupted" | "cancelling", number>;
@@ -865,8 +869,8 @@ export type ResearchJob = {
   operation_type?: string;
   company?: ResearchTaskSummary["company"];
   model?: string;
-  queue_position?: number;
-  ahead_count?: number;
+  queue_position?: number | null;
+  ahead_count?: number | null;
   created_at?: string;
   started_at?: string | null;
   finished_at?: string | null;
@@ -954,6 +958,7 @@ export type ResearchJob = {
   attempt_complete?: boolean;
   research_complete?: boolean;
   action_required?: boolean;
+  result_access?: ResearchResultAccess;
 };
 
 export type StructureRuntimeStatus = {

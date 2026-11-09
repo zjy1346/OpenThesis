@@ -18,6 +18,37 @@ use tauri_plugin_opener::OpenerExt;
 
 const MAX_EXPORT_BYTES: usize = 32 * 1024 * 1024;
 
+fn client_size_for_work_area(
+    inner: tauri::PhysicalSize<u32>,
+    outer: tauri::PhysicalSize<u32>,
+    work: tauri::PhysicalSize<u32>,
+) -> tauri::PhysicalSize<u32> {
+    let frame_width = outer.width.saturating_sub(inner.width);
+    let frame_height = outer.height.saturating_sub(inner.height);
+    tauri::PhysicalSize::new(
+        inner.width.min(work.width.saturating_sub(frame_width)).max(1),
+        inner.height.min(work.height.saturating_sub(frame_height)).max(1),
+    )
+}
+
+fn fit_initial_window(window: &tauri::WebviewWindow) {
+    let monitor = window.current_monitor().ok().flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let (Some(monitor), Ok(inner), Ok(outer)) = (monitor, window.inner_size(), window.outer_size()) else {
+        return;
+    };
+    let work = monitor.work_area();
+    let fitted = client_size_for_work_area(inner, outer, work.size);
+    if fitted == inner || window.set_size(fitted).is_err() {
+        return;
+    }
+    let frame_width = outer.width.saturating_sub(inner.width);
+    let frame_height = outer.height.saturating_sub(inner.height);
+    let x = work.position.x + (work.size.width.saturating_sub(fitted.width + frame_width) / 2) as i32;
+    let y = work.position.y + (work.size.height.saturating_sub(fitted.height + frame_height) / 2) as i32;
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
 fn sanitize_export_name(value: &str) -> String {
     let lower = value.to_ascii_lowercase();
     let extension = if lower.ends_with(".md") {
@@ -233,8 +264,20 @@ fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_for_export, is_allowed_external_url, sanitize_export_name, sanitize_json_export_name};
+    use super::{client_size_for_work_area, content_for_export, is_allowed_external_url, sanitize_export_name, sanitize_json_export_name};
     use std::path::PathBuf;
+
+    #[test]
+    fn initial_window_fits_the_physical_work_area_at_high_dpi() {
+        use tauri::PhysicalSize;
+        let inner = PhysicalSize::new(1770, 1020);
+        let outer = PhysicalSize::new(1794, 1076);
+        assert_eq!(
+            client_size_for_work_area(inner, outer, PhysicalSize::new(1280, 660)),
+            PhysicalSize::new(1256, 604),
+        );
+        assert_eq!(client_size_for_work_area(inner, outer, PhysicalSize::new(1920, 1080)), inner);
+    }
 
     #[test]
     fn export_format_is_selected_only_from_the_chosen_extension() {
@@ -272,6 +315,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(backend::BackendState::default())
         .manage(model_center::ModelCenterState::default())
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                fit_initial_window(&window);
+            }
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.state::<backend::BackendState>().guard_window_close() {

@@ -1,6 +1,6 @@
 [package]
 name = "openthesis-desktop"
-version = "3.3.3"
+version = "3.4.0"
 description = "OpenThesis desktop platform adapter"
 authors = ["OpenThesis Contributors"]
 edition = "2021"

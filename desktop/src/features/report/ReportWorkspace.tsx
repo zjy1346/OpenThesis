@@ -173,7 +173,7 @@ export function stripReportPreamble(markdown: string): string {
   return lines.slice(cursor).join("\n");
 }
 
-export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRevalidateSaved, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud, onApproveBudgetGaps, suppressResearchActions = false }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string, confirmNewAttempt?: boolean) => Promise<void>; onRevalidateSaved?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void; onApproveBudgetGaps?: (runId: string, planDigest: string, gapIds: string[], adaptiveChoice?: "keep" | "remove") => Promise<void>; suppressResearchActions?: boolean }) {
+export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynthesis, onRetryGrowth, onRetryRecoveryStage, onRevalidateSaved, onRetryFinancials, onRebuildFinancials, onRefreshFinancialReport, onConfigureCloud, onApproveBudgetGaps, suppressResearchActions = false, taskAction }: { report: ResearchReport; copy: ReportCopy; onRetryModelStages?: () => Promise<void>; onRetrySynthesis?: (model?: ModelSelection) => Promise<void>; onRetryGrowth?: () => Promise<void>; onRetryRecoveryStage?: (target: RecoveryStageTarget, model: ModelSelection, planHash: string, confirmNewAttempt?: boolean) => Promise<void>; onRevalidateSaved?: () => Promise<void>; onRetryFinancials?: () => Promise<void>; onRebuildFinancials?: () => Promise<void>; onRefreshFinancialReport?: () => Promise<void>; onConfigureCloud?: () => void; onApproveBudgetGaps?: (runId: string, planDigest: string, gapIds: string[], adaptiveChoice?: "keep" | "remove") => Promise<void>; suppressResearchActions?: boolean; taskAction?: { label: string; open: () => void } }) {
   const [displayedReport, setDisplayedReport] = useState(report);
   const [zoom, setZoom] = useState(1);
   const [technical, setTechnical] = useState(false);
@@ -530,12 +530,13 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
       if (event.key === "F11") {
         event.preventDefault();
         cancelPendingClose();
         setSkipFocusMotion(true);
         setFocusState((current) => current === "normal" ? "focused" : "normal");
-      } else if (event.key === "Escape") {
+      } else if (event.key === "Escape" && focusState !== "normal") {
         event.preventDefault();
         cancelPendingClose();
         setSkipFocusMotion(true);
@@ -553,7 +554,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, []);
+  }, [focusState]);
 
   useEffect(() => () => cancelPendingClose(), []);
 
@@ -693,6 +694,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
           </div>
         </div>
         <div className="report-toolbar" role="toolbar" aria-label={copy.reportTools}>
+          {taskAction && <button type="button" className="report-task-action" onClick={taskAction.open}>{taskAction.label}</button>}
           {!noSubstantiveReport && !financialRuntimeRepairRequired && !recoveryAvailable && displayedReport.retryable_model_stages && onRetryModelStages && <button type="button" className="report-retry-button" aria-label={copy.retryModelStages} title={copy.retryModelStages} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("model-stages")}><RefreshCw size={16} /><span>{copy.retryModelStages}</span></button>}
           {!noSubstantiveReport && !financialRuntimeRepairRequired && !recoveryAvailable && displayedReport.retryable_growth && onRetryGrowth && <button type="button" className="report-retry-button" aria-label={copy.retryGrowth} title={copy.retryGrowth} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("growth")}><RefreshCw size={16} /><span>{copy.retryGrowth}</span></button>}
           {!noSubstantiveReport && !financialRuntimeRepairRequired && !recoveryAvailable && displayedReport.retryable_synthesis && onRetrySynthesis && !contextCapacityExceeded && <button type="button" className="report-retry-button" aria-label={copy.retrySynthesis} title={copy.retrySynthesis} style={{ width: "auto", minWidth: 34, padding: "0 10px", display: "inline-flex", alignItems: "center", gap: 6 }} disabled={retryState === "retrying"} onClick={() => void retryStage("synthesis")}><RefreshCw size={16} /><span>{copy.retrySynthesis}</span></button>}
@@ -713,7 +715,7 @@ export function ReportWorkspace({ report, copy, onRetryModelStages, onRetrySynth
           </>}
         </div>
       </header>
-      {!suppressResearchActions && <BudgetGapApproval runId={displayedReport.run_id} callPlan={displayedReport.call_plan}
+      {!suppressResearchActions && !taskAction && <BudgetGapApproval runId={displayedReport.run_id} callPlan={displayedReport.call_plan}
         language={displayedReport.report_language}
         onApprove={onApproveBudgetGaps ? (planDigest, gapIds, adaptiveChoice) => adaptiveChoice
           ? onApproveBudgetGaps(displayedReport.run_id, planDigest, gapIds, adaptiveChoice)

@@ -19,6 +19,7 @@ vi.mock("../backend", () => ({
   cancelModelCall: vi.fn(),
   cancelResearch: vi.fn(),
   continueResearchQueue: vi.fn(),
+  extendResearchBudget: vi.fn(),
   decideVisionUpload: vi.fn(),
   getResearchStatus: vi.fn(),
   listResearchTasks: vi.fn(),
@@ -243,10 +244,10 @@ describe("useResearchTasks", () => {
 
     await act(async () => { await Promise.resolve(); });
     expect(getResearchStatus).toHaveBeenCalledTimes(1);
-    expect(result.current.error).toBe("temporary status outage");
+    expect(result.current.detailError).toBe("temporary status outage");
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
     expect(getResearchStatus).toHaveBeenCalledTimes(2);
-    expect(result.current.error).toBe("");
+    expect(result.current.detailError).toBe("");
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
     expect(getResearchStatus).toHaveBeenCalledTimes(3);
     expect(result.current.detail?.state).toBe("completed");

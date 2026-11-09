@@ -101,13 +101,13 @@ export function isActiveResearchJob(job: ResearchJob | null): job is ResearchJob
   return Boolean(job && !TERMINAL_JOB_STATES.has(job.state));
 }
 
-export function useWorkbenchSession() {
+export function useWorkbenchSession(taskViews?: Parameters<typeof useResearchTasks>[1]) {
   const [bootstrap, setBootstrap] = useState<BootstrapResult | null>(null);
   const bootstrapValue = useRef<BootstrapResult | null>(null);
   const savedPreferences = useRef<Preferences | null>(null);
   const [report, setReport] = useState<ResearchReport | null>(null);
   const [reportLoadState, setReportLoadState] = useState<ReportLoadState>({ status: "idle" });
-  const tasks = useResearchTasks(Boolean(bootstrap));
+  const tasks = useResearchTasks(Boolean(bootstrap), taskViews);
   const [error, setError] = useState<WorkbenchError | null>(null);
   const storageMaintenanceRequired = useRef(false);
   const lastRequest = useRef<ResearchRequest | null>(null);
@@ -220,8 +220,10 @@ export function useWorkbenchSession() {
   }, [commitBootstrap, readReportForRun, recordCoreFailure]);
 
   useEffect(() => {
-    if (isStorageHealthRecoveryRequired(tasks.error)) recordCoreFailure(new Error(tasks.error));
-  }, [tasks.error, recordCoreFailure]);
+    if ([tasks.error, tasks.detailError, tasks.catalog.error].some(isStorageHealthRecoveryRequired)) {
+      recordCoreFailure(new Error(STORAGE_HEALTH_RECOVERY_REQUIRED));
+    }
+  }, [tasks.error, tasks.detailError, tasks.catalog.error, recordCoreFailure]);
 
   useEffect(() => {
     for (const notification of tasks.notifications) {
