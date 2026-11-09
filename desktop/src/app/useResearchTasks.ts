@@ -6,6 +6,7 @@ import {
   cancelResearch,
   continueResearchQueue,
   decideVisionUpload,
+  extendResearchBudget,
   getResearchStatus,
   listResearchTasks,
   resumeResearchTask,
@@ -18,6 +19,8 @@ import type {
   ResearchTaskState,
   ResearchTaskSummary,
 } from "../types";
+import { useResearchTaskCatalog } from "./useResearchTaskCatalog";
+import { TASK_FILTER_STATES } from "../features/tasks/taskPresentation";
 
 const PAGE_SIZE = 50;
 const NOTIFICATION_STORAGE_KEY = "openthesis.research-task-notifications.v1";
@@ -26,7 +29,7 @@ const POLLED_STATES = new Set<ResearchTaskState>(["running", "cancelling"]);
 
 export type ResearchTaskNotification = Pick<
   ResearchTaskSummary,
-  "job_id" | "run_id" | "state" | "revision" | "company" | "operation_type" | "message"
+  "job_id" | "run_id" | "state" | "revision" | "company" | "operation_type" | "message" | "result_access" | "research_complete"
 > & { id: string };
 
 type TaskListOptions = { limit: number; offset: number; since_revision?: number };
@@ -55,6 +58,9 @@ function summaryFromJob(job: ResearchJob, previous?: ResearchTaskSummary): Resea
     finished_at: job.finished_at ?? previous?.finished_at ?? null,
     ...(job.blocked_reason !== undefined ? { blocked_reason: job.blocked_reason } : {}),
     ...(job.action_required !== undefined ? { action_required: job.action_required } : {}),
+    ...(job.research_complete !== undefined ? { research_complete: job.research_complete } : {}),
+    ...(job.result_access !== undefined ? { result_access: job.result_access } : {}),
+    execution_draining: job.execution_draining,
   };
 }
 
@@ -103,7 +109,7 @@ function normalizeOptions(options: TaskListOptions): TaskListOptions {
   return { ...options };
 }
 
-export function useResearchTasks(enabled: boolean) {
+export function useResearchTasks(enabled: boolean, { catalogVisible = false, detailVisible = true, quickVisible = false } = {}) {
   const [items, setItems] = useState<ResearchTaskSummary[]>([]);
   const [counts, setCounts] = useState<ResearchTaskCounts>(emptyCounts);
   const [queuePaused, setQueuePaused] = useState(false);
@@ -113,7 +119,12 @@ export function useResearchTasks(enabled: boolean) {
   const [selectedTaskId, setSelectedTaskIdState] = useState<string | null>(null);
   const [detail, setDetail] = useState<ResearchJob | null>(null);
   const [notifications, setNotifications] = useState<ResearchTaskNotification[]>([]);
+  const [backgroundHead, setBackgroundHead] = useState<ResearchTaskList | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [detailVersion, setDetailVersion] = useState(0);
+  const [detailError, setDetailError] = useState("");
+  const [commands, setCommands] = useState<Record<string, { pending: boolean; error: string }>>({});
+  const pendingCommands = useRef(new Set<string>());
   const itemsRef = useRef(items);
   const countsRef = useRef(counts);
   const detailRef = useRef(detail);
@@ -127,6 +138,8 @@ export function useResearchTasks(enabled: boolean) {
   const loadMoreInFlightRef = useRef(false);
   const listRequestGenerationRef = useRef(0);
   const detailRequestsRef = useRef(new Set<string>());
+  const lastHead = useRef<ResearchTaskList | null>(null);
+  const rowListRevisions = useRef(new Map<string, number>());
 
   itemsRef.current = items;
   countsRef.current = counts;
@@ -137,11 +150,69 @@ export function useResearchTasks(enabled: boolean) {
     if (selectedTaskIdRef.current === id) return;
     selectionGenerationRef.current += 1;
     selectedTaskIdRef.current = id;
+    detailRef.current = null;
     setSelectedTaskIdState(id);
     setDetail(null);
+    setDetailError("");
   }, []);
 
-  const mergeJob = useCallback((job: ResearchJob, notifyTerminal: boolean) => {
+  const notify = useCallback((task: ResearchTaskSummary) => {
+    const key = notificationKey(task);
+    const seen = notificationKeysRef.current!;
+    const notice: ResearchTaskNotification = {
+      id: key, job_id: task.job_id, run_id: task.run_id, state: task.state,
+      revision: task.revision, company: task.company, operation_type: task.operation_type,
+      message: task.message, result_access: task.result_access, research_complete: task.research_complete,
+    };
+    if (seen.has(key)) {
+      // The durable list may confirm result access after a command response.
+      // Enrich an existing notice, but never reopen one the user dismissed.
+      if (notice.result_access) setNotifications((current) => current.some((item) => item.id === key && item.result_access !== notice.result_access)
+        ? current.map((item) => item.id === key ? notice : item) : current);
+      return;
+    }
+    seen.add(key);
+    persistNotificationKeys(seen);
+    setNotifications((current) => [...current, notice]);
+  }, []);
+
+  const observeRows = useCallback((rows: ResearchTaskSummary[], revision: number, notifyUpdates = true) => {
+    if (!rows.length) return;
+    const previousById = new Map(itemsRef.current.map((item) => [item.job_id, item]));
+    const accepted = rows.filter((item) => {
+      const previous = previousById.get(item.job_id);
+      if (previous && item.revision < previous.revision) return false;
+      if (previous && item.revision === previous.revision
+          && revision < (rowListRevisions.current.get(item.job_id) ?? 0)) return false;
+      rowListRevisions.current.set(item.job_id, revision);
+      return true;
+    });
+    for (const item of accepted) {
+      const previous = previousById.get(item.job_id);
+      if (notifyUpdates && previous && TERMINAL_STATES.has(item.state)
+          && (!TERMINAL_STATES.has(previous.state) || item.revision > previous.revision
+            || notificationKeysRef.current!.has(notificationKey(item)))) notify(item);
+    }
+    if (!accepted.length) return;
+    const merged = mergeSummaries(itemsRef.current, accepted);
+    itemsRef.current = merged;
+    setItems(merged);
+  }, [notify]);
+  const catalog = useResearchTaskCatalog(enabled && catalogVisible, backgroundHead, observeRows);
+  const waitingCount = counts.waiting_input + counts.interrupted;
+  const waitingPreviewNeeded = items.filter((item) => item.state === "waiting_input" || item.state === "interrupted").length < Math.min(waitingCount, 2);
+  useEffect(() => {
+    if (!enabled || !quickVisible || !waitingPreviewNeeded) return;
+    let active = true;
+    // The unfiltered head can be full of queued jobs. Read only the small
+    // missing attention preview while the panel is open.
+    void listResearchTasks({ limit: 2, states: TASK_FILTER_STATES.attention }).then((result) => {
+      if (active) observeRows(result.items, result.revision);
+    }).catch(() => { /* Global counts and the full attention view remain usable. */ });
+    return () => { active = false; };
+  }, [enabled, quickVisible, waitingPreviewNeeded, backgroundHead?.revision, observeRows]);
+
+  const mergeJob = useCallback((job: ResearchJob, notifyTerminal: boolean, updateCounts = true) => {
     const previous = itemsRef.current.find((item) => item.job_id === job.job_id);
     const incoming = summaryFromJob(job, previous);
     if (previous && incoming.revision < previous.revision) return false;
@@ -150,77 +221,40 @@ export function useResearchTasks(enabled: boolean) {
     const merged = mergeSummaries(itemsRef.current, [incoming]);
     itemsRef.current = merged;
     setItems(merged);
-    const nextCounts = taskCountsForTransition(countsRef.current, previous?.state, incoming.state);
-    countsRef.current = nextCounts;
-    setCounts(nextCounts);
-    if (terminalIsNew) {
-      const key = notificationKey(incoming);
-      const seen = notificationKeysRef.current!;
-      if (!seen.has(key)) {
-        seen.add(key);
-        persistNotificationKeys(seen);
-        setNotifications((current) => current.some((item) => notificationKey(item) === key)
-          ? current
-          : [...current, {
-            id: key,
-            job_id: incoming.job_id,
-            run_id: incoming.run_id,
-            state: incoming.state,
-            revision: incoming.revision,
-            company: incoming.company,
-            operation_type: incoming.operation_type,
-            message: incoming.message,
-          }]);
+    if (updateCounts) {
+      const nextCounts = taskCountsForTransition(countsRef.current, previous?.state, incoming.state);
+      countsRef.current = nextCounts;
+      setCounts(nextCounts);
+    }
+    if (terminalIsNew) notify(incoming);
+    if (selectedTaskIdRef.current === job.job_id) {
+      const current = detailRef.current;
+      if (current?.job_id !== job.job_id || (current.revision ?? 0) <= (job.revision ?? 0)) {
+        detailRef.current = job;
+        setDetail(job);
       }
     }
-    if (selectedTaskIdRef.current === job.job_id) {
-      setDetail((current) => current?.job_id === job.job_id && (current.revision ?? 0) > (job.revision ?? 0) ? current : job);
-    }
     return true;
-  }, []);
+  }, [notify]);
 
   const applyList = useCallback((result: ResearchTaskList, notifyUpdates: boolean, pageOffset = 0) => {
     if (revisionRef.current !== undefined && result.revision < revisionRef.current) return false;
-    const previousItems = itemsRef.current;
-    const nextItems = mergeSummaries(previousItems, result.items);
-    if (notifyUpdates) {
-      const previousById = new Map(previousItems.map((item) => [item.job_id, item]));
-      for (const item of result.items) {
-        const previous = previousById.get(item.job_id);
-        if (!previous || item.revision < previous.revision || !TERMINAL_STATES.has(item.state)) continue;
-        if (TERMINAL_STATES.has(previous.state) && item.revision <= previous.revision) continue;
-        const key = notificationKey(item);
-        const seen = notificationKeysRef.current!;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        persistNotificationKeys(seen);
-        setNotifications((current) => current.some((notification) => notificationKey(notification) === key)
-          ? current
-          : [...current, {
-            id: key,
-            job_id: item.job_id,
-            run_id: item.run_id,
-            state: item.state,
-            revision: item.revision,
-            company: item.company,
-            operation_type: item.operation_type,
-            message: item.message,
-          }]);
-      }
-    }
-    itemsRef.current = nextItems;
-    setItems(nextItems);
+    observeRows(result.items, result.revision, notifyUpdates);
     revisionRef.current = Math.max(revisionRef.current ?? 0, result.revision);
     setCounts(result.counts ?? emptyCounts());
     countsRef.current = result.counts ?? emptyCounts();
     setQueuePaused(result.queue_paused);
+    if (pageOffset === 0) {
+      lastHead.current = result;
+      setBackgroundHead(result);
+    }
     if (pageOffset > 0 || loadedThroughOffsetRef.current === 0) {
       loadedThroughOffsetRef.current = Math.max(loadedThroughOffsetRef.current, pageOffset);
       setHasMore(result.has_more);
       nextOffsetRef.current = result.next_offset;
     }
     return true;
-  }, []);
+  }, [observeRows]);
 
   const selectedSummary = items.find((item) => item.job_id === selectedTaskId);
   const selectedState = selectedSummary?.state;
@@ -255,7 +289,22 @@ export function useResearchTasks(enabled: boolean) {
         setError("");
         const changed = result.revision !== beforeRevision || first;
         unchangedPolls = changed ? 0 : unchangedPolls + 1;
-        if (!result.not_modified) applyList(result, initialListReceivedRef.current);
+        if (!result.not_modified) {
+          const nextIds = new Set(result.items.map((item) => item.job_id));
+          const departed = lastHead.current?.items.filter((item) => POLLED_STATES.has(item.state) && !nextIds.has(item.job_id)) ?? [];
+          if (applyList(result, initialListReceivedRef.current)) {
+            // A just-finished job can fall behind 50 queued jobs. Reconcile
+            // the vanished running row once, rather than polling every job.
+            for (const item of departed) {
+              const id = item.job_id;
+              if (detailRequestsRef.current.has(id)) continue;
+              detailRequestsRef.current.add(id);
+              void getResearchStatus(id).then((job) => {
+                if (active && job.job_id === id) mergeJob(job, true, false);
+              }).catch(() => undefined).finally(() => detailRequestsRef.current.delete(id));
+            }
+          }
+        }
         if (first) {
           first = false;
           initialListReceivedRef.current = true;
@@ -279,10 +328,10 @@ export function useResearchTasks(enabled: boolean) {
       active = false;
       window.clearTimeout(timeout);
     };
-  }, [enabled, refreshVersion, applyList]);
+  }, [enabled, refreshVersion, applyList, mergeJob]);
 
   useEffect(() => {
-    if (!enabled || !selectedTaskId) return;
+    if (!enabled || !detailVisible || !selectedTaskId) return;
     const knownDetail = detailRef.current;
     if (selectedState && selectedState !== "queued" && !POLLED_STATES.has(selectedState)
         && knownDetail?.job_id === selectedTaskId && knownDetail.state === selectedState
@@ -304,17 +353,17 @@ export function useResearchTasks(enabled: boolean) {
         const next = await getResearchStatus(selectedTaskId);
         if (!active || selectedTaskIdRef.current !== selectedTaskId || selectionGenerationRef.current !== generation || next.job_id !== selectedTaskId) return;
         consecutiveFailures = 0;
-        setError("");
+        setDetailError("");
         const summary = itemsRef.current.find((item) => item.job_id === selectedTaskId);
         const knownRevision = Math.max(summary?.revision ?? 0, detailRef.current?.job_id === selectedTaskId ? detailRef.current.revision ?? 0 : 0);
         const isCurrentRevision = (next.revision ?? 0) >= knownRevision;
         if (isCurrentRevision) mergeJob(next, true);
         const currentState = isCurrentRevision ? next.state : summary?.state;
-        if (currentState && POLLED_STATES.has(currentState)) timeout = window.setTimeout(() => void poll(), 1_000);
+        if (!isCurrentRevision || (currentState && POLLED_STATES.has(currentState))) timeout = window.setTimeout(() => void poll(), 1_000);
       } catch (reason) {
         if (active && selectedTaskIdRef.current === selectedTaskId && selectionGenerationRef.current === generation) {
           consecutiveFailures += 1;
-          setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_STATUS_UNAVAILABLE"));
+          setDetailError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_STATUS_UNAVAILABLE"));
           const delay = Math.min(10_000, 1_000 * 2 ** Math.min(consecutiveFailures - 1, 4));
           timeout = window.setTimeout(() => void poll(), delay);
         }
@@ -329,11 +378,11 @@ export function useResearchTasks(enabled: boolean) {
       window.clearTimeout(timeout);
     };
     // `detail` is intentionally read through a ref: detail updates must not create overlapping poll loops.
-  }, [enabled, selectedTaskId, selectedState, settledRevision, mergeJob]);
+  }, [enabled, detailVisible, selectedTaskId, selectedState, settledRevision, detailVersion, mergeJob]);
 
   const acceptJob = useCallback((job: ResearchJob): string => {
     mergeJob(job, true);
-    setSelectedTaskId(job.job_id);
+    if (selectedTaskIdRef.current === null) setSelectedTaskId(job.job_id);
     setError("");
     setRefreshVersion((value) => value + 1);
     return job.job_id;
@@ -366,88 +415,71 @@ export function useResearchTasks(enabled: boolean) {
     }
   }, [applyList, enabled]);
 
-  const cancel = useCallback(async (jobId: string) => {
+  const refreshDetail = useCallback(() => {
+    selectionGenerationRef.current += 1;
+    detailRef.current = null;
+    setDetail(null);
+    setDetailError("");
+    setDetailVersion((version) => version + 1);
+  }, []);
+
+  const command = useCallback(async <T,>(id: string, action: () => Promise<T>): Promise<T | null> => {
+    if (pendingCommands.current.has(id)) return null;
+    pendingCommands.current.add(id);
+    setCommands((current) => ({ ...current, [id]: { pending: true, error: "" } }));
+    let failure = "";
     try {
-      const next = await cancelResearch(jobId);
-      mergeJob(next, true);
-      refresh();
-      setError("");
-      return next;
+      return await action();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_CANCEL_FAILED"));
+      failure = reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_COMMAND_FAILED");
+      if (selectedTaskIdRef.current === id) refreshDetail();
       return null;
-    }
-  }, [mergeJob, refresh]);
-
-  const cancelModel = useCallback(async (jobId: string, requestId: string, attemptId: string) => {
-    try {
-      const next = await cancelModelCall(jobId, requestId, attemptId);
-      mergeJob(next, true);
+    } finally {
+      pendingCommands.current.delete(id);
+      setCommands((current) => ({ ...current, [id]: { pending: false, error: failure } }));
       refresh();
-      setError("");
-      return next;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_MODEL_CALL_CANCEL_FAILED"));
-      return null;
     }
-  }, [mergeJob, refresh]);
+  }, [refresh, refreshDetail]);
 
-  const decideVision = useCallback(async (jobId: string, revision: number, planId: string, approved: boolean) => {
-    try {
-      const next = await decideVisionUpload(jobId, approved, revision, planId);
-      mergeJob(next, true);
-      refresh();
-      setError("");
-      return next;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_VISION_DECISION_FAILED"));
-      return null;
-    }
-  }, [mergeJob, refresh]);
-
-  const resume = useCallback(async (jobId: string, revision: number, model?: ModelReference, useCurrentVisionSettings = false) => {
-    try {
-      const next = await resumeResearchTask(jobId, revision, model, useCurrentVisionSettings);
-      mergeJob(next, true);
-      refresh();
-      setError("");
-      return next;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_RESUME_FAILED"));
-      return null;
-    }
-  }, [mergeJob, refresh]);
-
-  const archive = useCallback(async (jobId: string, revision: number) => {
-    try {
-      await archiveResearchTask(jobId, revision);
-      setItems((current) => {
-        const next = current.filter((item) => item.job_id !== jobId);
-        itemsRef.current = next;
-        return next;
-      });
-      if (selectedTaskIdRef.current === jobId) setSelectedTaskId(null);
-      refresh();
-      setError("");
-      return true;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_TASK_ARCHIVE_FAILED"));
-      return false;
-    }
-  }, [refresh, setSelectedTaskId]);
-
-  const continueQueue = useCallback(async () => {
-    const requestGeneration = listRequestGenerationRef.current;
-    try {
-      const result = await continueResearchQueue();
-      if (requestGeneration !== listRequestGenerationRef.current || !applyList(result, true)) return false;
-      setError("");
-      return true;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason ?? "RESEARCH_QUEUE_CONTINUE_FAILED"));
-      return false;
-    }
-  }, [applyList]);
+  const taskCommand = (id: string, action: () => Promise<ResearchJob>) => command(id, async () => {
+    const next = await action();
+    if (next.job_id !== id) throw new Error("RESEARCH_TASK_IDENTITY_MISMATCH");
+    mergeJob(next, true);
+    return next;
+  });
+  const cancel = (jobId: string) => taskCommand(jobId, () => cancelResearch(jobId));
+  const cancelModel = (jobId: string, requestId: string, attemptId: string) =>
+    taskCommand(jobId, () => cancelModelCall(jobId, requestId, attemptId));
+  const decideVision = (jobId: string, revision: number, planId: string, approved: boolean) =>
+    taskCommand(jobId, () => decideVisionUpload(jobId, approved, revision, planId));
+  const resume = (jobId: string, revision: number, model?: ModelReference, useCurrentVisionSettings = false) =>
+    taskCommand(jobId, () => resumeResearchTask(jobId, revision, model, useCurrentVisionSettings));
+  const approveBudget = (job: ResearchJob, digest: string, gaps: string[], choice?: "keep" | "remove") =>
+    taskCommand(job.job_id, async () => {
+      const latest = detailRef.current;
+      const summary = itemsRef.current.find((item) => item.job_id === job.job_id);
+      if (!job.run_id || latest?.job_id !== job.job_id || latest.revision !== job.revision
+          || (summary && (summary.state !== job.state || summary.revision > (job.revision ?? 0)))
+          || latest.call_plan?.plan_digest !== digest || !["waiting_input", "interrupted"].includes(latest.state)) {
+        throw new Error("RESEARCH_TASK_REVISION_CONFLICT");
+      }
+      if (choice) await extendResearchBudget(job.run_id, digest, gaps, choice);
+      else await extendResearchBudget(job.run_id, digest, gaps);
+      return resumeResearchTask(job.job_id, job.revision ?? 0);
+    });
+  const archive = (jobId: string, revision: number) => command(jobId, async () => {
+    await archiveResearchTask(jobId, revision);
+    const remaining = itemsRef.current.filter((item) => item.job_id !== jobId);
+    itemsRef.current = remaining;
+    setItems(remaining);
+    catalog.remove(jobId);
+    if (selectedTaskIdRef.current === jobId) setSelectedTaskId(null);
+    return true;
+  });
+  const continueQueue = () => command("queue", async () => {
+    const result = await continueResearchQueue();
+    return applyList(result, true);
+  });
 
   const dismissNotification = useCallback((jobId: string) => {
     setNotifications((current) => {
@@ -471,6 +503,11 @@ export function useResearchTasks(enabled: boolean) {
     hasMore,
     selectedTaskId,
     detail,
+    detailError,
+    refreshDetail,
+    commands,
+    catalog,
+    selectedSummary,
     notifications,
     dismissNotification,
     selectTask: setSelectedTaskId,
@@ -486,6 +523,7 @@ export function useResearchTasks(enabled: boolean) {
     decideVisionUpload: decideVision,
     resumeTask: resume,
     resume,
+    approveBudget,
     archiveTask: archive,
     archive,
     continueQueue,

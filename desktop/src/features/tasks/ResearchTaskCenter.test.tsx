@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { openExternalUrl } from "../../backend";
@@ -43,35 +43,42 @@ function detail(jobId: string, state: ResearchJob["state"] = "running", patch: P
     percent: 35,
     stage: "synthesis",
     elapsed_seconds: 62,
+    result_access: state === "completed" ? "saved" : state === "waiting_input" || state === "interrupted" ? "recovery" : "none",
     ...patch,
   };
 }
 
-function props(overrides: Partial<ResearchTaskCenterProps> = {}): ResearchTaskCenterProps {
+type Scenario = Partial<ResearchTaskCenterProps> & {
+  items?: ResearchTaskSummary[];
+  onCancel?: ResearchTaskCenterProps["actions"]["cancel"];
+  onResume?: ResearchTaskCenterProps["actions"]["resume"];
+  onArchive?: ResearchTaskCenterProps["actions"]["archive"];
+  onViewReport?: (runId: string | null) => void;
+  onVisionDecision?: ResearchTaskCenterProps["actions"]["decideVision"];
+};
+function props({
+  items = [task("a"), task("b"), task("c", "queued")],
+  onCancel = vi.fn(), onResume = vi.fn(), onArchive = vi.fn(), onViewReport = vi.fn(),
+  onVisionDecision = vi.fn(), ...overrides
+}: Scenario = {}): ResearchTaskCenterProps {
   return {
-    variant: "drawer",
     language: "en",
-    items: [task("a"), task("b"), task("c", "queued")],
-    counts,
-    queuePaused: false,
-    loading: false,
-    error: "",
-    hasMore: false,
-    selectedTaskId: null,
-    detail: null,
-    onSelect: vi.fn(),
-    onCancel: vi.fn(),
-    onResume: vi.fn(),
-    onArchive: vi.fn(),
-    onViewReport: vi.fn(),
-    onClose: vi.fn(),
-    onFullPage: vi.fn(),
-    onContinueQueue: vi.fn(),
-    onLoadMore: vi.fn(),
-    onCancelModel: vi.fn(),
-    onVisionDecision: vi.fn(),
+    catalog: { filter: "all", items, loading: false, error: "", hasMore: false, hasPrevious: false, pageNumber: 1,
+      selectFilter: vi.fn(), refresh: vi.fn(), nextPage: vi.fn(), previousPage: vi.fn() },
+    counts, queuePaused: false, queuePending: false, queueError: "", onContinueQueue: vi.fn(),
+    selectedTaskId: null, detail: null, detailError: "", actionPending: false, actionError: "",
+    onSelect: vi.fn(), onReloadDetail: vi.fn(), openDetailToken: 0, models: [],
+    actions: { cancel: onCancel, resume: onResume, archive: onArchive, openResult: (job) => onViewReport(job.run_id),
+      decideVision: onVisionDecision, configureModels: vi.fn(), cancelModel: vi.fn(), approveBudget: vi.fn(),
+      loadCallHistory: vi.fn() },
     ...overrides,
   };
+}
+
+function openTechnicalDetails(language: ResearchTaskCenterProps["language"] = "en") {
+  const labels = language === "en" ? ["Diagnostics", "Diagnostic code"] : language === "zh-Hant" ? ["診斷", "診斷代碼"] : ["诊断", "诊断代码"];
+  fireEvent.click(screen.getByRole("tab", { name: labels[0] }));
+  fireEvent.click(within(screen.getByRole("tabpanel")).getByText(labels[1], { selector: "summary" }));
 }
 
 describe("ResearchTaskCenter", () => {
@@ -84,11 +91,12 @@ describe("ResearchTaskCenter", () => {
     expect(screen.getByText("Company c")).toBeInTheDocument();
     expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
     expect(screen.getByText("Queued")).toBeInTheDocument();
-    expect(view.container.querySelectorAll(".research-progress")).toHaveLength(0);
+    expect(screen.queryByRole("tab", { name: "Overview" })).not.toBeInTheDocument();
 
     view.rerender(<ResearchTaskCenter {...props({ selectedTaskId: "b", detail: detail("b") })} />);
-    expect(view.container.querySelectorAll(".research-progress")).toHaveLength(1);
-    expect(view.container.querySelector(".research-progress")).toHaveAttribute("data-state", "running");
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("heading", { name: "Company b" })).toBeVisible();
+    expect(screen.queryByText("35%")).not.toBeInTheDocument();
   });
 
   it("binds cancellation to selected detail B, not the other listed jobs", () => {
@@ -96,15 +104,6 @@ describe("ResearchTaskCenter", () => {
     render(<ResearchTaskCenter {...props({ selectedTaskId: "b", detail: detail("b"), onCancel })} />);
     fireEvent.click(screen.getByRole("button", { name: "Cancel task" }));
     expect(onCancel).toHaveBeenCalledExactlyOnceWith("b");
-  });
-
-  it("closes or handles Escape without cancelling any task", () => {
-    const onClose = vi.fn();
-    const onCancel = vi.fn();
-    render(<ResearchTaskCenter {...props({ selectedTaskId: "b", detail: detail("b"), onClose, onCancel })} />);
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledExactlyOnceWith();
-    expect(onCancel).not.toHaveBeenCalled();
   });
 
   it("does not resume an unknown remote result in waiting_input and keeps cancel and report recovery scoped", () => {
@@ -127,8 +126,8 @@ describe("ResearchTaskCenter", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel task" }));
     expect(onCancel).toHaveBeenCalledExactlyOnceWith("unknown");
     expect(onResume).not.toHaveBeenCalled();
-    expect(screen.getByText("The previous model request has an unconfirmed remote outcome. Check the report stage first; it will not be resent automatically.")).toBeInTheDocument();
-    expect(screen.queryByText("MODEL_REMOTE_RESULT_UNKNOWN", { selector: ".research-task-center__reason span" })).not.toBeInTheDocument();
+    expect(screen.getAllByText(/unknown remote outcome/i)).toHaveLength(1);
+    expect(screen.queryByText("MODEL_REMOTE_RESULT_UNKNOWN")).not.toBeInTheDocument();
   });
 
   it("binds an approval decision to job, detail revision, and plan id", () => {
@@ -167,24 +166,26 @@ describe("ResearchTaskCenter", () => {
 
   it("recognizes gateway configuration failures and translates operation and stage keys", () => {
     const job = detail("gateway", "interrupted", { blocked_reason: "MODEL_GATEWAY_CONFIGURATION_ERROR" });
-    const view = render(<ResearchTaskCenter {...props({
+    render(<ResearchTaskCenter {...props({
       items: [task("gateway", "interrupted"), { ...task("financial", "queued"), operation_type: "financial_retry" }],
       selectedTaskId: "gateway",
       detail: job,
       models: [{ configured_model_id: "replacement", configuration_version: 1, alias: "Replacement" }],
     })} />);
 
-    expect(screen.getByText("Financial retry")).toBeInTheDocument();
-    expect(screen.getByText("Integrating the investment conclusion…")).toBeInTheDocument();
+    expect(screen.getByText(/Financial retry/)).toBeInTheDocument();
+    expect(screen.getAllByText("Task interrupted; progress saved").length).toBeGreaterThan(0);
     expect(screen.getByText("The model configuration could not be checked. Review the model connection before continuing.")).toBeInTheDocument();
     expect(screen.getByLabelText("Choose model configuration")).toBeInTheDocument();
-    expect(view.container.querySelector(".research-task-center__reason small")).toHaveTextContent("MODEL_GATEWAY_CONFIGURATION_ERROR");
+    expect(screen.queryByText("MODEL_GATEWAY_CONFIGURATION_ERROR")).not.toBeInTheDocument();
+    openTechnicalDetails();
+    expect(screen.getByText("MODEL_GATEWAY_CONFIGURATION_ERROR")).toBeVisible();
   });
 
   it.each([
-    ["zh-CN", "正在校验财务数据……", "模型配置检查未能完成"],
-    ["zh-Hant", "正在驗證財務資料……", "模型設定檢查未能完成"],
-    ["en", "Validating financial data…", "The model configuration could not be checked"],
+    ["zh-CN", "任务已中断，进度已保留", "模型配置检查未能完成"],
+    ["zh-Hant", "任務已中斷，進度已保留", "模型設定檢查未能完成"],
+    ["en", "Task interrupted; progress saved", "The model configuration could not be checked"],
   ] as const)("localizes stage and configuration reason instead of showing raw keys in %s", (language, stageTitle, reason) => {
     render(<ResearchTaskCenter {...props({
       language,
@@ -208,7 +209,7 @@ describe("ResearchTaskCenter", () => {
       language,
       items: operationTypes.map((operation_type, index) => ({ ...task(`operation-${index}`, "queued"), operation_type })),
     })} />);
-    for (const operation of operations) expect(screen.getByText(operation)).toBeInTheDocument();
+    for (const operation of operations) expect(screen.getByText(new RegExp(operation))).toBeInTheDocument();
   });
 
   it.each([
@@ -256,9 +257,7 @@ describe("ResearchTaskCenter", () => {
       detail: detail("blank-reason", "waiting_input", { blocked_reason: blockedReason }),
     })} />);
 
-    expect(screen.getByText("This task needs review before it can continue.", {
-      selector: ".research-task-center__reason > span",
-    })).toBeInTheDocument();
+    expect(screen.getByText("This task needs review before it can continue.")).toBeInTheDocument();
   });
 
   it.each([
@@ -277,8 +276,9 @@ describe("ResearchTaskCenter", () => {
       selectedTaskId: "no-filings",
       detail: job,
     })} />);
-    expect(screen.getByRole("status")).toHaveTextContent(noFilings);
-    expect(screen.getByText(/NO_FILINGS_AVAILABLE/)).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(noFilings))).toBeVisible();
+    openTechnicalDetails(language);
+    expect(screen.getByText("NO_FILINGS_AVAILABLE")).toBeVisible();
     expect(screen.queryByText("The research is not complete. Review the report's missing data and evidence before deciding what to do next.")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: openDisclosure }));
     expect(openExternalUrl).toHaveBeenCalledWith("https://www.cninfo.com.cn/new/index");
@@ -303,14 +303,14 @@ describe("ResearchTaskCenter", () => {
       onViewReport,
     })} />);
 
-    expect(screen.getByText("This task attempt has ended.")).toBeInTheDocument();
-    expect(screen.getByText(/The research is not complete/)).toBeInTheDocument();
-    expect(screen.getByText(/Financial data does not yet meet the research requirements/)).toBeInTheDocument();
-    expect(screen.getByText(/FINANCIAL_DATA_QUALITY_FAILED/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Open report recovery" })).toBeInTheDocument();
+    expect(screen.getByText("Partial result")).toBeVisible();
+    expect(screen.getByText(/Financial data does not yet meet the research requirements/)).toBeVisible();
+    openTechnicalDetails();
+    expect(screen.getByText("FINANCIAL_DATA_QUALITY_FAILED")).toBeVisible();
+    expect(screen.getByRole("button", { name: "View saved research" })).toBeVisible();
     expect(screen.queryByText(/research is complete/i)).not.toBeInTheDocument();
     expect(onResume).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Open report recovery" }));
+    fireEvent.click(screen.getByRole("button", { name: "View saved research" }));
     expect(onViewReport).toHaveBeenCalledExactlyOnceWith("run-incomplete");
   });
 
@@ -326,7 +326,7 @@ describe("ResearchTaskCenter", () => {
       }),
     })} />);
 
-    expect(screen.getByText("This task attempt has ended.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View research report" })).toBeVisible();
     expect(screen.getByText("The research is complete.")).toBeInTheDocument();
     expect(screen.getByText("Further action is required for this task.")).toBeInTheDocument();
     expect(screen.queryByText(/research is not complete/i)).not.toBeInTheDocument();
@@ -342,9 +342,9 @@ describe("ResearchTaskCenter", () => {
       }),
     })} />);
 
-    expect(screen.getByText("This task attempt has ended.")).toBeInTheDocument();
-    expect(screen.getByText("Further action is required for this task.")).toBeInTheDocument();
-    expect(screen.queryByText(/research is (?:not )?complete/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View saved research" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "View research report" })).not.toBeInTheDocument();
+    expect(screen.queryByText("The research is complete.")).not.toBeInTheDocument();
   });
 
   it("does not expose untrusted disclosure URLs", () => {
@@ -394,22 +394,33 @@ describe("ResearchTaskCenter", () => {
     expect(onArchive).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["zh-CN", "研究任务", "关闭任务面板", "全页查看"],
-    ["zh-Hant", "研究任務", "關閉任務面板", "全頁檢視"],
-    ["en", "Research tasks", "Close task panel", "Open full page"],
-  ] as const)("localizes %s and distinguishes drawer/page controls", (language, title, close, openPage) => {
-    const onClose = vi.fn();
-    const onFullPage = vi.fn();
-    const view = render(<ResearchTaskCenter {...props({ language, onClose, onFullPage })} />);
-    expect(screen.getByRole("heading", { name: title })).toBeInTheDocument();
-    expect(view.container.querySelector('[data-variant="drawer"]')).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: close })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: openPage }));
-    expect(onFullPage).toHaveBeenCalledExactlyOnceWith();
+  it("keeps a selected task and its tab when that task leaves the current filter", () => {
+    const base = props({ selectedTaskId: "b", detail: detail("b") });
+    const catalog = { ...base.catalog, filter: "active" as const };
+    const view = render(<ResearchTaskCenter {...base} catalog={catalog} />);
+    fireEvent.click(screen.getByRole("tab", { name: "Preparation" }));
+    view.rerender(<ResearchTaskCenter {...base} catalog={{ ...catalog, items: [task("a")] }}
+      selectedSummary={task("b", "completed")} detail={detail("b", "completed")} />);
+    expect(screen.getByRole("heading", { name: "Company b" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Preparation" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText(/no longer in the selected filter/)).toBeVisible();
+  });
 
-    view.rerender(<ResearchTaskCenter {...props({ variant: "page", language, onClose, onFullPage })} />);
-    expect(view.container.querySelector('[data-variant="page"]')).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: openPage })).not.toBeInTheDocument();
+  it("does not expose approval or archived result actions from a previous selection", () => {
+    const base = props({ selectedTaskId: "b", detail: detail("b", "waiting_input", {
+      vision_approval_pending: true,
+      vision_upload_preview: { plan_id: "plan-b", provider: "offline fixture", pages: [3], total_bytes: 2048 },
+    }) });
+    const view = render(<ResearchTaskCenter {...base} />);
+    expect(screen.getByRole("button", { name: "Approve upload" })).toBeVisible();
+    view.rerender(<ResearchTaskCenter {...base} selectedTaskId="a" />);
+    expect(screen.queryByRole("button", { name: "Approve upload" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Company b" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer a saved result based on a run id alone", () => {
+    render(<ResearchTaskCenter {...props({ selectedTaskId: "b", detail: detail("b", "cancelled", { result_access: "none" }) })} />);
+    expect(screen.queryByRole("button", { name: /View (saved research|research report)/ })).not.toBeInTheDocument();
+    expect(screen.getByText("No saved research result is available for this attempt.")).toBeVisible();
   });
 });

@@ -289,15 +289,8 @@ export function ModelCallProgress({ calls, agentStates = {}, language, cancellin
       historyInFlight.current.delete(requestKey);
     }
   };
-  const priority = (stage: StageActivity) => {
-    if (stage.current && ACTIVE.has(stage.current.state)) return 0;
-    if (["running", "retrying"].includes(stage.agentState ?? "")) return 1;
-    if (stage.agentState === "queued") return 2;
-    return 3;
-  };
-  rows.sort((left, right) => priority(left) - priority(right)
-    || (right.current?.generation ?? 0) - (left.current?.generation ?? 0)
-    || left.stageId.localeCompare(right.stageId));
+  // Do not move a focused or expanded row as its calls change state.
+  rows.sort((left, right) => left.stageId.localeCompare(right.stageId));
 
   const completed = Object.values(agentStates).filter((state) => COMPLETED_AGENT_STATES.has(state)).length;
   const total = Object.keys(agentStates).length;

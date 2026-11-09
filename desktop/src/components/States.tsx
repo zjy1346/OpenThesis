@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { Clock3, FileText } from "lucide-react";
 
 import type { ModelCallHistoryPage, ResearchJob } from "../types";
@@ -149,7 +149,7 @@ export function LoadingState({ label }: { label: string }) {
   return <div className="center-state" aria-live="polite"><span className="loading-ring" /><p>{label}</p></div>;
 }
 
-export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, onReal }: {
+export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, onReal, demoPending }: {
   title: string;
   body: string;
   demoAction: string;
@@ -157,13 +157,14 @@ export function EmptyState({ title, body, demoAction, realAction, hint, onDemo, 
   hint: string;
   onDemo: () => void;
   onReal: () => void;
+  demoPending?: boolean;
 }) {
   return (
     <div className="center-state empty-state">
       <span className="empty-icon"><FileText size={28} strokeWidth={1.5} /></span>
       <h2>{title}</h2><p>{body}</p>
       <div className="empty-actions">
-        <button className="primary-button" type="button" onClick={onDemo}>{demoAction}</button>
+        <button className="primary-button" type="button" disabled={demoPending} aria-busy={demoPending} onClick={onDemo}>{demoAction}</button>
         <button className="secondary-button" type="button" onClick={onReal}>{realAction}</button>
       </div>
       <small>{hint}</small>
@@ -215,6 +216,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   };
   const modelResearchActivity = hasModelResearchActivity(job);
   const [activeTab, setActiveTab] = useState<ProgressTab>("preparation");
+  const tabsId = useId();
   const tabJobId = useRef(job.job_id);
   const autoSwitchedJobId = useRef<string | null>(null);
   useEffect(() => {
@@ -236,43 +238,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
   const agentStates = job.agent_states ?? {};
   const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
   const executionClockRunning = job.state === "running" || job.state === "cancelling";
-  const [elapsed, setElapsed] = useState(backendElapsed);
-  const elapsedAnchor = useRef({
-    jobId: job.job_id,
-    seconds: backendElapsed,
-    observedAt: Date.now(),
-  });
-  useEffect(() => {
-    const now = Date.now();
-    if (!executionClockRunning) {
-      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
-      setElapsed(backendElapsed);
-      return;
-    }
-    const anchor = elapsedAnchor.current;
-    const estimated = anchor.seconds + Math.max(0, Math.floor((now - anchor.observedAt) / 1_000));
-    if (anchor.jobId !== job.job_id || backendElapsed > estimated) {
-      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
-    }
-    setElapsed((current) => Math.max(current, backendElapsed));
-  }, [backendElapsed, job.job_id, executionClockRunning]);
-  useEffect(() => {
-    const now = Date.now();
-    elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
-    setElapsed(backendElapsed);
-    if (!executionClockRunning) return;
-    const update = () => {
-      const anchor = elapsedAnchor.current;
-      const actual = anchor.seconds + Math.max(0, Math.floor((Date.now() - anchor.observedAt) / 1_000));
-      setElapsed((current) => Math.max(current, actual));
-    };
-    const timer = window.setInterval(update, 1_000);
-    document.addEventListener("visibilitychange", update);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", update);
-    };
-  }, [job.job_id, executionClockRunning]);
+  const elapsed = useResearchElapsed(job);
   const stage = job.execution_draining && job.state !== "cancelling"
     ? "task-finalizing"
     : job.state === "running" ? job.stage : job.state;
@@ -315,6 +281,165 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
     : language === "zh-Hant"
       ? { total: "總計", active: "引擎", external: "外部等待" }
       : { total: "总计", active: "引擎", external: "外部等待" };
+  const completedFilingCount = filingStates.filter((filing) => COMPLETED_FILING_STATUSES.has(filing.status)
+    || filing.processing_state === "completed" || FINAL_FILING_STATUSES.has(filing.status)).length;
+  const countLocale = language === "en" ? "en-US" : language === "zh-Hant" ? "zh-Hant" : "zh-CN";
+  const formatCount = (value: number) => value.toLocaleString(countLocale);
+  const filingCountLabel = language === "en" ? "Filings processed:"
+    : language === "zh-Hant" ? "已處理財報：" : "已处理财报：";
+  const candidatePageLabel = language === "en" ? "Current file candidate pages:"
+    : language === "zh-Hant" ? "目前文件候選頁：" : "当前文件候选页：";
+  const currentCandidateProgress = activeFiling
+    && Number.isInteger(activeFiling.completed_page_count)
+    && Number.isInteger(activeFiling.candidate_page_count)
+    ? `${formatCount(activeFiling.completed_page_count!)} / ${formatCount(activeFiling.candidate_page_count!)}`
+    : null;
+  const showEstimating = ["filing-parse", "filing-page", "filing-validation"].includes(stage ?? "")
+    && !remaining && !progressStalled && job.state === "running" && !job.vision_approval_pending;
+  return (
+    <section className="research-progress" data-state={job.state}>
+      <div className="research-progress-summary">
+        <div className="research-progress-header">
+          <div className="research-stage-copy" aria-live="polite">
+            <strong>{stageCopy.title}</strong>
+            <span>“{stageCopy.note}”</span>
+            {job.state !== "running" && job.stage && job.stage !== stage && <small>
+              {language === "en" ? "Latest stage:" : language === "zh-Hant" ? "最近階段：" : "最近阶段："}{" "}
+              <span>{progressStageCopy(language, job.stage).title}</span>
+            </small>}
+            {stageDetail && <small>{stageDetail}</small>}
+            {filingStates.length > 0 && <small>
+              {filingCountLabel} {formatCount(completedFilingCount)} / {formatCount(filingStates.length)}
+              {currentCandidateProgress && <> · {candidatePageLabel} {currentCandidateProgress}</>}
+            </small>}
+          </div>
+          <div className="research-progress-metrics">
+            <span>{job.percent}%</span>
+            <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : language === "zh-Hant" ? "研究已用時間" : "研究已用时间"}>
+              <Clock3 size={14} aria-hidden="true" />{timingLabels.total} {formatElapsedTime(elapsed)}
+            </time>
+            <time dateTime={`PT${activeElapsed}S`}>{timingLabels.active} {formatElapsedTime(activeElapsed)}</time>
+            <time dateTime={`PT${externalElapsed}S`}>{timingLabels.external} {formatElapsedTime(externalElapsed)}</time>
+          </div>
+        </div>
+        <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
+        {executionClockRunning && !job.execution_draining && job.state !== "cancelling" && !job.vision_approval_pending
+          && <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>}
+        {remaining && <div className="research-remaining" aria-label={remainingLabel}>
+          <span>{remainingLabel}</span>
+          <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
+        </div>}
+        {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
+        {showEstimating && <small className="research-remaining">{estimatingCopy}</small>}
+      </div>
+      {showCancel && <button className="research-progress-cancel" type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
+        {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
+      </button>}
+      {job.vision_approval_pending && job.vision_upload_preview && <VisionUploadApproval dialog preview={job.vision_upload_preview}
+        onDecision={onVisionDecision} labels={{
+          title: copy.visionApprovalTitle ?? "Vision upload approval",
+          provider: copy.visionApprovalProvider ?? "Provider", document: copy.visionApprovalDocument ?? "Document",
+          pages: copy.visionApprovalPages ?? "Pages", size: copy.visionApprovalSize ?? "Size",
+          fingerprint: copy.visionApprovalFingerprint ?? "Fingerprint",
+          approve: copy.visionApprovalApprove ?? "Approve upload", decline: copy.visionApprovalDecline ?? "Do not upload",
+        }} />}
+      <div className="research-progress-tabs" role="tablist" aria-label={language === "en" ? "Research progress views" : language === "zh-Hant" ? "研究進度檢視" : "研究进度视图"}>
+        {(["preparation", "research"] as const).map((tab) => <button
+          id={`${tabsId}-${tab}`} key={tab} type="button" role="tab"
+          aria-selected={activeTab === tab} aria-controls={`${tabsId}-panel`}
+          className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}
+        >{tabLabels[tab]}</button>)}
+      </div>
+      <div id={`${tabsId}-panel`} className="research-progress-viewport" role="tabpanel"
+        aria-labelledby={`${tabsId}-${activeTab}`} tabIndex={0}>
+        {showTopLevelTimeWarning && <div className="research-stalled" role="status">{timeWarningCopy}</div>}
+        <FilingActivityDetails job={job} language={language} />
+        {activeTab === "preparation" ? <FilingPreparationProgress job={job} language={language} includeActivity={false} /> : <ModelCallProgress calls={job.model_calls ?? []} agentStates={agentStates} language={language}
+          runId={job.run_id} loadCallHistory={loadCallHistory}
+          cancelling={job.state === "cancelling"} onCancelCall={onCancelCall} />}
+      </div>
+    </section>
+  );
+}
+
+export function useResearchElapsed(job: ResearchJob): number {
+  const backendElapsed = Math.max(0, job.elapsed_seconds ?? 0);
+  const executionClockRunning = job.state === "running" || job.state === "cancelling";
+  const [elapsed, setElapsed] = useState(backendElapsed);
+  const elapsedAnchor = useRef({
+    jobId: job.job_id,
+    seconds: backendElapsed,
+    observedAt: Date.now(),
+  });
+  useEffect(() => {
+    const now = Date.now();
+    if (!executionClockRunning) {
+      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+      setElapsed(backendElapsed);
+      return;
+    }
+    const anchor = elapsedAnchor.current;
+    const estimated = anchor.seconds + Math.max(0, Math.floor((now - anchor.observedAt) / 1_000));
+    if (anchor.jobId !== job.job_id || backendElapsed > estimated) {
+      elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+    }
+    setElapsed((current) => Math.max(current, backendElapsed));
+  }, [backendElapsed, job.job_id, executionClockRunning]);
+  useEffect(() => {
+    const now = Date.now();
+    elapsedAnchor.current = { jobId: job.job_id, seconds: backendElapsed, observedAt: now };
+    setElapsed(backendElapsed);
+    if (!executionClockRunning) return;
+    const update = () => {
+      const anchor = elapsedAnchor.current;
+      const actual = anchor.seconds + Math.max(0, Math.floor((Date.now() - anchor.observedAt) / 1_000));
+      setElapsed((current) => Math.max(current, actual));
+    };
+    const timer = window.setInterval(update, 1_000);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [job.job_id, executionClockRunning]);
+  return elapsed;
+}
+
+export function VisionUploadApproval({ preview, labels, onDecision, disabled, dialog }: {
+  preview: NonNullable<ResearchJob["vision_upload_preview"]>;
+  labels: { title: string; provider: string; document: string; pages: string; size: string;
+    fingerprint: string; approve: string; decline: string; notice?: string };
+  onDecision?: (approved: boolean) => void;
+  disabled?: boolean;
+  dialog?: boolean;
+}) {
+  return <div className="vision-approval-card" role={dialog ? "dialog" : "group"} aria-label={labels.title}>
+    <strong>{labels.title}</strong>
+    {labels.notice && <span>{labels.notice}</span>}
+    <span>{labels.provider}: {preview.provider}</span>
+    <span>{labels.document}: {preview.source_document || "—"}</span>
+    <span>{labels.pages}: {preview.pages.join(", ")} · {labels.size}: {Math.round(preview.total_bytes / 1024)} KB</span>
+    {preview.filing_hash && <code aria-label={labels.fingerprint}>{labels.fingerprint}: {preview.filing_hash.slice(0, 12)}</code>}
+    <div className="vision-approval-actions">
+      <button type="button" disabled={!onDecision || disabled} onClick={() => onDecision?.(true)}>{labels.approve}</button>
+      <button type="button" disabled={!onDecision || disabled} onClick={() => onDecision?.(false)}>{labels.decline}</button>
+    </div>
+  </div>;
+}
+
+export function filingProgressCounts(job: ResearchJob) {
+  const filings = Object.values(job.filing_states ?? {});
+  return {
+    total: filings.length,
+    settled: filings.filter((filing) => SETTLED_FILING_STATUSES.has(filing.status)
+      || COMPLETED_FILING_STATUSES.has(filing.status) || FINAL_FILING_STATUSES.has(filing.status)
+      || filing.processing_state === "completed").length,
+  };
+}
+
+/** Filing rows and page/window detail, shared by both progress presentations. */
+export function FilingPreparationProgress({ job, language, includeActivity = true }: { job: ResearchJob; language: string; includeActivity?: boolean }) {
+  const filingStates = Object.values(job.filing_states ?? {});
   const filingStatus = (status: string) => {
     const values: Record<string, readonly [string, string, string]> = {
       queued: ["排队中", "Queued", "排隊中"],
@@ -383,101 +508,9 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
     historical: ["历史资料", "Historical", "歷史資料"],
   };
   const roleLabel = (role: string) => roleNames[role]?.[language === "en" ? 1 : language === "zh-Hant" ? 2 : 0] ?? role;
-  const completedFilingCount = filingStates.filter((filing) => COMPLETED_FILING_STATUSES.has(filing.status)
-    || filing.processing_state === "completed" || FINAL_FILING_STATUSES.has(filing.status)).length;
-  const countLocale = language === "en" ? "en-US" : language === "zh-Hant" ? "zh-Hant" : "zh-CN";
-  const formatCount = (value: number) => value.toLocaleString(countLocale);
-  const filingCountLabel = language === "en" ? "Filings processed:"
-    : language === "zh-Hant" ? "已處理財報：" : "已处理财报：";
-  const candidatePageLabel = language === "en" ? "Current file candidate pages:"
-    : language === "zh-Hant" ? "目前文件候選頁：" : "当前文件候选页：";
-  const currentCandidateProgress = activeFiling
-    && Number.isInteger(activeFiling.completed_page_count)
-    && Number.isInteger(activeFiling.candidate_page_count)
-    ? `${formatCount(activeFiling.completed_page_count!)} / ${formatCount(activeFiling.candidate_page_count!)}`
-    : null;
-  const productActivity = filingStates.filter((filing) => filing.last_product_at || filing.waiting_type
-    || (Number.isInteger(filing.current_page) && (filing.current_page ?? 0) > 0));
-  const activityLabels = language === "en"
-    ? { summary: "Filing activity details", lastProduct: "Last locatable product", waiting: "Current work state", page: "Current PDF page" }
-    : language === "zh-Hant"
-      ? { summary: "財報活動詳情", lastProduct: "最近可定位產物", waiting: "目前工作狀態", page: "目前 PDF 頁碼" }
-      : { summary: "财报活动详情", lastProduct: "最近可定位产物", waiting: "当前工作状态", page: "当前 PDF 页码" };
-  const showEstimating = ["filing-parse", "filing-page", "filing-validation"].includes(stage ?? "")
-    && !remaining && !progressStalled && job.state === "running" && !job.vision_approval_pending;
-  return (
-    <section className="research-progress" data-state={job.state}>
-      <div className="research-progress-summary">
-        <div className="research-progress-header">
-          <div className="research-stage-copy" aria-live="polite">
-            <strong>{stageCopy.title}</strong>
-            <span>“{stageCopy.note}”</span>
-            {job.state !== "running" && job.stage && job.stage !== stage && <small>
-              {language === "en" ? "Latest stage:" : language === "zh-Hant" ? "最近階段：" : "最近阶段："}{" "}
-              <span>{progressStageCopy(language, job.stage).title}</span>
-            </small>}
-            {stageDetail && <small>{stageDetail}</small>}
-            {filingStates.length > 0 && <small>
-              {filingCountLabel} {formatCount(completedFilingCount)} / {formatCount(filingStates.length)}
-              {currentCandidateProgress && <> · {candidatePageLabel} {currentCandidateProgress}</>}
-            </small>}
-          </div>
-          <div className="research-progress-metrics">
-            <span>{job.percent}%</span>
-            <time dateTime={`PT${elapsed}S`} aria-label={language === "en" ? "Elapsed research time" : language === "zh-Hant" ? "研究已用時間" : "研究已用时间"}>
-              <Clock3 size={14} aria-hidden="true" />{timingLabels.total} {formatElapsedTime(elapsed)}
-            </time>
-            <time dateTime={`PT${activeElapsed}S`}>{timingLabels.active} {formatElapsedTime(activeElapsed)}</time>
-            <time dateTime={`PT${externalElapsed}S`}>{timingLabels.external} {formatElapsedTime(externalElapsed)}</time>
-          </div>
-        </div>
-        <div className="progress-track"><span style={{ transform: `scaleX(${job.percent / 100})` }} /></div>
-        {executionClockRunning && !job.execution_draining && job.state !== "cancelling" && !job.vision_approval_pending
-          && <blockquote className="research-waiting-copy" key={waitingMessage}>{waitingMessage}</blockquote>}
-        {remaining && <div className="research-remaining" aria-label={remainingLabel}>
-          <span>{remainingLabel}</span>
-          <strong>{formatRemaining(remaining.lower, language)}–{formatRemaining(remaining.upper, language)}</strong>
-        </div>}
-        {progressStalled && <div className="research-stalled" role="status">{stalledCopy}</div>}
-        {showEstimating && <small className="research-remaining">{estimatingCopy}</small>}
-      </div>
-      {showCancel && <button className="research-progress-cancel" type="button" onClick={onCancel} disabled={job.state === "cancelling"}>
-        {job.state === "cancelling" ? copy.cancelling : copy.cancel ?? cancelLabel}
-      </button>}
-      {job.vision_approval_pending && job.vision_upload_preview && <div className="vision-approval-card" role="dialog" aria-label={copy.visionApprovalTitle ?? "Vision upload approval"}>
-        <strong>{copy.visionApprovalTitle ?? "Vision upload approval"}</strong>
-        <span>{copy.visionApprovalProvider ?? "Provider"}: {job.vision_upload_preview.provider}</span><span>{copy.visionApprovalDocument ?? "Document"}: {job.vision_upload_preview.source_document || "—"}</span>
-        <span>{copy.visionApprovalPages ?? "Pages"}: {job.vision_upload_preview.pages.join(", ")} · {copy.visionApprovalSize ?? "Size"}: {Math.round(job.vision_upload_preview.total_bytes / 1024)} KB</span>
-        {job.vision_upload_preview.filing_hash && <code aria-label={copy.visionApprovalFingerprint ?? "Fingerprint"}>{copy.visionApprovalFingerprint ?? "Fingerprint"}: {job.vision_upload_preview.filing_hash.slice(0, 12)}</code>}
-        <div className="vision-approval-actions">
-          <button type="button" onClick={() => onVisionDecision?.(true)}>{copy.visionApprovalApprove ?? "Approve upload"}</button>
-          <button type="button" onClick={() => onVisionDecision?.(false)}>{copy.visionApprovalDecline ?? "Do not upload"}</button>
-        </div>
-      </div>}
-      <div className="research-progress-tabs" role="tablist" aria-label={language === "en" ? "Research progress views" : language === "zh-Hant" ? "研究進度檢視" : "研究进度视图"}>
-        {(["preparation", "research"] as const).map((tab) => <button
-          id={`research-progress-tab-${tab}`} key={tab} type="button" role="tab"
-          aria-selected={activeTab === tab} aria-controls="research-progress-panel"
-          className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}
-        >{tabLabels[tab]}</button>)}
-      </div>
-      <div id="research-progress-panel" className="research-progress-viewport" role="tabpanel"
-        aria-labelledby={`research-progress-tab-${activeTab}`} tabIndex={0}>
-        {showTopLevelTimeWarning && <div className="research-stalled" role="status">{timeWarningCopy}</div>}
-        {productActivity.length > 0 && <details className="filing-progress-details">
-          <summary>{activityLabels.summary}</summary>
-          <dl>{productActivity.map((filing) => <div key={filing.filing_id}>
-            <dt>{filing.label}</dt>
-            <dd>
-              {filing.last_product_at && <div>{activityLabels.lastProduct}: <time dateTime={filing.last_product_at}>
-                {formatProductTime(filing.last_product_at, language)}</time></div>}
-              {filing.waiting_type && <div>{activityLabels.waiting}: {waitingTypeLabel(filing.waiting_type, language)}</div>}
-              {Number.isInteger(filing.current_page) && (filing.current_page ?? 0) > 0
-                && <div>{activityLabels.page}: {formatCount(filing.current_page!)}</div>}
-            </dd>
-          </div>)}</dl>
-        </details>}
-        {activeTab === "preparation" ? <div className="filing-progress-list" aria-label={language === "en" ? "Filing progress" : language === "zh-Hant" ? "財報進度" : "财报进度"}>
+  return <>
+    {includeActivity && <FilingActivityDetails job={job} language={language} />}
+    <div className="filing-progress-list" aria-label={language === "en" ? "Filing progress" : language === "zh-Hant" ? "財報進度" : "财报进度"}>
           {filingStates.length > 0 ? filingStates.map((filing) => {
             const inferredAvailability = FINAL_FILING_STATUSES.has(filing.status) ? filing.status : undefined;
             const availability = filing.availability ?? inferredAvailability;
@@ -508,6 +541,7 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
             return <article className="filing-progress-row" key={filing.filing_id} data-status={filing.status} data-availability={availability}>
               <div className="filing-progress-main">
                 <strong className="filing-progress-name" title={filing.label}>{filing.label}</strong>
+                {filing.fiscal_period && <span className="filing-progress-period">{filing.fiscal_period}</span>}
                 <div className="filing-progress-badges">
                   {processStatus && <span className="filing-progress-process">{filingStatus(processStatus)}</span>}
                   {availability && <span className="filing-progress-availability" data-availability={availability}>{availabilityLabel(availability)}</span>}
@@ -535,10 +569,33 @@ export function ResearchProgress({ job, cancelLabel, labels, language = "zh-CN",
               </div>}
             </article>;
           }) : <p className="progress-empty-state">{language === "en" ? "Filing details will appear here as documents are processed." : language === "zh-Hant" ? "文件處理進度會顯示在這裡。" : "文件处理进度会显示在这里。"}</p>}
-        </div> : <ModelCallProgress calls={job.model_calls ?? []} agentStates={agentStates} language={language}
-          runId={job.run_id} loadCallHistory={loadCallHistory}
-          cancelling={job.state === "cancelling"} onCancelCall={onCancelCall} />}
-      </div>
-    </section>
-  );
+        </div>
+  </>;
+}
+
+function FilingActivityDetails({ job, language }: { job: ResearchJob; language: string }) {
+  const filingStates = Object.values(job.filing_states ?? {});
+  const formatCount = (value: number) => value.toLocaleString(language);
+  const productActivity = filingStates.filter((filing) => filing.last_product_at || filing.waiting_type
+    || (Number.isInteger(filing.current_page) && (filing.current_page ?? 0) > 0));
+  const activityLabels = language === "en"
+    ? { summary: "Filing activity details", lastProduct: "Last locatable product", waiting: "Current work state", page: "Current PDF page" }
+    : language === "zh-Hant"
+      ? { summary: "財報活動詳情", lastProduct: "最近可定位產物", waiting: "目前工作狀態", page: "目前 PDF 頁碼" }
+      : { summary: "财报活动详情", lastProduct: "最近可定位产物", waiting: "当前工作状态", page: "当前 PDF 页码" };
+  return <>
+        {productActivity.length > 0 && <details className="filing-progress-details">
+          <summary>{activityLabels.summary}</summary>
+          <dl>{productActivity.map((filing) => <div key={filing.filing_id}>
+            <dt>{filing.label}</dt>
+            <dd>
+              {filing.last_product_at && <div>{activityLabels.lastProduct}: <time dateTime={filing.last_product_at}>
+                {formatProductTime(filing.last_product_at, language)}</time></div>}
+              {filing.waiting_type && <div>{activityLabels.waiting}: {waitingTypeLabel(filing.waiting_type, language)}</div>}
+              {Number.isInteger(filing.current_page) && (filing.current_page ?? 0) > 0
+                && <div>{activityLabels.page}: {formatCount(filing.current_page!)}</div>}
+            </dd>
+          </div>)}</dl>
+        </details>}
+  </>;
 }
